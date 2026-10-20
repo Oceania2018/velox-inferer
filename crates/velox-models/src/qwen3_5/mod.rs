@@ -225,13 +225,26 @@ impl<B: Backend> Qwen35Text<B> {
             )));
         }
         let mut t_last = 0;
+        let started = std::time::Instant::now();
         for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
             let base = i * ws.max_tokens;
             let pos = positions.map(|p| &p[base..base + chunk.len()]);
             self.chunk(b, s, ws, chunk, base, pos, inserts)?;
             t_last = chunk.len() - 1;
         }
-        self.logits(b, ws, t_last)
+        let queued = started.elapsed();
+        let logits = self.logits(b, ws, t_last);
+        // VELOX_STEP_TIMING=1: host time to enqueue a step vs the step's wall time. When the two
+        // are close, the GPU waits on kernel launches rather than the other way round.
+        if std::env::var_os("VELOX_STEP_TIMING").is_some() {
+            eprintln!(
+                "[step] {} tokens: enqueue {:.2} ms, total {:.2} ms",
+                ids.len(),
+                queued.as_secs_f64() * 1e3,
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        logits
     }
 
     /// One chunk of `ids`, which start at offset `base` of the `forward_with` call.
