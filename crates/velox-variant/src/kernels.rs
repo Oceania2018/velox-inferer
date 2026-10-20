@@ -1,7 +1,7 @@
 //! RTX 5090 kernel set. Each override tries the tuned kernel and falls back to the portable one
 //! when the kernel reports the shape as unsupported.
 
-use velox_core::backend::{ActPolicy, ActQuant, AttnPrecision, AttnShape, WeightView};
+use velox_core::backend::{ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, WeightView};
 use velox_core::check::to_i32;
 use velox_core::{Error, Op, Result, WeightFormat};
 use velox_cuda::{portable, status, CudaBuffer, CudaKernels};
@@ -19,6 +19,15 @@ extern "C" {
         rows: i32,
         input_divisor: f32,
         y: *mut f32,
+    ) -> i32;
+    fn velox_5090_attention_full(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
     ) -> i32;
     fn velox_5090_attention_prefill(
         q: *const f32,
@@ -67,7 +76,7 @@ fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<(
 
 impl CudaKernels for Rtx5090Kernels {
     fn native_ops(&self) -> &'static [Op] {
-        &[Op::MatMul, Op::Linear, Op::Attention]
+        &[Op::MatMul, Op::Linear, Op::Attention, Op::AttentionFull]
     }
 
     // Shapes were validated by CudaBackend before these are called.
@@ -108,6 +117,35 @@ impl CudaKernels for Rtx5090Kernels {
                 )
             },
             "rtx5090 attention prefill",
+        )
+    }
+
+    fn attention_full_precision(&self, s: FullAttnShape) -> AttnPrecision {
+        if s.tokens >= FLASH_MIN_TOKENS && s.head_dim <= 128 {
+            AttnPrecision::F16
+        } else {
+            AttnPrecision::Exact
+        }
+    }
+
+    fn attention_full(&self, q: &CudaBuffer, k: &CudaBuffer, v: &CudaBuffer, out: &mut CudaBuffer, s: FullAttnShape) -> Result<()> {
+        if self.attention_full_precision(s) == AttnPrecision::Exact {
+            return portable::attention_full(q, k, v, out, s);
+        }
+        // SAFETY: extents validated by CudaBackend (check::attention_full).
+        status(
+            unsafe {
+                velox_5090_attention_full(
+                    q.as_ptr(),
+                    k.as_ptr(),
+                    v.as_ptr(),
+                    out.as_mut_ptr(),
+                    to_i32("tokens", s.tokens)?,
+                    to_i32("heads", s.heads)?,
+                    to_i32("head_dim", s.head_dim)?,
+                )
+            },
+            "rtx5090 attention_full",
         )
     }
 
