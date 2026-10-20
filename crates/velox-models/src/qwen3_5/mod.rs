@@ -30,6 +30,10 @@ pub struct Session<B: Backend> {
     spec: Option<Spec<B>>,
 }
 
+/// Up to this many tokens (decode, verify) adjacent projections run as one fused linear; larger
+/// chunks keep them separate, where per-matrix GEMM tiles are faster than the split copy saves.
+const FUSE_MAX_TOKENS: usize = 16;
+
 /// Most tokens one `verify` call may feed (the anchor plus drafts).
 pub const VERIFY_MAX: usize = 16;
 
@@ -356,7 +360,7 @@ impl<B: Backend> Qwen35Text<B> {
                     dt_bias,
                     norm,
                 } => {
-                    match qkvz {
+                    match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
                         Some(f) => {
                             b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
                             b.split_cols(
@@ -510,7 +514,7 @@ impl<B: Backend> Qwen35Text<B> {
         else {
             return Err(Error::Config("attention_mixer on a GDN layer".into()));
         };
-        match fused {
+        match fused.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
             Some(f) => {
                 b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
                 let col = |d: &WDesc| d.row_begin - f.row_begin;
@@ -598,7 +602,7 @@ impl<B: Backend> Qwen35Text<B> {
     /// Dense FFN of one layer: `ws.h` to `ws.y`.
     fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize) -> Result<()> {
         let (c, w) = (&self.cfg, &self.w);
-        match &l.mlp_gate_up {
+        match l.mlp_gate_up.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
             Some(f) => {
                 b.linear(&ws.h, &w.view(f), &mut ws.gu, t)?;
                 let (g, u) = (
