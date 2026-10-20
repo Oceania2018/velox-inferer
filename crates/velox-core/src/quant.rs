@@ -91,9 +91,65 @@ pub fn quantize_activations(x: &mut [f32], k: usize, q: ActQuant) {
     }
 }
 
+/// `f32 -> f16 -> f32`, round to nearest even (`__float2half_rn`), overflowing to infinity.
+pub fn round_f16(x: f32) -> f32 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    let a = x.abs();
+    // Spacing of f16 values around `a`: 2^(e - 10) for normals, 2^-24 for subnormals.
+    let e = a.log2().floor() as i32;
+    let e = if a < 2f32.powi(e) {
+        e - 1
+    } else if a >= 2f32.powi(e + 1) {
+        e + 1
+    } else {
+        e
+    };
+    let step = 2f32.powi(e.max(-14) - 10);
+    let r = (a / step).round_ties_even() * step;
+    let r = if r > 65504.0 { f32::INFINITY } else { r };
+    r.copysign(x)
+}
+
+/// Applies the input rounding of `p` to a causal attention call's operands in place:
+/// `q` is `[tokens, heads, head_dim]`, `k`/`v` hold at least `kv_len` rows of `[kv_heads, head_dim]`.
+pub fn round_attention_inputs(
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    s: crate::backend::AttnShape,
+    p: crate::backend::AttnPrecision,
+) {
+    if p == crate::backend::AttnPrecision::Exact {
+        return;
+    }
+    let kv = s.kv_len() * s.kv_heads * s.head_dim;
+    quantize_activations(q, s.head_dim, ActQuant::Fp8Row);
+    quantize_activations(&mut k[..kv], s.head_dim, ActQuant::Fp8Row);
+    for x in &mut v[..kv] {
+        *x = round_f16(*x);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f16_rounding_matches_the_format() {
+        use crate::format::f16_to_f32;
+        // Every finite f16 value is a fixed point; midpoints go to the even neighbour.
+        for h in (0u16..0x7c00).step_by(7) {
+            let v = f16_to_f32(h);
+            assert_eq!(round_f16(v), v);
+            let next = f16_to_f32(h + 1);
+            let mid = (v + next) / 2.0;
+            let want = if h % 2 == 0 { v } else { next };
+            assert_eq!(round_f16(mid), want, "h = {h:#06x}");
+        }
+        assert_eq!(round_f16(1e6), f32::INFINITY);
+    }
 
     #[test]
     fn e4m3_round_trips_every_finite_code() {

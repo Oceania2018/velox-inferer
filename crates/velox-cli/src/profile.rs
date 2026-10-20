@@ -179,6 +179,9 @@ impl<B: Backend> Backend for Profiled<B> {
         };
         self.time(name, || self.inner.attention(q, k, v, out, s))
     }
+    fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
+        self.inner.attention_precision(s)
+    }
     fn conv1d_silu(
         &self,
         x: &B::Buffer,

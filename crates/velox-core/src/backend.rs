@@ -205,6 +205,16 @@ pub enum ActQuant {
     },
 }
 
+/// The operand precision of a causal `attention` kernel. Like [`ActQuant`], the CPU oracle applies
+/// the same input rounding before its exact computation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnPrecision {
+    Exact,
+    /// Q and K rounded per row (one `head_dim` vector) as [`ActQuant::Fp8Row`] for the score
+    /// product; V rounded to f16 and the softmax weights to f16 for the value product.
+    Fp8QkF16Pv,
+}
+
 /// Rows `[row_begin, row_begin + rows)` of a stored weight matrix `[parent_rows, k]`, kept in its
 /// encoded form. Views keep the parent geometry because plane offsets and NVFP4 scale swizzles
 /// depend on it.
@@ -369,6 +379,10 @@ pub trait Backend {
         out: &mut Self::Buffer,
         shape: AttnShape,
     ) -> Result<()>;
+    /// The operand precision `attention` uses for this shape.
+    fn attention_precision(&self, _shape: AttnShape) -> AttnPrecision {
+        AttnPrecision::Exact
+    }
     /// Non-causal multi-head attention: every token attends to all `shape.tokens` keys.
     /// `q`, `k`, `v`, `out` are `[tokens, heads, head_dim]`.
     fn attention_full(

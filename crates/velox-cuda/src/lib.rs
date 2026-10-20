@@ -8,8 +8,8 @@ use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
 use velox_core::backend::{
-    ActQuant, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind,
-    NormKind, RopePosShape, RopeShape, WeightView,
+    ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape,
+    GeluKind, NormKind, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{check, profile, DeviceProfile, Error, GpuArch, Op, Result, VariantInfo};
 
@@ -328,6 +328,11 @@ pub trait CudaKernels: Send + Sync {
         portable::attention(q, k, v, out, s)
     }
 
+    /// The operand precision of `attention`; see [`Backend::attention_precision`].
+    fn attention_precision(&self, _s: AttnShape) -> AttnPrecision {
+        AttnPrecision::Exact
+    }
+
     fn conv1d_silu(
         &self,
         x: &CudaBuffer,
@@ -612,6 +617,10 @@ impl Backend for CudaBackend {
     ) -> Result<()> {
         check::attention(q.len, k.len, v.len, out.len, &s)?;
         self.kernels.attention(q, k, v, out, s)
+    }
+
+    fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
+        self.kernels.attention_precision(s)
     }
 
     fn conv1d_silu(
