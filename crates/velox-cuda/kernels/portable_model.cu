@@ -122,7 +122,12 @@ __global__ void linear_kernel(const float* __restrict__ x, WDesc w, long long ro
 constexpr int kTile = 64, kTileK = 16;
 
 __global__ void __launch_bounds__(256)
-linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m, float* __restrict__ y) {
+linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m, float* __restrict__ y,
+                    long long k_split) {
+    // Split-K: block z covers [z * k_split, (z + 1) * k_split) and writes its own [m, rows] slice.
+    const long long k_begin = blockIdx.z * k_split;
+    const long long k_end = k_begin + k_split < w.k ? k_begin + k_split : w.k;
+    y += static_cast<size_t>(blockIdx.z) * m * rows;
     __shared__ float Xs[kTileK][kTile + 4];
     __shared__ float Ws[kTileK][kTile + 4];
     const int t = threadIdx.x;
@@ -130,13 +135,13 @@ linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, i
     const int lr = t / 4, lk = (t % 4) * 4;
     const int ty = t / 16, tx = t % 16;
     float acc[4][4] = {};
-    for (long long k0 = 0; k0 < w.k; k0 += kTileK) {
+    for (long long k0 = k_begin; k0 < k_end; k0 += kTileK) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const long long kk = k0 + lk + i;
             const int xm = m0 + lr, wn = n0 + lr;
-            Xs[lk + i][lr] = (xm < m && kk < w.k) ? x[static_cast<size_t>(xm) * w.k + kk] : 0.0f;
-            Ws[lk + i][lr] = (wn < rows && kk < w.k) ? weight_at(w, row_begin + wn, kk) : 0.0f;
+            Xs[lk + i][lr] = (xm < m && kk < k_end) ? x[static_cast<size_t>(xm) * w.k + kk] : 0.0f;
+            Ws[lk + i][lr] = (wn < rows && kk < k_end) ? weight_at(w, row_begin + wn, kk) : 0.0f;
         }
         __syncthreads();
 #pragma unroll
@@ -179,23 +184,35 @@ __global__ void sigmoid_mul_kernel(float* __restrict__ x, const float* __restric
 
 constexpr int kMaxConvWidth = 8;
 
-// One thread per channel walks the tokens in order, carrying the window.
-__global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ state,
-                                   float* __restrict__ out, int tokens, int channels, int width) {
+// One thread per (token, channel): tap j reads the input at time t - (width - 1) + j, from x when
+// that is >= 0 and otherwise from the rolling state (oldest first). The state is advanced by
+// conv1d_state_kernel afterwards, so every read here sees the state from before the call.
+__global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                   const float* __restrict__ state, float* __restrict__ out, int tokens, int channels,
+                                   int width) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<long long>(tokens) * channels) return;
+    const int t = static_cast<int>(i / channels), c = static_cast<int>(i % channels);
+    float acc = 0.0f;
+    for (int j = 0; j < width; ++j) {
+        const int s = t - (width - 1) + j;
+        const float in = s >= 0 ? x[static_cast<size_t>(s) * channels + c] : state[static_cast<size_t>(t + j) * channels + c];
+        acc += w[static_cast<size_t>(j) * channels + c] * in;
+    }
+    out[i] = acc / (1.0f + expf(-acc));
+}
+
+// state[j] <- input at time tokens - (width - 1) + j. Ascending j only reads indices >= j + tokens
+// of the old state, which are not yet overwritten.
+__global__ void conv1d_state_kernel(const float* __restrict__ x, float* __restrict__ state, int tokens, int channels,
+                                    int width) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
-    float win[kMaxConvWidth];
-    float wc[kMaxConvWidth];
-    for (int j = 0; j < width; ++j) wc[j] = w[static_cast<size_t>(j) * channels + c];
-    for (int j = 0; j < width - 1; ++j) win[j] = state[static_cast<size_t>(j) * channels + c];
-    for (int t = 0; t < tokens; ++t) {
-        win[width - 1] = x[static_cast<size_t>(t) * channels + c];
-        float acc = 0.0f;
-        for (int j = 0; j < width; ++j) acc += wc[j] * win[j];
-        out[static_cast<size_t>(t) * channels + c] = acc / (1.0f + expf(-acc));
-        for (int j = 0; j < width - 1; ++j) win[j] = win[j + 1];
+    for (int j = 0; j < width - 1; ++j) {
+        const int s = tokens - (width - 1) + j;
+        state[static_cast<size_t>(j) * channels + c] =
+            s >= 0 ? x[static_cast<size_t>(s) * channels + c] : state[static_cast<size_t>(j + tokens) * channels + c];
     }
-    for (int j = 0; j < width - 1; ++j) state[static_cast<size_t>(j) * channels + c] = win[j];
 }
 
 // Gated DeltaNet: state rows are independent, so one warp owns one row S[h][i][:] (lanes split
@@ -329,6 +346,30 @@ __global__ void linear_gemv_kernel(const float* __restrict__ x, WDesc w, long lo
     for (int i = 0; i < kGemvMaxM; ++i) {
         const float s = velox_warp_sum(acc[i]);
         if (lane == 0 && i < m) y[static_cast<size_t>(i) * rows + r] = s;
+    }
+}
+
+float* linear_split_scratch(size_t floats) {
+    static float* ptr = nullptr;
+    static size_t cap = 0;
+    if (floats > cap) {
+        if (ptr != nullptr) cudaFree(ptr);
+        if (cudaMalloc(&ptr, floats * sizeof(float)) != cudaSuccess) {
+            ptr = nullptr;
+            cap = 0;
+            return nullptr;
+        }
+        cap = floats;
+    }
+    return ptr;
+}
+
+__global__ void sum_splits_kernel(const float* __restrict__ part, int splits, long long n, float* __restrict__ y) {
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        float s = 0.0f;
+        for (int z = 0; z < splits; ++z) s += part[z * n + i];
+        y[i] = s;
     }
 }
 
@@ -490,9 +531,25 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
             linear_gemv_kernel<VELOX_FMT_NVFP4><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
         return velox_launch_status();
     }
+    // The tiled kernel needs enough output tiles to fill the GPU; skinny outputs (a few dozen rows,
+    // e.g. GDN gate projections) go to the warp-per-output kernel instead.
+    const long long tiles = static_cast<long long>((rows + kTile - 1) / kTile) * ((m + kTile - 1) / kTile);
     if (m >= 16 && (m + kTile - 1) / kTile <= 65535) {
-        const dim3 grid((rows + kTile - 1) / kTile, (m + kTile - 1) / kTile);
-        linear_tiled_kernel<<<grid, 256>>>(x, d, row_begin, rows, m, y);
+        // Too few tiles to fill the GPU (skinny outputs such as GDN gate projections): split K into
+        // slices written separately, then summed in a fixed order, so results stay deterministic.
+        int splits = 1;
+        while (tiles * splits < 256 && k / (splits * 2) >= 256) splits *= 2;
+        const long long k_split = (k + splits - 1) / splits;
+        const dim3 grid((rows + kTile - 1) / kTile, (m + kTile - 1) / kTile, splits);
+        if (splits == 1) {
+            linear_tiled_kernel<<<grid, 256>>>(x, d, row_begin, rows, m, y, k_split);
+        } else {
+            float* part = linear_split_scratch(static_cast<size_t>(splits) * m * rows);
+            if (part == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+            linear_tiled_kernel<<<grid, 256>>>(x, d, row_begin, rows, m, part, k_split);
+            const long long n = static_cast<long long>(m) * rows;
+            sum_splits_kernel<<<velox_grid_1d(n, 256), 256>>>(part, splits, n, y);
+        }
     } else {
         constexpr int kWarps = 8;
         const dim3 grid((rows + kWarps - 1) / kWarps, m < 65535 ? m : 65535);
@@ -515,7 +572,9 @@ VELOX_API int velox_portable_sigmoid_mul(float* x, const float* gate, long long 
 VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, float* state, float* out, int tokens,
                                          int channels, int width) {
     if (width > kMaxConvWidth) return VELOX_ERR_UNSUPPORTED;
-    conv1d_silu_kernel<<<(channels + 127) / 128, 128>>>(x, w, state, out, tokens, channels, width);
+    conv1d_silu_kernel<<<velox_grid_1d(static_cast<long long>(tokens) * channels, 256), 256>>>(x, w, state, out, tokens,
+                                                                                                channels, width);
+    conv1d_state_kernel<<<(channels + 255) / 256, 256>>>(x, state, tokens, channels, width);
     return velox_launch_status();
 }
 

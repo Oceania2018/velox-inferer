@@ -35,6 +35,7 @@ mod ffi {
         pub fn velox_cuda_free(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_htod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_dtoh(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
+        pub fn velox_cuda_stage(src: *const c_void, bytes: usize, dev: *mut *mut c_void) -> i32;
         pub fn velox_cuda_dtod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_synchronize() -> i32;
         pub fn velox_cuda_error_string(code: i32) -> *const c_char;
@@ -436,6 +437,19 @@ impl CudaBackend {
     pub fn device(&self) -> &DeviceInfo {
         &self.device
     }
+}
+
+/// Queues `data` for upload through a pinned ring and returns its device address. The address
+/// stays valid for kernels queued right after this call (the ring is recycled only after a stream
+/// synchronize), so it suits per-call inputs such as token ids, not persistent data.
+pub(crate) fn stage(data: &[u8]) -> Result<*const c_void> {
+    let mut d: *mut c_void = std::ptr::null_mut();
+    // SAFETY: the shim copies `data` into pinned memory before returning.
+    status(
+        unsafe { ffi::velox_cuda_stage(data.as_ptr().cast(), data.len(), &mut d) },
+        "stage upload",
+    )?;
+    Ok(d)
 }
 
 /// Uploads raw bytes into a fresh buffer of `ceil(len / 4)` f32 slots (tail zeroed).
