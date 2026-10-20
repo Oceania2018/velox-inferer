@@ -1,4 +1,4 @@
-//! Hardware variant of this build: **rtx-5090-laptop-24g** (branch `rtx-5090-laptop-24g`).
+//! Hardware variant of this build: **rtx-5090-24g** (branch `rtx-5090-24g`).
 //!
 //! RTX 5090 Laptop GPU 24 GB (GB203, 82 SMs): portable kernels, laptop VRAM policy
 //!
@@ -10,8 +10,8 @@
 use velox_core::{DeviceProfile, GpuArch, PlanPolicy, VariantInfo};
 
 pub static INFO: VariantInfo = VariantInfo {
-    id: "rtx-5090-laptop-24g",
-    branch: "rtx-5090-laptop-24g",
+    id: "rtx-5090-24g",
+    branch: "rtx-5090-24g",
     description: "RTX 5090 Laptop GPU 24 GB (GB203, 82 SMs): portable kernels, laptop VRAM policy",
     profiles: &["rtx-5090-laptop"],
     archs: &[GpuArch::Cuda {
