@@ -420,6 +420,18 @@ pub trait CudaKernels: Send + Sync {
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         portable::top_k(x, rows, row_len, limit, k)
     }
+
+    fn concat_cols(
+        &self,
+        a: &CudaBuffer,
+        b: &CudaBuffer,
+        out: &mut CudaBuffer,
+        rows: usize,
+        a_cols: usize,
+        b_cols: usize,
+    ) -> Result<()> {
+        portable::concat_cols(a, b, out, rows, a_cols, b_cols)
+    }
 }
 
 /// Every op on the portable kernels; the CUDA kernel set of the generic variant on main.
@@ -505,6 +517,21 @@ impl Backend for CudaBackend {
         k: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         self.timed("top_k", || self.kernels.top_k(x, rows, row_len, limit, k))
+    }
+
+    fn concat_cols(
+        &self,
+        a: &CudaBuffer,
+        b: &CudaBuffer,
+        out: &mut CudaBuffer,
+        rows: usize,
+        a_cols: usize,
+        b_cols: usize,
+    ) -> Result<()> {
+        check::concat_cols(a.len, b.len, out.len, rows, a_cols, b_cols)?;
+        self.timed("concat_cols", || {
+            self.kernels.concat_cols(a, b, out, rows, a_cols, b_cols)
+        })
     }
 
     type Buffer = CudaBuffer;

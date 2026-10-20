@@ -8,6 +8,9 @@
 
 mod prompt;
 mod sampling;
+pub mod spec;
+
+use spec::MtpDrafter;
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -38,6 +41,8 @@ pub struct EngineConfig {
     /// Capacity of a second, small lane for requests that share nothing with the main lane
     /// (probes, side questions), so they do not evict the agent's context. 0 disables it.
     pub scratch_capacity: usize,
+    /// MTP drafts per speculative round on the main lane (0: plain decoding).
+    pub mtp_drafts: usize,
 }
 
 /// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
@@ -48,6 +53,8 @@ struct Lane<B: Backend> {
     keys: Vec<u32>,
     checkpoints: Vec<Checkpoint<B>>,
     zero: Checkpoint<B>,
+    /// MTP drafter for speculative decoding (main lane only).
+    drafter: Option<MtpDrafter<B>>,
 }
 
 /// All lanes plus the activation workspace they share (requests run one at a time).
@@ -251,17 +258,32 @@ impl<B: Backend> QwenEngine<B> {
     ) -> Result<Self, CoreError> {
         let ws = model.workspace(&b, cfg.chunk)?;
         let mut lanes = Vec::new();
-        for capacity in [cfg.capacity, cfg.scratch_capacity.min(cfg.capacity)] {
+        for (i, capacity) in [cfg.capacity, cfg.scratch_capacity.min(cfg.capacity)]
+            .into_iter()
+            .enumerate()
+        {
             if capacity == 0 {
                 continue;
             }
             let session = model.session(&b, capacity)?;
             let zero = session.checkpoint(&b)?;
+            let drafter = if i == 0 && cfg.mtp_drafts > 0 && model.has_mtp() {
+                Some(MtpDrafter::new(
+                    &b,
+                    &model,
+                    capacity,
+                    cfg.chunk,
+                    cfg.mtp_drafts,
+                )?)
+            } else {
+                None
+            };
             lanes.push(Lane {
                 session,
                 keys: Vec::new(),
                 checkpoints: Vec::new(),
                 zero,
+                drafter,
             });
         }
         let special = SpecialTokens {
@@ -369,6 +391,88 @@ impl<B: Backend> QwenEngine<B> {
     }
 
     /// Prefills `p.ids[start..]` (checkpointing on the way) and returns the last logits.
+    /// Speculative decoding on a lane with an MTP drafter, from the candidates after the prompt.
+    /// Each round verifies `[pending, drafts..]`, accepts drafts by speculative sampling (exact
+    /// match when greedy), commits the fed prefix and drafts again. Returns the finish reason.
+    fn decode_speculative(
+        &self,
+        lane: &mut Lane<B>,
+        ws: &mut Workspace<B>,
+        sampler: &mut Sampler,
+        cands: Vec<(u32, f32)>,
+        max_tokens: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<&'static str, ApiError> {
+        let limit = self.fe.public_vocab;
+        let Lane {
+            session,
+            keys,
+            drafter,
+            ..
+        } = lane;
+        let dr = drafter.as_mut().expect("caller checked");
+        let (b, model) = (&self.b, &self.model);
+        let mut c = sampler.sample(&cands);
+        // Rows of the previous verify still to be paired in MTP (none: the prefill carry).
+        let (mut row0, mut kept_next) = (0usize, Vec::new());
+        loop {
+            if self.fe.is_eos(c) {
+                return Ok("stop");
+            }
+            out.push(c);
+            sampler.observe(c);
+            if out.len() >= max_tokens {
+                return Ok("length");
+            }
+            let drafts = dr
+                .draft(b, model, session, ws, row0, &kept_next, c, limit)
+                .map_err(core)?;
+            let mut window = vec![c];
+            window.extend(drafts.into_iter().take(max_tokens - out.len()));
+            let p = session.pos;
+            let rows = model
+                .verify(b, session, ws, &window, CANDIDATES, limit)
+                .map_err(core)?;
+            let mut keep = 1;
+            let mut finish = None;
+            let mut next = None;
+            for j in 0..window.len() {
+                if j + 1 == window.len() {
+                    next = Some(sampler.sample(&rows[j]));
+                    break;
+                }
+                match sampler.verify_draft(&rows[j], window[j + 1]) {
+                    Ok(()) => {
+                        keep += 1;
+                        let d = window[j + 1];
+                        if self.fe.is_eos(d) {
+                            finish = Some("stop");
+                            break;
+                        }
+                        out.push(d);
+                        sampler.observe(d);
+                        if out.len() >= max_tokens {
+                            finish = Some("length");
+                            break;
+                        }
+                    }
+                    Err(t) => {
+                        next = Some(t);
+                        break;
+                    }
+                }
+            }
+            model.commit(b, session, ws, keep).map_err(core)?;
+            keys.extend_from_slice(&window[..keep]);
+            if let Some(f) = finish {
+                return Ok(f);
+            }
+            row0 = p;
+            kept_next = window[1..keep].to_vec();
+            c = next.expect("a round ends with a sampled token");
+        }
+    }
+
     fn prefill(
         &self,
         lane: &mut Lane<B>,
@@ -414,14 +518,36 @@ impl<B: Backend> QwenEngine<B> {
                     })
                     .collect();
                 let positions = p.positions.as_ref().map(|v| &v[pos..cp]);
-                self.model.advance(
-                    &self.b,
-                    &mut lane.session,
-                    ws,
-                    &p.ids[pos..cp],
-                    positions,
-                    &inserts,
-                )?;
+                let Lane {
+                    session, drafter, ..
+                } = &mut *lane;
+                match drafter.as_mut() {
+                    Some(dr) => {
+                        let (row0, delta) = (session.pos, session.rope_delta);
+                        let model = &self.model;
+                        let b = &self.b;
+                        model.advance_rows(
+                            b,
+                            session,
+                            ws,
+                            &p.ids[pos..cp],
+                            positions,
+                            &inserts,
+                            &mut |ws, base, t| {
+                                let rows = positions.map(|v| &v[base..base + t]);
+                                dr.prefill_chunk(b, model, ws, row0 + base, t, delta, rows)
+                            },
+                        )?;
+                    }
+                    None => self.model.advance(
+                        &self.b,
+                        session,
+                        ws,
+                        &p.ids[pos..cp],
+                        positions,
+                        &inserts,
+                    )?,
+                }
                 pos = cp;
             }
             if cp < p.ids.len() {
@@ -510,6 +636,9 @@ where
                 self.checkpoint_positions(&p.ids, 0)
             );
         }
+        if let Some(dr) = lane.drafter.as_mut() {
+            dr.reset();
+        }
         let start = self.reuse(lane, &p.keys).map_err(core)?;
         // Checkpoints still valid for this prompt are those inside the shared prefix.
         lane.checkpoints.retain(|c| c.pos <= start);
@@ -534,26 +663,31 @@ where
         let t1 = Instant::now();
         let mut out = Vec::new();
         let mut finish = "length";
-        loop {
-            let next = sampler.sample(&cands);
-            if self.fe.is_eos(next) {
-                finish = "stop";
-                break;
+        if lane.drafter.is_some() {
+            finish =
+                self.decode_speculative(lane, ws, &mut sampler, cands, max_tokens, &mut out)?;
+        } else {
+            loop {
+                let next = sampler.sample(&cands);
+                if self.fe.is_eos(next) {
+                    finish = "stop";
+                    break;
+                }
+                out.push(next);
+                sampler.observe(next);
+                if out.len() >= max_tokens {
+                    break;
+                }
+                self.model
+                    .advance(&self.b, &mut lane.session, ws, &[next], None, &[])
+                    .and_then(|()| {
+                        self.model
+                            .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)
+                    })
+                    .map(|c| cands = c)
+                    .map_err(core)?;
+                lane.keys.push(next);
             }
-            out.push(next);
-            sampler.observe(next);
-            if out.len() >= max_tokens {
-                break;
-            }
-            self.model
-                .advance(&self.b, &mut lane.session, ws, &[next], None, &[])
-                .and_then(|()| {
-                    self.model
-                        .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)
-                })
-                .map(|c| cands = c)
-                .map_err(core)?;
-            lane.keys.push(next);
         }
         let predicted_ms = t1.elapsed().as_secs_f64() * 1e3;
 

@@ -272,6 +272,24 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn concat_cols(&mut self, rows: usize, a_cols: usize, b_cols: usize) -> Result<()> {
+        let (a, bb) = (
+            self.rng.vec(rows * a_cols, 1.0),
+            self.rng.vec(rows * b_cols, 1.0),
+        );
+        let n = rows * (a_cols + b_cols);
+        let mut want = vec![0.0; n];
+        CpuBackend.concat_cols(&a, &bb, &mut want, rows, a_cols, b_cols)?;
+        let (ad, bd) = (self.b.upload(&a)?, self.b.upload(&bb)?);
+        let mut od = self.b.alloc(n)?;
+        self.b
+            .concat_cols(&ad, &bd, &mut od, rows, a_cols, b_cols)?;
+        let got = fetch(self.b, &od, n)?;
+        let name = format!("concat_cols rows={rows} {a_cols}+{b_cols}");
+        self.record(name, Some(Op::ConcatCols), &got, &want, 0.0);
+        Ok(())
+    }
+
     /// `top_k` must agree exactly (indices and values) with the host selection, including ties
     /// (lower index first) and NaN (ranked last).
     fn top_k(&mut self, rows: usize, row_len: usize, limit: usize, k: usize) -> Result<()> {
@@ -727,11 +745,16 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.linear(f, 72, 1152, 0, 72, 20)?;
         // Vision-tower sizes, where tuned kernels switch to tensor cores (bf16 activations):
         // ragged token counts, a row view, and K = 4304 padded to 4352 in storage.
+        // Small m (decode, drafting): the vectorized GEMV for Q4 / Q8, row views and K-split rows.
+        s.linear(f, 3000, 1152, 37, 2500, 1)?;
+        s.linear(f, 300, 1152, 0, 300, 5)?;
         s.linear(f, 160, 1152, 32, 96, 130)?;
         s.linear(f, 96, 4304, 0, 96, 70)?;
     }
     // Sampling candidates: a Qwen-sized vocabulary row (public limit below the padded width), a
     // small one, and k larger than the row.
+    s.concat_cols(3, 5120, 5120)?;
+    s.concat_cols(7, 13, 5)?;
     s.top_k(2, 248_320, 248_077, 64)?;
     s.top_k(3, 5000, 4097, 20)?;
     s.top_k(1, 50, 50, 64)?;

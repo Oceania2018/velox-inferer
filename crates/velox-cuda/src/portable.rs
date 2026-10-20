@@ -568,3 +568,39 @@ pub fn top_k(
         })
         .collect())
 }
+
+extern "C" {
+    fn velox_portable_concat_cols(
+        a: *const f32,
+        b: *const f32,
+        out: *mut f32,
+        rows: i64,
+        a_cols: i32,
+        b_cols: i32,
+    ) -> i32;
+}
+
+pub fn concat_cols(
+    a: &CudaBuffer,
+    b: &CudaBuffer,
+    out: &mut CudaBuffer,
+    rows: usize,
+    a_cols: usize,
+    b_cols: usize,
+) -> Result<()> {
+    check::concat_cols(a.len(), b.len(), out.len(), rows, a_cols, b_cols)?;
+    // SAFETY: extents validated above.
+    status(
+        unsafe {
+            velox_portable_concat_cols(
+                a.as_ptr(),
+                b.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                to_i32("a_cols", a_cols)?,
+                to_i32("b_cols", b_cols)?,
+            )
+        },
+        "portable concat_cols",
+    )
+}

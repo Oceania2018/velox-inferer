@@ -320,3 +320,25 @@ VELOX_API int velox_portable_attention(const float* q, const float* k, const flo
     }
     return velox_launch_status();
 }
+
+namespace {
+__global__ void concat_cols_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out,
+                                   long long rows, int a_cols, int b_cols) {
+    const int w = a_cols + b_cols;
+    const long long n = rows * w;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / w;
+        const int c = static_cast<int>(i % w);
+        out[i] = c < a_cols ? a[r * a_cols + c] : b[r * b_cols + (c - a_cols)];
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_concat_cols(const float* a, const float* b, float* out, long long rows, int a_cols,
+                                         int b_cols) {
+    const long long n = rows * (a_cols + b_cols);
+    if (n == 0) return 0;
+    concat_cols_kernel<<<velox_grid_1d(n, 256), 256>>>(a, b, out, rows, a_cols, b_cols);
+    return velox_launch_status();
+}
