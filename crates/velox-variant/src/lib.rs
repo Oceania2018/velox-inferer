@@ -1,27 +1,29 @@
-//! Hardware variant of this build: **generic** (branch `main`).
+//! Hardware variant of this build: **rtx-5060-ti** (branch `rtx-5060-ti`).
 //!
-//! This crate is the only code that differs between hardware branches. Every branch exposes the
-//! same contract, which the CLI and conformance suite compile against:
+//! RTX 5060 Ti 16 GB / 8 GB (GB206, 36 SMs): portable kernels, small-VRAM policy
 //!
-//! - `INFO: VariantInfo`: id, branch, the profiles it tunes and the architectures its kernels run on;
-//! - `plan_policy(&DeviceProfile) -> PlanPolicy`: VRAM reserve and workspace per card;
-//! - with the `cuda` feature, `cuda_kernels(&DeviceInfo) -> Result<Arc<dyn CudaKernels>>`.
-//!
-//! The generic variant runs the portable kernels on any device. See docs/branching.md for how a
-//! hardware branch replaces this crate.
+//! Same contract as every branch (see main's version of this file): `INFO`, `plan_policy`,
+//! and with the `cuda` feature `cuda_kernels`. No op is tuned here yet: every op runs the
+//! portable kernel. Tuned kernels are added under `kernels/` (with `kernels/gencode.txt`) and
+//! listed in `native_ops`, following rtx-5090-32g; see docs/branching.md.
 
-use velox_core::{DeviceProfile, PlanPolicy, VariantInfo};
+use velox_core::{DeviceProfile, GpuArch, PlanPolicy, VariantInfo};
 
 pub static INFO: VariantInfo = VariantInfo {
-    id: "generic",
-    branch: "main",
-    description: "portable kernels for every supported GPU; correct everywhere, tuned nowhere",
-    profiles: &[],
-    archs: &[],
+    id: "rtx-5060-ti",
+    branch: "rtx-5060-ti",
+    description: "RTX 5060 Ti 16 GB / 8 GB (GB206, 36 SMs): portable kernels, small-VRAM policy",
+    profiles: &["rtx-5060-ti-16g", "rtx-5060-ti-8g"],
+    archs: &[GpuArch::Cuda { major: 12, minor: 0 }],
 };
 
 pub fn plan_policy(profile: &DeviceProfile) -> PlanPolicy {
-    PlanPolicy::for_profile(profile)
+    let mut p = PlanPolicy::for_profile(profile);
+    if profile.id == "rtx-5060-ti-8g" {
+        // 8 GB cannot spare a 2048-token f32 workspace next to weights and KV.
+        p.workspace_tokens = 1024;
+    }
+    p
 }
 
 #[cfg(feature = "cuda")]
