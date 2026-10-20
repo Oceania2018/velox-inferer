@@ -1,27 +1,30 @@
-//! Hardware variant of this build: **generic** (branch `main`).
+//! Hardware variant of this build: **rtx-5090-laptop-24g** (branch `rtx-5090-laptop-24g`).
 //!
-//! This crate is the only code that differs between hardware branches. Every branch exposes the
-//! same contract, which the CLI and conformance suite compile against:
+//! RTX 5090 Laptop GPU 24 GB (GB203, 82 SMs): portable kernels, laptop VRAM policy
 //!
-//! - `INFO: VariantInfo`: id, branch, the profiles it tunes and the architectures its kernels run on;
-//! - `plan_policy(&DeviceProfile) -> PlanPolicy`: VRAM reserve and workspace per card;
-//! - with the `cuda` feature, `cuda_kernels(&DeviceInfo) -> Result<Arc<dyn CudaKernels>>`.
-//!
-//! The generic variant runs the portable kernels on any device. See docs/branching.md for how a
-//! hardware branch replaces this crate.
+//! Same contract as every branch (see main's version of this file): `INFO`, `plan_policy`,
+//! and with the `cuda` feature `cuda_kernels`. No op is tuned here yet: every op runs the
+//! portable kernel. Tuned kernels are added under `kernels/` (with `kernels/gencode.txt`) and
+//! listed in `native_ops`, following rtx-5090-32g; see docs/branching.md.
 
-use velox_core::{DeviceProfile, PlanPolicy, VariantInfo};
+use velox_core::{DeviceProfile, GpuArch, PlanPolicy, VariantInfo};
 
 pub static INFO: VariantInfo = VariantInfo {
-    id: "generic",
-    branch: "main",
-    description: "portable kernels for every supported GPU; correct everywhere, tuned nowhere",
-    profiles: &[],
-    archs: &[],
+    id: "rtx-5090-laptop-24g",
+    branch: "rtx-5090-laptop-24g",
+    description: "RTX 5090 Laptop GPU 24 GB (GB203, 82 SMs): portable kernels, laptop VRAM policy",
+    profiles: &["rtx-5090-laptop"],
+    archs: &[GpuArch::Cuda { major: 12, minor: 0 }],
 };
 
 pub fn plan_policy(profile: &DeviceProfile) -> PlanPolicy {
-    PlanPolicy::for_profile(profile)
+    let mut p = PlanPolicy::for_profile(profile);
+    if INFO.tunes(profile) {
+        // Laptops often share the GPU with the desktop compositor and run power-limited; keep
+        // a larger reserve and the default 2048-token prefill chunk.
+        p.reserved_mib = p.reserved_mib.max(1536);
+    }
+    p
 }
 
 #[cfg(feature = "cuda")]
