@@ -24,6 +24,7 @@ pub enum Op {
     AddBias,
     Gelu,
     RopePositions,
+    TopK,
 }
 
 impl Op {
@@ -45,6 +46,7 @@ impl Op {
         Op::AddBias,
         Op::Gelu,
         Op::RopePositions,
+        Op::TopK,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -66,6 +68,7 @@ impl Op {
             Op::AddBias => "add_bias",
             Op::Gelu => "gelu",
             Op::RopePositions => "rope_positions",
+            Op::TopK => "top_k",
         }
     }
 }

@@ -260,6 +260,18 @@ pub fn to_i32(what: &str, v: usize) -> Result<i32> {
     i32::try_from(v).map_err(|_| Error::Shape(format!("{what}={v} exceeds i32 range")))
 }
 
+/// Largest k supported by `top_k` (sampling needs a few dozen candidates at most).
+pub const TOP_K_MAX: usize = 256;
+
+pub fn top_k(x: usize, rows: usize, row_len: usize, limit: usize, k: usize) -> Result<()> {
+    if limit > row_len || k == 0 || k > TOP_K_MAX {
+        return Err(Error::Shape(format!(
+            "top_k: k {k} (max {TOP_K_MAX}), limit {limit}, row_len {row_len}"
+        )));
+    }
+    need("top_k input", x, rows * row_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

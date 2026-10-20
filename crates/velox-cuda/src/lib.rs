@@ -404,6 +404,17 @@ pub trait CudaKernels: Send + Sync {
     fn rope_positions(&self, x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) -> Result<()> {
         portable::rope_positions(x, positions, s)
     }
+
+    fn top_k(
+        &self,
+        x: &CudaBuffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        portable::top_k(x, rows, row_len, limit, k)
+    }
 }
 
 /// Every op on the portable kernels; the CUDA kernel set of the generic variant on main.
@@ -480,6 +491,17 @@ pub(crate) fn upload_raw(data: &[u8]) -> Result<CudaBuffer> {
 }
 
 impl Backend for CudaBackend {
+    fn top_k(
+        &self,
+        x: &CudaBuffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        self.timed("top_k", || self.kernels.top_k(x, rows, row_len, limit, k))
+    }
+
     type Buffer = CudaBuffer;
 
     fn kind(&self) -> BackendKind {

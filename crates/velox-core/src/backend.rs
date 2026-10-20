@@ -415,6 +415,17 @@ pub trait Backend {
     ) -> Result<()>;
     /// `x[i] = gelu(x[i])` for the first `len` elements.
     fn gelu(&self, x: &mut Self::Buffer, len: usize, kind: GeluKind) -> Result<()>;
+    /// The `k` largest of the first `limit` values of each row of `x` (`[rows, row_len]`), returned
+    /// to the host in descending order, ties to the lower index, as `(index, value)`. NaN ranks
+    /// below every number and is reported as -inf. Rows with fewer than `k` values return all of them.
+    fn top_k(
+        &self,
+        x: &Self::Buffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>>;
     /// Rotary embedding with explicit per-axis positions (`[axes, tokens]`, host); see
     /// [`RopePosShape`].
     fn rope_positions(
@@ -423,4 +434,23 @@ pub trait Backend {
         positions: &[u32],
         shape: RopePosShape,
     ) -> Result<()>;
+}
+
+/// Host reference for [`Backend::top_k`] on one row: the `k` largest of `row`, descending, ties to
+/// the lower index, NaN below every number and reported as -inf.
+pub fn top_k_row(row: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let key = |v: f32| if v.is_nan() { f32::NEG_INFINITY } else { v };
+    let mut idx: Vec<u32> = (0..row.len() as u32).collect();
+    let k = k.min(row.len());
+    let better = |a: &u32, b: &u32| {
+        key(row[*b as usize])
+            .total_cmp(&key(row[*a as usize]))
+            .then(a.cmp(b))
+    };
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k, better);
+        idx.truncate(k);
+    }
+    idx.sort_unstable_by(better);
+    idx.into_iter().map(|i| (i, key(row[i as usize]))).collect()
 }

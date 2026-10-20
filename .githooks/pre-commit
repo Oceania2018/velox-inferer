@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Keeps main and the hardware branches merge-conflict free (docs/branching.md).
+# Enable once per clone: git config core.hooksPath .githooks
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+branch="$(git rev-parse --abbrev-ref HEAD)"
+# A merge commit from main legitimately brings main's files; only check ordinary commits.
+if [ -f "$(git rev-parse --git-dir)/MERGE_HEAD" ]; then exit 0; fi
+if [ "$branch" = "main" ]; then
+  exec bash "$root/scripts/check-main-scope.sh" --staged
+fi
+exec bash "$root/scripts/check-branch-scope.sh" --staged

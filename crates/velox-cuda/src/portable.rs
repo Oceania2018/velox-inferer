@@ -501,3 +501,70 @@ pub fn rope_positions(x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) ->
         "portable rope_positions",
     )
 }
+
+extern "C" {
+    fn velox_portable_top_k(
+        x: *const f32,
+        rows: i32,
+        row_len: i64,
+        limit: i32,
+        k: i32,
+        host_idx: *mut i32,
+        host_val: *mut f32,
+    ) -> i32;
+}
+
+pub fn top_k(
+    x: &CudaBuffer,
+    rows: usize,
+    row_len: usize,
+    limit: usize,
+    k: usize,
+) -> Result<Vec<Vec<(u32, f32)>>> {
+    check::top_k(x.len(), rows, row_len, limit, k)?;
+    let k = k.min(limit);
+    if rows == 0 || k == 0 {
+        return Ok(vec![Vec::new(); rows]);
+    }
+    let mut idx = vec![0i32; rows * k];
+    let mut val = vec![0f32; rows * k];
+    // SAFETY: x holds rows * row_len values (checked); the host arrays hold rows * k entries.
+    let code = unsafe {
+        velox_portable_top_k(
+            x.as_ptr(),
+            to_i32("rows", rows)?,
+            row_len as i64,
+            to_i32("limit", limit)?,
+            to_i32("k", k)?,
+            idx.as_mut_ptr(),
+            val.as_mut_ptr(),
+        )
+    };
+    if let Err(velox_core::Error::Unsupported(_)) = status(code, "portable top_k") {
+        // Too many candidates for one merge block: select on the host.
+        let mut host = vec![0f32; rows * row_len];
+        // SAFETY: x holds rows * row_len values (checked).
+        status(
+            unsafe {
+                crate::ffi::velox_cuda_dtoh(
+                    host.as_mut_ptr().cast(),
+                    x.as_ptr().cast(),
+                    host.len() * 4,
+                )
+            },
+            "download",
+        )?;
+        return Ok((0..rows)
+            .map(|r| velox_core::backend::top_k_row(&host[r * row_len..r * row_len + limit], k))
+            .collect());
+    }
+    status(code, "portable top_k")?;
+    Ok((0..rows)
+        .map(|r| {
+            (0..k)
+                .filter(|&j| idx[r * k + j] >= 0)
+                .map(|j| (idx[r * k + j] as u32, val[r * k + j]))
+                .collect()
+        })
+        .collect())
+}
