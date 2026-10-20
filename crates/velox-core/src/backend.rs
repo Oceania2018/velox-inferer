@@ -424,6 +424,17 @@ pub trait Backend {
     ) -> Result<()>;
     /// `x[i] = gelu(x[i])` for the first `len` elements.
     fn gelu(&self, x: &mut Self::Buffer, len: usize, kind: GeluKind) -> Result<()>;
+    /// `out[r] = a[r] ++ b[r]` for `rows` rows: `a` is `[rows, a_cols]`, `b` is `[rows, b_cols]`,
+    /// `out` is `[rows, a_cols + b_cols]`.
+    fn concat_cols(
+        &self,
+        a: &Self::Buffer,
+        b: &Self::Buffer,
+        out: &mut Self::Buffer,
+        rows: usize,
+        a_cols: usize,
+        b_cols: usize,
+    ) -> Result<()>;
     /// The `k` largest of the first `limit` values of each row of `x` (`[rows, row_len]`), returned
     /// to the host in descending order, ties to the lower index, as `(index, value)`. NaN ranks
     /// below every number and is reported as -inf. Rows with fewer than `k` values return all of them.
