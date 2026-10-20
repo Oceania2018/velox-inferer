@@ -55,3 +55,53 @@ VELOX_API const char* velox_cuda_error_string(int code) {
 VELOX_API int velox_cuda_runtime_version(int* v) { return static_cast<int>(cudaRuntimeGetVersion(v)); }
 
 VELOX_API int velox_cuda_driver_version(int* v) { return static_cast<int>(cudaDriverGetVersion(v)); }
+
+// Small per-call uploads (token ids, rope positions) without cudaMalloc/cudaFree, whose free
+// synchronizes the device. Bytes go through a pinned ring and an async copy queued on the default
+// stream ahead of the kernel that reads them. When the ring wraps, the stream is synchronized once
+// so no queued copy still reads a slot being overwritten.
+#include <mutex>
+
+namespace {
+struct StageRing {
+    std::mutex mu;
+    unsigned char* host = nullptr;
+    unsigned char* dev = nullptr;
+    size_t size = 0, off = 0;
+};
+StageRing g_stage;
+constexpr size_t kStageBytes = 8u << 20;
+}  // namespace
+
+VELOX_API int velox_cuda_stage(const void* src, size_t bytes, void** dev_out) {
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    if (bytes > kStageBytes / 2) return VELOX_ERR_UNSUPPORTED;
+    if (!g_stage.host) {
+        if (cudaError_t e = cudaMallocHost(&g_stage.host, kStageBytes)) return static_cast<int>(e);
+        if (cudaError_t e = cudaMalloc(&g_stage.dev, kStageBytes)) return static_cast<int>(e);
+        g_stage.size = kStageBytes;
+    }
+    const size_t n = (bytes + 255) / 256 * 256;
+    if (g_stage.off + n > g_stage.size) {
+        if (cudaError_t e = cudaStreamSynchronize(0)) return static_cast<int>(e);
+        g_stage.off = 0;
+    }
+    std::memcpy(g_stage.host + g_stage.off, src, bytes);
+    void* d = g_stage.dev + g_stage.off;
+    if (cudaError_t e = cudaMemcpyAsync(d, g_stage.host + g_stage.off, bytes, cudaMemcpyHostToDevice, 0))
+        return static_cast<int>(e);
+    g_stage.off += n;
+    *dev_out = d;
+    return 0;
+}
+
+// CUDA events for op timing (VELOX_GPU_TIMING): recorded on the default stream around each op.
+VELOX_API int velox_cuda_event_create(void** e) {
+    return static_cast<int>(cudaEventCreate(reinterpret_cast<cudaEvent_t*>(e)));
+}
+VELOX_API int velox_cuda_event_record(void* e) { return static_cast<int>(cudaEventRecord(static_cast<cudaEvent_t>(e), 0)); }
+VELOX_API int velox_cuda_event_elapsed(void* start, void* end, float* ms) {
+    if (cudaError_t err = cudaEventSynchronize(static_cast<cudaEvent_t>(end))) return static_cast<int>(err);
+    return static_cast<int>(cudaEventElapsedTime(ms, static_cast<cudaEvent_t>(start), static_cast<cudaEvent_t>(end)));
+}
+VELOX_API int velox_cuda_event_destroy(void* e) { return static_cast<int>(cudaEventDestroy(static_cast<cudaEvent_t>(e))); }

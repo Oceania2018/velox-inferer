@@ -12,7 +12,7 @@ rust-version = "1.80"
 # Dependencies are added on main only. Hardware branches never add any, so Cargo.lock never
 # conflicts when main is merged into them.
 [workspace.dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 velox-core = { path = "crates/velox-core" }
 velox-cpu = { path = "crates/velox-cpu" }
 velox-cuda = { path = "crates/velox-cuda" }
@@ -21,6 +21,9 @@ velox-variant = { path = "crates/velox-variant" }
 velox-conformance = { path = "crates/velox-conformance" }
 velox-weights = { path = "crates/velox-weights" }
 velox-serve = { path = "crates/velox-serve" }
+velox-models = { path = "crates/velox-models" }
+velox-frontend = { path = "crates/velox-frontend" }
+velox-engine = { path = "crates/velox-engine" }
 
 [profile.release]
 debug = 1

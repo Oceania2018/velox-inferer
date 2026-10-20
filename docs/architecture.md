@@ -37,6 +37,23 @@ on awkward shapes plus a multi-step prefill/decode through a decoder stack, and 
 the oracle with a relative-error metric. Tuned kernels must fall back (usually to `portable::*`)
 for shapes they do not cover; the conformance shapes are chosen to hit those fallbacks.
 
+### Low-precision activations
+
+Tensor-core `linear` kernels round their inputs to FP8 or NVFP4. That is a model decision, not a
+kernel one: each weight view carries the artifact's `ActPolicy` (`A16Only`, `AllowA8`, or
+`AllowA4 { divisor }` from `uses[].activation_policy` and its `activation_input_divisor`). A
+backend reports what it actually does through `Backend::linear_act(view, m)`, which returns
+`Exact`, `Fp8Row` or `Nvfp4 { divisor }` and never exceeds the policy. The conformance suite
+applies the same rounding on the host (`velox_core::quant`, bit-exact with the device: RNE,
+saturating, same operation order) and compares against the exact product of the rounded input.
+A low-precision kernel is therefore still held to the f64 oracle, and rounding a view whose
+policy forbids it fails the suite. Portable kernels on main stay exact.
+
+Attention follows the same pattern: `Backend::attention_precision(shape)` returns `Exact` or
+`Fp8QkF16Pv` (Q and K rounded per head vector to E4M3 for the scores, V and the softmax weights
+to f16 for the value product, as ninfer does). The oracle rounds Q, K and V identically
+(`quant::round_attention_inputs`); the unemulated f16 softmax weights set a 2e-3 tolerance.
+
 ## Current scope and next steps
 
 The engine is f32 end to end with synthetic weights. In dependency order, the work to run

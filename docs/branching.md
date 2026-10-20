@@ -14,12 +14,44 @@ velox-inferer ships one build per hardware family. Users pick the branch that ma
 AMD cards are already in the profile catalog; they need the HIP backend first
 ([adding-amd.md](adding-amd.md)), then an AMD branch on the same model.
 
-## The one rule: a hardware branch only changes `crates/velox-variant/`
+## The one rule: disjoint ownership, so merges never conflict
 
-Everything else (core contracts, profiles, planner, CPU oracle, portable kernels, CLI,
-conformance suite, weight formats) lives on main and reaches branches by merge. Because main does
-not edit `crates/velox-variant/` and branches edit nothing else, `git merge main` into a branch does
-not conflict. `scripts/check-branch-scope.sh` enforces this and runs in CI on every hardware branch.
+Main and the hardware branches own disjoint files:
+
+| Owner | Files |
+|---|---|
+| hardware branch | `crates/velox-variant/src/`, `crates/velox-variant/kernels/` |
+| main | everything else, including the variant crate's `Cargo.toml` and `build.rs`, and `Cargo.lock` |
+
+Main never edits `crates/velox-variant/{src,kernels}` after the commit that introduced them
+(`7c7f18c`), and a branch never edits anything else. Since no file is changed on both sides,
+`git merge main` into a branch cannot conflict. Enforcement:
+
+- `scripts/check-main-scope.sh` fails if main has touched the branch-owned directories;
+- `scripts/check-branch-scope.sh` fails if a branch has touched anything else;
+- `.githooks/pre-commit` runs the matching check on every commit
+  (enable once per clone: `git config core.hooksPath .githooks`);
+- `.github/workflows/scope.yml` runs it in CI, and on branches also test-merges main.
+
+If a conflict ever appears anyway, **main wins**. `scripts/sync-branches.sh` merges main into every
+hardware branch with `-X theirs` and resets any out-of-scope file on the branch to main's version.
+
+### Evolving the contract without touching branch files
+
+Because main cannot edit `crates/velox-variant/src`, every extension point a branch implements
+lives in a main-owned crate and is additive:
+
+- New kernel hooks are `CudaKernels` methods **with a default body** (the portable kernel).
+  `impl CudaKernels for PortableKernels {}` in velox-cuda is the compile-time check that every
+  method has one.
+- Existing signatures that branches call or implement (`CudaKernels`, `velox_cuda::portable`,
+  `status`, `CudaBuffer`, `velox_core` types) are not changed in place. Add the new form next to
+  the old one, move branches over, then retire the old one in a later release.
+- Per-branch knobs belong in methods with defaults (e.g. `linear_act`, `attention_precision`),
+  not in new fields of the `VariantInfo` literal or new free functions in the variant crate.
+
+A hardware branch therefore never needs a design that disagrees with main: anything shared is
+proposed on main first, and the branch only overrides.
 
 Per-card branches drift when they carry changes outside one owned directory; ninfer's
 `ninfer-4090` branch reached ~9k lines of divergence before it was folded back. Keeping the
