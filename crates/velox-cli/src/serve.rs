@@ -42,7 +42,7 @@ where
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
         max_checkpoints: a.parse("ctx-checkpoints", 8)?,
         scratch_capacity: a.parse("scratch-context", 8192)?,
-        mtp_drafts: a.parse("mtp-drafts", 3)?,
+        mtp_drafts: a.parse("mtp-drafts", 7)?,
     };
     let vision = if art.components().contains_key("vision")
         && a.get("vision").is_none_or(|v| v != "false")

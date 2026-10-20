@@ -463,6 +463,7 @@ impl<B: Backend> QwenEngine<B> {
                 }
             }
             model.commit(b, session, ws, keep).map_err(core)?;
+            dr.record(keep - 1, window.len() - 1);
             keys.extend_from_slice(&window[..keep]);
             if let Some(f) = finish {
                 return Ok(f);

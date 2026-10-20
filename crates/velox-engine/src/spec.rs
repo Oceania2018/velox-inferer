@@ -20,7 +20,11 @@ struct Carry {
 }
 
 pub struct MtpDrafter<B: Backend> {
+    /// Drafts per round right now; adapts to the acceptance rate within `2..=max_drafts`.
     pub draft_len: usize,
+    pub max_drafts: usize,
+    /// Moving average of the per-draft acceptance rate.
+    accept_ema: f64,
     session: MtpSession<B>,
     mw: MtpWorkspace<B>,
     /// Hidden input of the next MTP step: the carry row, or the previous draft hidden row.
@@ -37,12 +41,29 @@ impl<B: Backend> MtpDrafter<B> {
         draft_len: usize,
     ) -> Result<Self> {
         Ok(MtpDrafter {
-            draft_len,
+            draft_len: draft_len.min(3).max(1),
+            max_drafts: draft_len.max(1),
+            accept_ema: 0.6,
             session: model.mtp_session(b, capacity)?,
             mw: model.mtp_workspace(b, rows.max(velox_models::qwen3_5::VERIFY_MAX))?,
             prev: b.alloc(model.cfg.hidden)?,
             carry: None,
         })
+    }
+
+    /// Records a round's outcome and picks the next draft length: with per-draft acceptance `a`,
+    /// the expected accepted run is about `a / (1 - a)`, so drafting one more than that wastes
+    /// little when drafts are poor and lets long runs through when they are good (structured
+    /// output often accepts > 90%).
+    pub fn record(&mut self, accepted: usize, proposed: usize) {
+        if proposed == 0 {
+            return;
+        }
+        let rate = accepted as f64 / proposed as f64;
+        self.accept_ema = 0.7 * self.accept_ema + 0.3 * rate;
+        let a = self.accept_ema.min(0.98);
+        let want = (a / (1.0 - a)).ceil() as usize + 1;
+        self.draft_len = want.clamp(2.min(self.max_drafts), self.max_drafts);
     }
 
     /// Forgets the carry (a new prompt is about to be prefilled from `row`; MTP KV rows below it
