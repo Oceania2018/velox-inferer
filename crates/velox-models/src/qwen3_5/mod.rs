@@ -2,6 +2,7 @@
 //! The mathematics is specified in docs/qwen3_5-text.md.
 
 mod config;
+mod mtp;
 mod vision;
 mod weights;
 
@@ -11,6 +12,7 @@ use velox_core::backend::{
 use velox_core::{Error, Result};
 
 pub use config::{LayerKind, TextConfig};
+pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use vision::{Qwen35Vision, VisionConfig};
 pub use weights::{Layer, Mixer, TextWeights, WDesc};
 
@@ -135,6 +137,11 @@ pub struct Workspace<B: Backend> {
     pub hidden: B::Buffer,
     logits_rows: B::Buffer,
     logits: B::Buffer,
+    /// When set, each chunk leaves its composed input embeddings in `emb` and its final-normed
+    /// hidden rows in `rows_hidden` (draft-model prefill reads them through `advance_rows`).
+    pub keep_rows: bool,
+    pub emb: B::Buffer,
+    pub rows_hidden: B::Buffer,
     /// Row of the last token of the latest `advance`, inside the final chunk.
     last_row: usize,
 }
@@ -212,6 +219,9 @@ impl<B: Backend> Qwen35Text<B> {
             hidden: b.alloc(VERIFY_MAX * c.hidden)?,
             logits_rows: b.alloc(VERIFY_MAX * c.vocab)?,
             last_row: 0,
+            keep_rows: false,
+            emb: b.alloc(t * c.hidden)?,
+            rows_hidden: b.alloc(t * c.hidden)?,
         })
     }
 
@@ -302,6 +312,9 @@ impl<B: Backend> Qwen35Text<B> {
                 let src = (ins.row_offset + lo - ins.token) * hd;
                 b.copy(ins.buf, src, &mut ws.x, (lo - base) * hd, (hi - lo) * hd)?;
             }
+        }
+        if ws.keep_rows {
+            b.copy(&ws.x, 0, &mut ws.emb, 0, t * hd)?;
         }
         // Axis-major [3, t] positions for explicit MRoPE, else cache position + rope_delta.
         let axis_positions: Option<Vec<u32>> = positions.map(|p| {
@@ -406,6 +419,17 @@ impl<B: Backend> Qwen35Text<B> {
             )?;
             self.mlp(b, ws, l, t)?;
             b.add(&mut ws.x, &ws.y, t * hd)?;
+        }
+        if ws.keep_rows {
+            b.rms_norm(
+                &ws.x,
+                w.param(w.final_norm),
+                &mut ws.rows_hidden,
+                t,
+                hd,
+                c.eps,
+                NormKind::Offset,
+            )?;
         }
         s.pos += t;
         Ok(())
@@ -535,6 +559,36 @@ impl<B: Backend> Qwen35Text<B> {
         b.linear(&ws.h, &w.view(&l.mlp_up), &mut ws.mu, t)?;
         b.silu_mul(&mut ws.mg, &ws.mu, t * c.intermediate)?;
         b.linear(&ws.mg, &w.view(&l.mlp_down), &mut ws.y, t)
+    }
+
+    /// [`Self::advance`] that also hands every chunk's rows to `on_chunk` (with `ws.keep_rows`
+    /// set): composed embeddings in `ws.emb`, final-normed hidden rows in `ws.rows_hidden`, and
+    /// the chunk's offset into `ids` and its token count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_rows(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        ids: &[u32],
+        positions: Option<&[[u32; 3]]>,
+        inserts: &[EmbedInsert<'_, B::Buffer>],
+        on_chunk: &mut dyn FnMut(&Workspace<B>, usize, usize) -> Result<()>,
+    ) -> Result<()> {
+        ws.keep_rows = true;
+        let mut r = Ok(());
+        for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
+            let base = i * ws.max_tokens;
+            let pos = positions.map(|p| &p[base..base + chunk.len()]);
+            r = self
+                .advance(b, s, ws, chunk, pos, &shift_inserts(inserts, base))
+                .and_then(|()| on_chunk(ws, base, chunk.len()));
+            if r.is_err() {
+                break;
+            }
+        }
+        ws.keep_rows = false;
+        r
     }
 
     /// Speculative verify: feeds `ids` (the pending token, then drafts; at most [`VERIFY_MAX`] and
@@ -742,4 +796,25 @@ pub fn argmax(logits: &[f32], limit: usize) -> u32 {
 enum Rope<'a> {
     At(usize),
     Axes(&'a [u32]),
+}
+
+/// `inserts` relative to a sub-call starting at token `base` of the original call (rows before
+/// `base` are dropped; the chunk loop clips the rest).
+fn shift_inserts<'a, Buf>(
+    inserts: &[EmbedInsert<'a, Buf>],
+    base: usize,
+) -> Vec<EmbedInsert<'a, Buf>> {
+    inserts
+        .iter()
+        .filter(|ins| ins.token + ins.rows > base)
+        .map(|ins| {
+            let skip = base.saturating_sub(ins.token);
+            EmbedInsert {
+                token: ins.token + skip - base,
+                rows: ins.rows - skip,
+                buf: ins.buf,
+                row_offset: ins.row_offset + skip,
+            }
+        })
+        .collect()
 }

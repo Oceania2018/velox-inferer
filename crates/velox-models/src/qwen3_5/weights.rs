@@ -67,6 +67,10 @@ pub struct TextWeights<B: Backend> {
     pub head: WDesc,
     pub final_norm: usize,
     pub layers: Vec<Layer>,
+    /// The MTP predictor (`mtp/`), when the artifact has one.
+    pub mtp: Option<MtpWeights>,
+    /// The draft vocabulary head (`proposal/`): a row subset of the output head for drafting.
+    pub proposal: Option<Proposal>,
     /// Bytes uploaded for weights (parents + decoded params).
     pub bytes: u64,
 }
@@ -128,39 +132,9 @@ impl<B: Backend> TextWeights<B> {
                         norm: l.param(&p("gdn/norm"), cfg.gdn_v_dim)?,
                     }
                 }
-                LayerKind::FullAttention => {
-                    let (query, gate) = (
-                        l.matrix(&p("attention/query"))?,
-                        l.matrix(&p("attention/gate"))?,
-                    );
-                    let (key, value) = (
-                        l.matrix(&p("attention/key"))?,
-                        l.matrix(&p("attention/value"))?,
-                    );
-                    expect(&p("attention query"), query.rows, cfg.q_dim())?;
-                    expect(&p("attention gate"), gate.rows, cfg.q_dim())?;
-                    expect(&p("attention key"), key.rows, cfg.kv_dim())?;
-                    expect(&p("attention value"), value.rows, cfg.kv_dim())?;
-                    Mixer::Attention {
-                        query,
-                        gate,
-                        key,
-                        value,
-                        output: l.matrix(&p("attention/output"))?,
-                        q_norm: l.param(&p("attention/query_norm"), cfg.head_dim)?,
-                        k_norm: l.param(&p("attention/key_norm"), cfg.head_dim)?,
-                    }
-                }
+                LayerKind::FullAttention => load_attention(&mut l, cfg, &p)?,
             };
-            let layer = Layer {
-                input_norm,
-                post_norm: l.param(&p("post_attention_norm"), cfg.hidden)?,
-                mixer,
-                mlp_gate: l.matrix(&p("mlp/gate"))?,
-                mlp_up: l.matrix(&p("mlp/up"))?,
-                mlp_down: l.matrix(&p("mlp/down"))?,
-            };
-            expect(&p("mlp gate"), layer.mlp_gate.rows, cfg.intermediate)?;
+            let layer = finish_layer(&mut l, cfg, &p, input_norm, mixer)?;
             layers.push(layer);
             progress(&format!(
                 "layer {}/{} ({:.1} GB)",
@@ -169,6 +143,8 @@ impl<B: Backend> TextWeights<B> {
                 l.bytes as f64 / 1e9
             ));
         }
+        let mtp = load_mtp(&mut l, cfg)?;
+        let proposal = load_proposal(&mut l, art, cfg)?;
         Ok(TextWeights {
             parents: l.parents,
             params: l.params,
@@ -176,6 +152,8 @@ impl<B: Backend> TextWeights<B> {
             head,
             final_norm,
             layers,
+            mtp,
+            proposal,
             bytes: l.bytes,
         })
     }
@@ -192,7 +170,7 @@ fn expect(what: &str, got: usize, want: usize) -> Result<()> {
 
 pub(crate) struct Loader<'a, B: Backend> {
     b: &'a B,
-    art: &'a Artifact,
+    pub(crate) art: &'a Artifact,
     parents: Vec<B::Buffer>,
     index: HashMap<String, (usize, WeightFormat, usize, usize)>,
     /// Activation policy per logical parameter, from the artifact's `uses`.
@@ -237,7 +215,7 @@ fn read_policies(art: &Artifact) -> HashMap<String, ActPolicy> {
 
 impl<'a, B: Backend> Loader<'a, B> {
     /// (object id, element range) of a binding with one part or a whole object.
-    fn binding(&self, name: &str) -> Result<(String, Option<(u64, u64)>)> {
+    pub(crate) fn binding(&self, name: &str) -> Result<(String, Option<(u64, u64)>)> {
         let b = self.art.directory["bindings"]
             .get(name)
             .ok_or_else(|| Error::Config(format!("artifact has no binding '{name}'")))?;
@@ -429,4 +407,121 @@ impl<'a, B: Backend> Loader<'a, B> {
     pub(crate) fn finish(self) -> (Vec<B::Buffer>, Vec<B::Buffer>, u64) {
         (self.parents, self.params, self.bytes)
     }
+}
+
+/// MTP predictor weights (`Qwen3_5MTP`): stem norms and input projection, one attention block
+/// with the target's geometry, and a final norm. Embedding and output head are the target's.
+pub struct MtpWeights {
+    pub input_projection: WDesc,
+    pub embedding_norm: usize,
+    pub hidden_norm: usize,
+    pub final_norm: usize,
+    pub layer: Layer,
+}
+
+/// Draft vocabulary head: `head` rows are the tokens `token_ids` (a subset of the vocabulary).
+pub struct Proposal {
+    pub head: WDesc,
+    pub token_ids: Vec<u32>,
+}
+
+fn load_attention<B: Backend>(
+    l: &mut Loader<'_, B>,
+    cfg: &TextConfig,
+    p: &dyn Fn(&str) -> String,
+) -> Result<Mixer> {
+    let (query, gate) = (
+        l.matrix(&p("attention/query"))?,
+        l.matrix(&p("attention/gate"))?,
+    );
+    let (key, value) = (
+        l.matrix(&p("attention/key"))?,
+        l.matrix(&p("attention/value"))?,
+    );
+    expect(&p("attention query"), query.rows, cfg.q_dim())?;
+    expect(&p("attention gate"), gate.rows, cfg.q_dim())?;
+    expect(&p("attention key"), key.rows, cfg.kv_dim())?;
+    expect(&p("attention value"), value.rows, cfg.kv_dim())?;
+    Ok(Mixer::Attention {
+        query,
+        gate,
+        key,
+        value,
+        output: l.matrix(&p("attention/output"))?,
+        q_norm: l.param(&p("attention/query_norm"), cfg.head_dim)?,
+        k_norm: l.param(&p("attention/key_norm"), cfg.head_dim)?,
+    })
+}
+
+fn finish_layer<B: Backend>(
+    l: &mut Loader<'_, B>,
+    cfg: &TextConfig,
+    p: &dyn Fn(&str) -> String,
+    input_norm: usize,
+    mixer: Mixer,
+) -> Result<Layer> {
+    let layer = Layer {
+        input_norm,
+        post_norm: l.param(&p("post_attention_norm"), cfg.hidden)?,
+        mixer,
+        mlp_gate: l.matrix(&p("mlp/gate"))?,
+        mlp_up: l.matrix(&p("mlp/up"))?,
+        mlp_down: l.matrix(&p("mlp/down"))?,
+    };
+    expect(&p("mlp gate"), layer.mlp_gate.rows, cfg.intermediate)?;
+    Ok(layer)
+}
+
+fn has_binding(art: &Artifact, name: &str) -> bool {
+    art.directory["bindings"].get(name).is_some()
+}
+
+fn load_mtp<B: Backend>(l: &mut Loader<'_, B>, cfg: &TextConfig) -> Result<Option<MtpWeights>> {
+    if !has_binding(l.art, "mtp/input_projection") {
+        return Ok(None);
+    }
+    let p = |s: &str| format!("mtp/layers/0/{s}");
+    let input_projection = l.matrix("mtp/input_projection")?;
+    if input_projection.rows != cfg.hidden || input_projection.k != 2 * cfg.hidden {
+        return Err(Error::Config(
+            "mtp/input_projection is not [hidden, 2 * hidden]".into(),
+        ));
+    }
+    let embedding_norm = l.param("mtp/embedding_norm", cfg.hidden)?;
+    let hidden_norm = l.param("mtp/hidden_norm", cfg.hidden)?;
+    let final_norm = l.param("mtp/final_norm", cfg.hidden)?;
+    let input_norm = l.param(&p("input_norm"), cfg.hidden)?;
+    let mixer = load_attention(l, cfg, &p)?;
+    let layer = finish_layer(l, cfg, &p, input_norm, mixer)?;
+    Ok(Some(MtpWeights {
+        input_projection,
+        embedding_norm,
+        hidden_norm,
+        final_norm,
+        layer,
+    }))
+}
+
+fn load_proposal<B: Backend>(
+    l: &mut Loader<'_, B>,
+    art: &Artifact,
+    cfg: &TextConfig,
+) -> Result<Option<Proposal>> {
+    if !has_binding(art, "proposal/head") {
+        return Ok(None);
+    }
+    let head = l.matrix("proposal/head")?;
+    let (id, _) = l.binding("proposal/token_ids")?;
+    let raw = art.read_object(&id).map_err(werr)?;
+    let token_ids: Vec<u32> = raw
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32)
+        .collect();
+    if head.k != cfg.hidden
+        || token_ids.len() != head.rows
+        || token_ids.iter().any(|&t| t as usize >= cfg.vocab)
+    {
+        return Err(Error::Config("proposal head and token map disagree".into()));
+    }
+    Ok(Some(Proposal { head, token_ids }))
 }
