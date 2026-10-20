@@ -2,6 +2,7 @@
 // gating, causal depthwise convolution and the Gated DeltaNet recurrence. Simple and correct on
 // every supported architecture; hardware branches replace them with tuned kernels.
 #include <math.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 
 #include "velox_common.cuh"
@@ -11,6 +12,10 @@
 #define VELOX_FMT_BF16 1
 #define VELOX_FMT_FP8_ROW_BF16 2
 #define VELOX_FMT_NVFP4 3
+#define VELOX_FMT_Q4 4
+#define VELOX_FMT_Q5 5
+#define VELOX_FMT_Q6 6
+#define VELOX_FMT_Q8 7
 
 namespace {
 
@@ -56,6 +61,35 @@ __device__ float weight_at(const WDesc& d, long long row, long long col) {
         case VELOX_FMT_FP8_ROW_BF16: {
             const uint8_t* s = d.base + align256(d.n * d.k) + 2 * row;
             return e4m3fn_to_f32(d.base[row * d.k + col]) * bf16_to_f32(static_cast<uint16_t>(s[0] | (s[1] << 8)));
+        }
+        case VELOX_FMT_Q4:
+        case VELOX_FMT_Q5:
+        case VELOX_FMT_Q6:
+        case VELOX_FMT_Q8: {  // row_split_k128_v1
+            const int bits = d.format == VELOX_FMT_Q4 ? 4 : d.format == VELOX_FMT_Q5 ? 5 : d.format == VELOX_FMT_Q6 ? 6 : 8;
+            const int group = bits == 8 ? 32 : 64;
+            const int high = bits == 5 ? 8 : bits == 6 ? 16 : 0;
+            const long long gpr = (d.k + 127) / 128 * 128 / group;
+            const long long groups = d.n * gpr;
+            const long long high_off = align256(groups * 32);
+            const long long scale_off = high_off + align256(groups * high);
+            const long long gi = row * gpr + col / group;
+            const int lane = static_cast<int>(col % group);
+            uint32_t u;
+            if (bits == 8) {
+                u = d.base[gi * 32 + lane];
+            } else {
+                const uint8_t byte = d.base[gi * 32 + lane / 2];
+                u = (lane & 1) ? (byte >> 4) : (byte & 0xf);
+            }
+            const int hb = high > 0 ? bits - 4 : 0;  // Q5: 1, Q6: 2; Q4/Q8 have no high plane
+            for (int j = 0; j < hb; ++j) {
+                const int t = lane * hb + j;
+                u |= static_cast<uint32_t>((d.base[high_off + gi * high + t / 8] >> (t % 8)) & 1) << (4 + j);
+            }
+            const int q = u >= (1u << (bits - 1)) ? static_cast<int>(u) - (1 << bits) : static_cast<int>(u);
+            const uint8_t* s = d.base + scale_off + 2 * gi;
+            return __half2float(__ushort_as_half(static_cast<unsigned short>(s[0] | (s[1] << 8)))) * static_cast<float>(q);
         }
         default: {  // NVFP4
             const uint8_t byte = d.base[(row * d.k + col) / 2];

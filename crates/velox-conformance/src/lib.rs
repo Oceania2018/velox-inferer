@@ -8,7 +8,7 @@
 use velox_core::backend::{
     AttnShape, Backend, ConvShape, GdnShape, NormKind, RopeShape, WeightView,
 };
-use velox_core::format::{align256, f32_to_bf16, WeightFormat};
+use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::model::{HostLayer, Stack};
 use velox_core::rng::Rng;
 use velox_core::{ModelSpec, Op, Result};
@@ -93,7 +93,71 @@ pub fn random_weight(rng: &mut Rng, fmt: WeightFormat, n: usize, k: usize) -> Ve
             p.extend_from_slice(&96.0f32.to_le_bytes());
             p
         }
+        q => {
+            let rs = q.row_split().expect("row-split format");
+            let codes = random_codes(rng, rs, n, k);
+            encode_row_split(rs, n, k, &codes.0, &codes.1)
+        }
     }
+}
+
+/// Random legal signed codes `[n, k]` and positive binary16 scales (one per logical group).
+pub fn random_codes(rng: &mut Rng, rs: RowSplit, n: usize, k: usize) -> (Vec<i32>, Vec<u16>) {
+    let (lo, span) = if rs.bits == 8 {
+        (-127, 255)
+    } else {
+        (-(1 << (rs.bits - 1)), 1 << rs.bits)
+    };
+    let codes = (0..n * k)
+        .map(|_| lo + (rng.next_u64() % span as u64) as i32)
+        .collect();
+    // Exact binary16 scales 2^-7 .. 2^-3 with random mantissas.
+    let scales = (0..n * k.div_ceil(rs.group))
+        .map(|_| ((8 + rng.next_u64() % 5) << 10 | (rng.next_u64() % 1024)) as u16)
+        .collect();
+    (codes, scales)
+}
+
+/// Encodes codes/scales exactly as `row_split_k128_v1` specifies (planes, nibble order, lane-major
+/// high bits, zero physical padding), independently of the decoders under test.
+pub fn encode_row_split(
+    rs: RowSplit,
+    n: usize,
+    k: usize,
+    codes: &[i32],
+    scales: &[u16],
+) -> Vec<u8> {
+    let gpr = rs.groups_per_row(k);
+    let logical_groups = k.div_ceil(rs.group);
+    let (high_off, scale_off, total) = rs.planes(n, k);
+    let mut p = vec![0u8; total];
+    for r in 0..n {
+        for g in 0..gpr {
+            let gi = r * gpr + g;
+            for lane in 0..rs.group {
+                let c = g * rs.group + lane;
+                let q = if c < k { codes[r * k + c] } else { 0 };
+                let u = (q & ((1 << rs.bits) - 1)) as u8;
+                if rs.bits == 8 {
+                    p[gi * 32 + lane] = u;
+                } else {
+                    p[gi * 32 + lane / 2] |= (u & 0xf) << (4 * (lane % 2));
+                    let hb = rs.bits as usize - 4;
+                    for j in 0..hb {
+                        let t = lane * hb + j;
+                        p[high_off + gi * rs.high + t / 8] |= ((u >> (4 + j)) & 1) << (t % 8);
+                    }
+                }
+            }
+            let s = if g < logical_groups {
+                scales[r * logical_groups + g]
+            } else {
+                0
+            };
+            p[scale_off + 2 * gi..scale_off + 2 * gi + 2].copy_from_slice(&s.to_le_bytes());
+        }
+    }
+    p
 }
 
 struct Suite<'a, B: Backend> {
@@ -417,9 +481,20 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 16)?;
     s.linear(WeightFormat::Nvfp4, 256, 128, 0, 256, 1)?;
     s.linear(WeightFormat::Nvfp4, 384, 192, 128, 200, 5)?;
+    // Groupwise integer formats; K not a multiple of 128 exercises physical padding.
+    for f in [
+        WeightFormat::Q4G64,
+        WeightFormat::Q5G64,
+        WeightFormat::Q6G64,
+        WeightFormat::Q8G32,
+    ] {
+        s.linear(f, 40, 130, 3, 30, 2)?;
+        s.linear(f, 72, 1152, 0, 72, 20)?;
+    }
     s.embed(WeightFormat::Fp8RowBf16, 50, 64, &[3, 0, 49, 3])?;
     s.embed(WeightFormat::Bf16, 10, 130, &[9, 1])?;
     s.embed(WeightFormat::Nvfp4, 128, 64, &[127, 0, 64])?;
+    s.embed(WeightFormat::Q5G64, 20, 200, &[19, 0])?;
     s.rms_norm(1, 4096, NormKind::Plain)?;
     s.rms_norm(5, 130, NormKind::Plain)?;
     s.rms_norm(6, 256, NormKind::Offset)?;
@@ -515,6 +590,33 @@ mod tests {
         assert_eq!(max_err(&[1.0], &[1.0]), 0.0);
         assert!(max_err(&[f32::NAN], &[1.0]).is_infinite());
         assert!(max_err(&[1.0], &[1.0, 2.0]).is_infinite());
+    }
+
+    #[test]
+    fn row_split_decode_matches_encoded_codes() {
+        use velox_core::format::{decode_rows, f16_to_f32};
+        let mut rng = Rng::new(5);
+        for f in [
+            WeightFormat::Q4G64,
+            WeightFormat::Q5G64,
+            WeightFormat::Q6G64,
+            WeightFormat::Q8G32,
+        ] {
+            let rs = f.row_split().unwrap();
+            let (n, k) = (3, 200);
+            let (codes, scales) = random_codes(&mut rng, rs, n, k);
+            let bytes = encode_row_split(rs, n, k, &codes, &scales);
+            assert_eq!(bytes.len(), f.payload_bytes(n, k));
+            let got = decode_rows(f, &bytes, n, k, 0, n).unwrap();
+            let groups = k.div_ceil(rs.group);
+            for r in 0..n {
+                for c in 0..k {
+                    let want =
+                        f16_to_f32(scales[r * groups + c / rs.group]) * codes[r * k + c] as f32;
+                    assert_eq!(got[r * k + c], want, "{f:?} [{r},{c}]");
+                }
+            }
+        }
     }
 
     #[test]

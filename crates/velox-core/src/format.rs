@@ -17,6 +17,38 @@ pub enum WeightFormat {
     Fp8RowBf16,
     /// `nvfp4` / `block_scale_k16_m128x4_v1`: E2M1 codes, E4M3FN scale per 16, FP32 divisor.
     Nvfp4,
+    /// `q4_g64_fp16` / `row_split_k128_v1`: signed 4-bit codes, FP16 multiplier per 64.
+    Q4G64,
+    /// `q5_g64_fp16` / `row_split_k128_v1`.
+    Q5G64,
+    /// `q6_g64_fp16` / `row_split_k128_v1`.
+    Q6G64,
+    /// `q8_g32_fp16` / `row_split_k128_v1`: codes in [-127, 127], FP16 multiplier per 32.
+    Q8G32,
+}
+
+/// Geometry of a `row_split_k128_v1` format: code bits, group size, base and high-bit bytes per
+/// group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowSplit {
+    pub bits: u32,
+    pub group: usize,
+    pub base: usize,
+    pub high: usize,
+}
+
+impl RowSplit {
+    pub fn groups_per_row(&self, k: usize) -> usize {
+        k.div_ceil(128) * 128 / self.group
+    }
+
+    /// (high-plane offset, scale-plane offset, payload bytes) for a parent `[n, k]`.
+    pub fn planes(&self, n: usize, k: usize) -> (usize, usize, usize) {
+        let groups = n * self.groups_per_row(k);
+        let high_off = align256(groups * self.base);
+        let scale_off = high_off + align256(groups * self.high);
+        (high_off, scale_off, scale_off + 2 * groups)
+    }
 }
 
 impl WeightFormat {
@@ -27,6 +59,10 @@ impl WeightFormat {
             ("bf16", "contiguous_le_v1") => Ok(WeightFormat::Bf16),
             ("fp8_e4m3fn_row_bf16", "row_scale_v1") => Ok(WeightFormat::Fp8RowBf16),
             ("nvfp4", "block_scale_k16_m128x4_v1") => Ok(WeightFormat::Nvfp4),
+            ("q4_g64_fp16", "row_split_k128_v1") => Ok(WeightFormat::Q4G64),
+            ("q5_g64_fp16", "row_split_k128_v1") => Ok(WeightFormat::Q5G64),
+            ("q6_g64_fp16", "row_split_k128_v1") => Ok(WeightFormat::Q6G64),
+            ("q8_g32_fp16", "row_split_k128_v1") => Ok(WeightFormat::Q8G32),
             _ => Err(Error::Unsupported(format!(
                 "weight format {format} / {layout}"
             ))),
@@ -39,6 +75,28 @@ impl WeightFormat {
             WeightFormat::Bf16 => "bf16",
             WeightFormat::Fp8RowBf16 => "fp8_e4m3fn_row_bf16",
             WeightFormat::Nvfp4 => "nvfp4",
+            WeightFormat::Q4G64 => "q4_g64_fp16",
+            WeightFormat::Q5G64 => "q5_g64_fp16",
+            WeightFormat::Q6G64 => "q6_g64_fp16",
+            WeightFormat::Q8G32 => "q8_g32_fp16",
+        }
+    }
+
+    pub fn row_split(&self) -> Option<RowSplit> {
+        let rs = |bits, group, base, high| {
+            Some(RowSplit {
+                bits,
+                group,
+                base,
+                high,
+            })
+        };
+        match self {
+            WeightFormat::Q4G64 => rs(4, 64, 32, 0),
+            WeightFormat::Q5G64 => rs(5, 64, 32, 8),
+            WeightFormat::Q6G64 => rs(6, 64, 32, 16),
+            WeightFormat::Q8G32 => rs(8, 32, 32, 0),
+            _ => None,
         }
     }
 
@@ -65,12 +123,61 @@ impl WeightFormat {
             WeightFormat::Bf16 => n * k * 2,
             WeightFormat::Fp8RowBf16 => align256(n * k) + 2 * n,
             WeightFormat::Nvfp4 => align256(n * k / 2) + n * k / 16 + 4,
+            q => q.row_split().map_or(0, |r| r.planes(n, k).2),
         }
     }
 }
 
 pub fn align256(x: usize) -> usize {
     x.div_ceil(256) * 256
+}
+
+/// IEEE binary16 to f32 (exact).
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let e = i32::from((h >> 10) & 0x1f);
+    let m = f32::from(h & 0x3ff);
+    match e {
+        0 => sign * m * 2f32.powi(-24),
+        31 => {
+            if m == 0.0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => sign * (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+    }
+}
+
+/// Decoded weight `[r, c]` of a `row_split_k128_v1` parent `[n, k]`.
+pub fn row_split_at(rs: RowSplit, payload: &[u8], n: usize, k: usize, r: usize, c: usize) -> f32 {
+    let (high_off, scale_off, _) = rs.planes(n, k);
+    let gi = r * rs.groups_per_row(k) + c / rs.group;
+    let lane = c % rs.group;
+    let mut u = if rs.bits == 8 {
+        u32::from(payload[gi * rs.base + lane])
+    } else {
+        let byte = payload[gi * rs.base + lane / 2];
+        u32::from(if lane % 2 == 0 { byte & 0xf } else { byte >> 4 })
+    };
+    // High bits per lane: Q5 1, Q6 2; Q4 and Q8 have no high-bit plane.
+    let hb = if rs.high > 0 { rs.bits as usize - 4 } else { 0 };
+    for j in 0..hb {
+        let t = lane * hb + j;
+        let bit = (payload[high_off + gi * rs.high + t / 8] >> (t % 8)) & 1;
+        u |= u32::from(bit) << (4 + j);
+    }
+    let q = if u >= 1 << (rs.bits - 1) {
+        u as i32 - (1 << rs.bits)
+    } else {
+        u as i32
+    };
+    let s = f16_to_f32(u16::from_le_bytes([
+        payload[scale_off + 2 * gi],
+        payload[scale_off + 2 * gi + 1],
+    ]));
+    s * q as f32
 }
 
 pub fn bf16_to_f32(bits: u16) -> f32 {
@@ -173,6 +280,10 @@ pub fn decode_rows(
                     out.push(e2m1_to_f32(code) * scale / divisor);
                 }
             }
+            q => {
+                let rs = q.row_split().expect("row-split format");
+                out.extend((0..k).map(|c| row_split_at(rs, payload, n, k, r, c)));
+            }
         }
     }
     Ok(out)
@@ -211,6 +322,11 @@ mod tests {
         assert_eq!(WeightFormat::Nvfp4.payload_bytes(34816, 5120), 100_270_084);
         assert_eq!(WeightFormat::Nvfp4.payload_bytes(5120, 17408), 50_135_044);
         assert_eq!(WeightFormat::Bf16.payload_bytes(96, 5120), 983_040);
+        // Worked example from the row_split_k128_v1 contract: Q5 [2,130].
+        assert_eq!(
+            WeightFormat::Q5G64.row_split().unwrap().planes(2, 130),
+            (256, 512, 528)
+        );
     }
 
     #[test]

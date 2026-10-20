@@ -101,6 +101,10 @@ pub fn format_code(f: WeightFormat) -> i32 {
         WeightFormat::Bf16 => 1,
         WeightFormat::Fp8RowBf16 => 2,
         WeightFormat::Nvfp4 => 3,
+        WeightFormat::Q4G64 => 4,
+        WeightFormat::Q5G64 => 5,
+        WeightFormat::Q6G64 => 6,
+        WeightFormat::Q8G32 => 7,
     }
 }
 
