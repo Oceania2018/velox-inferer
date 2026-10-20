@@ -272,6 +272,78 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// Splits `[rows, sum(widths)]` into consecutive column blocks (5 parts: two launches).
+    fn split_cols(&mut self, rows: usize, widths: &[usize]) -> Result<()> {
+        let total: usize = widths.iter().sum();
+        let src = self.rng.vec(rows * total, 1.0);
+        let mut want: Vec<Vec<f32>> = widths.iter().map(|w| vec![0.0; rows * w]).collect();
+        let offs: Vec<usize> = widths
+            .iter()
+            .scan(0, |o, w| {
+                let s = *o;
+                *o += w;
+                Some(s)
+            })
+            .collect();
+        {
+            let mut outs: Vec<(&mut Vec<f32>, usize, usize)> = want
+                .iter_mut()
+                .zip(&offs)
+                .zip(widths)
+                .map(|((b, &o), &w)| (b, o, w))
+                .collect();
+            CpuBackend.split_cols(&src, rows, total, &mut outs)?;
+        }
+        let sd = self.b.upload(&src)?;
+        let mut dev: Vec<B::Buffer> = widths
+            .iter()
+            .map(|w| self.b.alloc(rows * w))
+            .collect::<Result<_>>()?;
+        {
+            let mut outs: Vec<(&mut B::Buffer, usize, usize)> = dev
+                .iter_mut()
+                .zip(&offs)
+                .zip(widths)
+                .map(|((b, &o), &w)| (b, o, w))
+                .collect();
+            self.b.split_cols(&sd, rows, total, &mut outs)?;
+        }
+        let mut got = Vec::new();
+        let mut all_want = Vec::new();
+        for (d, (w, wv)) in dev.iter().zip(widths.iter().zip(&want)) {
+            got.extend(fetch(self.b, d, rows * w)?);
+            all_want.extend_from_slice(wv);
+        }
+        self.record(
+            format!("split_cols rows={rows} {widths:?}"),
+            Some(Op::SplitCols),
+            &got,
+            &all_want,
+            0.0,
+        );
+        Ok(())
+    }
+
+    fn swiglu(&mut self, rows: usize, width: usize) -> Result<()> {
+        let cols = 2 * width + 3;
+        let src = self.rng.vec(rows * cols, 3.0);
+        let (gate, up) = (width + 3, 0);
+        let mut want = vec![0.0; rows * width];
+        CpuBackend.swiglu(&src, rows, cols, gate, up, width, &mut want)?;
+        let sd = self.b.upload(&src)?;
+        let mut od = self.b.alloc(rows * width)?;
+        self.b.swiglu(&sd, rows, cols, gate, up, width, &mut od)?;
+        let got = fetch(self.b, &od, rows * width)?;
+        self.record(
+            format!("swiglu rows={rows} width={width}"),
+            Some(Op::Swiglu),
+            &got,
+            &want,
+            1e-5,
+        );
+        Ok(())
+    }
+
     fn concat_cols(&mut self, rows: usize, a_cols: usize, b_cols: usize) -> Result<()> {
         let (a, bb) = (
             self.rng.vec(rows * a_cols, 1.0),
@@ -754,6 +826,10 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     // Sampling candidates: a Qwen-sized vocabulary row (public limit below the padded width), a
     // small one, and k larger than the row.
     s.concat_cols(3, 5120, 5120)?;
+    s.split_cols(3, &[6144, 1024, 6144, 1024])?;
+    s.split_cols(2, &[7, 5, 3, 9, 4])?;
+    s.swiglu(3, 17408)?;
+    s.swiglu(5, 77)?;
     s.concat_cols(7, 13, 5)?;
     s.top_k(2, 248_320, 248_077, 64)?;
     s.top_k(3, 5000, 4097, 20)?;

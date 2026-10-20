@@ -26,6 +26,8 @@ pub enum Op {
     RopePositions,
     TopK,
     ConcatCols,
+    SplitCols,
+    Swiglu,
 }
 
 impl Op {
@@ -49,6 +51,8 @@ impl Op {
         Op::RopePositions,
         Op::TopK,
         Op::ConcatCols,
+        Op::SplitCols,
+        Op::Swiglu,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -72,6 +76,8 @@ impl Op {
             Op::RopePositions => "rope_positions",
             Op::TopK => "top_k",
             Op::ConcatCols => "concat_cols",
+            Op::SplitCols => "split_cols",
+            Op::Swiglu => "swiglu",
         }
     }
 }
