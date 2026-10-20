@@ -4,11 +4,55 @@
 //! every device backend against, so clarity wins over speed here: never optimise it in ways that
 //! change its numerics.
 
-use velox_core::backend::{AttnShape, Backend, BackendKind, RopeShape};
+use velox_core::backend::{
+    AttnShape, Backend, BackendKind, ConvShape, GdnShape, NormKind, RopeShape, WeightView,
+};
+use velox_core::format::decode_rows;
 use velox_core::{check, DeviceProfile, Op, Result};
 
 #[derive(Default, Clone, Copy)]
 pub struct CpuBackend;
+
+/// Raw bytes of an f32 buffer (encoded weights are stored padded into f32 slots).
+fn as_bytes(v: &[f32]) -> &[u8] {
+    // SAFETY: f32 has no padding or invalid bit patterns; u8 has alignment 1.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 4) }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| f64::from(x) * f64::from(y))
+        .sum()
+}
+
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn silu(x: f64) -> f64 {
+    x * sigmoid(x)
+}
+
+fn softplus(x: f64) -> f64 {
+    if x > 20.0 {
+        x
+    } else {
+        x.exp().ln_1p()
+    }
+}
+
+/// Decoded rows of a weight view, `[rows, k]`.
+fn decode_view(w: &WeightView<'_, Vec<f32>>) -> Result<Vec<f32>> {
+    decode_rows(
+        w.format,
+        as_bytes(w.buf),
+        w.parent_rows,
+        w.k,
+        w.row_begin,
+        w.rows,
+    )
+}
 
 impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
@@ -35,6 +79,15 @@ impl Backend for CpuBackend {
 
     fn upload(&self, data: &[f32]) -> Result<Vec<f32>> {
         Ok(data.to_vec())
+    }
+
+    fn upload_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
+        let mut v = vec![0f32; data.len().div_ceil(4)];
+        // SAFETY: v holds at least data.len() bytes; any bit pattern is a valid f32.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), v.as_mut_ptr().cast::<u8>(), data.len())
+        };
+        Ok(v)
     }
 
     fn download(&self, buf: &Vec<f32>, out: &mut [f32]) -> Result<()> {
@@ -64,13 +117,42 @@ impl Backend for CpuBackend {
         for i in 0..m {
             let xr = &x[i * k..(i + 1) * k];
             for j in 0..n {
-                let wr = &w[j * k..(j + 1) * k];
-                y[i * n + j] = xr
-                    .iter()
-                    .zip(wr)
-                    .map(|(&a, &b)| f64::from(a) * f64::from(b))
-                    .sum::<f64>() as f32;
+                y[i * n + j] = dot(xr, &w[j * k..(j + 1) * k]) as f32;
             }
+        }
+        Ok(())
+    }
+
+    fn linear(
+        &self,
+        x: &Vec<f32>,
+        w: &WeightView<'_, Vec<f32>>,
+        y: &mut Vec<f32>,
+        m: usize,
+    ) -> Result<()> {
+        check::linear(x.len(), w, w.buf.len(), y.len(), m)?;
+        let wd = decode_view(w)?;
+        let (k, n) = (w.k, w.rows);
+        for i in 0..m {
+            let xr = &x[i * k..(i + 1) * k];
+            for j in 0..n {
+                y[i * n + j] = dot(xr, &wd[j * k..(j + 1) * k]) as f32;
+            }
+        }
+        Ok(())
+    }
+
+    fn embed(
+        &self,
+        ids: &[u32],
+        table: &WeightView<'_, Vec<f32>>,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        check::embed(ids, table, table.buf.len(), out.len())?;
+        let k = table.k;
+        for (t, &id) in ids.iter().enumerate() {
+            let row = decode_view(&table.rows(id as usize, 1))?;
+            out[t * k..(t + 1) * k].copy_from_slice(&row);
         }
         Ok(())
     }
@@ -83,14 +165,16 @@ impl Backend for CpuBackend {
         rows: usize,
         dim: usize,
         eps: f32,
+        kind: NormKind,
     ) -> Result<()> {
         check::rms_norm(x.len(), weight.len(), y.len(), rows, dim)?;
+        let offset = if kind == NormKind::Offset { 1.0 } else { 0.0 };
         for r in 0..rows {
             let xr = &x[r * dim..(r + 1) * dim];
             let ms = xr.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / dim as f64;
             let inv = 1.0 / (ms + f64::from(eps)).sqrt();
             for c in 0..dim {
-                y[r * dim + c] = (f64::from(xr[c]) * inv * f64::from(weight[c])) as f32;
+                y[r * dim + c] = (f64::from(xr[c]) * inv * (offset + f64::from(weight[c]))) as f32;
             }
         }
         Ok(())
@@ -98,13 +182,13 @@ impl Backend for CpuBackend {
 
     fn rope(&self, x: &mut Vec<f32>, s: RopeShape) -> Result<()> {
         check::rope(x.len(), &s)?;
-        let half = s.head_dim / 2;
+        let half = s.rotary_dim / 2;
         for t in 0..s.tokens {
             let pos = (s.pos0 + t) as f64;
             for h in 0..s.heads {
                 let base = (t * s.heads + h) * s.head_dim;
                 for i in 0..half {
-                    let freq = f64::from(s.theta).powf(-2.0 * i as f64 / s.head_dim as f64);
+                    let freq = f64::from(s.theta).powf(-2.0 * i as f64 / s.rotary_dim as f64);
                     let (sin, cos) = (pos * freq).sin_cos();
                     let a = f64::from(x[base + i]);
                     let b = f64::from(x[base + i + half]);
@@ -119,8 +203,15 @@ impl Backend for CpuBackend {
     fn silu_mul(&self, gate: &mut Vec<f32>, up: &Vec<f32>, len: usize) -> Result<()> {
         check::elementwise("silu_mul", &[gate.len(), up.len()], len)?;
         for (g, &u) in gate[..len].iter_mut().zip(&up[..len]) {
-            let v = f64::from(*g);
-            *g = (v / (1.0 + (-v).exp()) * f64::from(u)) as f32;
+            *g = (silu(f64::from(*g)) * f64::from(u)) as f32;
+        }
+        Ok(())
+    }
+
+    fn sigmoid_mul(&self, x: &mut Vec<f32>, gate: &Vec<f32>, len: usize) -> Result<()> {
+        check::elementwise("sigmoid_mul", &[x.len(), gate.len()], len)?;
+        for (v, &g) in x[..len].iter_mut().zip(&gate[..len]) {
+            *v = (f64::from(*v) * sigmoid(f64::from(g))) as f32;
         }
         Ok(())
     }
@@ -164,13 +255,7 @@ impl Backend for CpuBackend {
                 let kvh = h / group;
                 let qv = &q[(t * s.heads + h) * d..][..d];
                 for (j, sc) in scores[..visible].iter_mut().enumerate() {
-                    let kv = &k[(j * s.kv_heads + kvh) * d..][..d];
-                    *sc = qv
-                        .iter()
-                        .zip(kv)
-                        .map(|(&a, &b)| f64::from(a) * f64::from(b))
-                        .sum::<f64>()
-                        * scale;
+                    *sc = dot(qv, &k[(j * s.kv_heads + kvh) * d..][..d]) * scale;
                 }
                 let max = scores[..visible]
                     .iter()
@@ -192,11 +277,95 @@ impl Backend for CpuBackend {
         }
         Ok(())
     }
+
+    fn conv1d_silu(
+        &self,
+        x: &Vec<f32>,
+        weight: &Vec<f32>,
+        state: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+        s: ConvShape,
+    ) -> Result<()> {
+        check::conv1d(x.len(), weight.len(), state.len(), out.len(), &s)?;
+        let (c, w) = (s.channels, s.width);
+        // u = [state; x], rows of `c` channels.
+        let mut u = state[..(w - 1) * c].to_vec();
+        u.extend_from_slice(&x[..s.tokens * c]);
+        for t in 0..s.tokens {
+            for ch in 0..c {
+                let acc: f64 = (0..w)
+                    .map(|j| f64::from(weight[j * c + ch]) * f64::from(u[(t + j) * c + ch]))
+                    .sum();
+                out[t * c + ch] = silu(acc) as f32;
+            }
+        }
+        state[..(w - 1) * c].copy_from_slice(&u[s.tokens * c..]);
+        Ok(())
+    }
+
+    fn gated_delta_net(
+        &self,
+        qkv: &Vec<f32>,
+        ab: &Vec<f32>,
+        a_log: &Vec<f32>,
+        dt_bias: &Vec<f32>,
+        state: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+        s: GdnShape,
+    ) -> Result<()> {
+        check::gdn(
+            qkv.len(),
+            ab.len(),
+            a_log.len(),
+            dt_bias.len(),
+            state.len(),
+            out.len(),
+            &s,
+        )?;
+        let (dk, dv, w) = (s.k_dim, s.v_dim, s.qkv_width());
+        let group = s.v_heads / s.k_heads;
+        let l2 = |x: &[f32]| -> Vec<f64> {
+            let inv =
+                1.0 / (x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() + 1e-6).sqrt();
+            x.iter().map(|&v| f64::from(v) * inv).collect()
+        };
+        for t in 0..s.tokens {
+            let row = &qkv[t * w..(t + 1) * w];
+            for h in 0..s.v_heads {
+                let kh = h / group;
+                let q = l2(&row[kh * dk..(kh + 1) * dk]);
+                let k = l2(&row[(s.k_heads + kh) * dk..(s.k_heads + kh + 1) * dk]);
+                let v = &row[2 * s.k_heads * dk + h * dv..][..dv];
+                let a = f64::from(ab[t * 2 * s.v_heads + h]);
+                let b = f64::from(ab[t * 2 * s.v_heads + s.v_heads + h]);
+                let g = -f64::from(a_log[h]).exp() * softplus(a + f64::from(dt_bias[h]));
+                let (alpha, beta) = (g.exp(), sigmoid(b));
+                let st = &mut state[h * dv * dk..(h + 1) * dv * dk];
+                for i in 0..dv {
+                    let srow = &mut st[i * dk..(i + 1) * dk];
+                    let mut sk = 0.0;
+                    for (sv, &kv) in srow.iter_mut().zip(&k) {
+                        *sv = (f64::from(*sv) * alpha) as f32;
+                        sk += f64::from(*sv) * kv;
+                    }
+                    let delta = beta * (f64::from(v[i]) - sk);
+                    let mut o = 0.0;
+                    for ((sv, &kv), &qv) in srow.iter_mut().zip(&k).zip(&q) {
+                        *sv = (f64::from(*sv) + delta * kv) as f32;
+                        o += f64::from(*sv) * qv;
+                    }
+                    out[(t * s.v_heads + h) * dv + i] = (o / (dk as f64).sqrt()) as f32;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use velox_core::WeightFormat;
 
     #[test]
     fn matmul_small() {
@@ -209,6 +378,22 @@ mod tests {
     }
 
     #[test]
+    fn linear_bf16_matches_matmul() {
+        let b = CpuBackend;
+        // W = [[1, 2], [-0.5, 3]] as bf16 words.
+        let words: [u16; 4] = [0x3f80, 0x4000, 0xbf00, 0x4040];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let wb = b.upload_bytes(&bytes).unwrap();
+        let view = WeightView::full(&wb, WeightFormat::Bf16, 2, 2);
+        let mut y = vec![0.0; 2];
+        b.linear(&vec![1.0, 1.0], &view, &mut y, 1).unwrap();
+        assert_eq!(y, vec![3.0, 2.5]);
+        let mut e = vec![0.0; 2];
+        b.embed(&[1], &view, &mut e).unwrap();
+        assert_eq!(e, vec![-0.5, 3.0]);
+    }
+
+    #[test]
     fn single_key_attention_returns_value() {
         let b = CpuBackend;
         let s = AttnShape {
@@ -218,29 +403,81 @@ mod tests {
             head_dim: 2,
             pos0: 0,
         };
-        let q = vec![1.0, 2.0, -3.0, 0.5];
-        let k = vec![0.3, 0.7];
-        let v = vec![4.0, -1.0];
         let mut out = vec![0.0; 4];
-        b.attention(&q, &k, &v, &mut out, s).unwrap();
+        b.attention(
+            &vec![1.0, 2.0, -3.0, 0.5],
+            &vec![0.3, 0.7],
+            &vec![4.0, -1.0],
+            &mut out,
+            s,
+        )
+        .unwrap();
         assert_eq!(out, vec![4.0, -1.0, 4.0, -1.0]);
     }
 
     #[test]
-    fn rope_at_position_zero_is_identity() {
+    fn partial_rope_leaves_tail_untouched() {
         let b = CpuBackend;
-        let mut x = vec![1.0, 2.0, 3.0, 4.0];
+        let mut x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         b.rope(
             &mut x,
             RopeShape {
                 tokens: 1,
                 heads: 1,
-                head_dim: 4,
-                pos0: 0,
+                head_dim: 6,
+                rotary_dim: 4,
+                pos0: 3,
                 theta: 10_000.0,
             },
         )
         .unwrap();
-        assert_eq!(x, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&x[4..], &[5.0, 6.0]);
+        assert_ne!(x[0], 1.0);
+    }
+
+    #[test]
+    fn conv_state_carries_across_calls() {
+        let b = CpuBackend;
+        let s = ConvShape {
+            tokens: 1,
+            channels: 1,
+            width: 3,
+        };
+        let w = vec![1.0, 1.0, 1.0];
+        let mut state = vec![0.0; 2];
+        let mut out = vec![0.0; 1];
+        for x in [1.0f32, 2.0, 3.0] {
+            b.conv1d_silu(&vec![x], &w, &mut state, &mut out, s)
+                .unwrap();
+        }
+        // Last output sums 1 + 2 + 3 before SiLU.
+        assert!((f64::from(out[0]) - silu(6.0)).abs() < 1e-6);
+        assert_eq!(state, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn gdn_first_step_from_zero_state() {
+        // With S = 0: S' = β v ⊗ k̂ and o = S' q̂ / sqrt(dk) = β v (k̂·q̂) / sqrt(dk).
+        let b = CpuBackend;
+        let s = GdnShape {
+            tokens: 1,
+            k_heads: 1,
+            v_heads: 1,
+            k_dim: 2,
+            v_dim: 2,
+        };
+        let qkv = vec![1.0, 0.0, 1.0, 0.0, 2.0, -4.0];
+        let ab = vec![0.0, 0.0]; // β = 0.5
+        let mut state = vec![0.0; 4];
+        let mut out = vec![0.0; 2];
+        b.gated_delta_net(&qkv, &ab, &vec![0.0], &vec![0.0], &mut state, &mut out, s)
+            .unwrap();
+        let kq = 1.0 / (1.0 + 1e-6); // both normalised vectors are (1/sqrt(1+1e-6), 0)
+        let want = [0.5 * 2.0 * kq / 2f64.sqrt(), 0.5 * -4.0 * kq / 2f64.sqrt()];
+        assert!(
+            (f64::from(out[0]) - want[0]).abs() < 1e-6
+                && (f64::from(out[1]) - want[1]).abs() < 1e-6,
+            "{out:?}"
+        );
     }
 }

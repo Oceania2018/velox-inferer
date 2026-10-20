@@ -24,7 +24,7 @@ __global__ void matmul_warp_kernel(const float* __restrict__ x, const float* __r
 }
 
 __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ weight, float* __restrict__ y,
-                                int dim, float eps) {
+                                int dim, float eps, float offset) {
     __shared__ float scratch[VELOX_WARP];
     const float* xr = x + static_cast<size_t>(blockIdx.x) * dim;
     float* yr = y + static_cast<size_t>(blockIdx.x) * dim;
@@ -32,18 +32,19 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
     ss = velox_block_sum(ss, scratch);
     const float inv = rsqrtf(ss / dim + eps);
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) yr[i] = xr[i] * inv * weight[i];
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) yr[i] = xr[i] * inv * (offset + weight[i]);
 }
 
 // The angle is formed in double: positions reach 1e5+, where a float angle loses ~1e-2 rad.
-__global__ void rope_kernel(float* __restrict__ x, long long pairs, int heads, int head_dim, int pos0, float theta) {
-    const int half = head_dim / 2;
+__global__ void rope_kernel(float* __restrict__ x, long long pairs, int heads, int head_dim, int rotary_dim, int pos0,
+                            float theta) {
+    const int half = rotary_dim / 2;
     for (long long p = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; p < pairs;
          p += static_cast<long long>(gridDim.x) * blockDim.x) {
         const int i = static_cast<int>(p % half);
         const long long row = p / half;  // token * heads + head
         const int t = static_cast<int>(row / heads);
-        const double freq = pow(static_cast<double>(theta), -2.0 * i / head_dim);
+        const double freq = pow(static_cast<double>(theta), -2.0 * i / rotary_dim);
         double s, c;
         sincos(static_cast<double>(pos0 + t) * freq, &s, &c);
         float* base = x + row * head_dim;
@@ -124,14 +125,15 @@ VELOX_API int velox_portable_matmul(const float* x, const float* w, float* y, in
     return velox_launch_status();
 }
 
-VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float* y, int rows, int dim, float eps) {
-    rms_norm_kernel<<<rows, 256>>>(x, weight, y, dim, eps);
+VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float* y, int rows, int dim, float eps,
+                                      int offset) {
+    rms_norm_kernel<<<rows, 256>>>(x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
     return velox_launch_status();
 }
 
-VELOX_API int velox_portable_rope(float* x, int tokens, int heads, int head_dim, int pos0, float theta) {
-    const long long pairs = static_cast<long long>(tokens) * heads * (head_dim / 2);
-    rope_kernel<<<velox_grid_1d(pairs, 256), 256>>>(x, pairs, heads, head_dim, pos0, theta);
+VELOX_API int velox_portable_rope(float* x, int tokens, int heads, int head_dim, int rotary_dim, int pos0, float theta) {
+    const long long pairs = static_cast<long long>(tokens) * heads * (rotary_dim / 2);
+    rope_kernel<<<velox_grid_1d(pairs, 256), 256>>>(x, pairs, heads, head_dim, rotary_dim, pos0, theta);
     return velox_launch_status();
 }
 

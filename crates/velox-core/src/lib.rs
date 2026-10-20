@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod check;
 pub mod error;
+pub mod format;
 pub mod model;
 pub mod op;
 pub mod plan;
@@ -15,8 +16,11 @@ pub mod profile;
 pub mod rng;
 pub mod variant;
 
-pub use backend::{AttnShape, Backend, BackendKind, RopeShape};
+pub use backend::{
+    AttnShape, Backend, BackendKind, ConvShape, GdnShape, NormKind, RopeShape, WeightView,
+};
 pub use error::{Error, Result};
+pub use format::WeightFormat;
 pub use op::Op;
 pub use plan::{MemoryPlan, ModelSpec, PlanPolicy, PlanRequest};
 pub use profile::{DeviceProfile, FormFactor, GpuArch, HwCaps, Vendor};

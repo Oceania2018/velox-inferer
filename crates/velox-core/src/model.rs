@@ -4,7 +4,7 @@
 //! Embedding lookup, the LM head and sampling are not part of this stack yet; it takes and
 //! returns hidden states.
 
-use crate::backend::{AttnShape, Backend, RopeShape};
+use crate::backend::{AttnShape, Backend, NormKind, RopeShape};
 use crate::error::{Error, Result};
 use crate::plan::ModelSpec;
 use crate::rng::Rng;
@@ -164,6 +164,7 @@ impl<B: Backend> Stack<B> {
             tokens,
             heads,
             head_dim: s.head_dim,
+            rotary_dim: s.head_dim,
             pos0,
             theta: s.rope_theta,
         };
@@ -176,7 +177,15 @@ impl<B: Backend> Stack<B> {
         };
 
         for l in &mut self.layers {
-            b.rms_norm(x, &l.attn_norm, &mut ws.h, tokens, hd, s.norm_eps)?;
+            b.rms_norm(
+                x,
+                &l.attn_norm,
+                &mut ws.h,
+                tokens,
+                hd,
+                s.norm_eps,
+                NormKind::Plain,
+            )?;
             b.matmul(&ws.h, &l.wq, &mut ws.q, tokens, qd, hd)?;
             b.matmul(&ws.h, &l.wk, &mut ws.k, tokens, kvd, hd)?;
             b.matmul(&ws.h, &l.wv, &mut ws.v, tokens, kvd, hd)?;
@@ -188,7 +197,15 @@ impl<B: Backend> Stack<B> {
             b.matmul(&ws.attn, &l.wo, &mut ws.proj, tokens, hd, qd)?;
             b.add(x, &ws.proj, tokens * hd)?;
 
-            b.rms_norm(x, &l.mlp_norm, &mut ws.h, tokens, hd, s.norm_eps)?;
+            b.rms_norm(
+                x,
+                &l.mlp_norm,
+                &mut ws.h,
+                tokens,
+                hd,
+                s.norm_eps,
+                NormKind::Plain,
+            )?;
             b.matmul(&ws.h, &l.w_gate, &mut ws.gate, tokens, inter, hd)?;
             b.matmul(&ws.h, &l.w_up, &mut ws.up, tokens, inter, hd)?;
             b.silu_mul(&mut ws.gate, &ws.up, tokens * inter)?;

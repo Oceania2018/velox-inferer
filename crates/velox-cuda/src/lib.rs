@@ -7,7 +7,9 @@
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
-use velox_core::backend::{AttnShape, Backend, BackendKind, RopeShape};
+use velox_core::backend::{
+    AttnShape, Backend, BackendKind, ConvShape, GdnShape, NormKind, RopeShape, WeightView,
+};
 use velox_core::{check, profile, DeviceProfile, Error, GpuArch, Op, Result, VariantInfo};
 
 pub mod portable;
@@ -232,6 +234,7 @@ impl Drop for CudaBuffer {
 /// Every method defaults to the portable implementation. A hardware variant overrides the ops it
 /// has tuned, may fall back to `portable::*` for shapes its kernel does not cover, and lists the
 /// ops it overrides in [`CudaKernels::native_ops`].
+#[allow(clippy::too_many_arguments)]
 pub trait CudaKernels: Send + Sync {
     fn native_ops(&self) -> &'static [Op] {
         &[]
@@ -249,6 +252,25 @@ pub trait CudaKernels: Send + Sync {
         portable::matmul(x, w, y, m, n, k)
     }
 
+    fn linear(
+        &self,
+        x: &CudaBuffer,
+        w: &WeightView<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        portable::linear(x, w, y, m)
+    }
+
+    fn embed(
+        &self,
+        ids: &[u32],
+        table: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+    ) -> Result<()> {
+        portable::embed(ids, table, out)
+    }
+
     fn rms_norm(
         &self,
         x: &CudaBuffer,
@@ -257,8 +279,9 @@ pub trait CudaKernels: Send + Sync {
         rows: usize,
         dim: usize,
         eps: f32,
+        kind: NormKind,
     ) -> Result<()> {
-        portable::rms_norm(x, weight, y, rows, dim, eps)
+        portable::rms_norm(x, weight, y, rows, dim, eps, kind)
     }
 
     fn rope(&self, x: &mut CudaBuffer, s: RopeShape) -> Result<()> {
@@ -267,6 +290,10 @@ pub trait CudaKernels: Send + Sync {
 
     fn silu_mul(&self, gate: &mut CudaBuffer, up: &CudaBuffer, len: usize) -> Result<()> {
         portable::silu_mul(gate, up, len)
+    }
+
+    fn sigmoid_mul(&self, x: &mut CudaBuffer, gate: &CudaBuffer, len: usize) -> Result<()> {
+        portable::sigmoid_mul(x, gate, len)
     }
 
     fn add(&self, acc: &mut CudaBuffer, x: &CudaBuffer, len: usize) -> Result<()> {
@@ -292,6 +319,30 @@ pub trait CudaKernels: Send + Sync {
         s: AttnShape,
     ) -> Result<()> {
         portable::attention(q, k, v, out, s)
+    }
+
+    fn conv1d_silu(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        state: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: ConvShape,
+    ) -> Result<()> {
+        portable::conv1d_silu(x, weight, state, out, s)
+    }
+
+    fn gated_delta_net(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+    ) -> Result<()> {
+        portable::gated_delta_net(qkv, ab, a_log, dt_bias, state, out, s)
     }
 }
 
@@ -333,6 +384,19 @@ impl CudaBackend {
     }
 }
 
+/// Uploads raw bytes into a fresh buffer of `ceil(len / 4)` f32 slots (tail zeroed).
+pub(crate) fn upload_raw(data: &[u8]) -> Result<CudaBuffer> {
+    let buf = CudaBuffer::new(data.len().div_ceil(4))?;
+    if !data.is_empty() {
+        // SAFETY: buf holds at least data.len() bytes.
+        status(
+            unsafe { ffi::velox_cuda_htod(buf.ptr.cast(), data.as_ptr().cast(), data.len()) },
+            "upload",
+        )?;
+    }
+    Ok(buf)
+}
+
 impl Backend for CudaBackend {
     type Buffer = CudaBuffer;
 
@@ -363,17 +427,12 @@ impl Backend for CudaBackend {
     }
 
     fn upload(&self, data: &[f32]) -> Result<CudaBuffer> {
-        let buf = CudaBuffer::new(data.len())?;
-        if !data.is_empty() {
-            // SAFETY: buf holds data.len() f32 elements.
-            status(
-                unsafe {
-                    ffi::velox_cuda_htod(buf.ptr.cast(), data.as_ptr().cast(), data.len() * 4)
-                },
-                "upload",
-            )?;
-        }
-        Ok(buf)
+        // SAFETY: an f32 slice viewed as its bytes.
+        upload_raw(unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), data.len() * 4) })
+    }
+
+    fn upload_bytes(&self, data: &[u8]) -> Result<CudaBuffer> {
+        upload_raw(data)
     }
 
     fn download(&self, buf: &CudaBuffer, out: &mut [f32]) -> Result<()> {
@@ -415,6 +474,27 @@ impl Backend for CudaBackend {
         self.kernels.matmul(x, w, y, m, n, k)
     }
 
+    fn linear(
+        &self,
+        x: &CudaBuffer,
+        w: &WeightView<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        check::linear(x.len, w, w.buf.len, y.len, m)?;
+        self.kernels.linear(x, w, y, m)
+    }
+
+    fn embed(
+        &self,
+        ids: &[u32],
+        table: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+    ) -> Result<()> {
+        check::embed(ids, table, table.buf.len, out.len)?;
+        self.kernels.embed(ids, table, out)
+    }
+
     fn rms_norm(
         &self,
         x: &CudaBuffer,
@@ -423,9 +503,10 @@ impl Backend for CudaBackend {
         rows: usize,
         dim: usize,
         eps: f32,
+        kind: NormKind,
     ) -> Result<()> {
         check::rms_norm(x.len, weight.len, y.len, rows, dim)?;
-        self.kernels.rms_norm(x, weight, y, rows, dim, eps)
+        self.kernels.rms_norm(x, weight, y, rows, dim, eps, kind)
     }
 
     fn rope(&self, x: &mut CudaBuffer, s: RopeShape) -> Result<()> {
@@ -436,6 +517,11 @@ impl Backend for CudaBackend {
     fn silu_mul(&self, gate: &mut CudaBuffer, up: &CudaBuffer, len: usize) -> Result<()> {
         check::elementwise("silu_mul", &[gate.len, up.len], len)?;
         self.kernels.silu_mul(gate, up, len)
+    }
+
+    fn sigmoid_mul(&self, x: &mut CudaBuffer, gate: &CudaBuffer, len: usize) -> Result<()> {
+        check::elementwise("sigmoid_mul", &[x.len, gate.len], len)?;
+        self.kernels.sigmoid_mul(x, gate, len)
     }
 
     fn add(&self, acc: &mut CudaBuffer, x: &CudaBuffer, len: usize) -> Result<()> {
@@ -464,6 +550,41 @@ impl Backend for CudaBackend {
     ) -> Result<()> {
         check::attention(q.len, k.len, v.len, out.len, &s)?;
         self.kernels.attention(q, k, v, out, s)
+    }
+
+    fn conv1d_silu(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        state: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: ConvShape,
+    ) -> Result<()> {
+        check::conv1d(x.len, weight.len, state.len, out.len, &s)?;
+        self.kernels.conv1d_silu(x, weight, state, out, s)
+    }
+
+    fn gated_delta_net(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+    ) -> Result<()> {
+        check::gdn(
+            qkv.len,
+            ab.len,
+            a_log.len,
+            dt_bias.len,
+            state.len,
+            out.len,
+            &s,
+        )?;
+        self.kernels
+            .gated_delta_net(qkv, ab, a_log, dt_bias, state, out, s)
     }
 }
 
