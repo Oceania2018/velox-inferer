@@ -233,7 +233,7 @@ impl<B: Backend> Suite<'_, B> {
             .with_act(policy);
         let act = self.b.linear_act(&view, m);
         let permitted = match (act, policy) {
-            (ActQuant::Exact, _) => true,
+            (ActQuant::Exact | ActQuant::Bf16, _) => true,
             (ActQuant::Fp8Row, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. }) => true,
             (ActQuant::Nvfp4 { divisor: a }, ActPolicy::AllowA4 { divisor: b }) => a == b,
             _ => false,
@@ -256,6 +256,7 @@ impl<B: Backend> Suite<'_, B> {
             ActQuant::Exact => "",
             ActQuant::Fp8Row => " a8",
             ActQuant::Nvfp4 { .. } => " a4",
+            ActQuant::Bf16 => " bf16",
         };
         let name = format!(
             "linear {} [{n},{k}] rows {begin}+{rows} m={m}{tag}",
@@ -724,6 +725,10 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     ] {
         s.linear(f, 40, 130, 3, 30, 2)?;
         s.linear(f, 72, 1152, 0, 72, 20)?;
+        // Vision-tower sizes, where tuned kernels switch to tensor cores (bf16 activations):
+        // ragged token counts, a row view, and K = 4304 padded to 4352 in storage.
+        s.linear(f, 160, 1152, 32, 96, 130)?;
+        s.linear(f, 96, 4304, 0, 96, 70)?;
     }
     // Sampling candidates: a Qwen-sized vocabulary row (public limit below the padded width), a
     // small one, and k larger than the row.
