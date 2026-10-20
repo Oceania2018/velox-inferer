@@ -12,7 +12,7 @@ use velox_core::{Error, Result};
 
 pub use config::{LayerKind, TextConfig};
 pub use vision::{Qwen35Vision, VisionConfig};
-pub use weights::{Mixer, TextWeights, WDesc};
+pub use weights::{Layer, Mixer, TextWeights, WDesc};
 
 /// Per-sequence state: attention KV caches, GDN convolution and recurrent states, position.
 pub struct Session<B: Backend> {
@@ -385,78 +385,12 @@ impl<B: Backend> Qwen35Text<B> {
                     b.linear(&ws.z, &w.view(out), &mut ws.y, t)?;
                     gi += 1;
                 }
-                Mixer::Attention {
-                    query,
-                    gate,
-                    key,
-                    value,
-                    output,
-                    q_norm,
-                    k_norm,
-                } => {
-                    b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
-                    b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
-                    b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
-                    b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
-                    b.rms_norm(
-                        &ws.q,
-                        w.param(*q_norm),
-                        &mut ws.qn,
-                        t * c.heads,
-                        c.head_dim,
-                        c.eps,
-                        NormKind::Offset,
-                    )?;
-                    b.rms_norm(
-                        &ws.k,
-                        w.param(*k_norm),
-                        &mut ws.kn,
-                        t * c.kv_heads,
-                        c.head_dim,
-                        c.eps,
-                        NormKind::Offset,
-                    )?;
-                    match &axis_positions {
-                        Some(p) => {
-                            let rope = |heads| RopePosShape {
-                                tokens: t,
-                                heads,
-                                head_dim: c.head_dim,
-                                rotary_dim: c.rotary_dim,
-                                theta: c.rope_theta,
-                                axes: 3,
-                                layout: RopeLayout::Interleaved,
-                            };
-                            b.rope_positions(&mut ws.qn, p, rope(c.heads))?;
-                            b.rope_positions(&mut ws.kn, p, rope(c.kv_heads))?;
-                        }
-                        None => {
-                            let rope = |heads| RopeShape {
-                                tokens: t,
-                                heads,
-                                head_dim: c.head_dim,
-                                rotary_dim: c.rotary_dim,
-                                pos0: rope_pos0,
-                                theta: c.rope_theta,
-                            };
-                            b.rope(&mut ws.qn, rope(c.heads))?;
-                            b.rope(&mut ws.kn, rope(c.kv_heads))?;
-                        }
-                    }
-                    let (kc, vc) = &mut s.kv[ai];
-                    let kvd = c.kv_dim();
-                    b.copy(&ws.kn, 0, kc, pos0 * kvd, t * kvd)?;
-                    b.copy(&ws.v, 0, vc, pos0 * kvd, t * kvd)?;
-                    let shape = AttnShape {
-                        tokens: t,
-                        heads: c.heads,
-                        kv_heads: c.kv_heads,
-                        head_dim: c.head_dim,
-                        pos0,
+                Mixer::Attention { .. } => {
+                    let rope = match &axis_positions {
+                        Some(p) => Rope::Axes(p),
+                        None => Rope::At(rope_pos0),
                     };
-                    b.attention(&ws.qn, kc, vc, &mut ws.attn, shape)?;
-                    b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
-                    b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
+                    self.attention_mixer(b, ws, &l.mixer, &mut s.kv[ai], t, pos0, rope)?;
                     ai += 1;
                 }
             }
@@ -470,10 +404,7 @@ impl<B: Backend> Qwen35Text<B> {
                 c.eps,
                 NormKind::Offset,
             )?;
-            b.linear(&ws.h, &w.view(&l.mlp_gate), &mut ws.mg, t)?;
-            b.linear(&ws.h, &w.view(&l.mlp_up), &mut ws.mu, t)?;
-            b.silu_mul(&mut ws.mg, &ws.mu, t * c.intermediate)?;
-            b.linear(&ws.mg, &w.view(&l.mlp_down), &mut ws.y, t)?;
+            self.mlp(b, ws, l, t)?;
             b.add(&mut ws.x, &ws.y, t * hd)?;
         }
         s.pos += t;
@@ -503,6 +434,107 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(b.top_k(&ws.logits, 1, v, limit.min(v), k)?
             .pop()
             .unwrap_or_default())
+    }
+
+    /// Gated attention mixer of one layer: `ws.h` (normed input, `t` rows) to `ws.y`, appending
+    /// K/V at cache rows `pos0..` of `kv`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_mixer(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        mixer: &Mixer,
+        kv: &mut (B::Buffer, B::Buffer),
+        t: usize,
+        pos0: usize,
+        rope: Rope<'_>,
+    ) -> Result<()> {
+        let (c, w) = (&self.cfg, &self.w);
+        let Mixer::Attention {
+            query,
+            gate,
+            key,
+            value,
+            output,
+            q_norm,
+            k_norm,
+        } = mixer
+        else {
+            return Err(Error::Config("attention_mixer on a GDN layer".into()));
+        };
+        b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
+        b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
+        b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
+        b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
+        b.rms_norm(
+            &ws.q,
+            w.param(*q_norm),
+            &mut ws.qn,
+            t * c.heads,
+            c.head_dim,
+            c.eps,
+            NormKind::Offset,
+        )?;
+        b.rms_norm(
+            &ws.k,
+            w.param(*k_norm),
+            &mut ws.kn,
+            t * c.kv_heads,
+            c.head_dim,
+            c.eps,
+            NormKind::Offset,
+        )?;
+        match rope {
+            Rope::Axes(p) => {
+                let rope = |heads| RopePosShape {
+                    tokens: t,
+                    heads,
+                    head_dim: c.head_dim,
+                    rotary_dim: c.rotary_dim,
+                    theta: c.rope_theta,
+                    axes: 3,
+                    layout: RopeLayout::Interleaved,
+                };
+                b.rope_positions(&mut ws.qn, p, rope(c.heads))?;
+                b.rope_positions(&mut ws.kn, p, rope(c.kv_heads))?;
+            }
+            Rope::At(rope_pos0) => {
+                let rope = |heads| RopeShape {
+                    tokens: t,
+                    heads,
+                    head_dim: c.head_dim,
+                    rotary_dim: c.rotary_dim,
+                    pos0: rope_pos0,
+                    theta: c.rope_theta,
+                };
+                b.rope(&mut ws.qn, rope(c.heads))?;
+                b.rope(&mut ws.kn, rope(c.kv_heads))?;
+            }
+        }
+        let (kc, vc) = kv;
+        let kvd = c.kv_dim();
+        b.copy(&ws.kn, 0, kc, pos0 * kvd, t * kvd)?;
+        b.copy(&ws.v, 0, vc, pos0 * kvd, t * kvd)?;
+        let shape = AttnShape {
+            tokens: t,
+            heads: c.heads,
+            kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            pos0,
+        };
+        b.attention(&ws.qn, kc, vc, &mut ws.attn, shape)?;
+        b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
+        b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
+        Ok(())
+    }
+
+    /// Dense FFN of one layer: `ws.h` to `ws.y`.
+    fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize) -> Result<()> {
+        let (c, w) = (&self.cfg, &self.w);
+        b.linear(&ws.h, &w.view(&l.mlp_gate), &mut ws.mg, t)?;
+        b.linear(&ws.h, &w.view(&l.mlp_up), &mut ws.mu, t)?;
+        b.silu_mul(&mut ws.mg, &ws.mu, t * c.intermediate)?;
+        b.linear(&ws.mg, &w.view(&l.mlp_down), &mut ws.y, t)
     }
 
     /// Speculative verify: feeds `ids` (the pending token, then drafts; at most [`VERIFY_MAX`] and
@@ -702,4 +734,12 @@ pub fn argmax(logits: &[f32], limit: usize) -> u32 {
         }
     }
     best as u32
+}
+
+/// Rotary positions of an attention call: consecutive from a start, or explicit per-axis
+/// (`[3, t]`, MRoPE) positions.
+#[derive(Clone, Copy)]
+enum Rope<'a> {
+    At(usize),
+    Axes(&'a [u32]),
 }
