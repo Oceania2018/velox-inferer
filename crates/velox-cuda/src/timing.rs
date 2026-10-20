@@ -14,6 +14,8 @@ struct State {
     /// (op, start, end) not yet read back.
     pending: Vec<(String, *mut c_void, *mut c_void)>,
     totals: BTreeMap<String, (f64, u64)>,
+    /// When the current reporting window started (long-running servers print every 10 s).
+    window: Option<std::time::Instant>,
 }
 
 // SAFETY: events are plain handles used only under the mutex.
@@ -43,6 +45,11 @@ impl Timing {
         s.pending.push((op.to_string(), a, b));
         if s.pending.len() >= 4096 {
             Self::flush(&mut s);
+            let started = *s.window.get_or_insert_with(std::time::Instant::now);
+            if started.elapsed().as_secs() >= 10 {
+                Self::report(&mut s);
+                s.window = Some(std::time::Instant::now());
+            }
         }
         r
     }
@@ -67,6 +74,13 @@ impl Drop for Timing {
     fn drop(&mut self) {
         let mut s = self.0.lock().unwrap();
         Self::flush(&mut s);
+        Self::report(&mut s);
+    }
+}
+
+impl Timing {
+    /// Prints and clears the totals accumulated so far.
+    fn report(s: &mut State) {
         let total: f64 = s.totals.values().map(|v| v.0).sum();
         let mut rows: Vec<_> = s.totals.iter().collect();
         rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
@@ -78,5 +92,6 @@ impl Drop for Timing {
                 1e6 * t / *n as f64
             );
         }
+        s.totals.clear();
     }
 }
