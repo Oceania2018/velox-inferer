@@ -22,7 +22,7 @@ use velox_models::qwen3_5::{
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
 
 pub use prompt::{build as build_prompt, ImageRun, Prompt};
-pub use sampling::Sampler;
+pub use sampling::{Sampler, CANDIDATES};
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -376,7 +376,7 @@ impl<B: Backend> QwenEngine<B> {
         p: &Prompt,
         images: &[ImagePatches],
         start: usize,
-    ) -> Result<Vec<f32>, CoreError> {
+    ) -> Result<(), CoreError> {
         // Vision embeddings for images not already in the reused prefix.
         let mut embeds: Vec<(usize, B::Buffer)> = Vec::new();
         for (r, run) in p.runs.iter().enumerate() {
@@ -394,7 +394,6 @@ impl<B: Backend> QwenEngine<B> {
         }
         lane.session.rope_delta = p.rope_delta;
         let mut pos = start;
-        let mut logits = Vec::new();
         for cp in self
             .checkpoint_positions(&p.ids, start)
             .into_iter()
@@ -415,7 +414,7 @@ impl<B: Backend> QwenEngine<B> {
                     })
                     .collect();
                 let positions = p.positions.as_ref().map(|v| &v[pos..cp]);
-                logits = self.model.forward_with(
+                self.model.advance(
                     &self.b,
                     &mut lane.session,
                     ws,
@@ -429,7 +428,7 @@ impl<B: Backend> QwenEngine<B> {
                 lane.checkpoints.push(lane.session.checkpoint(&self.b)?);
             }
         }
-        Ok(logits)
+        Ok(())
     }
 }
 
@@ -487,7 +486,7 @@ where
                 ),
             });
         }
-        let mut sampler = Sampler::from_request(req);
+        let mut sampler = Sampler::from_request(req, thinking);
 
         let mut state = self
             .state
@@ -515,9 +514,12 @@ where
         // Checkpoints still valid for this prompt are those inside the shared prefix.
         lane.checkpoints.retain(|c| c.pos <= start);
         lane.keys.truncate(start);
-        let prefilled = self.prefill(lane, ws, &p, &images, start);
-        let mut logits = match prefilled {
-            Ok(l) => l,
+        let prefilled = self.prefill(lane, ws, &p, &images, start).and_then(|()| {
+            self.model
+                .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)
+        });
+        let mut cands = match prefilled {
+            Ok(c) => c,
             Err(e) => {
                 // The state is partially advanced; forget it so the next request starts clean.
                 lane.keys.clear();
@@ -533,18 +535,23 @@ where
         let mut out = Vec::new();
         let mut finish = "length";
         loop {
-            let next = sampler.sample(&logits, self.fe.public_vocab);
+            let next = sampler.sample(&cands);
             if self.fe.is_eos(next) {
                 finish = "stop";
                 break;
             }
             out.push(next);
+            sampler.observe(next);
             if out.len() >= max_tokens {
                 break;
             }
-            logits = self
-                .model
-                .forward(&self.b, &mut lane.session, ws, &[next])
+            self.model
+                .advance(&self.b, &mut lane.session, ws, &[next], None, &[])
+                .and_then(|()| {
+                    self.model
+                        .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)
+                })
+                .map(|c| cands = c)
                 .map_err(core)?;
             lane.keys.push(next);
         }
