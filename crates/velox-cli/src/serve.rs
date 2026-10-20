@@ -40,7 +40,7 @@ where
         chunk: a.parse("prefill-chunk", 512)?,
         default_max_tokens: a.parse("default-max-tokens", 4096)?,
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
-        max_checkpoints: a.parse("ctx-checkpoints", 4)?,
+        max_checkpoints: a.parse("ctx-checkpoints", 8)?,
         scratch_capacity: a.parse("scratch-context", 8192)?,
     };
     let vision = if art.components().contains_key("vision")

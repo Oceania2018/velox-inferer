@@ -298,26 +298,37 @@ impl<B: Backend> QwenEngine<B> {
         fits.into_iter().min_by_key(|&i| lanes[i].session.capacity)
     }
 
-    /// Positions worth checkpointing in `ids`: the start of the turn holding the last image, the
-    /// last image, and the generation prompt (the last `<|im_start|>`).
+    /// Positions worth checkpointing in `ids` after `after`: every turn boundary (`<|im_start|>`,
+    /// where agent loops rewrite history) and the last image.
     fn checkpoint_positions(&self, ids: &[u32], after: usize) -> Vec<usize> {
-        let last = |tok: Option<u32>| tok.and_then(|t| ids.iter().rposition(|&x| x == t));
-        let image = last(self.special.vision_start);
-        // Agent loops replace the whole turn that carries the screenshot, not just the image, so
-        // also checkpoint at the start of that turn.
-        let image_turn = image.and_then(|i| {
-            self.special
-                .im_start
-                .and_then(|t| ids[..i].iter().rposition(|&x| x == t))
-        });
-        let mut v: Vec<usize> = [image_turn, image, last(self.special.im_start)]
-            .into_iter()
-            .flatten()
+        let image = self
+            .special
+            .vision_start
+            .and_then(|t| ids.iter().rposition(|&x| x == t));
+        let turns = ids
+            .iter()
+            .enumerate()
+            .filter(|&(_, &t)| Some(t) == self.special.im_start)
+            .map(|(i, _)| i);
+        let mut v: Vec<usize> = turns
+            .chain(image)
             .filter(|&p| p > after && p < ids.len())
             .collect();
         v.sort_unstable();
         v.dedup();
         v
+    }
+
+    /// Keeps at most `max` checkpoints, dropping the one closest to its predecessor so the rest
+    /// stay spread over the prefix (the newest is always kept).
+    fn prune_checkpoints(checkpoints: &mut Vec<Checkpoint<B>>, max: usize) {
+        checkpoints.sort_by_key(|c| c.pos);
+        while checkpoints.len() > max.max(1) {
+            let drop = (1..checkpoints.len() - 1)
+                .min_by_key(|&i| checkpoints[i].pos - checkpoints[i - 1].pos)
+                .unwrap_or(0);
+            checkpoints.remove(drop);
+        }
     }
 
     /// Restores the best reusable state for `keys` and returns how many tokens are already in it.
@@ -515,9 +526,7 @@ where
             }
         };
         lane.keys.extend_from_slice(&p.keys[start..]);
-        while lane.checkpoints.len() > self.cfg.max_checkpoints {
-            lane.checkpoints.remove(0);
-        }
+        Self::prune_checkpoints(&mut lane.checkpoints, self.cfg.max_checkpoints);
         let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         let t1 = Instant::now();
