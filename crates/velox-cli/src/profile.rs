@@ -246,6 +246,32 @@ impl<B: Backend> Backend for Profiled<B> {
     fn gelu(&self, x: &mut B::Buffer, len: usize, kind: GeluKind) -> Result<()> {
         self.time("gelu", || self.inner.gelu(x, len, kind))
     }
+    fn split_cols(
+        &self,
+        src: &B::Buffer,
+        rows: usize,
+        src_cols: usize,
+        outs: &mut [(&mut B::Buffer, usize, usize)],
+    ) -> Result<()> {
+        self.time("split_cols", || {
+            self.inner.split_cols(src, rows, src_cols, outs)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn swiglu(
+        &self,
+        src: &B::Buffer,
+        rows: usize,
+        src_cols: usize,
+        gate: usize,
+        up: usize,
+        width: usize,
+        out: &mut B::Buffer,
+    ) -> Result<()> {
+        self.time("swiglu", || {
+            self.inner.swiglu(src, rows, src_cols, gate, up, width, out)
+        })
+    }
     fn concat_cols(
         &self,
         a: &B::Buffer,

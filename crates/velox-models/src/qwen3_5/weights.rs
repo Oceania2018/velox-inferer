@@ -32,6 +32,8 @@ pub enum Mixer {
         /// q | k | v projection rows, contiguous in one parent.
         qkv: WDesc,
         z: WDesc,
+        /// qkv and z as one view when they are adjacent in one parent (one GEMM, then a split).
+        qkvz: Option<WDesc>,
         /// a | b projection rows, contiguous in one parent.
         ab: WDesc,
         out: WDesc,
@@ -45,6 +47,8 @@ pub enum Mixer {
         gate: WDesc,
         key: WDesc,
         value: WDesc,
+        /// query, gate, key and value as one view when they tile one parent row range.
+        fused: Option<WDesc>,
         output: WDesc,
         q_norm: usize,
         k_norm: usize,
@@ -58,6 +62,8 @@ pub struct Layer {
     pub mlp_gate: WDesc,
     pub mlp_up: WDesc,
     pub mlp_down: WDesc,
+    /// gate and up as one view when adjacent in one parent.
+    pub mlp_gate_up: Option<WDesc>,
 }
 
 pub struct TextWeights<B: Backend> {
@@ -121,9 +127,11 @@ impl<B: Backend> TextWeights<B> {
                     expect(&p("gdn qkv"), qkv.rows, cfg.gdn_qkv())?;
                     expect(&p("gdn ab"), ab.rows, 2 * cfg.gdn_v_heads)?;
                     expect(&p("gdn z"), z.rows, cfg.gdn_v())?;
+                    let qkvz = fuse(&[&qkv, &z]);
                     Mixer::Gdn {
                         qkv,
                         z,
+                        qkvz,
                         ab,
                         out,
                         conv: l.param(&p("gdn/convolution"), cfg.conv_width * cfg.gdn_qkv())?,
@@ -442,11 +450,13 @@ fn load_attention<B: Backend>(
     expect(&p("attention gate"), gate.rows, cfg.q_dim())?;
     expect(&p("attention key"), key.rows, cfg.kv_dim())?;
     expect(&p("attention value"), value.rows, cfg.kv_dim())?;
+    let fused = fuse(&[&query, &gate, &key, &value]);
     Ok(Mixer::Attention {
         query,
         gate,
         key,
         value,
+        fused,
         output: l.matrix(&p("attention/output"))?,
         q_norm: l.param(&p("attention/query_norm"), cfg.head_dim)?,
         k_norm: l.param(&p("attention/key_norm"), cfg.head_dim)?,
@@ -467,6 +477,11 @@ fn finish_layer<B: Backend>(
         mlp_gate: l.matrix(&p("mlp/gate"))?,
         mlp_up: l.matrix(&p("mlp/up"))?,
         mlp_down: l.matrix(&p("mlp/down"))?,
+        mlp_gate_up: None,
+    };
+    let layer = Layer {
+        mlp_gate_up: fuse(&[&layer.mlp_gate, &layer.mlp_up]),
+        ..layer
     };
     expect(&p("mlp gate"), layer.mlp_gate.rows, cfg.intermediate)?;
     Ok(layer)
@@ -524,4 +539,27 @@ fn load_proposal<B: Backend>(
         return Err(Error::Config("proposal head and token map disagree".into()));
     }
     Ok(Some(Proposal { head, token_ids }))
+}
+
+/// One view covering `parts` when they are row ranges of one parent that tile a contiguous range
+/// (any order). Each part's columns in the fused output start at `part.row_begin - fused.row_begin`.
+pub fn fuse(parts: &[&WDesc]) -> Option<WDesc> {
+    let first = parts.first()?;
+    let mut sorted: Vec<&WDesc> = parts.to_vec();
+    sorted.sort_by_key(|d| d.row_begin);
+    let mut end = sorted[0].row_begin;
+    let mut act = first.act;
+    for d in &sorted {
+        if d.parent != first.parent || d.row_begin != end {
+            return None;
+        }
+        end += d.rows;
+        act = act.meet(d.act);
+    }
+    Some(WDesc {
+        row_begin: sorted[0].row_begin,
+        rows: end - sorted[0].row_begin,
+        act,
+        ..**first
+    })
 }

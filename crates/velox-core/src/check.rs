@@ -273,6 +273,42 @@ pub fn concat_cols(
     need("concat_cols out", out, rows * (a_cols + b_cols))
 }
 
+pub fn split_cols(
+    src: usize,
+    rows: usize,
+    src_cols: usize,
+    outs: &[(usize, usize, usize)],
+) -> Result<()> {
+    need("split_cols src", src, rows * src_cols)?;
+    for &(len, off, cols) in outs {
+        if off + cols > src_cols {
+            return Err(Error::Shape(format!(
+                "split_cols: columns {off}+{cols} past {src_cols}"
+            )));
+        }
+        need("split_cols out", len, rows * cols)?;
+    }
+    Ok(())
+}
+
+pub fn swiglu(
+    src: usize,
+    rows: usize,
+    src_cols: usize,
+    gate: usize,
+    up: usize,
+    width: usize,
+    out: usize,
+) -> Result<()> {
+    if gate + width > src_cols || up + width > src_cols {
+        return Err(Error::Shape(format!(
+            "swiglu: gate {gate} / up {up} + {width} past {src_cols}"
+        )));
+    }
+    need("swiglu src", src, rows * src_cols)?;
+    need("swiglu out", out, rows * width)
+}
+
 /// Largest k supported by `top_k` (sampling needs a few dozen candidates at most).
 pub const TOP_K_MAX: usize = 256;
 

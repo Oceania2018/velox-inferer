@@ -130,6 +130,10 @@ pub struct Workspace<B: Backend> {
     attn: B::Buffer,
     mg: B::Buffer,
     mu: B::Buffer,
+    /// Fused projection outputs before the split (GDN qkv|z, attention q|k|gate|v) and the fused
+    /// MLP gate|up output.
+    fused: B::Buffer,
+    gu: B::Buffer,
     last: B::Buffer,
     last_n: B::Buffer,
     /// Final-normed hidden rows of the latest `verify` (`[VERIFY_MAX, hidden]`), which condition
@@ -213,6 +217,8 @@ impl<B: Backend> Qwen35Text<B> {
             attn: b.alloc(t * c.q_dim())?,
             mg: b.alloc(t * c.intermediate)?,
             mu: b.alloc(t * c.intermediate)?,
+            fused: b.alloc(t * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
+            gu: b.alloc(t * 2 * c.intermediate)?,
             last: b.alloc(c.hidden)?,
             last_n: b.alloc(c.hidden)?,
             logits: b.alloc(c.vocab)?,
@@ -342,6 +348,7 @@ impl<B: Backend> Qwen35Text<B> {
                 Mixer::Gdn {
                     qkv,
                     z,
+                    qkvz,
                     ab,
                     out,
                     conv,
@@ -349,8 +356,24 @@ impl<B: Backend> Qwen35Text<B> {
                     dt_bias,
                     norm,
                 } => {
-                    b.linear(&ws.h, &w.view(qkv), &mut ws.qkv, t)?;
-                    b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
+                    match qkvz {
+                        Some(f) => {
+                            b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
+                            b.split_cols(
+                                &ws.fused,
+                                t,
+                                f.rows,
+                                &mut [
+                                    (&mut ws.qkv, qkv.row_begin - f.row_begin, qkv.rows),
+                                    (&mut ws.z, z.row_begin - f.row_begin, z.rows),
+                                ],
+                            )?;
+                        }
+                        None => {
+                            b.linear(&ws.h, &w.view(qkv), &mut ws.qkv, t)?;
+                            b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
+                        }
+                    }
                     b.linear(&ws.h, &w.view(ab), &mut ws.ab, t)?;
                     if let Some(sp) = s.spec.as_mut().filter(|sp| sp.recording) {
                         b.copy(&ws.qkv, 0, &mut sp.qkv[gi], 0, t * c.gdn_qkv())?;
@@ -479,6 +502,7 @@ impl<B: Backend> Qwen35Text<B> {
             gate,
             key,
             value,
+            fused,
             output,
             q_norm,
             k_norm,
@@ -486,10 +510,29 @@ impl<B: Backend> Qwen35Text<B> {
         else {
             return Err(Error::Config("attention_mixer on a GDN layer".into()));
         };
-        b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
-        b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
-        b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
-        b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
+        match fused {
+            Some(f) => {
+                b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
+                let col = |d: &WDesc| d.row_begin - f.row_begin;
+                b.split_cols(
+                    &ws.fused,
+                    t,
+                    f.rows,
+                    &mut [
+                        (&mut ws.q, col(query), query.rows),
+                        (&mut ws.g, col(gate), gate.rows),
+                        (&mut ws.k, col(key), key.rows),
+                        (&mut ws.v, col(value), value.rows),
+                    ],
+                )?;
+            }
+            None => {
+                b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
+                b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
+                b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
+                b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
+            }
+        }
         b.rms_norm(
             &ws.q,
             w.param(*q_norm),
@@ -555,9 +598,21 @@ impl<B: Backend> Qwen35Text<B> {
     /// Dense FFN of one layer: `ws.h` to `ws.y`.
     fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize) -> Result<()> {
         let (c, w) = (&self.cfg, &self.w);
-        b.linear(&ws.h, &w.view(&l.mlp_gate), &mut ws.mg, t)?;
-        b.linear(&ws.h, &w.view(&l.mlp_up), &mut ws.mu, t)?;
-        b.silu_mul(&mut ws.mg, &ws.mu, t * c.intermediate)?;
+        match &l.mlp_gate_up {
+            Some(f) => {
+                b.linear(&ws.h, &w.view(f), &mut ws.gu, t)?;
+                let (g, u) = (
+                    l.mlp_gate.row_begin - f.row_begin,
+                    l.mlp_up.row_begin - f.row_begin,
+                );
+                b.swiglu(&ws.gu, t, f.rows, g, u, c.intermediate, &mut ws.mg)?;
+            }
+            None => {
+                b.linear(&ws.h, &w.view(&l.mlp_gate), &mut ws.mg, t)?;
+                b.linear(&ws.h, &w.view(&l.mlp_up), &mut ws.mu, t)?;
+                b.silu_mul(&mut ws.mg, &ws.mu, t * c.intermediate)?;
+            }
+        }
         b.linear(&ws.mg, &w.view(&l.mlp_down), &mut ws.y, t)
     }
 

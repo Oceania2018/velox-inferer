@@ -604,3 +604,83 @@ pub fn concat_cols(
         "portable concat_cols",
     )
 }
+
+extern "C" {
+    fn velox_portable_split_cols(
+        src: *const f32,
+        rows: i64,
+        src_cols: i32,
+        ptrs: *const *mut f32,
+        offs: *const i32,
+        cols: *const i32,
+        n: i32,
+    ) -> i32;
+    fn velox_portable_swiglu(
+        src: *const f32,
+        rows: i64,
+        src_cols: i32,
+        gate: i32,
+        up: i32,
+        width: i32,
+        out: *mut f32,
+    ) -> i32;
+}
+
+pub fn split_cols(
+    src: &CudaBuffer,
+    rows: usize,
+    src_cols: usize,
+    outs: &mut [(&mut CudaBuffer, usize, usize)],
+) -> Result<()> {
+    let dims: Vec<(usize, usize, usize)> = outs.iter().map(|o| (o.0.len(), o.1, o.2)).collect();
+    check::split_cols(src.len(), rows, src_cols, &dims)?;
+    for group in outs.chunks_mut(4) {
+        let ptrs: Vec<*mut f32> = group.iter_mut().map(|o| o.0.as_mut_ptr()).collect();
+        let offs: Vec<i32> = group.iter().map(|o| o.1 as i32).collect();
+        let cols: Vec<i32> = group.iter().map(|o| o.2 as i32).collect();
+        // SAFETY: extents validated above; the kernel writes only inside each output.
+        status(
+            unsafe {
+                velox_portable_split_cols(
+                    src.as_ptr(),
+                    rows as i64,
+                    to_i32("src_cols", src_cols)?,
+                    ptrs.as_ptr(),
+                    offs.as_ptr(),
+                    cols.as_ptr(),
+                    group.len() as i32,
+                )
+            },
+            "portable split_cols",
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu(
+    src: &CudaBuffer,
+    rows: usize,
+    src_cols: usize,
+    gate: usize,
+    up: usize,
+    width: usize,
+    out: &mut CudaBuffer,
+) -> Result<()> {
+    check::swiglu(src.len(), rows, src_cols, gate, up, width, out.len())?;
+    // SAFETY: extents validated above.
+    status(
+        unsafe {
+            velox_portable_swiglu(
+                src.as_ptr(),
+                rows as i64,
+                to_i32("src_cols", src_cols)?,
+                gate as i32,
+                up as i32,
+                to_i32("width", width)?,
+                out.as_mut_ptr(),
+            )
+        },
+        "portable swiglu",
+    )
+}
