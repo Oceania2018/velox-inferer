@@ -35,22 +35,41 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     for (int i = threadIdx.x; i < dim; i += blockDim.x) yr[i] = xr[i] * inv * (offset + weight[i]);
 }
 
+__global__ void rms_norm_warp_kernel(const float* __restrict__ x, const float* __restrict__ weight,
+                                     float* __restrict__ y, int rows, int dim, float eps, float offset) {
+    const int row = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    const int lane = threadIdx.x % VELOX_WARP;
+    if (row >= rows) return;
+    const float* xr = x + static_cast<size_t>(row) * dim;
+    float* yr = y + static_cast<size_t>(row) * dim;
+    float ss = 0.0f;
+    for (int i = lane; i < dim; i += VELOX_WARP) ss += xr[i] * xr[i];
+    ss = velox_warp_sum(ss);
+    const float inv = rsqrtf(ss / dim + eps);
+    for (int i = lane; i < dim; i += VELOX_WARP) yr[i] = xr[i] * inv * (offset + weight[i]);
+}
+
 // The angle is formed in double: positions reach 1e5+, where a float angle loses ~1e-2 rad.
-__global__ void rope_kernel(float* __restrict__ x, long long pairs, int heads, int head_dim, int rotary_dim, int pos0,
-                            float theta) {
-    const int half = rotary_dim / 2;
-    for (long long p = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; p < pairs;
-         p += static_cast<long long>(gridDim.x) * blockDim.x) {
-        const int i = static_cast<int>(p % half);
-        const long long row = p / half;  // token * heads + head
-        const int t = static_cast<int>(row / heads);
+// One block per token: the token's rotary/2 angles are formed once (in double) into shared
+// memory, then every head applies them. Double is slow on consumer GPUs, so it runs once per
+// pair per token rather than once per pair per head.
+__global__ void rope_kernel(float* __restrict__ x, int heads, int head_dim, int rotary_dim, int pos0, float theta) {
+    extern __shared__ float cs[];  // [half] cos, then [half] sin
+    const int half = rotary_dim / 2, t = blockIdx.x;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
         const double freq = pow(static_cast<double>(theta), -2.0 * i / rotary_dim);
         double s, c;
         sincos(static_cast<double>(pos0 + t) * freq, &s, &c);
-        float* base = x + row * head_dim;
-        const float a = base[i], b = base[i + half];
-        base[i] = static_cast<float>(a * c - b * s);
-        base[i + half] = static_cast<float>(a * s + b * c);
+        cs[i] = static_cast<float>(c);
+        cs[half + i] = static_cast<float>(s);
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < heads * half; p += blockDim.x) {
+        const int h = p / half, i = p % half;
+        float* base = x + (static_cast<size_t>(t) * heads + h) * head_dim;
+        const float a = base[i], b = base[i + half], c = cs[i], s = cs[half + i];
+        base[i] = a * c - b * s;
+        base[i + half] = a * s + b * c;
     }
 }
 
@@ -127,13 +146,18 @@ VELOX_API int velox_portable_matmul(const float* x, const float* w, float* y, in
 
 VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float* y, int rows, int dim, float eps,
                                       int offset) {
+    if (dim <= 1024) {
+        // Many short rows (per-head norms): one warp per row, 8 rows per block.
+        rms_norm_warp_kernel<<<(rows + 7) / 8, 256>>>(x, weight, y, rows, dim, eps, offset ? 1.0f : 0.0f);
+        return velox_launch_status();
+    }
     rms_norm_kernel<<<rows, 256>>>(x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
     return velox_launch_status();
 }
 
 VELOX_API int velox_portable_rope(float* x, int tokens, int heads, int head_dim, int rotary_dim, int pos0, float theta) {
-    const long long pairs = static_cast<long long>(tokens) * heads * (rotary_dim / 2);
-    rope_kernel<<<velox_grid_1d(pairs, 256), 256>>>(x, pairs, heads, head_dim, rotary_dim, pos0, theta);
+    if (tokens <= 0) return 0;
+    rope_kernel<<<tokens, 256, rotary_dim * sizeof(float)>>>(x, heads, head_dim, rotary_dim, pos0, theta);
     return velox_launch_status();
 }
 
@@ -152,18 +176,18 @@ namespace {
 // Split-KV (flash-decoding) attention for few queries over a long cache: each (token, head, split)
 // warp reduces kSplitKeys keys to a partial (max, sum, acc), then one warp per (token, head)
 // merges the splits.
-constexpr int kSplitKeys = 256;
+constexpr int kSplitKeys = 256;  // widest split; short caches use narrower ones
 
 template <int PER>
 __global__ void attention_partial_kernel(const float* __restrict__ q, const float* __restrict__ k,
                                          const float* __restrict__ v, float* __restrict__ part_acc,
                                          float* __restrict__ part_ml, int heads, int kv_heads, int head_dim, int pos0,
-                                         float scale, int splits) {
+                                         float scale, int splits, int split_keys) {
     const int h = blockIdx.x, t = blockIdx.y, sp = blockIdx.z, lane = threadIdx.x;
     const int kvh = h / (heads / kv_heads);
     const size_t q_off = (static_cast<size_t>(t) * heads + h) * head_dim;
     const int visible = pos0 + t + 1;
-    const int j0 = sp * kSplitKeys, j1 = min(j0 + kSplitKeys, visible);
+    const int j0 = sp * split_keys, j1 = min(j0 + split_keys, visible);
     float qr[PER], acc[PER];
 #pragma unroll
     for (int p = 0; p < PER; ++p) {
@@ -252,14 +276,19 @@ float* split_scratch(size_t floats) {
 template <int PER>
 int attention_split(const float* q, const float* k, const float* v, float* out, int tokens, int heads, int kv_heads,
                     int head_dim, int pos0, float scale) {
-    const int splits = (pos0 + tokens + kSplitKeys - 1) / kSplitKeys;
+    // Aim for >= 512 partial warps so short caches still occupy the GPU, with 32..256 keys each.
+    const int kv = pos0 + tokens;
+    const int want = (512 + tokens * heads - 1) / (tokens * heads);
+    int split_keys = (kv + want - 1) / want;
+    split_keys = split_keys < 32 ? 32 : split_keys > kSplitKeys ? kSplitKeys : split_keys;
+    const int splits = (kv + split_keys - 1) / split_keys;
     const size_t parts = static_cast<size_t>(tokens) * heads * splits;
     float* scratch = split_scratch(parts * (head_dim + 2));
     if (scratch == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
     float* part_acc = scratch;
     float* part_ml = scratch + parts * head_dim;
     attention_partial_kernel<PER><<<dim3(heads, tokens, splits), VELOX_WARP>>>(q, k, v, part_acc, part_ml, heads,
-                                                                              kv_heads, head_dim, pos0, scale, splits);
+                                                                              kv_heads, head_dim, pos0, scale, splits, split_keys);
     attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
                                                                        splits);
     return velox_launch_status();
@@ -271,7 +300,7 @@ VELOX_API int velox_portable_attention(const float* q, const float* k, const flo
                                        int heads, int kv_heads, int head_dim, int pos0, float scale) {
     if (tokens > 65535) return VELOX_ERR_UNSUPPORTED;
     // Few queries over a long cache: split the keys so the whole GPU works on them.
-    if (pos0 + tokens > 2 * kSplitKeys && tokens * heads <= 2048 && head_dim <= 256) {
+    if (tokens * heads <= 2048 && head_dim <= 256) {
         if (head_dim <= 64) return attention_split<2>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
         if (head_dim <= 128) return attention_split<4>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
         return attention_split<8>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);

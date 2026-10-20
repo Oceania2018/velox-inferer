@@ -396,18 +396,22 @@ __device__ __forceinline__ float2 e2m1x2_scaled(uint32_t t) {
     return __half22float2(*reinterpret_cast<const __half2*>(&h));
 }
 
-template <int FMT, int R, int M>
+// KW warps share one row group and split its K (KW = 8 for matrices with few rows, where one warp
+// per row would leave most SMs idle); their sums meet in shared memory.
+template <int FMT, int R, int M, int KW>
 __global__ void __launch_bounds__(256)
 linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m,
                        float* __restrict__ y) {
-    const int warp = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    __shared__ float red[KW][R][M];
+    const int wid = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    const int kw = (threadIdx.x / VELOX_WARP) % KW;
     const int lane = threadIdx.x % VELOX_WARP;
-    const int r0 = warp * R;
-    if (r0 >= rows) return;
+    const int r0 = (wid / KW) * R;
+    if (r0 >= rows) return;  // whole row groups only, so KW > 1 blocks return together
     const long long k = w.k;
-    const long long row_bytes = FMT == VELOX_FMT_NVFP4 ? k / 2 : k;
+    const long long row_bytes = FMT == VELOX_FMT_NVFP4 ? k / 2 : FMT == VELOX_FMT_BF16 ? 2 * k : k;
     const long long chunks = row_bytes / 16;
-    constexpr int kElems = FMT == VELOX_FMT_NVFP4 ? 32 : 16;
+    constexpr int kElems = FMT == VELOX_FMT_NVFP4 ? 32 : FMT == VELOX_FMT_BF16 ? 8 : 16;
     const uint8_t* rp[R];
     bool live[R];
 #pragma unroll
@@ -425,7 +429,7 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
 #pragma unroll
     for (int r = 0; r < R; ++r) sbase[r] = w.base + scale_plane + nvfp4_scale_offset(row_begin + r0 + (live[r] ? r : 0), 0, k);
 
-    for (long long c = lane; c < chunks; c += VELOX_WARP) {
+    for (long long c = kw * VELOX_WARP + lane; c < chunks; c += VELOX_WARP * KW) {
         uint4 wv[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) wv[r] = velox_ld_stream(rp[r] + c * 16);
@@ -462,6 +466,12 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
                         if (b < 8) s0 += s; else s1 += s;
                     }
                     acc[r][i] += s0 * sc[r][0] + s1 * sc[r][1];
+                } else if (FMT == VELOX_FMT_BF16) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < 4; ++b)
+                        s += __uint_as_float(words[b] << 16) * xv[2 * b] + __uint_as_float(words[b] & 0xffff0000u) * xv[2 * b + 1];
+                    acc[r][i] += s;
                 } else {
                     float s = 0.0f;
 #pragma unroll
@@ -471,12 +481,32 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
             }
         }
     }
+    if (KW > 1) {
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int i = 0; i < M; ++i) {
+                const float s = velox_warp_sum(acc[r][i]);
+                if (lane == 0) red[kw][r][i] = s;
+            }
+        __syncthreads();
+        if (kw != 0) return;
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int i = 0; i < M; ++i) {
+                float s = 0.0f;
+                for (int j = 0; j < KW; ++j) s += red[j][r][i];
+                acc[r][i] = lane == 0 ? s : 0.0f;  // the warp sum below then returns s
+            }
+    }
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         if (!live[r]) continue;
         const long long row = row_begin + r0 + r;
-        float post;
-        if (FMT == VELOX_FMT_NVFP4) {
+        float post = 1.0f;
+        if (FMT == VELOX_FMT_BF16) {
+        } else if (FMT == VELOX_FMT_NVFP4) {
             post = 1.0f / *reinterpret_cast<const float*>(w.base + scale_plane + w.n * k / 16);
         } else {
             const uint8_t* sp = w.base + align256(w.n * k) + 2 * row;
@@ -493,13 +523,18 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
 template <int FMT, int M>
 int launch_gemv_vec(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
     constexpr int kWarps = 8;
-    // Prefer more rows per warp (more x reuse) while keeping enough warps to fill the GPU.
+    // Few rows: a whole block (8 warps) per row, splitting K. Otherwise prefer more rows per warp
+    // (more x reuse) while keeping enough warps to fill the GPU.
+    if (rows < 2048) {
+        linear_gemv_vec_kernel<FMT, 1, M, kWarps><<<rows, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+        return velox_launch_status();
+    }
     const int r = rows >= 4 * 4096 ? 4 : rows >= 2 * 2048 ? 2 : 1;
     const int warps = (rows + r - 1) / r;
     const dim3 grid((warps + kWarps - 1) / kWarps);
-    if (r == 4) linear_gemv_vec_kernel<FMT, 4, M><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
-    else if (r == 2) linear_gemv_vec_kernel<FMT, 2, M><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
-    else linear_gemv_vec_kernel<FMT, 1, M><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    if (r == 4) linear_gemv_vec_kernel<FMT, 4, M, 1><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else if (r == 2) linear_gemv_vec_kernel<FMT, 2, M, 1><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else linear_gemv_vec_kernel<FMT, 1, M, 1><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
     return velox_launch_status();
 }
 
@@ -521,6 +556,7 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
         if (format == VELOX_FMT_NVFP4) return launch_gemv_vec_m<VELOX_FMT_NVFP4>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_FP8_ROW_BF16)
             return launch_gemv_vec_m<VELOX_FMT_FP8_ROW_BF16>(x, d, row_begin, rows, m, y);
+        if (format == VELOX_FMT_BF16) return launch_gemv_vec_m<VELOX_FMT_BF16>(x, d, row_begin, rows, m, y);
     }
     if (m <= kGemvMaxM && (format == VELOX_FMT_FP8_ROW_BF16 || format == VELOX_FMT_NVFP4)) {
         constexpr int kWarps = 8;
