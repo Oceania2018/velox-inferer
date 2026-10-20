@@ -115,6 +115,35 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             Input::Ids(ids) => (None, ids),
         };
         let mut session = model.session(b, capacity)?;
+        if let Some(n) = a.get("mtp") {
+            let draft_len: usize = n
+                .parse()
+                .map_err(|_| Error::Config("--mtp takes a draft count".into()))?;
+            mtp_generate(
+                b,
+                &model,
+                &mut session,
+                &mut ws,
+                &ids,
+                max_tokens,
+                draft_len,
+                chunk,
+                &fe,
+            )?;
+            continue;
+        }
+        if a.get("spec-check").is_some() {
+            spec_check(
+                b,
+                &model,
+                &mut session,
+                &mut ws,
+                &ids,
+                max_tokens,
+                fe.public_vocab,
+            )?;
+            continue;
+        }
         let t1 = Instant::now();
         let mut logits = model.forward(b, &mut session, &mut ws, &ids)?;
         let prefill = t1.elapsed().as_secs_f64();
@@ -157,4 +186,139 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `--spec-check`: speculative verify/commit must reproduce sequential decoding. Decodes greedily
+/// token by token, rewinds to the prefill checkpoint, then replays the same tokens through
+/// `verify` windows of 4 with a deliberately wrong draft every third position (forcing
+/// rollbacks), comparing each verified row's best candidate with the sequential step.
+fn spec_check<B: Backend>(
+    b: &B,
+    model: &Qwen35Text<B>,
+    s: &mut velox_models::qwen3_5::Session<B>,
+    ws: &mut velox_models::qwen3_5::Workspace<B>,
+    ids: &[u32],
+    steps: usize,
+    limit: usize,
+) -> Result<()> {
+    model.advance(b, s, ws, ids, None, &[])?;
+    let cp = s.checkpoint(b)?;
+    // Sequential reference: (token, logit) after each step.
+    let mut want = Vec::new();
+    let mut c = model.candidates(b, ws, 1, limit)?[0];
+    for _ in 0..steps {
+        want.push(c);
+        model.advance(b, s, ws, &[c.0], None, &[])?;
+        c = model.candidates(b, ws, 1, limit)?[0];
+    }
+    want.push(c);
+    s.restore(b, &cp)?;
+    // want[i] is the token generated at step i; the pending anchor starts as want[0].
+    let (mut done, mut rounds, mut accepted_total, mut max_err, mut mismatches) =
+        (0usize, 0, 0, 0f32, 0);
+    while done < steps {
+        let mut window = vec![want[done].0];
+        for j in 1..4.min(steps - done) {
+            let good = want[done + j].0;
+            window.push(if (done + j) % 3 == 0 { good + 1 } else { good });
+        }
+        let rows = model.verify(b, s, ws, &window, 1, limit)?;
+        // Row j predicts the token after window[j]; drafts are accepted while they match.
+        let mut keep = 1;
+        for j in 0..window.len() {
+            let got = rows[j][0];
+            let reference = want[done + j + 1];
+            if got.0 != reference.0 {
+                mismatches += 1;
+            }
+            max_err = max_err.max((got.1 - reference.1).abs() / (1.0 + reference.1.abs()));
+            if j + 1 < window.len() && window[j + 1] == got.0 {
+                keep += 1;
+            } else {
+                break;
+            }
+        }
+        model.commit(b, s, ws, keep)?;
+        done += keep;
+        accepted_total += keep - 1;
+        rounds += 1;
+    }
+    println!(
+        "spec-check: {steps} steps in {rounds} rounds ({accepted_total} drafts accepted), \
+         top-1 mismatches {mismatches}, max logit rel. err {max_err:.2e}"
+    );
+    Ok(())
+}
+
+/// `--mtp N`: greedy speculative decoding with N MTP drafts per round. Prints the text, the
+/// acceptance statistics and the decode rate (the output should match plain greedy decoding).
+#[allow(clippy::too_many_arguments)]
+fn mtp_generate<B: Backend>(
+    b: &B,
+    model: &Qwen35Text<B>,
+    s: &mut velox_models::qwen3_5::Session<B>,
+    ws: &mut velox_models::qwen3_5::Workspace<B>,
+    ids: &[u32],
+    max_tokens: usize,
+    draft_len: usize,
+    chunk: usize,
+    fe: &Frontend,
+) -> Result<()> {
+    use velox_engine::spec::MtpDrafter;
+    let limit = fe.public_vocab;
+    let mut dr = MtpDrafter::new(b, model, s.capacity, chunk, draft_len)?;
+    let row0 = s.pos;
+    let t0 = Instant::now();
+    model.advance_rows(b, s, ws, ids, None, &[], &mut |ws, base, t| {
+        dr.prefill_chunk(b, model, ws, row0 + base, t, 0, None)
+    })?;
+    let mut c = model.candidates(b, ws, 1, limit)?[0].0;
+    let prefill = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    let mut out = vec![c];
+    let mut drafts = dr.draft(b, model, s, ws, 0, &[], c, limit)?;
+    let (mut rounds, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
+    while out.len() < max_tokens && !fe.is_eos(c) {
+        let mut window = vec![c];
+        window.extend(drafts.iter().copied().take(max_tokens - out.len()));
+        let p = s.pos;
+        let rows = model.verify(b, s, ws, &window, 1, limit)?;
+        let mut keep = 1;
+        while keep < window.len() && rows[keep - 1][0].0 == window[keep] {
+            keep += 1;
+        }
+        let next = rows[keep - 1][0].0;
+        model.commit(b, s, ws, keep)?;
+        rounds += 1;
+        proposed += window.len() - 1;
+        accepted += keep - 1;
+        let mut stop = false;
+        for &tok in window[1..keep].iter().chain(std::iter::once(&next)) {
+            out.push(tok);
+            if fe.is_eos(tok) || out.len() >= max_tokens {
+                stop = true;
+                break;
+            }
+        }
+        if stop {
+            break;
+        }
+        c = next;
+        drafts = dr.draft(b, model, s, ws, p, &window[1..keep], c, limit)?;
+    }
+    let decode = t1.elapsed().as_secs_f64();
+    if out.last().is_some_and(|&t| fe.is_eos(t)) {
+        out.pop();
+    }
+    println!("prompt    {} tokens, prefill {prefill:.2}s", ids.len());
+    println!(
+        "decode    {} tokens in {decode:.2}s ({:.2} tok/s), {rounds} rounds, accepted {accepted}/{proposed} drafts ({:.0}%), {:.2} tokens/round",
+        out.len(),
+        out.len() as f64 / decode.max(1e-9),
+        100.0 * accepted as f64 / proposed.max(1) as f64,
+        out.len() as f64 / rounds.max(1) as f64
+    );
+    println!("ids       {out:?}");
+    println!("text      {:?}", fe.decode(&out)?);
+    Ok(())
 }
