@@ -2,6 +2,7 @@
 
 mod args;
 mod bench;
+mod generate;
 mod replay;
 mod select;
 mod serve;
@@ -42,6 +43,9 @@ COMMANDS:
       --artifact <path>
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
+  generate                Greedy generation from token ids with a real artifact
+      --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
+      [--max-tokens 64] [--chunk 256] [--capacity 4096]
   serve                   OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
@@ -89,6 +93,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench") => bench_cmd(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
+        Some("generate") => generate::run(a),
         Some("serve") => serve::run(a),
         Some("replay") => replay::run(a),
         Some("replay-compare") => replay::compare(a),

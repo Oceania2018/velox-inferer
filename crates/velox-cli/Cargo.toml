@@ -19,5 +19,7 @@ velox-variant.workspace = true
 velox-conformance.workspace = true
 velox-weights.workspace = true
 velox-serve.workspace = true
+velox-models.workspace = true
+velox-frontend.workspace = true
 serde_json.workspace = true
 velox-cuda = { workspace = true, optional = true }
