@@ -49,6 +49,11 @@ saturating, same operation order) and compares against the exact product of the 
 A low-precision kernel is therefore still held to the f64 oracle, and rounding a view whose
 policy forbids it fails the suite. Portable kernels on main stay exact.
 
+Attention follows the same pattern: `Backend::attention_precision(shape)` returns `Exact` or
+`Fp8QkF16Pv` (Q and K rounded per head vector to E4M3 for the scores, V and the softmax weights
+to f16 for the value product, as ninfer does). The oracle rounds Q, K and V identically
+(`quant::round_attention_inputs`); the unemulated f16 softmax weights set a 2e-3 tolerance.
+
 ## Current scope and next steps
 
 The engine is f32 end to end with synthetic weights. In dependency order, the work to run

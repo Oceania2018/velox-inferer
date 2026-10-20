@@ -6,12 +6,12 @@
 //! must fall back correctly.
 
 use velox_core::backend::{
-    ActPolicy, ActQuant, AttnShape, Backend, ConvShape, FullAttnShape, GdnShape, GeluKind,
-    NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, ConvShape, FullAttnShape, GdnShape,
+    GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::model::{HostLayer, Stack};
-use velox_core::quant::quantize_activations;
+use velox_core::quant::{quantize_activations, round_attention_inputs};
 use velox_core::rng::Rng;
 use velox_core::{ModelSpec, Op, Result};
 use velox_cpu::CpuBackend;
@@ -381,17 +381,26 @@ impl<B: Backend> Suite<'_, B> {
         let q = self.rng.vec(q_len, 2.0);
         let k = self.rng.vec(kv_len, 2.0);
         let v = self.rng.vec(kv_len, 1.0);
+        // The reference rounds its inputs as the backend says its kernel does. The f16 softmax
+        // weights in the value product are not emulated; they set the looser tolerance.
+        let precision = self.b.attention_precision(s);
+        let (mut qr, mut kr, mut vr) = (q.clone(), k.clone(), v.clone());
+        round_attention_inputs(&mut qr, &mut kr, &mut vr, s, precision);
         let mut want = vec![0.0; q_len];
-        CpuBackend.attention(&q, &k, &v, &mut want, s)?;
+        CpuBackend.attention(&qr, &kr, &vr, &mut want, s)?;
         let (qd, kd, vd) = (self.b.upload(&q)?, self.b.upload(&k)?, self.b.upload(&v)?);
         let mut od = self.b.alloc(q_len)?;
         self.b.attention(&qd, &kd, &vd, &mut od, s)?;
         let got = fetch(self.b, &od, q_len)?;
+        let (tag, tol) = match precision {
+            AttnPrecision::Exact => ("", 2e-4),
+            AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+        };
         let name = format!(
-            "attention t={} h={}/{} d={} pos0={}",
+            "attention t={} h={}/{} d={} pos0={}{tag}",
             s.tokens, s.heads, s.kv_heads, s.head_dim, s.pos0
         );
-        self.record(name, Some(Op::Attention), &got, &want, 2e-4);
+        self.record(name, Some(Op::Attention), &got, &want, tol);
         Ok(())
     }
 
@@ -709,6 +718,29 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.elementwise(4097)?;
     s.copy(300, 1000, 123)?;
     for a in [
+        // Prefill at the Qwen3.5 geometry (head_dim 256, 6 query heads per KV head); tensor-core
+        // kernels tile 64 queries x 32 keys, so these are ragged in both.
+        AttnShape {
+            tokens: 70,
+            heads: 6,
+            kv_heads: 1,
+            head_dim: 256,
+            pos0: 0,
+        },
+        AttnShape {
+            tokens: 130,
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 256,
+            pos0: 333,
+        },
+        AttnShape {
+            tokens: 17,
+            heads: 6,
+            kv_heads: 1,
+            head_dim: 256,
+            pos0: 2_000,
+        },
         AttnShape {
             tokens: 1,
             heads: 8,
