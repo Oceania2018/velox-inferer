@@ -1,6 +1,7 @@
 //! Text frontend: HF tokenizer, Jinja chat template (rendered like HF `apply_chat_template`),
 //! stop tokens and Qwen XML tool-call parsing. Resources come from the artifact.
 
+pub mod image;
 pub mod template;
 pub mod tool_calls;
 
@@ -19,6 +20,9 @@ pub struct Frontend {
     pub eos: Vec<u32>,
     /// Token ids the tokenizer can produce; logits past it are never sampled.
     pub public_vocab: usize,
+    /// Vision `(min_pixels, max_pixels)` from `preprocessor_config.json`, when the artifact has a
+    /// vision component.
+    pub vision_pixels: Option<(u64, u64)>,
 }
 
 fn resource(art: &Artifact, role: &str) -> Result<Vec<u8>> {
@@ -57,11 +61,13 @@ impl Frontend {
                 .map_err(|_| Error::Config("chat template is not UTF-8".into()))?,
         };
         let public_vocab = tokenizer.get_vocab_size(true);
+        let vision_pixels = vision_pixels(art)?;
         Ok(Frontend {
             tokenizer,
             template: ChatTemplate::new(source)?,
             eos,
             public_vocab,
+            vision_pixels,
         })
     }
 
@@ -84,4 +90,27 @@ impl Frontend {
     pub fn is_eos(&self, id: u32) -> bool {
         self.eos.contains(&id)
     }
+}
+
+/// `size.shortest_edge` / `size.longest_edge` (pixel areas) of the vision preprocessor config.
+fn vision_pixels(art: &Artifact) -> Result<Option<(u64, u64)>> {
+    let Some(id) = art
+        .components()
+        .get("vision")
+        .and_then(|v| v["resources"].get("preprocessor_config.json"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let bytes = art
+        .read_object(id)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let cfg: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Config(format!("preprocessor_config.json: {e}")))?;
+    let get = |k: &str| {
+        cfg["size"][k]
+            .as_u64()
+            .ok_or_else(|| Error::Config(format!("preprocessor_config.json: size.{k} missing")))
+    };
+    Ok(Some((get("shortest_edge")?, get("longest_edge")?)))
 }

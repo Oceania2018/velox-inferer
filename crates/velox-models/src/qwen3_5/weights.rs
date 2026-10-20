@@ -194,7 +194,7 @@ fn expect(what: &str, got: usize, want: usize) -> Result<()> {
     Ok(())
 }
 
-struct Loader<'a, B: Backend> {
+pub(crate) struct Loader<'a, B: Backend> {
     b: &'a B,
     art: &'a Artifact,
     parents: Vec<B::Buffer>,
@@ -207,7 +207,7 @@ fn werr(e: velox_weights::Error) -> Error {
     Error::Config(e.to_string())
 }
 
-impl<B: Backend> Loader<'_, B> {
+impl<'a, B: Backend> Loader<'a, B> {
     /// (object id, element range) of a binding with one part or a whole object.
     fn binding(&self, name: &str) -> Result<(String, Option<(u64, u64)>)> {
         let b = self.art.directory["bindings"]
@@ -284,7 +284,7 @@ impl<B: Backend> Loader<'_, B> {
         Ok(entry)
     }
 
-    fn matrix(&mut self, name: &str) -> Result<WDesc> {
+    pub(crate) fn matrix(&mut self, name: &str) -> Result<WDesc> {
         let (id, range) = self.binding(name)?;
         let (parent, format, n, k) = self.parent(&id)?;
         let (row_begin, rows) = match range {
@@ -310,7 +310,7 @@ impl<B: Backend> Loader<'_, B> {
     }
 
     /// Concatenation of row views that are adjacent in one parent, as one view.
-    fn rows_of(&mut self, names: &[&str]) -> Result<WDesc> {
+    pub(crate) fn rows_of(&mut self, names: &[&str]) -> Result<WDesc> {
         let mut acc: Option<WDesc> = None;
         for name in names {
             let d = self.matrix(name)?;
@@ -331,7 +331,8 @@ impl<B: Backend> Loader<'_, B> {
     }
 
     /// Decodes a small direct-format parameter to f32 and uploads it.
-    fn param(&mut self, name: &str, elements: usize) -> Result<usize> {
+    /// Decodes a small direct-format parameter to f32 on the host.
+    pub(crate) fn host_param(&mut self, name: &str, elements: usize) -> Result<Vec<f32>> {
         let (id, range) = self.binding(name)?;
         let obj = self
             .art
@@ -366,8 +367,30 @@ impl<B: Backend> Loader<'_, B> {
                 values.len()
             )));
         }
+        Ok(values)
+    }
+
+    /// Decodes a small parameter and uploads it as f32; returns its slot.
+    pub(crate) fn param(&mut self, name: &str, elements: usize) -> Result<usize> {
+        let values = self.host_param(name, elements)?;
         self.bytes += 4 * values.len() as u64;
         self.params.push(self.b.upload(&values)?);
         Ok(self.params.len() - 1)
+    }
+
+    pub(crate) fn new(b: &'a B, art: &'a Artifact) -> Self {
+        Loader {
+            b,
+            art,
+            parents: Vec::new(),
+            index: HashMap::new(),
+            params: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    /// (parent buffers, parameter buffers, uploaded bytes).
+    pub(crate) fn finish(self) -> (Vec<B::Buffer>, Vec<B::Buffer>, u64) {
+        (self.parents, self.params, self.bytes)
     }
 }

@@ -1,10 +1,12 @@
-//! Chat engine for Qwen3.5 text models behind the OpenAI-compatible server.
+//! Chat engine for Qwen3.5 text + vision models behind the OpenAI-compatible server.
 //!
 //! One generation lane. Agent loops resend almost the same prompt every step, so the lane keeps
-//! the token sequence its state holds plus recurrent-state checkpoints taken where the next
+//! the keys of the tokens its state holds plus recurrent-state checkpoints taken where the next
 //! request is likely to diverge (before the last image and before the generation prompt). A new
-//! request restores the latest checkpoint inside the common prefix and prefills only the rest.
+//! request restores the latest checkpoint inside the common prefix and prefills only the rest;
+//! the vision tower runs only for images in that remainder.
 
+mod prompt;
 mod sampling;
 
 use std::sync::Mutex;
@@ -12,10 +14,14 @@ use std::time::Instant;
 
 use serde_json::Value;
 use velox_core::{Backend, Error as CoreError};
+use velox_frontend::image::{decode_data_url, preprocess, ImagePatches};
 use velox_frontend::{parse_output, Frontend};
-use velox_models::qwen3_5::{Checkpoint, Qwen35Text, Session, Workspace};
+use velox_models::qwen3_5::{
+    Checkpoint, EmbedInsert, Qwen35Text, Qwen35Vision, Session, Workspace,
+};
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
 
+pub use prompt::{build as build_prompt, ImageRun, Prompt};
 pub use sampling::Sampler;
 
 #[derive(Clone, Debug)]
@@ -34,7 +40,7 @@ pub struct EngineConfig {
 struct Lane<B: Backend> {
     session: Session<B>,
     ws: Workspace<B>,
-    /// Tokens the session state has consumed, in order.
+    /// Keys of the tokens the session state has consumed, in order (see `Prompt::keys`).
     keys: Vec<u32>,
     checkpoints: Vec<Checkpoint<B>>,
     zero: Checkpoint<B>,
@@ -43,6 +49,7 @@ struct Lane<B: Backend> {
 pub struct QwenEngine<B: Backend> {
     b: B,
     model: Qwen35Text<B>,
+    vision: Option<Qwen35Vision<B>>,
     fe: Frontend,
     cfg: EngineConfig,
     lane: Mutex<Lane<B>>,
@@ -52,6 +59,7 @@ pub struct QwenEngine<B: Backend> {
 struct SpecialTokens {
     im_start: Option<u32>,
     vision_start: Option<u32>,
+    image_pad: Option<u32>,
 }
 
 fn core(e: CoreError) -> ApiError {
@@ -67,19 +75,31 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+fn is_image_part(p: &Value) -> bool {
+    p.get("image_url").is_some() || p.get("type").and_then(Value::as_str) == Some("image_url")
+}
+
 /// OpenAI messages -> template input: tool-call `arguments` strings become objects (the template
-/// iterates them), and image parts are rejected until the vision path lands.
-fn normalize_messages(messages: &Value) -> Result<Value, ApiError> {
+/// iterates them). Returns the image URLs in prompt order.
+fn normalize_messages(messages: &Value) -> Result<(Value, Vec<String>), ApiError> {
     let mut out = messages.clone();
+    let mut images = Vec::new();
     for m in out.as_array_mut().into_iter().flatten() {
-        if let Some(parts) = m.get("content").and_then(Value::as_array) {
-            if parts.iter().any(|p| {
-                p.get("image_url").is_some()
-                    || p.get("type").and_then(Value::as_str) == Some("image_url")
-            }) {
-                return Err(ApiError::not_implemented(
-                    "image inputs are not supported by velox-inferer yet (vision is in progress)",
-                ));
+        for p in m
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if is_image_part(p) {
+                let url = p
+                    .pointer("/image_url/url")
+                    .or_else(|| p.get("image_url"))
+                    .and_then(Value::as_str);
+                images.push(
+                    url.ok_or_else(|| ApiError::invalid("image_url part without a url"))?
+                        .to_string(),
+                );
             }
         }
         for call in m
@@ -96,13 +116,18 @@ fn normalize_messages(messages: &Value) -> Result<Value, ApiError> {
             }
         }
     }
-    Ok(out)
+    Ok((out, images))
+}
+
+fn single_token(fe: &Frontend, text: &str) -> Option<u32> {
+    fe.encode(text).ok().filter(|v| v.len() == 1).map(|v| v[0])
 }
 
 impl<B: Backend> QwenEngine<B> {
     pub fn new(
         b: B,
         model: Qwen35Text<B>,
+        vision: Option<Qwen35Vision<B>>,
         fe: Frontend,
         cfg: EngineConfig,
     ) -> Result<Self, CoreError> {
@@ -110,16 +135,9 @@ impl<B: Backend> QwenEngine<B> {
         let ws = model.workspace(&b, cfg.chunk)?;
         let zero = session.checkpoint(&b)?;
         let special = SpecialTokens {
-            im_start: fe
-                .encode("<|im_start|>")
-                .ok()
-                .filter(|v| v.len() == 1)
-                .map(|v| v[0]),
-            vision_start: fe
-                .encode("<|vision_start|>")
-                .ok()
-                .filter(|v| v.len() == 1)
-                .map(|v| v[0]),
+            im_start: single_token(&fe, "<|im_start|>"),
+            vision_start: single_token(&fe, "<|vision_start|>"),
+            image_pad: single_token(&fe, "<|image_pad|>"),
         };
         let lane = Mutex::new(Lane {
             session,
@@ -131,6 +149,7 @@ impl<B: Backend> QwenEngine<B> {
         Ok(QwenEngine {
             b,
             model,
+            vision,
             fe,
             cfg,
             lane,
@@ -152,10 +171,10 @@ impl<B: Backend> QwenEngine<B> {
         v
     }
 
-    /// Restores the best reusable state for `ids` and returns how many tokens are already in it.
-    fn reuse(&self, lane: &mut Lane<B>, ids: &[u32]) -> Result<usize, CoreError> {
+    /// Restores the best reusable state for `keys` and returns how many tokens are already in it.
+    fn reuse(&self, lane: &mut Lane<B>, keys: &[u32]) -> Result<usize, CoreError> {
         // At least the last prompt token must be fed to produce logits.
-        let target = common_prefix(&lane.keys, ids).min(ids.len() - 1);
+        let target = common_prefix(&lane.keys, keys).min(keys.len() - 1);
         if lane.session.pos == lane.keys.len() && lane.keys.len() <= target {
             return Ok(lane.keys.len());
         }
@@ -170,6 +189,87 @@ impl<B: Backend> QwenEngine<B> {
         }
         Ok(lane.session.pos)
     }
+
+    fn load_images(&self, urls: &[String]) -> Result<Vec<ImagePatches>, ApiError> {
+        if urls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (Some(_), Some((min_px, max_px))) = (&self.vision, self.fe.vision_pixels) else {
+            return Err(ApiError::invalid(
+                "this model was loaded without vision; images are not accepted",
+            ));
+        };
+        urls.iter()
+            .map(|u| {
+                let (rgb, w, h) =
+                    decode_data_url(u).map_err(|e| ApiError::invalid(e.to_string()))?;
+                preprocess(&rgb, w, h, min_px, max_px).map_err(|e| ApiError::invalid(e.to_string()))
+            })
+            .collect()
+    }
+
+    /// Prefills `p.ids[start..]` (checkpointing on the way) and returns the last logits.
+    fn prefill(
+        &self,
+        lane: &mut Lane<B>,
+        p: &Prompt,
+        images: &[ImagePatches],
+        start: usize,
+    ) -> Result<Vec<f32>, CoreError> {
+        // Vision embeddings for images not already in the reused prefix.
+        let mut embeds: Vec<(usize, B::Buffer)> = Vec::new();
+        for (r, run) in p.runs.iter().enumerate() {
+            if run.start + run.len > start {
+                let vision = self
+                    .vision
+                    .as_ref()
+                    .ok_or_else(|| CoreError::Unsupported("no vision tower".into()))?;
+                let img = &images[run.image];
+                embeds.push((
+                    r,
+                    vision.encode(&self.b, &img.data, img.grid_h, img.grid_w)?,
+                ));
+            }
+        }
+        lane.session.rope_delta = p.rope_delta;
+        let mut pos = start;
+        let mut logits = Vec::new();
+        for cp in self
+            .checkpoint_positions(&p.ids, start)
+            .into_iter()
+            .chain(std::iter::once(p.ids.len()))
+        {
+            if cp > pos {
+                let inserts: Vec<EmbedInsert<'_, B::Buffer>> = embeds
+                    .iter()
+                    .filter_map(|(r, buf)| {
+                        let run = &p.runs[*r];
+                        let (lo, hi) = (run.start.max(pos), (run.start + run.len).min(cp));
+                        (lo < hi).then(|| EmbedInsert {
+                            token: lo - pos,
+                            rows: hi - lo,
+                            buf,
+                            row_offset: lo - run.start,
+                        })
+                    })
+                    .collect();
+                let positions = p.positions.as_ref().map(|v| &v[pos..cp]);
+                logits = self.model.forward_with(
+                    &self.b,
+                    &mut lane.session,
+                    &mut lane.ws,
+                    &p.ids[pos..cp],
+                    positions,
+                    &inserts,
+                )?;
+                pos = cp;
+            }
+            if cp < p.ids.len() {
+                lane.checkpoints.push(lane.session.checkpoint(&self.b)?);
+            }
+        }
+        Ok(logits)
+    }
 }
 
 impl<B> ChatEngine for QwenEngine<B>
@@ -183,7 +283,7 @@ where
 
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
         self.b.bind_thread().map_err(core)?;
-        let messages = normalize_messages(&req["messages"])?;
+        let (messages, urls) = normalize_messages(&req["messages"])?;
         let tools = req
             .get("tools")
             .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
@@ -197,20 +297,28 @@ where
             .render(&messages, tools, thinking, true)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
         let ids = self.fe.encode(&text).map_err(core)?;
+        let images = self.load_images(&urls)?;
+        let p = match self.special.image_pad {
+            Some(pad) => build_prompt(&ids, pad, &images).map_err(ApiError::invalid)?,
+            None if images.is_empty() => {
+                build_prompt(&ids, u32::MAX, &[]).map_err(ApiError::invalid)?
+            }
+            None => return Err(ApiError::invalid("tokenizer has no <|image_pad|> token")),
+        };
         let max_tokens = req
             .get("max_completion_tokens")
             .or_else(|| req.get("max_tokens"))
             .and_then(Value::as_u64)
             .map_or(self.cfg.default_max_tokens, |n| n as usize)
             .max(1);
-        if ids.len() + max_tokens > self.cfg.capacity {
+        if p.ids.len() + max_tokens > self.cfg.capacity {
             return Err(ApiError {
                 status: 400,
                 kind: "invalid_request_error",
                 code: "context_length_exceeded",
                 message: format!(
                     "{} prompt + {} completion tokens exceed the context of {}",
-                    ids.len(),
+                    p.ids.len(),
                     max_tokens,
                     self.cfg.capacity
                 ),
@@ -224,30 +332,21 @@ where
             .map_err(|_| core(CoreError::Backend("engine lane poisoned".into())))?;
         let lane = &mut *lane;
         let t0 = Instant::now();
-        let start = self.reuse(lane, &ids).map_err(core)?;
+        let start = self.reuse(lane, &p.keys).map_err(core)?;
         // Checkpoints still valid for this prompt are those inside the shared prefix.
         lane.checkpoints.retain(|c| c.pos <= start);
         lane.keys.truncate(start);
-        let mut pos = start;
-        let mut logits = Vec::new();
-        for cp in self
-            .checkpoint_positions(&ids, start)
-            .into_iter()
-            .chain(std::iter::once(ids.len()))
-        {
-            if cp > pos {
-                logits = self
-                    .model
-                    .forward(&self.b, &mut lane.session, &mut lane.ws, &ids[pos..cp])
-                    .map_err(core)?;
-                pos = cp;
+        let prefilled = self.prefill(lane, &p, &images, start);
+        let mut logits = match prefilled {
+            Ok(l) => l,
+            Err(e) => {
+                // The state is partially advanced; forget it so the next request starts clean.
+                lane.keys.clear();
+                lane.checkpoints.clear();
+                return Err(core(e));
             }
-            if cp < ids.len() {
-                lane.checkpoints
-                    .push(lane.session.checkpoint(&self.b).map_err(core)?);
-            }
-        }
-        lane.keys.extend_from_slice(&ids[start..]);
+        };
+        lane.keys.extend_from_slice(&p.keys[start..]);
         while lane.checkpoints.len() > self.cfg.max_checkpoints {
             lane.checkpoints.remove(0);
         }
@@ -289,7 +388,7 @@ where
             } else {
                 finish.into()
             },
-            prompt_tokens: ids.len() as u64,
+            prompt_tokens: p.ids.len() as u64,
             cached_tokens: start as u64,
             completion_tokens: out.len() as u64,
             prompt_ms,
@@ -306,17 +405,21 @@ mod tests {
     #[test]
     fn tool_call_arguments_become_objects() {
         let m = json!([{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": "{\"x\": 1}"}}]}]);
-        let n = normalize_messages(&m).unwrap();
+        let (n, imgs) = normalize_messages(&m).unwrap();
         assert_eq!(
             n[0]["tool_calls"][0]["function"]["arguments"],
             json!({"x": 1})
         );
+        assert!(imgs.is_empty());
     }
 
     #[test]
-    fn images_are_rejected_until_vision() {
-        let m = json!([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:..."}}]}]);
-        assert_eq!(normalize_messages(&m).unwrap_err().status, 501);
+    fn images_are_collected_in_order() {
+        let m = json!([
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:a"}}, {"type": "text", "text": "x"}]},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:b"}}]}
+        ]);
+        assert_eq!(normalize_messages(&m).unwrap().1, vec!["data:a", "data:b"]);
     }
 
     #[test]

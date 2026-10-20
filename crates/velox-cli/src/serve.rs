@@ -7,7 +7,7 @@ use std::time::Instant;
 use velox_core::{Backend, Error, Result};
 use velox_engine::{EngineConfig, QwenEngine};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{Qwen35Text, TextConfig, TextWeights};
+use velox_models::qwen3_5::{Qwen35Text, Qwen35Vision, TextConfig, TextWeights};
 use velox_serve::{ChatEngine, Config, Server, UnimplementedEngine};
 use velox_weights::Artifact;
 
@@ -42,8 +42,22 @@ where
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
         max_checkpoints: a.parse("ctx-checkpoints", 4)?,
     };
+    let vision = if art.components().contains_key("vision")
+        && a.get("vision").is_none_or(|v| v != "false")
+    {
+        let t1 = Instant::now();
+        let v = Qwen35Vision::load(&b, art, cfg.hidden)?;
+        eprintln!(
+            "vision tower loaded ({:.2} GB) in {:.1}s",
+            v.bytes as f64 / 1e9,
+            t1.elapsed().as_secs_f64()
+        );
+        Some(v)
+    } else {
+        None
+    };
     let model = Qwen35Text::new(cfg, w);
-    Ok(Box::new(QwenEngine::new(b, model, fe, engine_cfg)?))
+    Ok(Box::new(QwenEngine::new(b, model, vision, fe, engine_cfg)?))
 }
 
 pub fn run(a: &Args) -> Result<ExitCode> {

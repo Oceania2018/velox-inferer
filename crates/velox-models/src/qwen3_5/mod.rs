@@ -2,18 +2,25 @@
 //! The mathematics is specified in docs/qwen3_5-text.md.
 
 mod config;
+mod vision;
 mod weights;
 
-use velox_core::backend::{AttnShape, Backend, ConvShape, GdnShape, NormKind, RopeShape};
+use velox_core::backend::{
+    AttnShape, Backend, ConvShape, GdnShape, NormKind, RopeLayout, RopePosShape, RopeShape,
+};
 use velox_core::{Error, Result};
 
 pub use config::{LayerKind, TextConfig};
+pub use vision::{Qwen35Vision, VisionConfig};
 pub use weights::{Mixer, TextWeights, WDesc};
 
 /// Per-sequence state: attention KV caches, GDN convolution and recurrent states, position.
 pub struct Session<B: Backend> {
     pub pos: usize,
     pub capacity: usize,
+    /// Rotary position minus cache position for tokens after the prompt. MRoPE compresses each
+    /// image run, so this is negative once a prompt contains an image.
+    pub rope_delta: i64,
     kv: Vec<(B::Buffer, B::Buffer)>,
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
@@ -24,6 +31,7 @@ pub struct Session<B: Backend> {
 /// recurrent state.
 pub struct Checkpoint<B: Backend> {
     pub pos: usize,
+    pub rope_delta: i64,
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
 }
@@ -43,6 +51,7 @@ impl<B: Backend> Session<B> {
         };
         Ok(Checkpoint {
             pos: self.pos,
+            rope_delta: self.rope_delta,
             conv: dup(&self.conv)?,
             ssm: dup(&self.ssm)?,
         })
@@ -64,8 +73,18 @@ impl<B: Backend> Session<B> {
             b.copy(src, 0, dst, 0, n)?;
         }
         self.pos = cp.pos;
+        self.rope_delta = cp.rope_delta;
         Ok(())
     }
+}
+
+/// Embedding rows `buf[row_offset .. row_offset + rows]` (`[*, hidden]`) that replace the token
+/// embeddings at tokens `token .. token + rows` of a `forward_with` call (image placeholders).
+pub struct EmbedInsert<'a, Buf> {
+    pub token: usize,
+    pub rows: usize,
+    pub buf: &'a Buf,
+    pub row_offset: usize,
 }
 
 /// Activations for chunks of up to `max_tokens` tokens.
@@ -130,6 +149,7 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(Session {
             pos: 0,
             capacity,
+            rope_delta: 0,
             kv,
             conv,
             ssm,
@@ -166,7 +186,7 @@ impl<B: Backend> Qwen35Text<B> {
     }
 
     /// Feeds `ids` (any length, processed in workspace-sized chunks) and returns the logits after
-    /// the last one.
+    /// the last one. Rotary positions are `cache position + session.rope_delta`.
     pub fn forward(
         &self,
         b: &B,
@@ -174,6 +194,25 @@ impl<B: Backend> Qwen35Text<B> {
         ws: &mut Workspace<B>,
         ids: &[u32],
     ) -> Result<Vec<f32>> {
+        self.forward_with(b, s, ws, ids, None, &[])
+    }
+
+    /// `forward` with explicit MRoPE positions (one (t, h, w) triple per id) and embedding rows
+    /// that replace image placeholder embeddings.
+    pub fn forward_with(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        ids: &[u32],
+        positions: Option<&[[u32; 3]]>,
+        inserts: &[EmbedInsert<'_, B::Buffer>],
+    ) -> Result<Vec<f32>> {
+        if positions.is_some_and(|p| p.len() != ids.len()) {
+            return Err(Error::Shape(
+                "one position triple per token is required".into(),
+            ));
+        }
         if ids.is_empty() {
             return Err(Error::Config("forward needs at least one token".into()));
         }
@@ -186,20 +225,51 @@ impl<B: Backend> Qwen35Text<B> {
             )));
         }
         let mut t_last = 0;
-        for chunk in ids.chunks(ws.max_tokens) {
-            self.chunk(b, s, ws, chunk)?;
+        for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
+            let base = i * ws.max_tokens;
+            let pos = positions.map(|p| &p[base..base + chunk.len()]);
+            self.chunk(b, s, ws, chunk, base, pos, inserts)?;
             t_last = chunk.len() - 1;
         }
         self.logits(b, ws, t_last)
     }
 
-    fn chunk(&self, b: &B, s: &mut Session<B>, ws: &mut Workspace<B>, ids: &[u32]) -> Result<()> {
+    /// One chunk of `ids`, which start at offset `base` of the `forward_with` call.
+    #[allow(clippy::too_many_arguments)]
+    fn chunk(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        ids: &[u32],
+        base: usize,
+        positions: Option<&[[u32; 3]]>,
+        inserts: &[EmbedInsert<'_, B::Buffer>],
+    ) -> Result<()> {
         let c = &self.cfg;
         let w = &self.w;
         let t = ids.len();
         let pos0 = s.pos;
         let hd = c.hidden;
         b.embed(ids, &w.view(&w.embed), &mut ws.x)?;
+        for ins in inserts {
+            let (lo, hi) = (ins.token.max(base), (ins.token + ins.rows).min(base + t));
+            if lo < hi {
+                let src = (ins.row_offset + lo - ins.token) * hd;
+                b.copy(ins.buf, src, &mut ws.x, (lo - base) * hd, (hi - lo) * hd)?;
+            }
+        }
+        // Axis-major [3, t] positions for explicit MRoPE, else cache position + rope_delta.
+        let axis_positions: Option<Vec<u32>> = positions.map(|p| {
+            (0..3)
+                .flat_map(|a| p.iter().map(move |tri| tri[a]))
+                .collect()
+        });
+        let rope_pos0 = match axis_positions {
+            Some(_) => 0, // unused: explicit positions
+            None => usize::try_from(pos0 as i64 + s.rope_delta)
+                .map_err(|_| Error::Shape("negative rotary position".into()))?,
+        };
         let (mut ai, mut gi) = (0, 0);
         for l in &w.layers {
             b.rms_norm(
@@ -298,16 +368,33 @@ impl<B: Backend> Qwen35Text<B> {
                         c.eps,
                         NormKind::Offset,
                     )?;
-                    let rope = |heads| RopeShape {
-                        tokens: t,
-                        heads,
-                        head_dim: c.head_dim,
-                        rotary_dim: c.rotary_dim,
-                        pos0,
-                        theta: c.rope_theta,
-                    };
-                    b.rope(&mut ws.qn, rope(c.heads))?;
-                    b.rope(&mut ws.kn, rope(c.kv_heads))?;
+                    match &axis_positions {
+                        Some(p) => {
+                            let rope = |heads| RopePosShape {
+                                tokens: t,
+                                heads,
+                                head_dim: c.head_dim,
+                                rotary_dim: c.rotary_dim,
+                                theta: c.rope_theta,
+                                axes: 3,
+                                layout: RopeLayout::Interleaved,
+                            };
+                            b.rope_positions(&mut ws.qn, p, rope(c.heads))?;
+                            b.rope_positions(&mut ws.kn, p, rope(c.kv_heads))?;
+                        }
+                        None => {
+                            let rope = |heads| RopeShape {
+                                tokens: t,
+                                heads,
+                                head_dim: c.head_dim,
+                                rotary_dim: c.rotary_dim,
+                                pos0: rope_pos0,
+                                theta: c.rope_theta,
+                            };
+                            b.rope(&mut ws.qn, rope(c.heads))?;
+                            b.rope(&mut ws.kn, rope(c.kv_heads))?;
+                        }
+                    }
                     let (kc, vc) = &mut s.kv[ai];
                     let kvd = c.kv_dim();
                     b.copy(&ws.kn, 0, kc, pos0 * kvd, t * kvd)?;
