@@ -111,6 +111,8 @@ pub struct Workspace<B: Backend> {
     last: B::Buffer,
     last_n: B::Buffer,
     logits: B::Buffer,
+    /// Row of the last token of the latest `advance`, inside the final chunk.
+    last_row: usize,
 }
 
 pub struct Qwen35Text<B: Backend> {
@@ -182,6 +184,7 @@ impl<B: Backend> Qwen35Text<B> {
             last: b.alloc(c.hidden)?,
             last_n: b.alloc(c.hidden)?,
             logits: b.alloc(c.vocab)?,
+            last_row: 0,
         })
     }
 
@@ -208,6 +211,21 @@ impl<B: Backend> Qwen35Text<B> {
         positions: Option<&[[u32; 3]]>,
         inserts: &[EmbedInsert<'_, B::Buffer>],
     ) -> Result<Vec<f32>> {
+        self.advance(b, s, ws, ids, positions, inserts)?;
+        self.logits(b, ws)
+    }
+
+    /// Feeds `ids` like [`Self::forward_with`] without producing logits; follow with
+    /// [`Self::logits`] or [`Self::candidates`] when the next token is needed.
+    pub fn advance(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        ids: &[u32],
+        positions: Option<&[[u32; 3]]>,
+        inserts: &[EmbedInsert<'_, B::Buffer>],
+    ) -> Result<()> {
         if positions.is_some_and(|p| p.len() != ids.len()) {
             return Err(Error::Shape(
                 "one position triple per token is required".into(),
@@ -224,27 +242,13 @@ impl<B: Backend> Qwen35Text<B> {
                 s.capacity
             )));
         }
-        let mut t_last = 0;
-        let started = std::time::Instant::now();
         for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
             let base = i * ws.max_tokens;
             let pos = positions.map(|p| &p[base..base + chunk.len()]);
             self.chunk(b, s, ws, chunk, base, pos, inserts)?;
-            t_last = chunk.len() - 1;
+            ws.last_row = chunk.len() - 1;
         }
-        let queued = started.elapsed();
-        let logits = self.logits(b, ws, t_last);
-        // VELOX_STEP_TIMING=1: host time to enqueue a step vs the step's wall time. When the two
-        // are close, the GPU waits on kernel launches rather than the other way round.
-        if std::env::var_os("VELOX_STEP_TIMING").is_some() {
-            eprintln!(
-                "[step] {} tokens: enqueue {:.2} ms, total {:.2} ms",
-                ids.len(),
-                queued.as_secs_f64() * 1e3,
-                started.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        logits
+        Ok(())
     }
 
     /// One chunk of `ids`, which start at offset `base` of the `forward_with` call.
@@ -445,8 +449,35 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
-    fn logits(&self, b: &B, ws: &mut Workspace<B>, row: usize) -> Result<Vec<f32>> {
+    /// Next-token logits after the last `advance`d token (downloaded: the whole vocabulary).
+    pub fn logits(&self, b: &B, ws: &mut Workspace<B>) -> Result<Vec<f32>> {
+        self.head(b, ws)?;
+        let mut out = vec![0.0; self.cfg.vocab];
+        b.synchronize()?;
+        b.download(&ws.logits, &mut out)?;
+        Ok(out)
+    }
+
+    /// The `k` best next-token candidates among the first `limit` ids, selected on the device:
+    /// only `k` (id, logit) pairs cross to the host.
+    pub fn candidates(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        k: usize,
+        limit: usize,
+    ) -> Result<Vec<(u32, f32)>> {
+        self.head(b, ws)?;
+        let v = self.cfg.vocab;
+        Ok(b.top_k(&ws.logits, 1, v, limit.min(v), k)?
+            .pop()
+            .unwrap_or_default())
+    }
+
+    /// Final norm and output head for the last advanced row, into `ws.logits`.
+    fn head(&self, b: &B, ws: &mut Workspace<B>) -> Result<()> {
         let (c, w) = (&self.cfg, &self.w);
+        let row = ws.last_row;
         b.copy(&ws.x, row * c.hidden, &mut ws.last, 0, c.hidden)?;
         b.rms_norm(
             &ws.last,
@@ -457,11 +488,7 @@ impl<B: Backend> Qwen35Text<B> {
             c.eps,
             NormKind::Offset,
         )?;
-        b.linear(&ws.last_n, &w.view(&w.head), &mut ws.logits, 1)?;
-        let mut out = vec![0.0; c.vocab];
-        b.synchronize()?;
-        b.download(&ws.logits, &mut out)?;
-        Ok(out)
+        b.linear(&ws.last_n, &w.view(&w.head), &mut ws.logits, 1)
     }
 }
 
