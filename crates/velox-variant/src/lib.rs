@@ -7,7 +7,8 @@
 //! - `plan_policy(&DeviceProfile) -> PlanPolicy`;
 //! - with the `cuda` feature, `cuda_kernels(&DeviceInfo) -> Result<Arc<dyn CudaKernels>>`.
 //!
-//! Native ops: MatMul (small-M GEMV tile, tiled SGEMM) and Attention (split-key). Every other op,
+//! Native ops: MatMul (small-M GEMV tile, tiled SGEMM) and Linear (NVFP4 x NVFP4 and FP8 x FP8
+//! block-scaled MMA for prefill, where the artifact allows rounded activations). Every other op,
 //! and every shape a tuned kernel does not cover, runs the portable kernel.
 
 use velox_core::{DeviceProfile, GpuArch, PlanPolicy, VariantInfo};
@@ -18,7 +19,7 @@ mod kernels;
 pub static INFO: VariantInfo = VariantInfo {
     id: "rtx-5090-32g",
     branch: "rtx-5090-32g",
-    description: "RTX 5090 32 GB: vectorized GEMV + tiled SGEMM matmul, split-key attention",
+    description: "RTX 5090 32 GB: NVFP4/FP8 tensor-core prefill linear, tiled SGEMM matmul",
     profiles: &["rtx-5090"],
     archs: &[GpuArch::Cuda { major: 12, minor: 0 }],
 };
