@@ -14,7 +14,10 @@ pub static INFO: VariantInfo = VariantInfo {
     branch: "rtx-5060-ti",
     description: "RTX 5060 Ti 16 GB / 8 GB (GB206, 36 SMs): portable kernels, small-VRAM policy",
     profiles: &["rtx-5060-ti-16g", "rtx-5060-ti-8g"],
-    archs: &[GpuArch::Cuda { major: 12, minor: 0 }],
+    archs: &[GpuArch::Cuda {
+        major: 12,
+        minor: 0,
+    }],
 };
 
 pub fn plan_policy(profile: &DeviceProfile) -> PlanPolicy {
