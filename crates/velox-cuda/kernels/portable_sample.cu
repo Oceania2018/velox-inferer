@@ -1,10 +1,9 @@
 // Top-k over logits rows for sampling: the k best (value desc, index asc; NaN lowest) of the first
 // `limit` values of each row, so the host only receives a few candidates instead of the vocabulary.
 //
-// Two passes. Pass 1: blocks of 256 threads take 4096-value slices of a row and select their
-// top-k by repeated block argmax; every thread keeps the best of its own values, so a round
-// is one block reduction plus a rescan by the single thread that owned the winner. Pass 2: one
-// 1024-thread block per row selects the final top-k from all slice candidates the same way.
+// Two passes. Pass 1: blocks of 256 threads take 4096-value slices of a row and keep the top k of
+// each by a bitonic sort in shared memory. Pass 2: one 1024-thread block per row sorts all slice
+// candidates the same way and keeps the final top k.
 #include <math.h>
 #include <stdint.h>
 
@@ -20,66 +19,37 @@ constexpr int kMergeCap = 1024 * kMergePer;  // candidates one pass-2 block can 
 
 __device__ __forceinline__ float rank_key(float v) { return isnan(v) ? -INFINITY : v; }
 
-// a ranks before b.
+// a ranks before b. Index -1 marks padding, which ranks after everything.
 __device__ __forceinline__ bool before(float va, int ia, float vb, int ib) {
-    return va > vb || (va == vb && static_cast<unsigned>(ia) < static_cast<unsigned>(ib));
+    if (ia < 0) return false;
+    if (ib < 0) return true;
+    return va > vb || (va == vb && ia < ib);
 }
 
-// Selects the top k of the n (value, index) pairs in shared memory sv/si (strided per thread) into
-// out_v/out_i; positions past the available values get index -1. Destroys sv.
+// Selects the top k of the n (value, index) pairs in shared memory sv/si (THREADS * PER slots,
+// entries past n are padding) into out_v/out_i by a bitonic sort of all slots, best first:
+// log2(N)^2 / 2 compare-exchange passes, each a single sweep by the block.
 template <int THREADS, int PER>
 __device__ void block_top_k(float* sv, int* si, int n, int k, float* out_v, int* out_i) {
-    __shared__ float wv[THREADS / 32];
-    __shared__ int wi[THREADS / 32];
-    __shared__ int winner;
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    float bv = -INFINITY;
-    int bi = -1;
-    auto rescan = [&]() {
-        bv = -INFINITY;
-        bi = -1;
-        for (int p = 0; p < PER; ++p) {
-            const int j = p * THREADS + tid;
-            if (j < n && si[j] >= 0 && (bi < 0 || before(sv[j], si[j], bv, bi))) bv = sv[j], bi = si[j];
-        }
-    };
-    rescan();
-    for (int r = 0; r < k; ++r) {
-        float v = bv;
-        int i = bi;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, v, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, i, o);
-            if (oi >= 0 && (i < 0 || before(ov, oi, v, i))) v = ov, i = oi;
-        }
-        if (lane == 0) wv[warp] = v, wi[warp] = i;
-        __syncthreads();
-        if (warp == 0) {
-            v = lane < THREADS / 32 ? wv[lane] : -INFINITY;
-            i = lane < THREADS / 32 ? wi[lane] : -1;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) {
-                const float ov = __shfl_xor_sync(0xffffffffu, v, o);
-                const int oi = __shfl_xor_sync(0xffffffffu, i, o);
-                if (oi >= 0 && (i < 0 || before(ov, oi, v, i))) v = ov, i = oi;
+    constexpr int N = THREADS * PER;
+    for (int j = n + static_cast<int>(threadIdx.x); j < N; j += THREADS) sv[j] = -INFINITY, si[j] = -1;
+    __syncthreads();
+    for (int size = 2; size <= N; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int t = threadIdx.x; t < N / 2; t += THREADS) {
+                const int i = 2 * t - (t & (stride - 1)), j = i + stride;
+                const bool best_first = (i & size) == 0;
+                if (best_first != before(sv[i], si[i], sv[j], si[j])) {
+                    const float v = sv[i];
+                    const int x = si[i];
+                    sv[i] = sv[j], si[i] = si[j];
+                    sv[j] = v, si[j] = x;
+                }
             }
-            if (lane == 0) {
-                out_v[r] = v;
-                out_i[r] = i;
-                winner = i;
-            }
-        }
-        __syncthreads();
-        // Indices are unique, so exactly one thread owns the winner (none once values run out).
-        if (winner >= 0 && bi == winner) {
-            for (int p = 0; p < PER; ++p) {
-                const int j = p * THREADS + tid;
-                if (j < n && si[j] == winner) si[j] = -1;
-            }
-            rescan();
+            __syncthreads();
         }
     }
+    for (int r = threadIdx.x; r < k; r += THREADS) out_v[r] = sv[r], out_i[r] = si[r];
 }
 
 __global__ void __launch_bounds__(256) top_k_slices(const float* __restrict__ x, long long row_len, int limit, int k,

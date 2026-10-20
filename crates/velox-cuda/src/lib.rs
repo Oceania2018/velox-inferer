@@ -374,6 +374,11 @@ pub trait CudaKernels: Send + Sync {
         portable::attention_full(q, k, v, out, s)
     }
 
+    /// The operand precision of `attention_full`; see [`Backend::attention_full_precision`].
+    fn attention_full_precision(&self, _s: FullAttnShape) -> AttnPrecision {
+        AttnPrecision::Exact
+    }
+
     fn layer_norm(
         &self,
         x: &CudaBuffer,
@@ -743,6 +748,10 @@ impl Backend for CudaBackend {
         self.timed("attention_full", || {
             self.kernels.attention_full(q, k, v, out, s)
         })
+    }
+
+    fn attention_full_precision(&self, s: FullAttnShape) -> AttnPrecision {
+        self.kernels.attention_full_precision(s)
     }
 
     fn layer_norm(
