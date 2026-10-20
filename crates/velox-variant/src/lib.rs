@@ -1,27 +1,35 @@
-//! Hardware variant of this build: **generic** (branch `main`).
+//! Hardware variant of this build: **rtx-5090-32g** (branch `rtx-5090-32g`).
 //!
-//! This crate is the only code that differs between hardware branches. Every branch exposes the
-//! same contract, which the CLI and conformance suite compile against:
+//! Tuned for the 32 GB desktop RTX 5090 (GB202, 170 SMs, sm_120a). Same contract as every
+//! branch (see main's version of this file):
 //!
-//! - `INFO: VariantInfo`: id, branch, the profiles it tunes and the architectures its kernels run on;
-//! - `plan_policy(&DeviceProfile) -> PlanPolicy`: VRAM reserve and workspace per card;
+//! - `INFO: VariantInfo`;
+//! - `plan_policy(&DeviceProfile) -> PlanPolicy`;
 //! - with the `cuda` feature, `cuda_kernels(&DeviceInfo) -> Result<Arc<dyn CudaKernels>>`.
 //!
-//! The generic variant runs the portable kernels on any device. See docs/branching.md for how a
-//! hardware branch replaces this crate.
+//! Native ops: MatMul (small-M GEMV tile, tiled SGEMM) and Attention (split-key). Every other op,
+//! and every shape a tuned kernel does not cover, runs the portable kernel.
 
-use velox_core::{DeviceProfile, PlanPolicy, VariantInfo};
+use velox_core::{DeviceProfile, GpuArch, PlanPolicy, VariantInfo};
+
+#[cfg(feature = "cuda")]
+mod kernels;
 
 pub static INFO: VariantInfo = VariantInfo {
-    id: "generic",
-    branch: "main",
-    description: "portable kernels for every supported GPU; correct everywhere, tuned nowhere",
-    profiles: &[],
-    archs: &[],
+    id: "rtx-5090-32g",
+    branch: "rtx-5090-32g",
+    description: "RTX 5090 32 GB: vectorized GEMV + tiled SGEMM matmul, split-key attention",
+    profiles: &["rtx-5090"],
+    archs: &[GpuArch::Cuda { major: 12, minor: 0 }],
 };
 
 pub fn plan_policy(profile: &DeviceProfile) -> PlanPolicy {
-    PlanPolicy::for_profile(profile)
+    let mut p = PlanPolicy::for_profile(profile);
+    if INFO.tunes(profile) {
+        // 32 GB leaves room for larger prefill chunks, which cut per-chunk overhead.
+        p.workspace_tokens = 4096;
+    }
+    p
 }
 
 #[cfg(feature = "cuda")]
@@ -29,5 +37,5 @@ pub fn cuda_kernels(
     device: &velox_cuda::DeviceInfo,
 ) -> velox_core::Result<std::sync::Arc<dyn velox_cuda::CudaKernels>> {
     velox_cuda::require_arch(device, &INFO)?;
-    Ok(std::sync::Arc::new(velox_cuda::PortableKernels))
+    Ok(std::sync::Arc::new(kernels::Rtx5090Kernels))
 }
