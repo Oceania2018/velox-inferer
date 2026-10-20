@@ -144,7 +144,7 @@ pub static CATALOG: &[DeviceProfile] = &[
         sm_count: 82,
         mem_bandwidth_gbs: 896,
         reserved_mib: 1536,
-        tuned_branch: Some("rtx-5090-laptop-24g"),
+        tuned_branch: Some("rtx-5090-24g"),
     },
     DeviceProfile {
         id: "rtx-5060-ti-16g",
