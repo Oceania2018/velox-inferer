@@ -1,7 +1,7 @@
 //! RTX 5090 kernel set. Each override tries the tuned kernel and falls back to the portable one
 //! when the kernel reports the shape as unsupported.
 
-use velox_core::backend::{ActPolicy, ActQuant, WeightView};
+use velox_core::backend::{ActPolicy, ActQuant, AttnPrecision, AttnShape, WeightView};
 use velox_core::check::to_i32;
 use velox_core::{Error, Op, Result, WeightFormat};
 use velox_cuda::{portable, status, CudaBuffer, CudaKernels};
@@ -19,6 +19,18 @@ extern "C" {
         rows: i32,
         input_divisor: f32,
         y: *mut f32,
+    ) -> i32;
+    fn velox_5090_attention_prefill(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
     ) -> i32;
     fn velox_5090_linear_a8(
         x: *const f32,
@@ -39,6 +51,10 @@ const SMALL_M_MAX: usize = 8;
 /// tensor-core GEMM with rounded activations takes over where the artifact allows.
 const GEMV_MAX_M: usize = 8;
 
+/// From this many query tokens attention uses the tensor-core prefill kernel; below it the exact
+/// split-KV kernel, which is bound by reading the cache anyway.
+const FLASH_MIN_TOKENS: usize = 16;
+
 pub struct Rtx5090Kernels;
 
 fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -50,7 +66,7 @@ fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<(
 
 impl CudaKernels for Rtx5090Kernels {
     fn native_ops(&self) -> &'static [Op] {
-        &[Op::MatMul, Op::Linear]
+        &[Op::MatMul, Op::Linear, Op::Attention]
     }
 
     // Shapes were validated by CudaBackend before these are called.
@@ -60,6 +76,38 @@ impl CudaKernels for Rtx5090Kernels {
         // SAFETY: extents validated by CudaBackend; kernels guard their own edges.
         let r = status(unsafe { launch(x.as_ptr(), w.as_ptr(), y.as_mut_ptr(), mi, ni, ki) }, "rtx5090 matmul");
         or_fallback(r, || portable::matmul(x, w, y, m, n, k))
+    }
+
+    fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
+        if s.tokens >= FLASH_MIN_TOKENS && s.head_dim == 256 && s.heads % s.kv_heads == 0 && s.kv_len() <= i32::MAX as usize {
+            AttnPrecision::Fp8QkF16Pv
+        } else {
+            AttnPrecision::Exact
+        }
+    }
+
+    fn attention(&self, q: &CudaBuffer, k: &CudaBuffer, v: &CudaBuffer, out: &mut CudaBuffer, s: AttnShape) -> Result<()> {
+        if self.attention_precision(s) == AttnPrecision::Exact {
+            return portable::attention(q, k, v, out, s);
+        }
+        // SAFETY: extents validated by CudaBackend (check::attention).
+        status(
+            unsafe {
+                velox_5090_attention_prefill(
+                    q.as_ptr(),
+                    k.as_ptr(),
+                    v.as_ptr(),
+                    out.as_mut_ptr(),
+                    to_i32("tokens", s.tokens)?,
+                    to_i32("heads", s.heads)?,
+                    to_i32("kv_heads", s.kv_heads)?,
+                    to_i32("head_dim", s.head_dim)?,
+                    to_i32("pos0", s.pos0)?,
+                    s.scale(),
+                )
+            },
+            "rtx5090 attention prefill",
+        )
     }
 
     fn linear_act(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> ActQuant {
