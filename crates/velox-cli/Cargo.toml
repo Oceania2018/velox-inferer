@@ -1,0 +1,23 @@
+[package]
+name = "velox-cli"
+description = "velox command line: devices, profiles, plan, selftest, bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "velox"
+path = "src/main.rs"
+
+[features]
+cuda = ["dep:velox-cuda", "velox-variant/cuda", "velox-conformance/cuda"]
+
+[dependencies]
+velox-core.workspace = true
+velox-cpu.workspace = true
+velox-variant.workspace = true
+velox-conformance.workspace = true
+velox-weights.workspace = true
+velox-serve.workspace = true
+serde_json.workspace = true
+velox-cuda = { workspace = true, optional = true }

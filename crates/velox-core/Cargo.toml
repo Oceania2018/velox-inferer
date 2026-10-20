@@ -1,0 +1,6 @@
+[package]
+name = "velox-core"
+description = "Hardware-agnostic contracts: device profiles, Backend trait, memory planner, model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

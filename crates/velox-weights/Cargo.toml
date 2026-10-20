@@ -1,0 +1,9 @@
+[package]
+name = "velox-weights"
+description = "Weight containers: velox .vi (native) and ninfer .ninfer v3 (import)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true

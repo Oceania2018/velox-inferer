@@ -1,0 +1,20 @@
+# The hardware variant. This is the ONLY crate a hardware branch (rtx-5090, rtx-5060-ti,
+# rtx-4090, ...) changes. Keep this manifest identical across branches so that merging main
+# never conflicts here: branches add sources under src/ and kernels/, not dependencies.
+[package]
+name = "velox-variant"
+description = "Hardware variant selected by the checked-out branch (main: generic portable kernels)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[features]
+cuda = ["dep:velox-cuda"]
+
+[dependencies]
+velox-core.workspace = true
+velox-cuda = { workspace = true, optional = true }
+
+[build-dependencies]
+velox-build.workspace = true

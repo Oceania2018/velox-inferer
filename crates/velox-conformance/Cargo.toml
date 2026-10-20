@@ -1,0 +1,15 @@
+[package]
+name = "velox-conformance"
+description = "Conformance suite: every backend/variant is checked against the CPU oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+cuda = ["dep:velox-cuda", "velox-variant/cuda"]
+
+[dependencies]
+velox-core.workspace = true
+velox-cpu.workspace = true
+velox-variant.workspace = true
+velox-cuda = { workspace = true, optional = true }

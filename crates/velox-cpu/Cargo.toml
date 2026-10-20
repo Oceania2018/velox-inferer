@@ -1,0 +1,9 @@
+[package]
+name = "velox-cpu"
+description = "CPU reference backend; the numerical oracle for every other backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velox-core.workspace = true

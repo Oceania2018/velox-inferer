@@ -1,0 +1,6 @@
+[package]
+name = "velox-build"
+description = "build.rs helper: compiles .cu sources with nvcc into a static library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
