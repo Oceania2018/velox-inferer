@@ -1,8 +1,126 @@
 //! Shared shape validation. Every backend calls these before launching work, so a malformed call
 //! fails identically on CPU, CUDA and future backends instead of reading out of bounds.
 
-use crate::backend::{AttnShape, RopeShape};
+use crate::backend::{
+    AttnShape, ConvShape, FullAttnShape, GdnShape, RopePosShape, RopeShape, WeightView,
+};
 use crate::error::{Error, Result};
+
+pub fn attention_full(q: usize, k: usize, v: usize, out: usize, s: &FullAttnShape) -> Result<()> {
+    if s.tokens == 0 || s.heads == 0 || s.head_dim == 0 {
+        return Err(Error::Shape(format!(
+            "attention_full dims must be non-zero: {s:?}"
+        )));
+    }
+    let len = product(&[s.tokens, s.heads, s.head_dim])?;
+    for (what, have) in [("q", q), ("k", k), ("v", v), ("out", out)] {
+        need(&format!("attention_full {what}"), have, len)?;
+    }
+    Ok(())
+}
+
+pub fn layer_norm(
+    x: usize,
+    weight: usize,
+    bias: usize,
+    y: usize,
+    rows: usize,
+    dim: usize,
+) -> Result<()> {
+    rms_norm(x, weight, y, rows, dim)?;
+    need("layer_norm bias", bias, dim)
+}
+
+pub fn add_bias(x: usize, bias: usize, rows: usize, dim: usize) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(Error::Shape(
+            "add_bias rows and dim must be non-zero".into(),
+        ));
+    }
+    need("add_bias x", x, product(&[rows, dim])?)?;
+    need("add_bias bias", bias, dim)
+}
+
+pub fn rope_positions(x: usize, positions: &[u32], s: &RopePosShape) -> Result<()> {
+    let pairs = s.rotary_dim / 2;
+    if s.rotary_dim == 0
+        || !s.rotary_dim.is_multiple_of(2)
+        || s.rotary_dim > s.head_dim
+        || s.axes == 0
+    {
+        return Err(Error::Shape(format!(
+            "rope_positions: bad rotary geometry {s:?}"
+        )));
+    }
+    if s.layout == crate::backend::RopeLayout::Blocked && !pairs.is_multiple_of(s.axes) {
+        return Err(Error::Shape(format!(
+            "rope_positions: {pairs} pairs do not split into {} axes",
+            s.axes
+        )));
+    }
+    if positions.len() != s.axes * s.tokens {
+        return Err(Error::Shape(format!(
+            "rope_positions: {} positions for {} axes x {} tokens",
+            positions.len(),
+            s.axes,
+            s.tokens
+        )));
+    }
+    need(
+        "rope_positions x",
+        x,
+        product(&[s.tokens, s.heads, s.head_dim])?,
+    )
+}
+
+/// A weight view against its buffer (`buf_slots` f32 slots): layout shape rules, row range, and
+/// that the buffer holds the parent's full encoded payload.
+pub fn weight<B>(w: &WeightView<'_, B>, buf_slots: usize) -> Result<()> {
+    w.format.check_shape(w.parent_rows, w.k)?;
+    if w.rows == 0 || w.row_begin + w.rows > w.parent_rows {
+        return Err(Error::Shape(format!(
+            "weight rows {}+{} outside parent of {} rows",
+            w.row_begin, w.rows, w.parent_rows
+        )));
+    }
+    let bytes = w.format.payload_bytes(w.parent_rows, w.k);
+    need(
+        &format!("{} weight", w.format.name()),
+        buf_slots,
+        bytes.div_ceil(4),
+    )
+}
+
+pub fn linear<B>(
+    x: usize,
+    w: &WeightView<'_, B>,
+    w_slots: usize,
+    y: usize,
+    m: usize,
+) -> Result<()> {
+    if m == 0 {
+        return Err(Error::Shape("linear m must be non-zero".into()));
+    }
+    weight(w, w_slots)?;
+    need("linear x", x, product(&[m, w.k])?)?;
+    need("linear y", y, product(&[m, w.rows])?)
+}
+
+pub fn embed<B>(
+    ids: &[u32],
+    table: &WeightView<'_, B>,
+    table_slots: usize,
+    out: usize,
+) -> Result<()> {
+    weight(table, table_slots)?;
+    if let Some(&bad) = ids.iter().find(|&&i| i as usize >= table.rows) {
+        return Err(Error::Shape(format!(
+            "token id {bad} outside vocabulary of {}",
+            table.rows
+        )));
+    }
+    need("embed out", out, product(&[ids.len(), table.k])?)
+}
 
 fn need(what: &str, have: usize, required: usize) -> Result<()> {
     if have < required {
@@ -43,13 +161,54 @@ pub fn rms_norm(x: usize, weight: usize, y: usize, rows: usize, dim: usize) -> R
 }
 
 pub fn rope(x: usize, s: &RopeShape) -> Result<()> {
-    if s.head_dim == 0 || !s.head_dim.is_multiple_of(2) {
+    if s.rotary_dim == 0 || !s.rotary_dim.is_multiple_of(2) || s.rotary_dim > s.head_dim {
         return Err(Error::Shape(format!(
-            "rope head_dim must be even and non-zero, got {}",
-            s.head_dim
+            "rope rotary_dim must be even, non-zero and <= head_dim {}, got {}",
+            s.head_dim, s.rotary_dim
         )));
     }
     need("rope x", x, product(&[s.tokens, s.heads, s.head_dim])?)
+}
+
+pub fn conv1d(x: usize, weight: usize, state: usize, out: usize, s: &ConvShape) -> Result<()> {
+    if s.tokens == 0 || s.channels == 0 || s.width < 2 {
+        return Err(Error::Shape(format!(
+            "conv1d needs tokens, channels > 0 and width >= 2: {s:?}"
+        )));
+    }
+    let rows = product(&[s.tokens, s.channels])?;
+    need("conv1d x", x, rows)?;
+    need("conv1d weight", weight, product(&[s.width, s.channels])?)?;
+    need("conv1d state", state, product(&[s.width - 1, s.channels])?)?;
+    need("conv1d out", out, rows)
+}
+
+pub fn gdn(
+    qkv: usize,
+    ab: usize,
+    a_log: usize,
+    dt_bias: usize,
+    state: usize,
+    out: usize,
+    s: &GdnShape,
+) -> Result<()> {
+    if s.tokens == 0 || s.k_heads == 0 || s.v_heads == 0 || s.k_dim == 0 || s.v_dim == 0 {
+        return Err(Error::Shape(format!(
+            "gated_delta_net dims must be non-zero: {s:?}"
+        )));
+    }
+    if !s.v_heads.is_multiple_of(s.k_heads) {
+        return Err(Error::Shape(format!(
+            "v_heads {} not divisible by k_heads {}",
+            s.v_heads, s.k_heads
+        )));
+    }
+    need("gdn qkv", qkv, product(&[s.tokens, s.qkv_width()])?)?;
+    need("gdn ab", ab, product(&[s.tokens, 2 * s.v_heads])?)?;
+    need("gdn a_log", a_log, s.v_heads)?;
+    need("gdn dt_bias", dt_bias, s.v_heads)?;
+    need("gdn state", state, product(&[s.v_heads, s.v_dim, s.k_dim])?)?;
+    need("gdn out", out, product(&[s.tokens, s.v_heads, s.v_dim])?)
 }
 
 pub fn elementwise(what: &str, lens: &[usize], len: usize) -> Result<()> {
@@ -59,8 +218,17 @@ pub fn elementwise(what: &str, lens: &[usize], len: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn copy(src: usize, dst: usize, dst_offset: usize, len: usize) -> Result<()> {
-    need("copy src", src, len)?;
+pub fn copy(
+    src: usize,
+    src_offset: usize,
+    dst: usize,
+    dst_offset: usize,
+    len: usize,
+) -> Result<()> {
+    let src_end = src_offset
+        .checked_add(len)
+        .ok_or_else(|| Error::Shape("copy range overflows".into()))?;
+    need("copy src", src, src_end)?;
     let end = dst_offset
         .checked_add(len)
         .ok_or_else(|| Error::Shape("copy range overflows".into()))?;
@@ -117,8 +285,10 @@ mod tests {
 
     #[test]
     fn copy_checks_destination_end() {
-        assert!(copy(4, 10, 6, 4).is_ok());
-        assert!(copy(4, 10, 7, 4).is_err());
-        assert!(copy(4, 10, usize::MAX, 4).is_err());
+        assert!(copy(4, 0, 10, 6, 4).is_ok());
+        assert!(copy(4, 0, 10, 7, 4).is_err());
+        assert!(copy(4, 0, 10, usize::MAX, 4).is_err());
+        assert!(copy(6, 2, 10, 0, 4).is_ok());
+        assert!(copy(6, 3, 10, 0, 4).is_err());
     }
 }

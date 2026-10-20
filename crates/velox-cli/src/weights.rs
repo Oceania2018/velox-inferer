@@ -67,7 +67,33 @@ pub fn inspect(a: &Args) -> Result<ExitCode> {
         println!("  {key:<48} {n:>5} objects {:>9.3} GB", gb(bytes));
     }
     println!("structure  ok");
+    if a.parse("uses", false)? {
+        print_uses(&art)?;
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One line per use: parameter, its activation policy and the activation input divisor.
+fn print_uses(art: &Artifact) -> Result<()> {
+    let uses = art.directory["uses"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for u in &uses {
+        let param = u["parameter"].as_str().unwrap_or("?");
+        let policy = u["activation_policy"].as_str().unwrap_or("-");
+        let divisor = match u["auxiliaries"]["activation_input_divisor"]["object"].as_str() {
+            Some(id) => {
+                let b = art
+                    .read_object(id)
+                    .map_err(|e| Error::Config(e.to_string()))?;
+                format!("{}", f32::from_le_bytes(b[..4].try_into().unwrap()))
+            }
+            None => "-".into(),
+        };
+        println!("use  {param:<56} {policy:<10} {divisor}");
+    }
+    Ok(())
 }
 
 pub fn convert(a: &Args) -> Result<ExitCode> {
