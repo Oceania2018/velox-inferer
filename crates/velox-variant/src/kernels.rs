@@ -41,6 +41,17 @@ extern "C" {
         pos0: i32,
         scale: f32,
     ) -> i32;
+    fn velox_5090_linear_rowsplit(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        bits: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5090_linear_a8(
         x: *const f32,
         m: i32,
@@ -64,6 +75,10 @@ const GEMV_MAX_M: usize = 1;
 /// From this many query tokens attention uses the tensor-core prefill kernel; below it the exact
 /// split-KV kernel, which is bound by reading the cache anyway.
 const FLASH_MIN_TOKENS: usize = 16;
+
+/// From this many tokens groupwise-integer weights (vision tower, draft models) use the bf16
+/// tensor-core kernel; below it the exact portable path.
+const ROWSPLIT_MIN_M: usize = 64;
 
 pub struct Rtx5090Kernels;
 
@@ -150,6 +165,9 @@ impl CudaKernels for Rtx5090Kernels {
     }
 
     fn linear_act(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> ActQuant {
+        if m >= ROWSPLIT_MIN_M && w.format.row_split().is_some() {
+            return ActQuant::Bf16;
+        }
         if m <= GEMV_MAX_M {
             return ActQuant::Exact;
         }
@@ -181,6 +199,13 @@ impl CudaKernels for Rtx5090Kernels {
                 unsafe { velox_5090_linear_a8(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr()) },
                 "rtx5090 linear a8",
             ),
+            ActQuant::Bf16 => {
+                let bits = w.format.row_split().map_or(0, |r| r.bits as i32);
+                status(
+                    unsafe { velox_5090_linear_rowsplit(x.as_ptr(), mi, wp, pr, k, rb, rows, bits, y.as_mut_ptr()) },
+                    "rtx5090 linear rowsplit",
+                )
+            }
         }
     }
 }
