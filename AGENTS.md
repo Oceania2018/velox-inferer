@@ -6,8 +6,10 @@ velox-inferer is a Rust (host) + CUDA (kernels) inference framework for consumer
 [architecture](docs/architecture.md) and [branching](docs/branching.md) before structural changes.
 
 - main owns abstractions and everything shareable. Hardware branches (`rtx-5090-32g`,
-  `rtx-5090-24g`, `rtx-5060-ti`, `rtx-4090`) change **only**
-  `crates/velox-variant/{src,kernels}`; `scripts/check-branch-scope.sh` enforces it.
+  `rtx-5090-24g`, `rtx-5060-ti`, `rtx-4090`) change **only** `crates/velox-variant/{src,kernels}`,
+  and main **never** changes those, so merging main into a branch cannot conflict; if it ever
+  does, main wins (`scripts/sync-branches.sh`). `scripts/check-{main,branch}-scope.sh` and
+  `.githooks/pre-commit` (`git config core.hooksPath .githooks`) enforce it.
 - New ops land on main with a CPU reference, a portable kernel, a `CudaKernels` method that
   defaults to the portable kernel, and conformance cases. Branches then override.
 - Hardware branches add no dependencies. Dependencies are added on main only.
