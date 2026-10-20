@@ -8,7 +8,7 @@ use velox_core::backend::{
 use velox_core::check::{self, to_i32};
 use velox_core::{Result, WeightFormat};
 
-use crate::{dtod, status, upload_raw, CudaBuffer};
+use crate::{dtod, stage, status, CudaBuffer};
 
 extern "C" {
     fn velox_portable_matmul(
@@ -160,12 +160,12 @@ pub fn embed(ids: &[u32], table: &WeightView<'_, CudaBuffer>, out: &mut CudaBuff
         return Ok(());
     }
     let id_bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
-    let dev_ids = upload_raw(&id_bytes)?;
+    let dev_ids = stage(&id_bytes)?;
     // SAFETY: ids are in range (checked) and out holds ids.len() rows.
     status(
         unsafe {
             velox_portable_embed(
-                dev_ids.as_ptr().cast(),
+                dev_ids.cast(),
                 to_i32("ids", ids.len())?,
                 table.buf.as_ptr().cast(),
                 format_code(table.format),
@@ -482,13 +482,13 @@ pub fn gelu(x: &mut CudaBuffer, len: usize, kind: GeluKind) -> Result<()> {
 pub fn rope_positions(x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) -> Result<()> {
     check::rope_positions(x.len(), positions, &s)?;
     let bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
-    let pos = upload_raw(&bytes)?;
+    let pos = stage(&bytes)?;
     // SAFETY: buffer extents validated above; pos holds axes * tokens u32 values.
     status(
         unsafe {
             velox_portable_rope_positions(
                 x.as_mut_ptr(),
-                pos.as_ptr().cast(),
+                pos.cast(),
                 to_i32("tokens", s.tokens)?,
                 to_i32("heads", s.heads)?,
                 to_i32("head_dim", s.head_dim)?,
