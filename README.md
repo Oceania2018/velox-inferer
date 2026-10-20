@@ -15,7 +15,7 @@ branch, and AMD support is planned.
 |---|---|
 | `main` | any supported GPU, portable kernels |
 | `rtx-5090-32g` | RTX 5090 (32 GB desktop) |
-| `rtx-5090-laptop-24g` | RTX 5090 Laptop GPU (24 GB) |
+| `rtx-5090-24g` | RTX 5090 Laptop GPU (24 GB) |
 | `rtx-5060-ti` | RTX 5060 Ti 16 GB / 8 GB |
 | `rtx-4090` | RTX 4090 (24 GB) |
 
