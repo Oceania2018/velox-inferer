@@ -186,6 +186,7 @@ impl<B: Backend> Qwen35Vision<B> {
             k: d.k,
             row_begin: d.row_begin,
             rows: d.rows,
+            act: d.act,
         }
     }
 

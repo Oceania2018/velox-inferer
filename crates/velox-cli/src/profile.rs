@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use velox_core::backend::{
-    AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind,
-    RopePosShape, RopeShape, WeightView,
+    ActQuant, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind,
+    NormKind, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{DeviceProfile, Op, Result};
 
@@ -116,6 +116,9 @@ impl<B: Backend> Backend for Profiled<B> {
             if m == 1 { "m=1" } else { "m>1" }
         );
         self.time(&name, || self.inner.linear(x, w, y, m))
+    }
+    fn linear_act(&self, w: &WeightView<'_, B::Buffer>, m: usize) -> ActQuant {
+        self.inner.linear_act(w, m)
     }
     fn embed(
         &self,

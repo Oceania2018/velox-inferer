@@ -99,3 +99,53 @@ pub fn run<B: Backend>(b: &B, c: &Config) -> Result<()> {
     }
     Ok(())
 }
+
+/// `velox bench-linear`: one `linear` at a real model shape with random weights in a stored
+/// format, timed per token count. Reports achieved weight bandwidth and tensor throughput.
+pub struct LinearConfig {
+    pub format: velox_core::WeightFormat,
+    pub n: usize,
+    pub k: usize,
+    pub ms: Vec<usize>,
+    pub act: velox_core::ActPolicy,
+    pub iters: usize,
+}
+
+pub fn run_linear<B: Backend>(b: &B, c: &LinearConfig) -> Result<()> {
+    let mut rng = velox_core::rng::Rng::new(11);
+    let bytes = velox_conformance::random_weight(&mut rng, c.format, c.n, c.k);
+    let wd = b.upload_bytes(&bytes)?;
+    let view = velox_core::WeightView::full(&wd, c.format, c.n, c.k).with_act(c.act);
+    println!(
+        "linear {} [{}, {}]  {:.1} MB  on {}",
+        c.format.name(),
+        c.n,
+        c.k,
+        bytes.len() as f64 / 1e6,
+        b.describe()
+    );
+    for &m in &c.ms {
+        let x = b.upload(&rng.vec(m * c.k, 1.0))?;
+        let mut y = b.alloc(m * c.n)?;
+        for _ in 0..3 {
+            b.linear(&x, &view, &mut y, m)?;
+        }
+        b.synchronize()?;
+        let mut samples = Vec::with_capacity(c.iters);
+        for _ in 0..c.iters {
+            let t0 = Instant::now();
+            b.linear(&x, &view, &mut y, m)?;
+            b.synchronize()?;
+            samples.push(t0.elapsed().as_secs_f64());
+        }
+        let t = median(samples);
+        println!(
+            "  m={m:<5} {:>9.1} us  {:>7.0} GB/s weights  {:>7.1} TFLOPS  act {:?}",
+            t * 1e6,
+            bytes.len() as f64 / t / 1e9,
+            2.0 * (m * c.n * c.k) as f64 / t / 1e12,
+            b.linear_act(&view, m)
+        );
+    }
+    Ok(())
+}

@@ -6,11 +6,12 @@
 //! must fall back correctly.
 
 use velox_core::backend::{
-    AttnShape, Backend, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopeLayout,
-    RopePosShape, RopeShape, WeightView,
+    ActPolicy, ActQuant, AttnShape, Backend, ConvShape, FullAttnShape, GdnShape, GeluKind,
+    NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::model::{HostLayer, Stack};
+use velox_core::quant::quantize_activations;
 use velox_core::rng::Rng;
 use velox_core::{ModelSpec, Op, Result};
 use velox_cpu::CpuBackend;
@@ -206,28 +207,65 @@ impl<B: Backend> Suite<'_, B> {
         rows: usize,
         m: usize,
     ) -> Result<()> {
+        self.linear_act(fmt, n, k, begin, rows, m, ActPolicy::A16Only)
+    }
+
+    /// `linear` under an activation policy. The reference rounds the input exactly as the backend
+    /// reports it does (`linear_act`), then multiplies exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_act(
+        &mut self,
+        fmt: WeightFormat,
+        n: usize,
+        k: usize,
+        begin: usize,
+        rows: usize,
+        m: usize,
+        policy: ActPolicy,
+    ) -> Result<()> {
         let bytes = random_weight(&mut self.rng, fmt, n, k);
         let x = self.rng.vec(m * k, 1.0);
+        let wd = self.b.upload_bytes(&bytes)?;
+        let view = WeightView::full(&wd, fmt, n, k)
+            .rows(begin, rows)
+            .with_act(policy);
+        let act = self.b.linear_act(&view, m);
+        let permitted = match (act, policy) {
+            (ActQuant::Exact, _) => true,
+            (ActQuant::Fp8Row, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. }) => true,
+            (ActQuant::Nvfp4 { divisor: a }, ActPolicy::AllowA4 { divisor: b }) => a == b,
+            _ => false,
+        };
+        let mut xq = x.clone();
+        quantize_activations(&mut xq, k, act);
         let wc = CpuBackend.upload_bytes(&bytes)?;
         let mut want = vec![0.0; m * rows];
         CpuBackend.linear(
-            &x,
+            &xq,
             &WeightView::full(&wc, fmt, n, k).rows(begin, rows),
             &mut want,
             m,
         )?;
-        let wd = self.b.upload_bytes(&bytes)?;
         let xd = self.b.upload(&x)?;
         let mut yd = self.b.alloc(m * rows)?;
-        self.b.linear(
-            &xd,
-            &WeightView::full(&wd, fmt, n, k).rows(begin, rows),
-            &mut yd,
-            m,
-        )?;
+        self.b.linear(&xd, &view, &mut yd, m)?;
         let got = fetch(self.b, &yd, m * rows)?;
-        let name = format!("linear {} [{n},{k}] rows {begin}+{rows} m={m}", fmt.name());
-        self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+        let tag = match act {
+            ActQuant::Exact => "",
+            ActQuant::Fp8Row => " a8",
+            ActQuant::Nvfp4 { .. } => " a4",
+        };
+        let name = format!(
+            "linear {} [{n},{k}] rows {begin}+{rows} m={m}{tag}",
+            fmt.name()
+        );
+        if permitted {
+            self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+        } else {
+            // Rounding the policy forbids fails whatever the numbers say.
+            let name = name + " (rounding not permitted)";
+            self.record(name, Some(Op::Linear), &[f32::NAN], &[0.0], 0.0);
+        }
         Ok(())
     }
 
@@ -577,6 +615,54 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 16)?;
     s.linear(WeightFormat::Nvfp4, 256, 128, 0, 256, 1)?;
     s.linear(WeightFormat::Nvfp4, 384, 192, 128, 200, 5)?;
+    // Activation policies: tuned kernels may round inputs to FP8 / NVFP4 where the artifact allows.
+    // Shapes cover MMA tile edges in tokens, rows and K, and row views into a fused parent.
+    let a4 = ActPolicy::AllowA4 { divisor: 600.0 };
+    for (n, k, begin, rows, m) in [
+        (256, 512, 0, 256, 16),
+        (384, 640, 128, 256, 37),
+        (512, 1024, 0, 512, 130),
+        (256, 256, 128, 128, 300),
+        (128, 64, 0, 128, 1),
+    ] {
+        s.linear_act(WeightFormat::Nvfp4, n, k, begin, rows, m, a4)?;
+    }
+    for (n, k, begin, rows, m) in [
+        (256, 512, 0, 256, 16),
+        (200, 320, 17, 150, 70),
+        (512, 1024, 64, 384, 130),
+        (96, 300, 0, 96, 40),
+        (64, 128, 0, 64, 2),
+    ] {
+        s.linear_act(
+            WeightFormat::Fp8RowBf16,
+            n,
+            k,
+            begin,
+            rows,
+            m,
+            ActPolicy::AllowA8,
+        )?;
+    }
+    // A16-only views stay exact even where a kernel could round.
+    s.linear_act(
+        WeightFormat::Nvfp4,
+        256,
+        512,
+        0,
+        256,
+        64,
+        ActPolicy::A16Only,
+    )?;
+    s.linear_act(
+        WeightFormat::Fp8RowBf16,
+        256,
+        512,
+        0,
+        256,
+        64,
+        ActPolicy::A16Only,
+    )?;
     // Groupwise integer formats; K not a multiple of 128 exercises physical padding.
     for f in [
         WeightFormat::Q4G64,

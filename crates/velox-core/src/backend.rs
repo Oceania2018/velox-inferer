@@ -166,6 +166,45 @@ impl GdnShape {
     }
 }
 
+/// The lowest activation precision a weight's use permits (artifact `uses[].activation_policy`).
+/// The model author decides this per projection; a kernel may round activations no further.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ActPolicy {
+    /// Activations stay exact (f32 here, BF16 in the source model).
+    #[default]
+    A16Only,
+    /// Per-token E4M3 activations are allowed.
+    AllowA8,
+    /// NVFP4 activations are allowed with this static input divisor.
+    AllowA4 { divisor: f32 },
+}
+
+impl ActPolicy {
+    /// The stricter of two policies, for a view that serves several uses.
+    pub fn meet(self, other: ActPolicy) -> ActPolicy {
+        use ActPolicy::*;
+        match (self, other) {
+            (A16Only, _) | (_, A16Only) => A16Only,
+            (AllowA4 { divisor: a }, AllowA4 { divisor: b }) if a == b => self,
+            _ => AllowA8,
+        }
+    }
+}
+
+/// How a `linear` kernel rounds its input activations before the product. The CPU oracle applies
+/// the same rounding ([`crate::quant::quantize_activations`]), so low-precision kernels are still
+/// checked against an exact reference.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ActQuant {
+    Exact,
+    /// Per row: `scale = amax / 448`, codes `e4m3(x * (1 / scale))` (RNE, saturating).
+    Fp8Row,
+    /// Per 16 elements: `s = e4m3(divisor * amax / 6)`, codes `e2m1(x * divisor / s)`.
+    Nvfp4 {
+        divisor: f32,
+    },
+}
+
 /// Rows `[row_begin, row_begin + rows)` of a stored weight matrix `[parent_rows, k]`, kept in its
 /// encoded form. Views keep the parent geometry because plane offsets and NVFP4 scale swizzles
 /// depend on it.
@@ -176,6 +215,7 @@ pub struct WeightView<'a, Buf> {
     pub k: usize,
     pub row_begin: usize,
     pub rows: usize,
+    pub act: ActPolicy,
 }
 
 impl<Buf> Clone for WeightView<'_, Buf> {
@@ -196,7 +236,12 @@ impl<'a, Buf> WeightView<'a, Buf> {
             k,
             row_begin: 0,
             rows: n,
+            act: ActPolicy::A16Only,
         }
+    }
+
+    pub fn with_act(self, act: ActPolicy) -> Self {
+        WeightView { act, ..self }
     }
 
     /// Rows `[begin, begin + rows)` of this view.
@@ -243,6 +288,11 @@ pub trait Backend {
         y: &mut Self::Buffer,
         m: usize,
     ) -> Result<()>;
+    /// The activation rounding `linear` applies to this view at `m` rows: `Exact`, or a rounding
+    /// that `w.act` permits.
+    fn linear_act(&self, _w: &WeightView<'_, Self::Buffer>, _m: usize) -> ActQuant {
+        ActQuant::Exact
+    }
     /// Embedding lookup: `out[t, :] = W[ids[t], :]` decoded, for a `[vocab, k]` table view.
     fn embed(
         &self,

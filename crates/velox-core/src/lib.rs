@@ -13,12 +13,13 @@ pub mod model;
 pub mod op;
 pub mod plan;
 pub mod profile;
+pub mod quant;
 pub mod rng;
 pub mod variant;
 
 pub use backend::{
-    AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind,
-    RopeLayout, RopePosShape, RopeShape, WeightView,
+    ActPolicy, ActQuant, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape,
+    GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 pub use error::{Error, Result};
 pub use format::WeightFormat;

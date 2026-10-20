@@ -332,11 +332,155 @@ __global__ void linear_gemv_kernel(const float* __restrict__ x, WDesc w, long lo
     }
 }
 
+// Vectorized small-m linear for FP8-row and NVFP4. Each warp owns R adjacent weight rows and
+// streams them in 16-byte loads (16 FP8 or 32 NVFP4 codes per lane per row), so one x load feeds
+// R rows and several loads per lane are in flight. Requires 16-byte aligned rows: k % 16 == 0
+// for FP8; NVFP4 always qualifies (k % 64 == 0).
+__device__ __forceinline__ uint4 velox_ld_stream(const void* p) {
+    return __ldg(reinterpret_cast<const uint4*>(p));
+}
+
+// E4M3FN byte -> f32 by moving sign, exponent and mantissa into place and rebiasing (2^120 is
+// exact, and covers the subnormals). NaN codes never occur in valid weights.
+__device__ __forceinline__ float e4m3_bits(uint32_t word, int byte) {
+    const uint32_t b = (word >> (8 * byte)) & 0xffu;
+    return __uint_as_float(((b & 0x80u) << 24) | ((b & 0x7fu) << 20)) * 0x1p120f;
+}
+
+// The two E2M1 codes of the low byte of `t`, times 2^-14: each nibble's magnitude bits go to f16
+// bits [11:9] and its sign to bit 15, so exponent e becomes 2^(e-15) and e = 0 a subnormal
+// m * 2^-15, i.e. code value * 2^-14 exactly. Callers fold 2^14 into the block scale.
+__device__ __forceinline__ float2 e2m1x2_scaled(uint32_t t) {
+    const uint32_t h = ((t & 0x7u) << 9) | ((t & 0x8u) << 12) | ((t & 0x70u) << 21) | ((t & 0x80u) << 24);
+    return __half22float2(*reinterpret_cast<const __half2*>(&h));
+}
+
+template <int FMT, int R, int M>
+__global__ void __launch_bounds__(256)
+linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m,
+                       float* __restrict__ y) {
+    const int warp = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    const int lane = threadIdx.x % VELOX_WARP;
+    const int r0 = warp * R;
+    if (r0 >= rows) return;
+    const long long k = w.k;
+    const long long row_bytes = FMT == VELOX_FMT_NVFP4 ? k / 2 : k;
+    const long long chunks = row_bytes / 16;
+    constexpr int kElems = FMT == VELOX_FMT_NVFP4 ? 32 : 16;
+    const uint8_t* rp[R];
+    bool live[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        live[r] = r0 + r < rows;
+        rp[r] = w.base + (row_begin + (live[r] ? r0 + r : r0)) * row_bytes;
+    }
+    float acc[R][M];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int i = 0; i < M; ++i) acc[r][i] = 0.0f;
+    const long long scale_plane = align256(w.n * k / 2);
+    const uint8_t* sbase[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) sbase[r] = w.base + scale_plane + nvfp4_scale_offset(row_begin + r0 + (live[r] ? r : 0), 0, k);
+
+    for (long long c = lane; c < chunks; c += VELOX_WARP) {
+        uint4 wv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) wv[r] = velox_ld_stream(rp[r] + c * 16);
+        float sc[R][2];
+        if (FMT == VELOX_FMT_NVFP4) {
+            // Groups 2c and 2c+1 are adjacent bytes of one 4-byte scale word: 512-byte tiles per
+            // 64 columns, so chunk c sits at (c / 2) * 512 + (c % 2) * 2 past the row's base.
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint32_t s2 = *reinterpret_cast<const uint16_t*>(sbase[r] + (c >> 1) * 512 + (c & 1) * 2);
+                sc[r][0] = e4m3_bits(s2, 0) * 16384.0f;  // e2m1x2_scaled is 2^-14 times the code
+                sc[r][1] = e4m3_bits(s2, 1) * 16384.0f;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < M; ++i) {
+            if (i >= m) break;
+            const float4* xp = reinterpret_cast<const float4*>(x + static_cast<size_t>(i) * k + c * kElems);
+            float xv[kElems];
+#pragma unroll
+            for (int q = 0; q < kElems / 4; ++q) {
+                const float4 t = __ldg(xp + q);
+                xv[4 * q] = t.x, xv[4 * q + 1] = t.y, xv[4 * q + 2] = t.z, xv[4 * q + 3] = t.w;
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint32_t words[4] = {wv[r].x, wv[r].y, wv[r].z, wv[r].w};
+                if (FMT == VELOX_FMT_NVFP4) {
+                    float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < 16; ++b) {
+                        const float2 v = e2m1x2_scaled(words[b / 4] >> (8 * (b % 4)));
+                        const float s = v.x * xv[2 * b] + v.y * xv[2 * b + 1];
+                        if (b < 8) s0 += s; else s1 += s;
+                    }
+                    acc[r][i] += s0 * sc[r][0] + s1 * sc[r][1];
+                } else {
+                    float s = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < 16; ++b) s += e4m3_bits(words[b / 4], b % 4) * xv[b];
+                    acc[r][i] += s;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (!live[r]) continue;
+        const long long row = row_begin + r0 + r;
+        float post;
+        if (FMT == VELOX_FMT_NVFP4) {
+            post = 1.0f / *reinterpret_cast<const float*>(w.base + scale_plane + w.n * k / 16);
+        } else {
+            const uint8_t* sp = w.base + align256(w.n * k) + 2 * row;
+            post = bf16_to_f32(static_cast<uint16_t>(sp[0] | (sp[1] << 8)));
+        }
+#pragma unroll
+        for (int i = 0; i < M; ++i) {
+            const float s = velox_warp_sum(acc[r][i]);
+            if (lane == 0 && i < m) y[static_cast<size_t>(i) * rows + r0 + r] = s * post;
+        }
+    }
+}
+
+template <int FMT, int M>
+int launch_gemv_vec(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
+    constexpr int kWarps = 8;
+    // Prefer more rows per warp (more x reuse) while keeping enough warps to fill the GPU.
+    const int r = rows >= 4 * 4096 ? 4 : rows >= 2 * 2048 ? 2 : 1;
+    const int warps = (rows + r - 1) / r;
+    const dim3 grid((warps + kWarps - 1) / kWarps);
+    if (r == 4) linear_gemv_vec_kernel<FMT, 4, M><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else if (r == 2) linear_gemv_vec_kernel<FMT, 2, M><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else linear_gemv_vec_kernel<FMT, 1, M><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    return velox_launch_status();
+}
+
+template <int FMT>
+int launch_gemv_vec_m(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
+    if (m == 1) return launch_gemv_vec<FMT, 1>(x, d, row_begin, rows, m, y);
+    if (m == 2) return launch_gemv_vec<FMT, 2>(x, d, row_begin, rows, m, y);
+    if (m <= 4) return launch_gemv_vec<FMT, 4>(x, d, row_begin, rows, m, y);
+    return launch_gemv_vec<FMT, 8>(x, d, row_begin, rows, m, y);
+}
+
 }  // namespace
 
 VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format, long long n, long long k,
                                     long long row_begin, int rows, int m, float* y) {
     const WDesc d{w, format, n, k};
+    // x rows are read as float4, so k must keep them 16-byte aligned too.
+    if (m <= kGemvMaxM && k % 16 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0) {
+        if (format == VELOX_FMT_NVFP4) return launch_gemv_vec_m<VELOX_FMT_NVFP4>(x, d, row_begin, rows, m, y);
+        if (format == VELOX_FMT_FP8_ROW_BF16)
+            return launch_gemv_vec_m<VELOX_FMT_FP8_ROW_BF16>(x, d, row_begin, rows, m, y);
+    }
     if (m <= kGemvMaxM && (format == VELOX_FMT_FP8_ROW_BF16 || format == VELOX_FMT_NVFP4)) {
         constexpr int kWarps = 8;
         const dim3 grid((rows + kWarps - 1) / kWarps);

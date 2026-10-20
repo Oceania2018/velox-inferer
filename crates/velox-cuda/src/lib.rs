@@ -8,8 +8,8 @@ use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
 use velox_core::backend::{
-    AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind,
-    RopePosShape, RopeShape, WeightView,
+    ActQuant, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind,
+    NormKind, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{check, profile, DeviceProfile, Error, GpuArch, Op, Result, VariantInfo};
 
@@ -261,6 +261,11 @@ pub trait CudaKernels: Send + Sync {
         m: usize,
     ) -> Result<()> {
         portable::linear(x, w, y, m)
+    }
+
+    /// The activation rounding `linear` applies; see [`Backend::linear_act`].
+    fn linear_act(&self, _w: &WeightView<'_, CudaBuffer>, _m: usize) -> ActQuant {
+        ActQuant::Exact
     }
 
     fn embed(
@@ -535,6 +540,10 @@ impl Backend for CudaBackend {
     ) -> Result<()> {
         check::linear(x.len, w, w.buf.len, y.len, m)?;
         self.kernels.linear(x, w, y, m)
+    }
+
+    fn linear_act(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> ActQuant {
+        self.kernels.linear_act(w, m)
     }
 
     fn embed(

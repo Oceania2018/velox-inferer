@@ -41,6 +41,12 @@ COMMANDS:
       --context <n>         cached tokens before measuring (default 1024)
       --prefill <n>         prefill chunk to time (default 128)
       --iters <n>           timed iterations (default 20)
+  bench-linear            Time one linear at a model shape with random stored weights
+      --format <name>       nvfp4 | fp8 | bf16 | q4 | q8 ... (default nvfp4)
+      --n <rows> --k <cols> default 17408 x 5120 (Qwen3.8 MLP gate)
+      --m <list>            token counts, comma separated (default 1,4,16,128,512)
+      --act <a16|a8|a4>     activation policy (default a16); --divisor <f> for a4 (default 500)
+      --iters <n>           timed iterations (default 20)
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path>
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
@@ -94,6 +100,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("plan") => plan_cmd(a),
         Some("selftest") => selftest(a),
         Some("bench") => bench_cmd(a),
+        Some("bench-linear") => bench_linear(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
         Some("generate") => generate::run(a),
@@ -281,6 +288,51 @@ fn selftest(a: &Args) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+fn bench_linear(a: &Args) -> Result<ExitCode> {
+    use velox_core::{ActPolicy, Error, WeightFormat};
+    let format = match a.get("format").unwrap_or("nvfp4") {
+        "nvfp4" => WeightFormat::Nvfp4,
+        "fp8" => WeightFormat::Fp8RowBf16,
+        "bf16" => WeightFormat::Bf16,
+        "f32" => WeightFormat::F32,
+        "q4" => WeightFormat::Q4G64,
+        "q5" => WeightFormat::Q5G64,
+        "q6" => WeightFormat::Q6G64,
+        "q8" => WeightFormat::Q8G32,
+        other => return Err(Error::Config(format!("unknown --format {other}"))),
+    };
+    let act = match a.get("act").unwrap_or("a16") {
+        "a16" => ActPolicy::A16Only,
+        "a8" => ActPolicy::AllowA8,
+        "a4" => ActPolicy::AllowA4 {
+            divisor: a.parse("divisor", 500.0)?,
+        },
+        other => return Err(Error::Config(format!("unknown --act {other}"))),
+    };
+    let ms = a
+        .get("m")
+        .unwrap_or("1,4,16,128,512")
+        .split(',')
+        .map(|s| s.trim().parse::<usize>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| Error::Config("--m takes comma-separated integers".into()))?;
+    let cfg = bench::LinearConfig {
+        format,
+        n: a.parse("n", 17408)?,
+        k: a.parse("k", 5120)?,
+        ms,
+        act,
+        iters: a.parse("iters", 20)?,
+    };
+    let sel = select::backend(a)?;
+    match &sel {
+        Selected::Cpu(b) => bench::run_linear(b, &cfg)?,
+        #[cfg(feature = "cuda")]
+        Selected::Cuda(b) => bench::run_linear(b, &cfg)?,
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn bench_cmd(a: &Args) -> Result<ExitCode> {

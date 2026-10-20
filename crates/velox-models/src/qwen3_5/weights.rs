@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use velox_core::backend::{Backend, WeightView};
+use velox_core::backend::{ActPolicy, Backend, WeightView};
 use velox_core::format::{decode_rows, WeightFormat};
 use velox_core::{Error, Result};
 use velox_weights::{Artifact, ObjectKind};
@@ -15,7 +15,7 @@ use velox_weights::{Artifact, ObjectKind};
 use super::config::{LayerKind, TextConfig};
 
 /// A row view into an uploaded parent object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WDesc {
     pub parent: usize,
     pub format: WeightFormat,
@@ -23,6 +23,8 @@ pub struct WDesc {
     pub k: usize,
     pub row_begin: usize,
     pub rows: usize,
+    /// Activation rounding the artifact permits for this projection.
+    pub act: ActPolicy,
 }
 
 pub enum Mixer {
@@ -78,6 +80,7 @@ impl<B: Backend> TextWeights<B> {
             k: d.k,
             row_begin: d.row_begin,
             rows: d.rows,
+            act: d.act,
         }
     }
 
@@ -92,14 +95,7 @@ impl<B: Backend> TextWeights<B> {
         cfg: &TextConfig,
         mut progress: impl FnMut(&str),
     ) -> Result<Self> {
-        let mut l = Loader::<B> {
-            b,
-            art,
-            parents: Vec::new(),
-            index: HashMap::new(),
-            params: Vec::new(),
-            bytes: 0,
-        };
+        let mut l = Loader::new(b, art);
         let embed = l.matrix("text/token_embedding")?;
         let head = l.matrix("text/output_head")?;
         let final_norm = l.param("text/final_norm", cfg.hidden)?;
@@ -199,12 +195,44 @@ pub(crate) struct Loader<'a, B: Backend> {
     art: &'a Artifact,
     parents: Vec<B::Buffer>,
     index: HashMap<String, (usize, WeightFormat, usize, usize)>,
+    /// Activation policy per logical parameter, from the artifact's `uses`.
+    policies: HashMap<String, ActPolicy>,
     params: Vec<B::Buffer>,
     bytes: u64,
 }
 
 fn werr(e: velox_weights::Error) -> Error {
     Error::Config(e.to_string())
+}
+
+/// Activation policy per parameter from the artifact's `uses` (`activation_policy` plus the
+/// `activation_input_divisor` auxiliary). A parameter with several uses gets the strictest; anything
+/// unreadable falls back to `A16Only`, which is always correct.
+fn read_policies(art: &Artifact) -> HashMap<String, ActPolicy> {
+    let mut out: HashMap<String, ActPolicy> = HashMap::new();
+    let uses = art.directory["uses"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for u in uses {
+        let Some(param) = u["parameter"].as_str() else {
+            continue;
+        };
+        let divisor = u["auxiliaries"]["activation_input_divisor"]["object"]
+            .as_str()
+            .and_then(|id| art.read_object(id).ok())
+            .and_then(|b| Some(f32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
+            .filter(|d| d.is_finite() && *d > 0.0);
+        let p = match (u["activation_policy"].as_str(), divisor) {
+            (Some("AllowA4"), Some(divisor)) => ActPolicy::AllowA4 { divisor },
+            (Some("AllowA4" | "AllowA8"), _) => ActPolicy::AllowA8,
+            _ => ActPolicy::A16Only,
+        };
+        out.entry(param.to_string())
+            .and_modify(|q| *q = q.meet(p))
+            .or_insert(p);
+    }
+    out
 }
 
 impl<'a, B: Backend> Loader<'a, B> {
@@ -306,6 +334,7 @@ impl<'a, B: Backend> Loader<'a, B> {
             k,
             row_begin,
             rows,
+            act: self.policy(name),
         })
     }
 
@@ -318,6 +347,7 @@ impl<'a, B: Backend> Loader<'a, B> {
                 None => d,
                 Some(a) if a.parent == d.parent && a.row_begin + a.rows == d.row_begin => WDesc {
                     rows: a.rows + d.rows,
+                    act: a.act.meet(d.act),
                     ..a
                 },
                 Some(_) => {
@@ -384,9 +414,15 @@ impl<'a, B: Backend> Loader<'a, B> {
             art,
             parents: Vec::new(),
             index: HashMap::new(),
+            policies: read_policies(art),
             params: Vec::new(),
             bytes: 0,
         }
+    }
+
+    /// The activation policy of `name`: the meet over its uses; `A16Only` when it has none.
+    fn policy(&self, name: &str) -> ActPolicy {
+        self.policies.get(name).copied().unwrap_or_default()
     }
 
     /// (parent buffers, parameter buffers, uploaded bytes).
