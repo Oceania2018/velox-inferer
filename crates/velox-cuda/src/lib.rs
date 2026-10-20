@@ -432,6 +432,30 @@ pub trait CudaKernels: Send + Sync {
     ) -> Result<()> {
         portable::concat_cols(a, b, out, rows, a_cols, b_cols)
     }
+
+    fn split_cols(
+        &self,
+        src: &CudaBuffer,
+        rows: usize,
+        src_cols: usize,
+        outs: &mut [(&mut CudaBuffer, usize, usize)],
+    ) -> Result<()> {
+        portable::split_cols(src, rows, src_cols, outs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn swiglu(
+        &self,
+        src: &CudaBuffer,
+        rows: usize,
+        src_cols: usize,
+        gate: usize,
+        up: usize,
+        width: usize,
+        out: &mut CudaBuffer,
+    ) -> Result<()> {
+        portable::swiglu(src, rows, src_cols, gate, up, width, out)
+    }
 }
 
 /// Every op on the portable kernels; the CUDA kernel set of the generic variant on main.
@@ -531,6 +555,36 @@ impl Backend for CudaBackend {
         check::concat_cols(a.len, b.len, out.len, rows, a_cols, b_cols)?;
         self.timed("concat_cols", || {
             self.kernels.concat_cols(a, b, out, rows, a_cols, b_cols)
+        })
+    }
+
+    fn split_cols(
+        &self,
+        src: &CudaBuffer,
+        rows: usize,
+        src_cols: usize,
+        outs: &mut [(&mut CudaBuffer, usize, usize)],
+    ) -> Result<()> {
+        self.timed("split_cols", || {
+            self.kernels.split_cols(src, rows, src_cols, outs)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn swiglu(
+        &self,
+        src: &CudaBuffer,
+        rows: usize,
+        src_cols: usize,
+        gate: usize,
+        up: usize,
+        width: usize,
+        out: &mut CudaBuffer,
+    ) -> Result<()> {
+        check::swiglu(src.len, rows, src_cols, gate, up, width, out.len)?;
+        self.timed("swiglu", || {
+            self.kernels
+                .swiglu(src, rows, src_cols, gate, up, width, out)
         })
     }
 

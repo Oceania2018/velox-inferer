@@ -342,3 +342,60 @@ VELOX_API int velox_portable_concat_cols(const float* a, const float* b, float* 
     concat_cols_kernel<<<velox_grid_1d(n, 256), 256>>>(a, b, out, rows, a_cols, b_cols);
     return velox_launch_status();
 }
+
+namespace {
+struct SplitOuts {
+    float* ptr[4];
+    int off[4];
+    int cols[4];
+    int n;
+};
+
+// One thread per source element; each element lands in at most one output.
+__global__ void split_cols_kernel(const float* __restrict__ src, long long rows, int src_cols, SplitOuts o) {
+    const long long n = rows * src_cols;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / src_cols;
+        const int c = static_cast<int>(i % src_cols);
+        for (int j = 0; j < o.n; ++j) {
+            if (c >= o.off[j] && c < o.off[j] + o.cols[j]) {
+                o.ptr[j][r * o.cols[j] + (c - o.off[j])] = src[i];
+                break;
+            }
+        }
+    }
+}
+
+__global__ void swiglu_kernel(const float* __restrict__ src, long long rows, int src_cols, int gate, int up, int width,
+                              float* __restrict__ out) {
+    const long long n = rows * width;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / width;
+        const int c = static_cast<int>(i % width);
+        const float g = src[r * src_cols + gate + c];
+        out[i] = g / (1.0f + expf(-g)) * src[r * src_cols + up + c];
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_split_cols(const float* src, long long rows, int src_cols, float* const* ptrs,
+                                        const int* offs, const int* cols, int n) {
+    if (n <= 0 || n > 4) return VELOX_ERR_UNSUPPORTED;
+    SplitOuts o{};
+    for (int j = 0; j < n; ++j) o.ptr[j] = ptrs[j], o.off[j] = offs[j], o.cols[j] = cols[j];
+    o.n = n;
+    const long long total = rows * src_cols;
+    if (total == 0) return 0;
+    split_cols_kernel<<<velox_grid_1d(total, 256), 256>>>(src, rows, src_cols, o);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_swiglu(const float* src, long long rows, int src_cols, int gate, int up, int width,
+                                    float* out) {
+    const long long n = rows * width;
+    if (n == 0) return 0;
+    swiglu_kernel<<<velox_grid_1d(n, 256), 256>>>(src, rows, src_cols, gate, up, width, out);
+    return velox_launch_status();
+}
