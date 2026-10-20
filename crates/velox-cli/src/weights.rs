@@ -67,7 +67,55 @@ pub fn inspect(a: &Args) -> Result<ExitCode> {
         println!("  {key:<48} {n:>5} objects {:>9.3} GB", gb(bytes));
     }
     println!("structure  ok");
+    if a.parse("uses", false)? {
+        print_uses(&art)?;
+    }
+    if let Some(prefix) = a.get("bindings") {
+        // Where each logical parameter lives: object, or parts (object + element range).
+        if let Some(b) = art.directory["bindings"].as_object() {
+            for (name, v) in b.iter().filter(|(n, _)| n.starts_with(prefix)) {
+                let id = v["object"]
+                    .as_str()
+                    .or_else(|| v["parts"][0]["object"].as_str());
+                let kind = id
+                    .and_then(|id| art.object(id))
+                    .map(|o| match &o.kind {
+                        ObjectKind::Tensor {
+                            shape,
+                            format,
+                            layout,
+                        } => format!("{format}/{layout} {shape:?}"),
+                        ObjectKind::Resource { encoding } => format!("resource {encoding}"),
+                    })
+                    .unwrap_or_default();
+                println!("binding  {name:<48} {v}  {kind}");
+            }
+        }
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One line per use: parameter, its activation policy and the activation input divisor.
+fn print_uses(art: &Artifact) -> Result<()> {
+    let uses = art.directory["uses"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for u in &uses {
+        let param = u["parameter"].as_str().unwrap_or("?");
+        let policy = u["activation_policy"].as_str().unwrap_or("-");
+        let divisor = match u["auxiliaries"]["activation_input_divisor"]["object"].as_str() {
+            Some(id) => {
+                let b = art
+                    .read_object(id)
+                    .map_err(|e| Error::Config(e.to_string()))?;
+                format!("{}", f32::from_le_bytes(b[..4].try_into().unwrap()))
+            }
+            None => "-".into(),
+        };
+        println!("use  {param:<56} {policy:<10} {divisor}");
+    }
+    Ok(())
 }
 
 pub fn convert(a: &Args) -> Result<ExitCode> {

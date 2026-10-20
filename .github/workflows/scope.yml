@@ -1,0 +1,22 @@
+# main and the hardware branches stay merge-conflict free: main never edits
+# crates/velox-variant/{src,kernels}; hardware branches edit nothing else (docs/branching.md).
+name: branch scope
+on: [push, pull_request]
+jobs:
+  scope:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: check
+        run: |
+          git fetch origin main:main 2>/dev/null || true
+          branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          if [ "$branch" = "main" ]; then
+            bash scripts/check-main-scope.sh
+          else
+            bash scripts/check-branch-scope.sh main
+            # The merge must stay conflict free.
+            git -c user.name=ci -c user.email=ci@invalid merge --no-commit --no-ff main
+          fi

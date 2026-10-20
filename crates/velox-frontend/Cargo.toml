@@ -1,0 +1,16 @@
+[package]
+name = "velox-frontend"
+description = "Text frontend: tokenizer, Jinja chat template, tool-call parsing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velox-core.workspace = true
+velox-weights.workspace = true
+serde_json.workspace = true
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+minijinja = { version = "2", features = ["loop_controls", "preserve_order"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+base64 = "0.22"
