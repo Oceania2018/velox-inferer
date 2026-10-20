@@ -260,6 +260,19 @@ pub fn to_i32(what: &str, v: usize) -> Result<i32> {
     i32::try_from(v).map_err(|_| Error::Shape(format!("{what}={v} exceeds i32 range")))
 }
 
+pub fn concat_cols(
+    a: usize,
+    b: usize,
+    out: usize,
+    rows: usize,
+    a_cols: usize,
+    b_cols: usize,
+) -> Result<()> {
+    need("concat_cols a", a, rows * a_cols)?;
+    need("concat_cols b", b, rows * b_cols)?;
+    need("concat_cols out", out, rows * (a_cols + b_cols))
+}
+
 /// Largest k supported by `top_k` (sampling needs a few dozen candidates at most).
 pub const TOP_K_MAX: usize = 256;
 
