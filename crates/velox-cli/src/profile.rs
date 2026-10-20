@@ -182,6 +182,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_precision(s)
     }
+    fn attention_full_precision(&self, s: FullAttnShape) -> velox_core::AttnPrecision {
+        self.inner.attention_full_precision(s)
+    }
     fn conv1d_silu(
         &self,
         x: &B::Buffer,
