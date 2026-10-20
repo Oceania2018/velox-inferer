@@ -117,21 +117,31 @@ __global__ void quant_fp8_kernel(const float* __restrict__ x, int m, int k, uint
 }
 
 // ---------------------------------------------------------------------------------------------
-// GEMM.
+// GEMM. Tile configurations: Cfg<WM, WN, MT> has WM x WN warps, each covering MT x 16 tokens and
+// 32 weight rows, so a block is BM = WM * MT * 16 tokens by BN = WN * 32 rows.
+//   Big<2,4,4>:   128 x 128, 256 threads (prefill)
+//   Small<1,4,1>:  16 x 128, 128 threads (speculative verify and short chunks), with split-K so
+//                  a handful of tokens still spreads the weight stream over every SM.
 
-constexpr int kBM = 128;      // tokens per block
-constexpr int kBN = 128;      // weight rows per block
-constexpr int kBK = 64;       // code bytes per row per stage (two MMA k-steps)
+constexpr int kBK = 64;  // code bytes per row per stage (two MMA k-steps)
 constexpr int kStages = 3;
-constexpr int kThreads = 256;  // 8 warps: 2 along tokens x 4 along rows, 64 x 32 each
 
 enum Kind { kFp4 = 0, kFp8 = 1 };
 
+template <int WM_, int WN_, int MT_>
+struct Cfg {
+    static constexpr int WM = WM_, WN = WN_, MT = MT_;
+    static constexpr int BM = WM * MT * 16, BN = WN * 32, THREADS = WM * WN * 32;
+};
+using Big = Cfg<2, 4, 4>;
+using Small = Cfg<1, 4, 1>;
+
+template <class C>
 struct Smem {
-    uint8_t a[kStages][kBM * kBK];
-    uint8_t b[kStages][kBN * kBK];
-    uint32_t a_scale[kStages][kBM][2];  // FP4: per row, the scale words of the stage's two k64 steps
-    uint8_t b_scale[kStages][2][512];   // FP4: the weight's swizzled 128x4 scale tiles, as stored
+    uint8_t a[kStages][C::BM * kBK];
+    uint8_t b[kStages][C::BN * kBK];
+    uint32_t a_scale[kStages][C::BM][2];  // FP4: per row, the scale words of the stage's two k64 steps
+    uint8_t b_scale[kStages][2][512];     // FP4: the weight's swizzled 128x4 scale tiles, as stored
 };
 
 // 16-byte chunk c of row r lives at chunk c ^ ((r >> 1) & 3): ldmatrix over 8 rows is
@@ -197,21 +207,24 @@ struct GemmArgs {
     int k;                    // logical K
     int kb;                   // code bytes per row
     float alpha;              // FP4: 1 / (input divisor * weight divisor)
-    float* y;                 // [m, rows]
+    int kt_per_split;         // stages per blockIdx.z slice
+    float* y;                 // [m, rows], or [splits, m, rows] partials when split
 };
 
-template <int KIND>
-__device__ __forceinline__ void load_stage(Smem& s, const GemmArgs& p, int stage, int kt, int m0, int n0,
+template <class C, int KIND>
+__device__ __forceinline__ void load_stage(Smem<C>& s, const GemmArgs& p, int stage, int kt, int m0, int n0,
                                            const uint8_t* w_scale_plane) {
     const int t = threadIdx.x;
     const int kbyte = kt * kBK;
-    // A and B: 128 rows x 4 chunks each, two chunks per thread per operand.
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int idx = t + i * kThreads;
+    for (int idx = t; idx < C::BM * 4; idx += C::THREADS) {
         const int row = idx >> 2, chunk = idx & 3;
         cp_async16(s.a[stage] + swz(row, chunk * 16),
                    p.a + static_cast<long long>(m0 + row) * p.kb + kbyte + chunk * 16, true);
+    }
+#pragma unroll
+    for (int idx = t; idx < C::BN * 4; idx += C::THREADS) {
+        const int row = idx >> 2, chunk = idx & 3;
         const long long wrow = p.row_begin + n0 + row;
         const bool ok = wrow < p.parent_rows;
         cp_async16(s.b[stage] + swz(row, chunk * 16), p.w + (ok ? wrow : 0) * p.kb + kbyte + chunk * 16, ok);
@@ -219,7 +232,7 @@ __device__ __forceinline__ void load_stage(Smem& s, const GemmArgs& p, int stage
     if (KIND == kFp4) {
         // Two k64 steps per stage. A: one 8-byte copy per row. B: two contiguous 512-byte tiles.
         const int k64 = kt * 2;
-        if (t < kBM)
+        if (t < C::BM)
             cp_async8(&s.a_scale[stage][t][0], p.a_scales + static_cast<long long>(m0 + t) * (p.k / 16) + k64 * 4);
         if (t < 64) {
             const int half = t >> 5, off = (t & 31) * 16;
@@ -230,26 +243,28 @@ __device__ __forceinline__ void load_stage(Smem& s, const GemmArgs& p, int stage
     }
 }
 
-template <int KIND>
-__global__ void __launch_bounds__(kThreads, 2) gemm_kernel(GemmArgs p) {
+template <class C, int KIND>
+__global__ void __launch_bounds__(C::THREADS) gemm_kernel(GemmArgs p) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
-    Smem& s = *reinterpret_cast<Smem*>(smem_raw);
-    const int n0 = blockIdx.x * kBN, m0 = blockIdx.y * kBM;
+    Smem<C>& s = *reinterpret_cast<Smem<C>*>(smem_raw);
+    const int n0 = blockIdx.x * C::BN, m0 = blockIdx.y * C::BM;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int wm = warp >> 2, wn = warp & 3;  // 2 x 4 warps
-    const int kt_count = p.kb / kBK;
-    const uint8_t* w_scale_plane =
-        p.w + (KIND == kFp4 ? ((p.parent_rows * p.kb + 255) / 256 * 256) : 0);
+    const int wm = warp / C::WN, wn = warp % C::WN;
+    const int kt_begin = blockIdx.z * p.kt_per_split;
+    const int kt_end = min(p.kb / kBK, kt_begin + p.kt_per_split);
+    const int kt_count = kt_end - kt_begin;
+    const uint8_t* w_scale_plane = p.w + (KIND == kFp4 ? ((p.parent_rows * p.kb + 255) / 256 * 256) : 0);
+    float* y = p.y + static_cast<long long>(blockIdx.z) * p.m * p.rows;
 
 #pragma unroll
     for (int st = 0; st < kStages - 1; ++st) {
-        if (st < kt_count) load_stage<KIND>(s, p, st, st, m0, n0, w_scale_plane);
+        if (st < kt_count) load_stage<C, KIND>(s, p, st, kt_begin + st, m0, n0, w_scale_plane);
         cp_commit();
     }
 
-    float acc[4][4][4];
+    float acc[C::MT][4][4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < C::MT; ++i)
 #pragma unroll
         for (int j = 0; j < 4; ++j)
 #pragma unroll
@@ -261,22 +276,23 @@ __global__ void __launch_bounds__(kThreads, 2) gemm_kernel(GemmArgs p) {
     const int b_row = (lane & 7) + ((lane >> 4) << 3), b_byte = ((lane >> 3) & 1) << 4;
     const int sfa_row = ((lane & 1) << 3) | (lane >> 2);
     const int sfb_row = lane >> 2;
+    constexpr int WROWS = C::MT * 16;
 
-    for (int kt = 0; kt < kt_count; ++kt) {
+    for (int i = 0; i < kt_count; ++i) {
         cp_wait<kStages - 2>();
         __syncthreads();
-        const int next = kt + kStages - 1;
-        if (next < kt_count) load_stage<KIND>(s, p, next % kStages, next, m0, n0, w_scale_plane);
+        const int next = i + kStages - 1;
+        if (next < kt_count) load_stage<C, KIND>(s, p, next % kStages, kt_begin + next, m0, n0, w_scale_plane);
         cp_commit();
-        const int st = kt % kStages;
+        const int st = i % kStages;
 #pragma unroll
         for (int ks = 0; ks < 2; ++ks) {
-            uint32_t af[4][4], bf[4][2], sfa[4], sfb[4];
+            uint32_t af[C::MT][4], bf[4][2], sfa[C::MT], sfb[4];
 #pragma unroll
-            for (int mt = 0; mt < 4; ++mt) {
-                const int r = wm * 64 + mt * 16 + a_row;
+            for (int mt = 0; mt < C::MT; ++mt) {
+                const int r = wm * WROWS + mt * 16 + a_row;
                 ldmatrix_x4(af[mt], s.a[st] + swz(r, ks * 32 + a_byte));
-                if (KIND == kFp4) sfa[mt] = s.a_scale[st][wm * 64 + mt * 16 + sfa_row][ks];
+                if (KIND == kFp4) sfa[mt] = s.a_scale[st][wm * WROWS + mt * 16 + sfa_row][ks];
             }
 #pragma unroll
             for (int nt = 0; nt < 4; nt += 2) {
@@ -293,7 +309,7 @@ __global__ void __launch_bounds__(kThreads, 2) gemm_kernel(GemmArgs p) {
                 }
             }
 #pragma unroll
-            for (int mt = 0; mt < 4; ++mt)
+            for (int mt = 0; mt < C::MT; ++mt)
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
                     if (KIND == kFp4) mma_fp4(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1], sfa[mt], sfb[nt]);
@@ -303,7 +319,8 @@ __global__ void __launch_bounds__(kThreads, 2) gemm_kernel(GemmArgs p) {
     }
     cp_wait<0>();
 
-    // Epilogue: c0,c1 at (row g, cols 2q, 2q+1); c2,c3 at row g+8.
+    // Epilogue: c0,c1 at (row g, cols 2q, 2q+1); c2,c3 at row g+8. Scales are linear in the
+    // accumulator, so split-K partials can be scaled before they are summed.
     const int g = lane >> 2, q = lane & 3;
     const uint8_t* wscale = p.w + (p.parent_rows * p.kb + 255) / 256 * 256;  // FP8 BF16 row scales
 #pragma unroll
@@ -317,13 +334,13 @@ __global__ void __launch_bounds__(kThreads, 2) gemm_kernel(GemmArgs p) {
             f1 = n + 1 < p.rows ? __uint_as_float(static_cast<uint32_t>(sp[r0 + 1]) << 16) : 0.0f;
         }
 #pragma unroll
-        for (int mt = 0; mt < 4; ++mt) {
+        for (int mt = 0; mt < C::MT; ++mt) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                const int t = m0 + wm * 64 + mt * 16 + g + h * 8;
+                const int t = m0 + wm * WROWS + mt * 16 + g + h * 8;
                 if (t >= p.m) continue;
                 const float xs = KIND == kFp8 ? p.a_row[t] : 1.0f;
-                float* out = p.y + static_cast<long long>(t) * p.rows + n;
+                float* out = y + static_cast<long long>(t) * p.rows + n;
                 const float v0 = acc[mt][nt][2 * h] * f0 * xs, v1 = acc[mt][nt][2 * h + 1] * f1 * xs;
                 if (n + 1 < p.rows && (p.rows & 1) == 0) {
                     *reinterpret_cast<float2*>(out) = make_float2(v0, v1);
@@ -336,8 +353,17 @@ __global__ void __launch_bounds__(kThreads, 2) gemm_kernel(GemmArgs p) {
     }
 }
 
-// Grow-only device scratch for quantized activations. The engine issues kernels from one thread;
-// the mutex only guards against concurrent first use.
+__global__ void sum_splits(const float* __restrict__ part, int splits, long long n, float* __restrict__ y) {
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        float s = 0.0f;
+        for (int z = 0; z < splits; ++z) s += part[z * n + i];
+        y[i] = s;
+    }
+}
+
+// Grow-only device scratch. The engine issues kernels from one thread; the mutex only guards
+// against concurrent first use.
 struct Scratch {
     std::mutex mu;
     uint8_t* ptr = nullptr;
@@ -354,18 +380,47 @@ struct Scratch {
         return ptr;
     }
 };
-Scratch g_scratch;
+Scratch g_scratch;  // quantized activations
+Scratch g_part;     // split-K partial sums
+
+constexpr int kSms = 170;
+constexpr int kSmallMaxM = 32;
+
+// Token rows the quantizers pad to: the tile height of the configuration launch_gemm picks.
+int m_tile(int m) { return m <= kSmallMaxM ? Small::BM : Big::BM; }
+
+template <class C, int KIND>
+int launch_cfg(GemmArgs p) {
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(gemm_kernel<C, KIND>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem<C>));
+        configured = true;
+    }
+    const int kt_total = p.kb / kBK;
+    const long long blocks = static_cast<long long>((p.rows + C::BN - 1) / C::BN) * ((p.m + C::BM - 1) / C::BM);
+    // Split K until the grid covers the GPU twice, keeping at least 8 stages per slice.
+    int splits = 1;
+    // The small tile always may split; the large one only when its grid is badly under-filled,
+    // since the partial pass costs more than it saves on prefill-sized grids.
+    while ((C::BM == Small::BM || blocks < 64) && blocks * splits < 2 * kSms && kt_total / (splits * 2) >= 8) splits *= 2;
+    p.kt_per_split = (kt_total + splits - 1) / splits;
+    float* y = p.y;
+    if (splits > 1) {
+        p.y = reinterpret_cast<float*>(g_part.get(static_cast<size_t>(splits) * p.m * p.rows * sizeof(float)));
+        if (!p.y) return static_cast<int>(cudaErrorMemoryAllocation);
+    }
+    const dim3 grid((p.rows + C::BN - 1) / C::BN, (p.m + C::BM - 1) / C::BM, splits);
+    gemm_kernel<C, KIND><<<grid, C::THREADS, sizeof(Smem<C>)>>>(p);
+    if (splits > 1) {
+        const long long n = static_cast<long long>(p.m) * p.rows;
+        sum_splits<<<velox_grid_1d(n, 256), 256>>>(p.y, splits, n, y);
+    }
+    return velox_launch_status();
+}
 
 template <int KIND>
 int launch_gemm(const GemmArgs& p) {
-    static bool configured = false;
-    if (!configured) {
-        cudaFuncSetAttribute(gemm_kernel<KIND>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem));
-        configured = true;
-    }
-    const dim3 grid((p.rows + kBN - 1) / kBN, (p.m + kBM - 1) / kBM);
-    gemm_kernel<KIND><<<grid, kThreads, sizeof(Smem)>>>(p);
-    return velox_launch_status();
+    return p.m <= kSmallMaxM ? launch_cfg<Small, KIND>(p) : launch_cfg<Big, KIND>(p);
 }
 
 }  // namespace
@@ -376,7 +431,8 @@ VELOX_API int velox_5090_linear_a4(const float* x, int m, const uint8_t* w, long
                                    long long row_begin, int rows, float input_divisor, float* y) {
     if (k % 128 != 0 || row_begin % 128 != 0 || m <= 0 || reinterpret_cast<uintptr_t>(x) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
-    const int m_pad = (m + kBM - 1) / kBM * kBM;
+    const int mt = m_tile(m);
+    const int m_pad = (m + mt - 1) / mt * mt;
     const size_t code_bytes = static_cast<size_t>(m_pad) * k / 2;
     uint8_t* buf = g_scratch.get(code_bytes + static_cast<size_t>(m_pad) * k / 16);
     if (!buf) return static_cast<int>(cudaErrorMemoryAllocation);
@@ -402,7 +458,7 @@ VELOX_API int velox_5090_linear_a4(const float* x, int m, const uint8_t* w, long
         weight_divisor = it->second;
     }
     GemmArgs p{codes, scales, nullptr, w, parent_rows, row_begin, rows, m, static_cast<int>(k),
-               static_cast<int>(k / 2), 1.0f / (input_divisor * weight_divisor), y};
+               static_cast<int>(k / 2), 1.0f / (input_divisor * weight_divisor), 0, y};
     if (const int e = velox_launch_status()) return e;
     return launch_gemm<kFp4>(p);
 }
@@ -411,7 +467,8 @@ VELOX_API int velox_5090_linear_a4(const float* x, int m, const uint8_t* w, long
 VELOX_API int velox_5090_linear_a8(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                    long long row_begin, int rows, float* y) {
     if (k % 64 != 0 || m <= 0 || reinterpret_cast<uintptr_t>(x) % 16 != 0) return VELOX_ERR_UNSUPPORTED;
-    const int m_pad = (m + kBM - 1) / kBM * kBM;
+    const int mt = m_tile(m);
+    const int m_pad = (m + mt - 1) / mt * mt;
     const size_t code_bytes = static_cast<size_t>(m_pad) * k;
     uint8_t* buf = g_scratch.get(code_bytes + static_cast<size_t>(m_pad) * 4);
     if (!buf) return static_cast<int>(cudaErrorMemoryAllocation);
@@ -419,6 +476,6 @@ VELOX_API int velox_5090_linear_a8(const float* x, int m, const uint8_t* w, long
     quant_fp8_kernel<<<m_pad, 256>>>(x, m, static_cast<int>(k), buf, row_scale);
     if (const int e = velox_launch_status()) return e;
     GemmArgs p{buf, nullptr, row_scale, w, parent_rows, row_begin, rows, m, static_cast<int>(k),
-               static_cast<int>(k), 1.0f, y};
+               static_cast<int>(k), 1.0f, 0, y};
     return launch_gemm<kFp8>(p);
 }

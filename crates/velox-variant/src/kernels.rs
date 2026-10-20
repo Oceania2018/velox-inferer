@@ -47,9 +47,10 @@ extern "C" {
 /// Above this many rows the tiled SGEMM beats re-streaming weights per 8-row tile.
 const SMALL_M_MAX: usize = 8;
 
-/// Up to this many tokens `linear` stays on main's exact, bandwidth-bound GEMV; above it the
-/// tensor-core GEMM with rounded activations takes over where the artifact allows.
-const GEMV_MAX_M: usize = 8;
+/// Single-token `linear` stays on main's exact, bandwidth-bound GEMV. From two tokens
+/// (speculative verify, short chunks) the tensor-core GEMM with rounded activations takes over
+/// where the artifact allows: its 16-token tile with split-K streams the weights once.
+const GEMV_MAX_M: usize = 1;
 
 /// From this many query tokens attention uses the tensor-core prefill kernel; below it the exact
 /// split-KV kernel, which is bound by reading the cache anyway.
