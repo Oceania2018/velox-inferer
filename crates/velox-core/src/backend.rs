@@ -424,6 +424,28 @@ pub trait Backend {
     ) -> Result<()>;
     /// `x[i] = gelu(x[i])` for the first `len` elements.
     fn gelu(&self, x: &mut Self::Buffer, len: usize, kind: GeluKind) -> Result<()>;
+    /// Column blocks of `src` (`[rows, src_cols]`) into separate buffers: `out.0[r] =
+    /// src[r][out.1 .. out.1 + out.2]` for each `(buffer, column offset, columns)`.
+    fn split_cols(
+        &self,
+        src: &Self::Buffer,
+        rows: usize,
+        src_cols: usize,
+        outs: &mut [(&mut Self::Buffer, usize, usize)],
+    ) -> Result<()>;
+    /// SwiGLU over a fused gate|up projection: `out[r][i] = silu(src[r][gate + i]) * src[r][up + i]`
+    /// for `i < width`; `src` is `[rows, src_cols]`, `out` is `[rows, width]`.
+    #[allow(clippy::too_many_arguments)]
+    fn swiglu(
+        &self,
+        src: &Self::Buffer,
+        rows: usize,
+        src_cols: usize,
+        gate: usize,
+        up: usize,
+        width: usize,
+        out: &mut Self::Buffer,
+    ) -> Result<()>;
     /// `out[r] = a[r] ++ b[r]` for `rows` rows: `a` is `[rows, a_cols]`, `b` is `[rows, b_cols]`,
     /// `out` is `[rows, a_cols + b_cols]`.
     fn concat_cols(

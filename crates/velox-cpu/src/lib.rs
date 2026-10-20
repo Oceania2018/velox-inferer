@@ -456,6 +456,46 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn split_cols(
+        &self,
+        src: &Vec<f32>,
+        rows: usize,
+        src_cols: usize,
+        outs: &mut [(&mut Vec<f32>, usize, usize)],
+    ) -> Result<()> {
+        let dims: Vec<(usize, usize, usize)> = outs.iter().map(|o| (o.0.len(), o.1, o.2)).collect();
+        check::split_cols(src.len(), rows, src_cols, &dims)?;
+        for (dst, off, cols) in outs.iter_mut() {
+            for r in 0..rows {
+                dst[r * *cols..(r + 1) * *cols]
+                    .copy_from_slice(&src[r * src_cols + *off..r * src_cols + *off + *cols]);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn swiglu(
+        &self,
+        src: &Vec<f32>,
+        rows: usize,
+        src_cols: usize,
+        gate: usize,
+        up: usize,
+        width: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        check::swiglu(src.len(), rows, src_cols, gate, up, width, out.len())?;
+        for r in 0..rows {
+            for i in 0..width {
+                let g = f64::from(src[r * src_cols + gate + i]);
+                let u = f64::from(src[r * src_cols + up + i]);
+                out[r * width + i] = (g / (1.0 + (-g).exp()) * u) as f32;
+            }
+        }
+        Ok(())
+    }
+
     fn concat_cols(
         &self,
         a: &Vec<f32>,
