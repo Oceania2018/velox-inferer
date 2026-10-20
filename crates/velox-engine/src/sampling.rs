@@ -78,6 +78,34 @@ impl Sampler {
 
     /// Picks the next token from candidates sorted by logit (descending).
     pub fn sample(&mut self, cands: &[(u32, f32)]) -> u32 {
+        let d = self.distribution(cands);
+        self.draw(&d)
+    }
+
+    /// Speculative sampling with a deterministic draft: accepts `draft` with probability p(draft)
+    /// under this step's distribution. On rejection returns the token drawn from p with `draft`
+    /// removed (the residual max(p - q, 0) for a one-hot q), so the output distribution is exactly
+    /// that of [`Self::sample`]. Greedy accepts iff the draft is the argmax.
+    pub fn verify_draft(&mut self, cands: &[(u32, f32)], draft: u32) -> Result<(), u32> {
+        let d = self.distribution(cands);
+        let p = d
+            .iter()
+            .find(|&&(id, _)| id == draft)
+            .map_or(0.0, |&(_, p)| p);
+        if p > 0.0 && (p >= 1.0 || f64::from(self.rng.uniform() * 0.5 + 0.5) <= p) {
+            return Ok(());
+        }
+        let rest: Vec<(u32, f64)> = d.into_iter().filter(|&(id, _)| id != draft).collect();
+        if rest.is_empty() {
+            // p(draft) == 1 handled above; an empty residual only arises from rounding.
+            return Ok(());
+        }
+        Err(self.draw(&rest))
+    }
+
+    /// The step's distribution over the kept candidates (presence penalty, then greedy, or
+    /// temperature + top-k + top-p), as (id, probability) summing to 1.
+    fn distribution(&self, cands: &[(u32, f32)]) -> Vec<(u32, f64)> {
         let mut c: Vec<(u32, f32)> = cands
             .iter()
             .map(|&(id, l)| {
@@ -92,10 +120,10 @@ impl Sampler {
         // Stable: equal logits keep the device's order (lower id first).
         c.sort_by(|a, b| b.1.total_cmp(&a.1));
         if c.is_empty() {
-            return 0;
+            return vec![(0, 1.0)];
         }
         if self.temperature <= 0.0 {
-            return c[0].0;
+            return vec![(c[0].0, 1.0)];
         }
         c.truncate(self.top_k);
         let max = c[0].1;
@@ -115,14 +143,27 @@ impl Sampler {
             }
         }
         let mass: f64 = probs[..keep].iter().sum();
+        c[..keep]
+            .iter()
+            .zip(&probs)
+            .map(|(&(id, _), &p)| (id, p / mass))
+            .collect()
+    }
+
+    /// Draws from a distribution (probabilities summing to at most 1; renormalized).
+    fn draw(&mut self, d: &[(u32, f64)]) -> u32 {
+        if d.len() == 1 {
+            return d[0].0;
+        }
+        let mass: f64 = d.iter().map(|x| x.1).sum();
         let mut r = f64::from(self.rng.uniform() * 0.5 + 0.5) * mass;
-        for (n, &p) in probs[..keep].iter().enumerate() {
+        for &(id, p) in d {
             r -= p;
             if r <= 0.0 {
-                return c[n].0;
+                return id;
             }
         }
-        c[keep - 1].0
+        d[d.len() - 1].0
     }
 }
 
@@ -164,6 +205,39 @@ mod tests {
             (t.temperature, t.top_k, t.top_p, t.presence_penalty),
             (1.0, 20, 0.95, 0.0)
         );
+    }
+
+    #[test]
+    fn speculative_sampling_preserves_the_distribution() {
+        // Target p = softmax over three candidates; a fixed draft accepted with p(draft) and the
+        // residual otherwise must reproduce p.
+        let c = cands(&[2.0, 1.0, 0.5]);
+        let mut s = Sampler::from_request(
+            &json!({"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0, "seed": 9}),
+            false,
+        );
+        let p = s.distribution(&c);
+        let mut counts = [0usize; 3];
+        let n = 200_000;
+        for _ in 0..n {
+            let tok = match s.verify_draft(&c, 1) {
+                Ok(()) => 1,
+                Err(t) => t,
+            };
+            counts[tok as usize] += 1;
+        }
+        for &(id, prob) in &p {
+            let got = counts[id as usize] as f64 / n as f64;
+            assert!((got - prob).abs() < 0.01, "token {id}: {got} vs {prob}");
+        }
+    }
+
+    #[test]
+    fn greedy_accepts_only_the_argmax() {
+        let mut s = Sampler::from_request(&json!({"temperature": 0}), false);
+        let c = cands(&[0.0, 3.0, 1.0]);
+        assert_eq!(s.verify_draft(&c, 1), Ok(()));
+        assert_eq!(s.verify_draft(&c, 2), Err(1));
     }
 
     #[test]
