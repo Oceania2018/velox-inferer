@@ -706,6 +706,7 @@ dependencies = [
  "velox-core",
  "velox-cpu",
  "velox-cuda",
+ "velox-engine",
  "velox-frontend",
  "velox-models",
  "velox-serve",
@@ -740,6 +741,17 @@ version = "0.1.0"
 dependencies = [
  "velox-build",
  "velox-core",
+]
+
+[[package]]
+name = "velox-engine"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "velox-core",
+ "velox-frontend",
+ "velox-models",
+ "velox-serve",
 ]
 
 [[package]]

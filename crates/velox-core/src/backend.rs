@@ -170,6 +170,11 @@ pub trait Backend {
     fn upload_bytes(&self, data: &[u8]) -> Result<Self::Buffer>;
     /// Waits for all queued work; timing and downloads rely on it.
     fn synchronize(&self) -> Result<()>;
+    /// Makes this backend's device current on the calling thread. Servers call it before using
+    /// a backend from a thread other than the one that created it (CUDA devices are per-thread).
+    fn bind_thread(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// `y[m, rows] = x[m, k] · Wᵀ` with `W` the view's rows decoded from their stored format.
     fn linear(

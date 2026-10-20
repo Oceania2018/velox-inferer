@@ -50,7 +50,8 @@ COMMANDS:
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
       --model-id <id>       default: artifact metadata name
-      --max-concurrency <n> generation lanes (default 1)
+      --chat-template <file> --max-context <n> (32768) --prefill-chunk <n> (512)
+      --ctx-checkpoints <n> (4) --enable-thinking true|false (false)
   replay                  Replay a recorded agent session against an OpenAI-compatible server
       --session <dir>       directory with session.json and screenshots/
       --endpoint <url>      e.g. http://127.0.0.1:8010 (default)

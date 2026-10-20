@@ -462,6 +462,14 @@ impl Backend for CudaBackend {
         )
     }
 
+    fn bind_thread(&self) -> Result<()> {
+        // SAFETY: plain value argument.
+        status(
+            unsafe { ffi::velox_cuda_set_device(self.device.index) },
+            "cudaSetDevice",
+        )
+    }
+
     fn matmul(
         &self,
         x: &CudaBuffer,

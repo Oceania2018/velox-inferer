@@ -19,6 +19,55 @@ pub struct Session<B: Backend> {
     ssm: Vec<B::Buffer>,
 }
 
+/// The recurrent (GDN) state of a session after `pos` tokens. Attention KV needs no copy: rows
+/// below `pos` are never rewritten, so restoring a checkpoint only rewinds the position and the
+/// recurrent state.
+pub struct Checkpoint<B: Backend> {
+    pub pos: usize,
+    conv: Vec<B::Buffer>,
+    ssm: Vec<B::Buffer>,
+}
+
+impl<B: Backend> Session<B> {
+    /// Device copy of the recurrent state at the current position.
+    pub fn checkpoint(&self, b: &B) -> Result<Checkpoint<B>> {
+        let dup = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
+            bufs.iter()
+                .map(|s| {
+                    let n = b.len(s);
+                    let mut d = b.alloc(n)?;
+                    b.copy(s, 0, &mut d, 0, n)?;
+                    Ok(d)
+                })
+                .collect()
+        };
+        Ok(Checkpoint {
+            pos: self.pos,
+            conv: dup(&self.conv)?,
+            ssm: dup(&self.ssm)?,
+        })
+    }
+
+    /// Rewinds to `cp`, which must have been taken from this session (or a session with the
+    /// same token prefix up to `cp.pos`).
+    pub fn restore(&mut self, b: &B, cp: &Checkpoint<B>) -> Result<()> {
+        if cp.pos > self.capacity {
+            return Err(Error::Config("checkpoint beyond session capacity".into()));
+        }
+        for (dst, src) in self
+            .conv
+            .iter_mut()
+            .zip(&cp.conv)
+            .chain(self.ssm.iter_mut().zip(&cp.ssm))
+        {
+            let n = b.len(src);
+            b.copy(src, 0, dst, 0, n)?;
+        }
+        self.pos = cp.pos;
+        Ok(())
+    }
+}
+
 /// Activations for chunks of up to `max_tokens` tokens.
 pub struct Workspace<B: Backend> {
     max_tokens: usize,

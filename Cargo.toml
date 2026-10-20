@@ -23,6 +23,7 @@ velox-weights = { path = "crates/velox-weights" }
 velox-serve = { path = "crates/velox-serve" }
 velox-models = { path = "crates/velox-models" }
 velox-frontend = { path = "crates/velox-frontend" }
+velox-engine = { path = "crates/velox-engine" }
 
 [profile.release]
 debug = 1
