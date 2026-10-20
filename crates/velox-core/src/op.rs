@@ -25,6 +25,7 @@ pub enum Op {
     Gelu,
     RopePositions,
     TopK,
+    ConcatCols,
 }
 
 impl Op {
@@ -47,6 +48,7 @@ impl Op {
         Op::Gelu,
         Op::RopePositions,
         Op::TopK,
+        Op::ConcatCols,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -69,6 +71,7 @@ impl Op {
             Op::Gelu => "gelu",
             Op::RopePositions => "rope_positions",
             Op::TopK => "top_k",
+            Op::ConcatCols => "concat_cols",
         }
     }
 }

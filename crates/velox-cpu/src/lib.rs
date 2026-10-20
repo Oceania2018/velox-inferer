@@ -456,6 +456,24 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn concat_cols(
+        &self,
+        a: &Vec<f32>,
+        b: &Vec<f32>,
+        out: &mut Vec<f32>,
+        rows: usize,
+        a_cols: usize,
+        b_cols: usize,
+    ) -> Result<()> {
+        check::concat_cols(a.len(), b.len(), out.len(), rows, a_cols, b_cols)?;
+        let w = a_cols + b_cols;
+        for r in 0..rows {
+            out[r * w..r * w + a_cols].copy_from_slice(&a[r * a_cols..(r + 1) * a_cols]);
+            out[r * w + a_cols..(r + 1) * w].copy_from_slice(&b[r * b_cols..(r + 1) * b_cols]);
+        }
+        Ok(())
+    }
+
     fn top_k(
         &self,
         x: &Vec<f32>,

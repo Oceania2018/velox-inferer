@@ -8,6 +8,7 @@
 
 mod prompt;
 mod sampling;
+pub mod spec;
 
 use std::sync::Mutex;
 use std::time::Instant;

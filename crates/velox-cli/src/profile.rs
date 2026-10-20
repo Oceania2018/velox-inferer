@@ -246,6 +246,19 @@ impl<B: Backend> Backend for Profiled<B> {
     fn gelu(&self, x: &mut B::Buffer, len: usize, kind: GeluKind) -> Result<()> {
         self.time("gelu", || self.inner.gelu(x, len, kind))
     }
+    fn concat_cols(
+        &self,
+        a: &B::Buffer,
+        b: &B::Buffer,
+        out: &mut B::Buffer,
+        rows: usize,
+        a_cols: usize,
+        b_cols: usize,
+    ) -> Result<()> {
+        self.time("concat_cols", || {
+            self.inner.concat_cols(a, b, out, rows, a_cols, b_cols)
+        })
+    }
     fn top_k(
         &self,
         x: &B::Buffer,
