@@ -308,6 +308,37 @@ fn stats(v: &mut [f64]) -> Value {
     json!({"n": v.len(), "mean": v.iter().sum::<f64>() / v.len() as f64, "p50": pct(0.5), "p90": pct(0.9), "min": v[0], "max": v[v.len() - 1]})
 }
 
+/// The session's requests with screenshots restored, plus each step's recorded metrics
+/// (`--session`, optional `--steps`). Used by `prompt-debug`.
+pub fn load_requests(a: &Args) -> Result<Vec<(Value, Value)>> {
+    let dir = PathBuf::from(
+        a.get("session")
+            .ok_or_else(|| cfg("--session <dir> is required"))?,
+    );
+    let text = std::fs::read_to_string(dir.join("session.json"))
+        .map_err(|e| cfg(format!("session.json: {e}")))?;
+    let session: Value =
+        serde_json::from_str(&text).map_err(|e| cfg(format!("session.json: {e}")))?;
+    let mut steps = Vec::new();
+    collect_steps(&session, &dir, &mut steps)?;
+    steps.truncate(a.parse("steps", usize::MAX)?);
+    steps
+        .into_iter()
+        .map(|st| {
+            let mut req = st.request;
+            let data_url = match &st.screenshot {
+                Some(p) if p.exists() => Some(format!(
+                    "data:image/jpeg;base64,{}",
+                    base64(&std::fs::read(p).map_err(|e| cfg(format!("{}: {e}", p.display())))?)
+                )),
+                _ => None,
+            };
+            fill_images(&mut req, &data_url)?;
+            Ok((req, st.recorded))
+        })
+        .collect()
+}
+
 pub fn run(a: &Args) -> Result<ExitCode> {
     let dir = PathBuf::from(
         a.get("session")

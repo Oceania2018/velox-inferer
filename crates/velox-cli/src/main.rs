@@ -3,6 +3,8 @@
 mod args;
 mod bench;
 mod generate;
+mod profile;
+mod prompt_debug;
 mod replay;
 mod select;
 mod serve;
@@ -96,6 +98,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("convert") => weights::convert(a),
         Some("generate") => generate::run(a),
         Some("serve") => serve::run(a),
+        Some("prompt-debug") => prompt_debug::run(a),
         Some("replay") => replay::run(a),
         Some("replay-compare") => replay::compare(a),
         None | Some("help") | Some("--help") | Some("-h") => {

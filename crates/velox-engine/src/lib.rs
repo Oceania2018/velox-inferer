@@ -12,7 +12,7 @@ mod sampling;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use velox_core::{Backend, Error as CoreError};
 use velox_frontend::image::{decode_data_url, preprocess, ImagePatches};
 use velox_frontend::{parse_output, Frontend};
@@ -33,18 +33,31 @@ pub struct EngineConfig {
     pub default_max_tokens: usize,
     /// Default for `chat_template_kwargs.enable_thinking` (ninfer `--no-thinking` = false).
     pub enable_thinking: bool,
-    /// Recurrent-state checkpoints kept for prefix reuse.
+    /// Recurrent-state checkpoints kept per lane for prefix reuse.
     pub max_checkpoints: usize,
+    /// Capacity of a second, small lane for requests that share nothing with the main lane
+    /// (probes, side questions), so they do not evict the agent's context. 0 disables it.
+    pub scratch_capacity: usize,
 }
 
+/// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
+/// checkpoints of its recurrent state.
 struct Lane<B: Backend> {
     session: Session<B>,
-    ws: Workspace<B>,
     /// Keys of the tokens the session state has consumed, in order (see `Prompt::keys`).
     keys: Vec<u32>,
     checkpoints: Vec<Checkpoint<B>>,
     zero: Checkpoint<B>,
 }
+
+/// All lanes plus the activation workspace they share (requests run one at a time).
+struct Lanes<B: Backend> {
+    ws: Workspace<B>,
+    lanes: Vec<Lane<B>>,
+}
+
+/// Below this much shared prefix a request counts as unrelated to a lane.
+const MIN_REUSE: usize = 64;
 
 pub struct QwenEngine<B: Backend> {
     b: B,
@@ -52,7 +65,7 @@ pub struct QwenEngine<B: Backend> {
     vision: Option<Qwen35Vision<B>>,
     fe: Frontend,
     cfg: EngineConfig,
-    lane: Mutex<Lane<B>>,
+    state: Mutex<Lanes<B>>,
     special: SpecialTokens,
 }
 
@@ -79,44 +92,149 @@ fn is_image_part(p: &Value) -> bool {
     p.get("image_url").is_some() || p.get("type").and_then(Value::as_str) == Some("image_url")
 }
 
-/// OpenAI messages -> template input: tool-call `arguments` strings become objects (the template
-/// iterates them). Returns the image URLs in prompt order.
-fn normalize_messages(messages: &Value) -> Result<(Value, Vec<String>), ApiError> {
-    let mut out = messages.clone();
+/// A request turned into chat-template input exactly as ninfer builds it, so both engines render
+/// identical prompts for the same request:
+/// - messages become `{role, content}`: text-only content is one string (parts joined without a
+///   separator); content with images stays a list of `{type: text, text}` / `{type: image}` in
+///   order; non-empty `reasoning_content`, `tool_calls` (`{id, type, function: {name, arguments}}`
+///   with arguments parsed, `{}` when empty) and `tool_call_id` are kept; `name` is dropped;
+/// - each tool is rebuilt as `{type: function, function: {name, parameters, strict,
+///   description}}` with `parameters` defaulting to an empty object schema and `strict` to false.
+pub struct Normalized {
+    pub messages: Value,
+    pub tools: Option<Value>,
+    /// Image URLs in prompt order.
+    pub images: Vec<String>,
+}
+
+pub fn normalize_request(req: &Value) -> Result<Normalized, ApiError> {
+    let src = req
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::invalid("messages must be an array"))?;
+    let mut messages = Vec::with_capacity(src.len());
     let mut images = Vec::new();
-    for m in out.as_array_mut().into_iter().flatten() {
-        for p in m
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if is_image_part(p) {
-                let url = p
-                    .pointer("/image_url/url")
-                    .or_else(|| p.get("image_url"))
-                    .and_then(Value::as_str);
-                images.push(
-                    url.ok_or_else(|| ApiError::invalid("image_url part without a url"))?
-                        .to_string(),
-                );
-            }
-        }
-        for call in m
-            .get_mut("tool_calls")
-            .and_then(Value::as_array_mut)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(args) = call.pointer_mut("/function/arguments") {
-                if let Some(s) = args.as_str() {
-                    *args =
-                        serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()));
+    for m in src {
+        let role = m
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::invalid("message without a role"))?;
+        let mut out = serde_json::Map::new();
+        out.insert("role".into(), role.into());
+        let content = match m.get("content") {
+            None | Some(Value::Null) => Value::String(String::new()),
+            Some(Value::String(s)) => Value::String(s.clone()),
+            Some(Value::Array(parts)) if parts.iter().any(is_image_part) => {
+                let mut items = Vec::new();
+                for p in parts {
+                    if is_image_part(p) {
+                        let url = p
+                            .pointer("/image_url/url")
+                            .or_else(|| p.get("image_url"))
+                            .and_then(Value::as_str);
+                        images.push(
+                            url.ok_or_else(|| ApiError::invalid("image_url part without a url"))?
+                                .to_string(),
+                        );
+                        items.push(json!({"type": "image"}));
+                    } else if let Some(t) = p.get("text").and_then(Value::as_str) {
+                        items.push(json!({"type": "text", "text": t}));
+                    }
                 }
+                Value::Array(items)
             }
+            Some(Value::Array(parts)) => Value::String(
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect(),
+            ),
+            Some(other) => {
+                return Err(ApiError::invalid(format!(
+                    "unsupported message content {other}"
+                )))
+            }
+        };
+        out.insert("content".into(), content);
+        let reasoning = m
+            .get("reasoning_content")
+            .or_else(|| m.get("reasoning"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !reasoning.is_empty() {
+            out.insert("reasoning_content".into(), reasoning.into());
         }
+        if let Some(calls) = m
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .filter(|c| !c.is_empty())
+        {
+            let calls: Vec<Value> = calls
+                .iter()
+                .map(|c| {
+                    let f = c.get("function").unwrap_or(c);
+                    let args = match f.get("arguments") {
+                        Some(Value::String(s)) if s.trim().is_empty() => json!({}),
+                        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
+                        Some(Value::Null) | None => json!({}),
+                        Some(v) => v.clone(),
+                    };
+                    json!({"id": c.get("id").cloned().unwrap_or_else(|| "".into()), "type": "function",
+                           "function": {"name": f.get("name").cloned().unwrap_or_else(|| "".into()), "arguments": args}})
+                })
+                .collect();
+            out.insert("tool_calls".into(), Value::Array(calls));
+        }
+        if let Some(id) = m
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            out.insert("tool_call_id".into(), id.into());
+        }
+        messages.push(Value::Object(out));
     }
-    Ok((out, images))
+    let tools = match req.get("tools").and_then(Value::as_array) {
+        Some(list) if !list.is_empty() => Some(Value::Array(
+            list.iter()
+                .map(|t| {
+                    let f = t.get("function").unwrap_or(t);
+                    let mut function = serde_json::Map::new();
+                    function.insert(
+                        "name".into(),
+                        f.get("name").cloned().unwrap_or_else(|| "".into()),
+                    );
+                    let params = f
+                        .get("parameters")
+                        .filter(|p| !p.is_null())
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                    function.insert("parameters".into(), params);
+                    function.insert(
+                        "strict".into(),
+                        f.get("strict")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            .into(),
+                    );
+                    if let Some(d) = f
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .filter(|d| !d.is_empty())
+                    {
+                        function.insert("description".into(), d.into());
+                    }
+                    json!({"type": "function", "function": function})
+                })
+                .collect(),
+        )),
+        _ => None,
+    };
+    Ok(Normalized {
+        messages: Value::Array(messages),
+        tools,
+        images,
+    })
 }
 
 fn single_token(fe: &Frontend, text: &str) -> Option<u32> {
@@ -131,37 +249,68 @@ impl<B: Backend> QwenEngine<B> {
         fe: Frontend,
         cfg: EngineConfig,
     ) -> Result<Self, CoreError> {
-        let session = model.session(&b, cfg.capacity)?;
         let ws = model.workspace(&b, cfg.chunk)?;
-        let zero = session.checkpoint(&b)?;
+        let mut lanes = Vec::new();
+        for capacity in [cfg.capacity, cfg.scratch_capacity.min(cfg.capacity)] {
+            if capacity == 0 {
+                continue;
+            }
+            let session = model.session(&b, capacity)?;
+            let zero = session.checkpoint(&b)?;
+            lanes.push(Lane {
+                session,
+                keys: Vec::new(),
+                checkpoints: Vec::new(),
+                zero,
+            });
+        }
         let special = SpecialTokens {
             im_start: single_token(&fe, "<|im_start|>"),
             vision_start: single_token(&fe, "<|vision_start|>"),
             image_pad: single_token(&fe, "<|image_pad|>"),
         };
-        let lane = Mutex::new(Lane {
-            session,
-            ws,
-            keys: Vec::new(),
-            checkpoints: Vec::new(),
-            zero,
-        });
+        let state = Mutex::new(Lanes { ws, lanes });
         Ok(QwenEngine {
             b,
             model,
             vision,
             fe,
             cfg,
-            lane,
+            state,
             special,
         })
     }
 
-    /// Positions worth checkpointing in `ids`: before the last image and before the generation
-    /// prompt (the last `<|im_start|>`).
+    /// The lane for a prompt of `keys` needing `needed` tokens of capacity: the one that can reuse
+    /// the most, or, when no lane shares a meaningful prefix, the smallest lane that fits, so
+    /// unrelated short requests do not evict a long context.
+    fn pick_lane(lanes: &[Lane<B>], keys: &[u32], needed: usize) -> Option<usize> {
+        let fits: Vec<usize> = (0..lanes.len())
+            .filter(|&i| lanes[i].session.capacity >= needed)
+            .collect();
+        let (best, shared) = fits
+            .iter()
+            .map(|&i| (i, common_prefix(&lanes[i].keys, keys)))
+            .max_by_key(|&(_, s)| s)?;
+        if shared >= MIN_REUSE {
+            return Some(best);
+        }
+        fits.into_iter().min_by_key(|&i| lanes[i].session.capacity)
+    }
+
+    /// Positions worth checkpointing in `ids`: the start of the turn holding the last image, the
+    /// last image, and the generation prompt (the last `<|im_start|>`).
     fn checkpoint_positions(&self, ids: &[u32], after: usize) -> Vec<usize> {
         let last = |tok: Option<u32>| tok.and_then(|t| ids.iter().rposition(|&x| x == t));
-        let mut v: Vec<usize> = [last(self.special.vision_start), last(self.special.im_start)]
+        let image = last(self.special.vision_start);
+        // Agent loops replace the whole turn that carries the screenshot, not just the image, so
+        // also checkpoint at the start of that turn.
+        let image_turn = image.and_then(|i| {
+            self.special
+                .im_start
+                .and_then(|t| ids[..i].iter().rposition(|&x| x == t))
+        });
+        let mut v: Vec<usize> = [image_turn, image, last(self.special.im_start)]
             .into_iter()
             .flatten()
             .filter(|&p| p > after && p < ids.len())
@@ -212,6 +361,7 @@ impl<B: Backend> QwenEngine<B> {
     fn prefill(
         &self,
         lane: &mut Lane<B>,
+        ws: &mut Workspace<B>,
         p: &Prompt,
         images: &[ImagePatches],
         start: usize,
@@ -257,7 +407,7 @@ impl<B: Backend> QwenEngine<B> {
                 logits = self.model.forward_with(
                     &self.b,
                     &mut lane.session,
-                    &mut lane.ws,
+                    ws,
                     &p.ids[pos..cp],
                     positions,
                     &inserts,
@@ -283,10 +433,12 @@ where
 
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
         self.b.bind_thread().map_err(core)?;
-        let (messages, urls) = normalize_messages(&req["messages"])?;
-        let tools = req
-            .get("tools")
-            .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
+        let Normalized {
+            messages,
+            tools,
+            images: urls,
+        } = normalize_request(req)?;
+        let tools = tools.as_ref();
         let thinking = req
             .pointer("/chat_template_kwargs/enable_thinking")
             .and_then(Value::as_bool)
@@ -326,17 +478,33 @@ where
         }
         let mut sampler = Sampler::from_request(req);
 
-        let mut lane = self
-            .lane
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| core(CoreError::Backend("engine lane poisoned".into())))?;
-        let lane = &mut *lane;
+            .map_err(|_| core(CoreError::Backend("engine lanes poisoned".into())))?;
+        let Lanes { ws, lanes } = &mut *state;
+        let li = Self::pick_lane(lanes, &p.keys, p.ids.len() + max_tokens)
+            .ok_or_else(|| ApiError::invalid("no lane can hold this request"))?;
+        let lane = &mut lanes[li];
         let t0 = Instant::now();
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+            let shared = common_prefix(&lane.keys, &p.keys);
+            let cps: Vec<usize> = lane.checkpoints.iter().map(|c| c.pos).collect();
+            eprintln!(
+                "[prefix] lane {li} prompt {} held {} pos {} shared {} checkpoints {:?} next {:?}",
+                p.keys.len(),
+                lane.keys.len(),
+                lane.session.pos,
+                shared,
+                cps,
+                self.checkpoint_positions(&p.ids, 0)
+            );
+        }
         let start = self.reuse(lane, &p.keys).map_err(core)?;
         // Checkpoints still valid for this prompt are those inside the shared prefix.
         lane.checkpoints.retain(|c| c.pos <= start);
         lane.keys.truncate(start);
-        let prefilled = self.prefill(lane, &p, &images, start);
+        let prefilled = self.prefill(lane, ws, &p, &images, start);
         let mut logits = match prefilled {
             Ok(l) => l,
             Err(e) => {
@@ -367,7 +535,7 @@ where
             }
             logits = self
                 .model
-                .forward(&self.b, &mut lane.session, &mut lane.ws, &[next])
+                .forward(&self.b, &mut lane.session, ws, &[next])
                 .map_err(core)?;
             lane.keys.push(next);
         }
@@ -403,23 +571,46 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_call_arguments_become_objects() {
-        let m = json!([{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": "{\"x\": 1}"}}]}]);
-        let (n, imgs) = normalize_messages(&m).unwrap();
+    fn messages_follow_ninfer_shape() {
+        let r = json!({"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}], "name": "x"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{\"x\": 1}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "user", "content": [{"type": "text", "text": "see"}, {"type": "image_url", "image_url": {"url": "data:a"}}]}
+        ]});
+        let n = normalize_request(&r).unwrap();
+        assert_eq!(n.messages[0], json!({"role": "system", "content": "ab"}));
         assert_eq!(
-            n[0]["tool_calls"][0]["function"]["arguments"],
-            json!({"x": 1})
+            n.messages[1]["tool_calls"][0],
+            json!({"id": "c1", "type": "function", "function": {"name": "f", "arguments": {"x": 1}}})
         );
-        assert!(imgs.is_empty());
+        assert_eq!(
+            n.messages[2],
+            json!({"role": "tool", "content": "ok", "tool_call_id": "c1"})
+        );
+        assert_eq!(
+            n.messages[3]["content"],
+            json!([{"type": "text", "text": "see"}, {"type": "image"}])
+        );
+        assert_eq!(n.images, vec!["data:a"]);
+        assert!(n.tools.is_none());
     }
 
     #[test]
-    fn images_are_collected_in_order() {
-        let m = json!([
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:a"}}, {"type": "text", "text": "x"}]},
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:b"}}]}
-        ]);
-        assert_eq!(normalize_messages(&m).unwrap().1, vec!["data:a", "data:b"]);
+    fn tools_are_rebuilt_with_strict() {
+        let r = json!({"messages": [], "tools": [
+            {"type": "function", "function": {"name": "click", "description": "Click it.", "parameters": {"type": "object"}, "extra": 1}},
+            {"type": "function", "function": {"name": "noop", "description": ""}}
+        ]});
+        let tools = normalize_request(&r).unwrap().tools.unwrap();
+        assert_eq!(
+            velox_frontend::template::py_json(&tools[0]),
+            r#"{"type": "function", "function": {"name": "click", "parameters": {"type": "object"}, "strict": false, "description": "Click it."}}"#
+        );
+        assert_eq!(
+            tools[1]["function"],
+            json!({"name": "noop", "parameters": {"type": "object", "properties": {}}, "strict": false})
+        );
     }
 
     #[test]

@@ -16,10 +16,19 @@ use crate::select::Selected;
 
 pub fn run(a: &Args) -> Result<ExitCode> {
     let sel = crate::select::backend(a)?;
-    match &sel {
-        Selected::Cpu(b) => generate(b, a),
+    let profile = a.get("profile-ops").is_some();
+    match sel {
+        Selected::Cpu(b) => generate(&b, a, &mut |_| {}),
         #[cfg(feature = "cuda")]
-        Selected::Cuda(b) => generate(b, a),
+        Selected::Cuda(b) if profile => {
+            let p = crate::profile::Profiled::new(b);
+            generate(&p, a, &mut |phase| {
+                eprintln!("[{phase}] {}", p.report());
+                p.reset();
+            })
+        }
+        #[cfg(feature = "cuda")]
+        Selected::Cuda(b) => generate(&b, a, &mut |_| {}),
     }
 }
 
@@ -28,7 +37,7 @@ enum Input {
     Ids(Vec<u32>),
 }
 
-fn generate<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
+fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Result<ExitCode> {
     let path = a
         .get("artifact")
         .ok_or_else(|| Error::Config("--artifact is required".into()))?;
@@ -44,7 +53,12 @@ fn generate<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
     };
     let fe = Frontend::from_artifact(&art, template)?;
     let (inputs, jsonl) = match (a.get("prompt"), a.get("prompts-file"), a.get("ids")) {
-        (Some(p), _, _) => (vec![Input::Prompt(p.to_string())], false),
+        (Some(p), _, _) => {
+            // --filler-tokens N prepends ~N tokens of filler text to measure long contexts.
+            let filler: usize = a.parse("filler-tokens", 0)?;
+            let pad = "The quick brown fox jumps over the lazy dog. ".repeat(filler / 10);
+            (vec![Input::Prompt(format!("{pad}{p}"))], false)
+        }
         (None, Some(f), _) => {
             let text =
                 std::fs::read_to_string(f).map_err(|e| Error::Config(format!("{f}: {e}")))?;
@@ -104,6 +118,7 @@ fn generate<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
         let t1 = Instant::now();
         let mut logits = model.forward(b, &mut session, &mut ws, &ids)?;
         let prefill = t1.elapsed().as_secs_f64();
+        on_phase("prefill");
         let mut out = Vec::new();
         let t2 = Instant::now();
         loop {
@@ -118,6 +133,7 @@ fn generate<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
             logits = model.forward(b, &mut session, &mut ws, &[next])?;
         }
         let decode = t2.elapsed().as_secs_f64();
+        on_phase("decode");
         let text = fe.decode(&out)?;
         if jsonl {
             let line = json!({"prompt": prompt, "prompt_tokens": ids.len(), "ids": out, "text": text,
