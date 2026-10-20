@@ -409,9 +409,17 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
     const int r0 = (wid / KW) * R;
     if (r0 >= rows) return;  // whole row groups only, so KW > 1 blocks return together
     const long long k = w.k;
-    const long long row_bytes = FMT == VELOX_FMT_NVFP4 ? k / 2 : FMT == VELOX_FMT_BF16 ? 2 * k : k;
-    const long long chunks = row_bytes / 16;
-    constexpr int kElems = FMT == VELOX_FMT_NVFP4 ? 32 : FMT == VELOX_FMT_BF16 ? 8 : 16;
+    // Groupwise Q4 (group 64) / Q8 (group 32), row_split_k128_v1: a row's base plane is gpr
+    // groups of 32 bytes over K padded to 128; one 16-byte chunk is half a group either way.
+    constexpr bool kRowSplit = FMT == VELOX_FMT_Q4 || FMT == VELOX_FMT_Q8;
+    const long long gpr = (k + 127) / 128 * 128 / (FMT == VELOX_FMT_Q8 ? 32 : 64);
+    const long long row_bytes = kRowSplit ? gpr * 32
+                                : FMT == VELOX_FMT_NVFP4 ? k / 2
+                                : FMT == VELOX_FMT_BF16  ? 2 * k
+                                                         : k;
+    constexpr int kElems = FMT == VELOX_FMT_NVFP4 || FMT == VELOX_FMT_Q4 ? 32 : FMT == VELOX_FMT_BF16 ? 8 : 16;
+    // Only real columns are visited (the launcher requires k % kElems == 0 for row-split).
+    const long long chunks = kRowSplit ? k / kElems : row_bytes / 16;
     const uint8_t* rp[R];
     bool live[R];
 #pragma unroll
@@ -428,6 +436,11 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
     const uint8_t* sbase[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) sbase[r] = w.base + scale_plane + nvfp4_scale_offset(row_begin + r0 + (live[r] ? r : 0), 0, k);
+    // Row-split FP16 group scales follow the base plane (no high plane for Q4/Q8).
+    const uint16_t* gscale[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        gscale[r] = reinterpret_cast<const uint16_t*>(w.base + align256(w.n * gpr * 32)) + (row_begin + r0 + (live[r] ? r : 0)) * gpr;
 
     for (long long c = kw * VELOX_WARP + lane; c < chunks; c += VELOX_WARP * KW) {
         uint4 wv[R];
@@ -443,6 +456,10 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
                 sc[r][0] = e4m3_bits(s2, 0) * 16384.0f;  // e2m1x2_scaled is 2^-14 times the code
                 sc[r][1] = e4m3_bits(s2, 1) * 16384.0f;
             }
+        }
+        if (kRowSplit) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) sc[r][0] = __half2float(__ushort_as_half(gscale[r][c >> 1]));
         }
 #pragma unroll
         for (int i = 0; i < M; ++i) {
@@ -466,6 +483,22 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
                         if (b < 8) s0 += s; else s1 += s;
                     }
                     acc[r][i] += s0 * sc[r][0] + s1 * sc[r][1];
+                } else if (FMT == VELOX_FMT_Q4) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < 16; ++b) {
+                        const uint32_t byte = (words[b / 4] >> (8 * (b % 4))) & 0xffu;
+                        const int lo = static_cast<int>(byte & 0xfu) - (byte & 0x8u ? 16 : 0);
+                        const int hi = static_cast<int>(byte >> 4) - (byte & 0x80u ? 16 : 0);
+                        s += static_cast<float>(lo) * xv[2 * b] + static_cast<float>(hi) * xv[2 * b + 1];
+                    }
+                    acc[r][i] += s * sc[r][0];
+                } else if (FMT == VELOX_FMT_Q8) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < 16; ++b)
+                        s += static_cast<float>(static_cast<int8_t>((words[b / 4] >> (8 * (b % 4))) & 0xffu)) * xv[b];
+                    acc[r][i] += s * sc[r][0];
                 } else if (FMT == VELOX_FMT_BF16) {
                     float s = 0.0f;
 #pragma unroll
@@ -505,7 +538,7 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
         if (!live[r]) continue;
         const long long row = row_begin + r0 + r;
         float post = 1.0f;
-        if (FMT == VELOX_FMT_BF16) {
+        if (FMT == VELOX_FMT_BF16 || kRowSplit) {
         } else if (FMT == VELOX_FMT_NVFP4) {
             post = 1.0f / *reinterpret_cast<const float*>(w.base + scale_plane + w.n * k / 16);
         } else {
@@ -557,6 +590,8 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
         if (format == VELOX_FMT_FP8_ROW_BF16)
             return launch_gemv_vec_m<VELOX_FMT_FP8_ROW_BF16>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_BF16) return launch_gemv_vec_m<VELOX_FMT_BF16>(x, d, row_begin, rows, m, y);
+        if (format == VELOX_FMT_Q4 && k % 32 == 0) return launch_gemv_vec_m<VELOX_FMT_Q4>(x, d, row_begin, rows, m, y);
+        if (format == VELOX_FMT_Q8) return launch_gemv_vec_m<VELOX_FMT_Q8>(x, d, row_begin, rows, m, y);
     }
     if (m <= kGemvMaxM && (format == VELOX_FMT_FP8_ROW_BF16 || format == VELOX_FMT_NVFP4)) {
         constexpr int kWarps = 8;

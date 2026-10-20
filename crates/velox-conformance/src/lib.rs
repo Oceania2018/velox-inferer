@@ -745,6 +745,9 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.linear(f, 72, 1152, 0, 72, 20)?;
         // Vision-tower sizes, where tuned kernels switch to tensor cores (bf16 activations):
         // ragged token counts, a row view, and K = 4304 padded to 4352 in storage.
+        // Small m (decode, drafting): the vectorized GEMV for Q4 / Q8, row views and K-split rows.
+        s.linear(f, 3000, 1152, 37, 2500, 1)?;
+        s.linear(f, 300, 1152, 0, 300, 5)?;
         s.linear(f, 160, 1152, 32, 96, 130)?;
         s.linear(f, 96, 4304, 0, 96, 70)?;
     }
