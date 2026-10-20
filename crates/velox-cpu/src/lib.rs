@@ -5,8 +5,8 @@
 //! change its numerics.
 
 use velox_core::backend::{
-    AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind,
-    RopePosShape, RopeShape, WeightView,
+    top_k_row, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind,
+    NormKind, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::decode_rows;
 use velox_core::{check, DeviceProfile, Op, Result};
@@ -454,6 +454,20 @@ impl Backend for CpuBackend {
             *v = g as f32;
         }
         Ok(())
+    }
+
+    fn top_k(
+        &self,
+        x: &Vec<f32>,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        check::top_k(x.len(), rows, row_len, limit, k)?;
+        Ok((0..rows)
+            .map(|r| top_k_row(&x[r * row_len..r * row_len + limit], k))
+            .collect())
     }
 
     fn rope_positions(&self, x: &mut Vec<f32>, positions: &[u32], s: RopePosShape) -> Result<()> {

@@ -243,6 +243,16 @@ impl<B: Backend> Backend for Profiled<B> {
     fn gelu(&self, x: &mut B::Buffer, len: usize, kind: GeluKind) -> Result<()> {
         self.time("gelu", || self.inner.gelu(x, len, kind))
     }
+    fn top_k(
+        &self,
+        x: &B::Buffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        self.time("top_k", || self.inner.top_k(x, rows, row_len, limit, k))
+    }
     fn rope_positions(&self, x: &mut B::Buffer, p: &[u32], s: RopePosShape) -> Result<()> {
         self.time("rope_positions", || self.inner.rope_positions(x, p, s))
     }

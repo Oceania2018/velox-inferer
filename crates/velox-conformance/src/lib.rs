@@ -269,6 +269,37 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `top_k` must agree exactly (indices and values) with the host selection, including ties
+    /// (lower index first) and NaN (ranked last).
+    fn top_k(&mut self, rows: usize, row_len: usize, limit: usize, k: usize) -> Result<()> {
+        let mut x = self.rng.vec(rows * row_len, 4.0);
+        // Ties and NaN: copy a value forward and poison a few entries.
+        for r in 0..rows {
+            let base = r * row_len;
+            x[base + limit / 2] = x[base + limit / 3];
+            x[base + 1] = f32::NAN;
+        }
+        let want = CpuBackend.top_k(&x, rows, row_len, limit, k)?;
+        let xd = self.b.upload(&x)?;
+        let got = self.b.top_k(&xd, rows, row_len, limit, k)?;
+        let same = got.len() == want.len()
+            && got.iter().zip(&want).all(|(g, w)| {
+                g.len() == w.len()
+                    && g.iter()
+                        .zip(w)
+                        .all(|(a, b)| a.0 == b.0 && (a.1 == b.1 || (a.1.is_nan() && b.1.is_nan())))
+            });
+        let name = format!("top_k rows={rows} len={row_len} limit={limit} k={k}");
+        self.record(
+            name,
+            Some(Op::TopK),
+            &[if same { 0.0 } else { f32::NAN }],
+            &[0.0],
+            0.0,
+        );
+        Ok(())
+    }
+
     fn embed(&mut self, fmt: WeightFormat, n: usize, k: usize, ids: &[u32]) -> Result<()> {
         let bytes = random_weight(&mut self.rng, fmt, n, k);
         let wc = CpuBackend.upload_bytes(&bytes)?;
@@ -682,6 +713,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.linear(f, 40, 130, 3, 30, 2)?;
         s.linear(f, 72, 1152, 0, 72, 20)?;
     }
+    // Sampling candidates: a Qwen-sized vocabulary row (public limit below the padded width), a
+    // small one, and k larger than the row.
+    s.top_k(2, 248_320, 248_077, 64)?;
+    s.top_k(3, 5000, 4097, 20)?;
+    s.top_k(1, 50, 50, 64)?;
+    s.top_k(4, 1000, 1000, 1)?;
     s.embed(WeightFormat::Fp8RowBf16, 50, 64, &[3, 0, 49, 3])?;
     s.embed(WeightFormat::Bf16, 10, 130, &[9, 1])?;
     s.embed(WeightFormat::Nvfp4, 128, 64, &[127, 0, 64])?;

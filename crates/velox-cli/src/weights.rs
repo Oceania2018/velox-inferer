@@ -74,7 +74,21 @@ pub fn inspect(a: &Args) -> Result<ExitCode> {
         // Where each logical parameter lives: object, or parts (object + element range).
         if let Some(b) = art.directory["bindings"].as_object() {
             for (name, v) in b.iter().filter(|(n, _)| n.starts_with(prefix)) {
-                println!("binding  {name:<48} {v}");
+                let id = v["object"]
+                    .as_str()
+                    .or_else(|| v["parts"][0]["object"].as_str());
+                let kind = id
+                    .and_then(|id| art.object(id))
+                    .map(|o| match &o.kind {
+                        ObjectKind::Tensor {
+                            shape,
+                            format,
+                            layout,
+                        } => format!("{format}/{layout} {shape:?}"),
+                        ObjectKind::Resource { encoding } => format!("resource {encoding}"),
+                    })
+                    .unwrap_or_default();
+                println!("binding  {name:<48} {v}  {kind}");
             }
         }
     }
