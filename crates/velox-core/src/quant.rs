@@ -62,6 +62,11 @@ pub fn f32_to_e2m1(x: f32) -> u8 {
 pub fn quantize_activations(x: &mut [f32], k: usize, q: ActQuant) {
     match q {
         ActQuant::Exact => {}
+        ActQuant::Bf16 => {
+            for v in x.iter_mut() {
+                *v = crate::format::bf16_to_f32(crate::format::f32_to_bf16(*v));
+            }
+        }
         ActQuant::Fp8Row => {
             for row in x.chunks_mut(k) {
                 let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));

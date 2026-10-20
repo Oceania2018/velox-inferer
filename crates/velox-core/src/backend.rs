@@ -197,6 +197,9 @@ impl ActPolicy {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActQuant {
     Exact,
+    /// Rounded to bf16 (RNE): the source model's own activation precision, so every policy
+    /// (including `A16Only`) permits it.
+    Bf16,
     /// Per row: `scale = amax / 448`, codes `e4m3(x * (1 / scale))` (RNE, saturating).
     Fp8Row,
     /// Per 16 elements: `s = e4m3(divisor * amax / 6)`, codes `e2m1(x * divisor / s)`.
