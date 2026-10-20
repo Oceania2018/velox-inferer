@@ -14,6 +14,7 @@ use velox_core::backend::{
 use velox_core::{check, profile, DeviceProfile, Error, GpuArch, Op, Result, VariantInfo};
 
 pub mod portable;
+mod timing;
 
 mod ffi {
     use super::*;
@@ -36,6 +37,10 @@ mod ffi {
         pub fn velox_cuda_htod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_dtoh(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_stage(src: *const c_void, bytes: usize, dev: *mut *mut c_void) -> i32;
+        pub fn velox_cuda_event_create(e: *mut *mut c_void) -> i32;
+        pub fn velox_cuda_event_record(e: *mut c_void) -> i32;
+        pub fn velox_cuda_event_elapsed(a: *mut c_void, b: *mut c_void, ms: *mut f32) -> i32;
+        pub fn velox_cuda_event_destroy(e: *mut c_void) -> i32;
         pub fn velox_cuda_dtod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_synchronize() -> i32;
         pub fn velox_cuda_error_string(code: i32) -> *const c_char;
@@ -411,6 +416,7 @@ pub struct CudaBackend {
     profile: Option<&'static DeviceProfile>,
     variant: &'static VariantInfo,
     kernels: Arc<dyn CudaKernels>,
+    timing: Option<timing::Timing>,
 }
 
 impl CudaBackend {
@@ -431,11 +437,19 @@ impl CudaBackend {
             profile,
             variant,
             kernels,
+            timing: timing::Timing::from_env(),
         })
     }
 
     pub fn device(&self) -> &DeviceInfo {
         &self.device
+    }
+
+    fn timed<T>(&self, op: &str, f: impl FnOnce() -> T) -> T {
+        match &self.timing {
+            Some(t) => t.time(op, f),
+            None => f(),
+        }
     }
 }
 
@@ -547,7 +561,7 @@ impl Backend for CudaBackend {
         k: usize,
     ) -> Result<()> {
         check::matmul(x.len, w.len, y.len, m, n, k)?;
-        self.kernels.matmul(x, w, y, m, n, k)
+        self.timed("matmul", || self.kernels.matmul(x, w, y, m, n, k))
     }
 
     fn linear(
@@ -558,7 +572,12 @@ impl Backend for CudaBackend {
         m: usize,
     ) -> Result<()> {
         check::linear(x.len, w, w.buf.len, y.len, m)?;
-        self.kernels.linear(x, w, y, m)
+        let op = format!(
+            "linear {} {}",
+            w.format.name(),
+            if m == 1 { "m=1" } else { "m>1" }
+        );
+        self.timed(&op, || self.kernels.linear(x, w, y, m))
     }
 
     fn linear_act(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> ActQuant {
@@ -572,7 +591,7 @@ impl Backend for CudaBackend {
         out: &mut CudaBuffer,
     ) -> Result<()> {
         check::embed(ids, table, table.buf.len, out.len)?;
-        self.kernels.embed(ids, table, out)
+        self.timed("embed", || self.kernels.embed(ids, table, out))
     }
 
     fn rms_norm(
@@ -586,27 +605,29 @@ impl Backend for CudaBackend {
         kind: NormKind,
     ) -> Result<()> {
         check::rms_norm(x.len, weight.len, y.len, rows, dim)?;
-        self.kernels.rms_norm(x, weight, y, rows, dim, eps, kind)
+        self.timed("rms_norm", || {
+            self.kernels.rms_norm(x, weight, y, rows, dim, eps, kind)
+        })
     }
 
     fn rope(&self, x: &mut CudaBuffer, s: RopeShape) -> Result<()> {
         check::rope(x.len, &s)?;
-        self.kernels.rope(x, s)
+        self.timed("rope", || self.kernels.rope(x, s))
     }
 
     fn silu_mul(&self, gate: &mut CudaBuffer, up: &CudaBuffer, len: usize) -> Result<()> {
         check::elementwise("silu_mul", &[gate.len, up.len], len)?;
-        self.kernels.silu_mul(gate, up, len)
+        self.timed("silu_mul", || self.kernels.silu_mul(gate, up, len))
     }
 
     fn sigmoid_mul(&self, x: &mut CudaBuffer, gate: &CudaBuffer, len: usize) -> Result<()> {
         check::elementwise("sigmoid_mul", &[x.len, gate.len], len)?;
-        self.kernels.sigmoid_mul(x, gate, len)
+        self.timed("sigmoid_mul", || self.kernels.sigmoid_mul(x, gate, len))
     }
 
     fn add(&self, acc: &mut CudaBuffer, x: &CudaBuffer, len: usize) -> Result<()> {
         check::elementwise("add", &[acc.len, x.len], len)?;
-        self.kernels.add(acc, x, len)
+        self.timed("add", || self.kernels.add(acc, x, len))
     }
 
     fn copy(
@@ -618,7 +639,9 @@ impl Backend for CudaBackend {
         len: usize,
     ) -> Result<()> {
         check::copy(src.len, src_offset, dst.len, dst_offset, len)?;
-        self.kernels.copy(src, src_offset, dst, dst_offset, len)
+        self.timed("copy", || {
+            self.kernels.copy(src, src_offset, dst, dst_offset, len)
+        })
     }
 
     fn attention(
@@ -630,7 +653,12 @@ impl Backend for CudaBackend {
         s: AttnShape,
     ) -> Result<()> {
         check::attention(q.len, k.len, v.len, out.len, &s)?;
-        self.kernels.attention(q, k, v, out, s)
+        let op = if s.tokens == 1 {
+            "attention decode"
+        } else {
+            "attention prefill"
+        };
+        self.timed(op, || self.kernels.attention(q, k, v, out, s))
     }
 
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
@@ -646,7 +674,9 @@ impl Backend for CudaBackend {
         s: ConvShape,
     ) -> Result<()> {
         check::conv1d(x.len, weight.len, state.len, out.len, &s)?;
-        self.kernels.conv1d_silu(x, weight, state, out, s)
+        self.timed("conv1d_silu", || {
+            self.kernels.conv1d_silu(x, weight, state, out, s)
+        })
     }
 
     fn gated_delta_net(
@@ -668,8 +698,15 @@ impl Backend for CudaBackend {
             out.len,
             &s,
         )?;
-        self.kernels
-            .gated_delta_net(qkv, ab, a_log, dt_bias, state, out, s)
+        let op = if s.tokens == 1 {
+            "gated_delta_net decode"
+        } else {
+            "gated_delta_net prefill"
+        };
+        self.timed(op, || {
+            self.kernels
+                .gated_delta_net(qkv, ab, a_log, dt_bias, state, out, s)
+        })
     }
 
     fn attention_full(
@@ -681,7 +718,9 @@ impl Backend for CudaBackend {
         s: FullAttnShape,
     ) -> Result<()> {
         check::attention_full(q.len, k.len, v.len, out.len, &s)?;
-        self.kernels.attention_full(q, k, v, out, s)
+        self.timed("attention_full", || {
+            self.kernels.attention_full(q, k, v, out, s)
+        })
     }
 
     fn layer_norm(
@@ -695,7 +734,9 @@ impl Backend for CudaBackend {
         eps: f32,
     ) -> Result<()> {
         check::layer_norm(x.len, weight.len, bias.len, y.len, rows, dim)?;
-        self.kernels.layer_norm(x, weight, bias, y, rows, dim, eps)
+        self.timed("layer_norm", || {
+            self.kernels.layer_norm(x, weight, bias, y, rows, dim, eps)
+        })
     }
 
     fn add_bias(
@@ -706,17 +747,19 @@ impl Backend for CudaBackend {
         dim: usize,
     ) -> Result<()> {
         check::add_bias(x.len, bias.len, rows, dim)?;
-        self.kernels.add_bias(x, bias, rows, dim)
+        self.timed("add_bias", || self.kernels.add_bias(x, bias, rows, dim))
     }
 
     fn gelu(&self, x: &mut CudaBuffer, len: usize, kind: GeluKind) -> Result<()> {
         check::elementwise("gelu", &[x.len], len)?;
-        self.kernels.gelu(x, len, kind)
+        self.timed("gelu", || self.kernels.gelu(x, len, kind))
     }
 
     fn rope_positions(&self, x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) -> Result<()> {
         check::rope_positions(x.len, positions, &s)?;
-        self.kernels.rope_positions(x, positions, s)
+        self.timed("rope_positions", || {
+            self.kernels.rope_positions(x, positions, s)
+        })
     }
 }
 

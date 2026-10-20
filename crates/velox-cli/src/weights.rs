@@ -70,6 +70,14 @@ pub fn inspect(a: &Args) -> Result<ExitCode> {
     if a.parse("uses", false)? {
         print_uses(&art)?;
     }
+    if let Some(prefix) = a.get("bindings") {
+        // Where each logical parameter lives: object, or parts (object + element range).
+        if let Some(b) = art.directory["bindings"].as_object() {
+            for (name, v) in b.iter().filter(|(n, _)| n.starts_with(prefix)) {
+                println!("binding  {name:<48} {v}");
+            }
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 

@@ -94,3 +94,14 @@ VELOX_API int velox_cuda_stage(const void* src, size_t bytes, void** dev_out) {
     *dev_out = d;
     return 0;
 }
+
+// CUDA events for op timing (VELOX_GPU_TIMING): recorded on the default stream around each op.
+VELOX_API int velox_cuda_event_create(void** e) {
+    return static_cast<int>(cudaEventCreate(reinterpret_cast<cudaEvent_t*>(e)));
+}
+VELOX_API int velox_cuda_event_record(void* e) { return static_cast<int>(cudaEventRecord(static_cast<cudaEvent_t>(e), 0)); }
+VELOX_API int velox_cuda_event_elapsed(void* start, void* end, float* ms) {
+    if (cudaError_t err = cudaEventSynchronize(static_cast<cudaEvent_t>(end))) return static_cast<int>(err);
+    return static_cast<int>(cudaEventElapsedTime(ms, static_cast<cudaEvent_t>(start), static_cast<cudaEvent_t>(end)));
+}
+VELOX_API int velox_cuda_event_destroy(void* e) { return static_cast<int>(cudaEventDestroy(static_cast<cudaEvent_t>(e))); }
