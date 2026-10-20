@@ -1,23 +1,20 @@
-//! Hardware variant of this build: **generic** (branch `main`).
+//! Hardware variant of this build: **rtx-4090** (branch `rtx-4090`).
 //!
-//! This crate is the only code that differs between hardware branches. Every branch exposes the
-//! same contract, which the CLI and conformance suite compile against:
+//! RTX 4090 24 GB (AD102, 128 SMs, sm_89): portable kernels; no TMA, no FP4
 //!
-//! - `INFO: VariantInfo`: id, branch, the profiles it tunes and the architectures its kernels run on;
-//! - `plan_policy(&DeviceProfile) -> PlanPolicy`: VRAM reserve and workspace per card;
-//! - with the `cuda` feature, `cuda_kernels(&DeviceInfo) -> Result<Arc<dyn CudaKernels>>`.
-//!
-//! The generic variant runs the portable kernels on any device. See docs/branching.md for how a
-//! hardware branch replaces this crate.
+//! Same contract as every branch (see main's version of this file): `INFO`, `plan_policy`,
+//! and with the `cuda` feature `cuda_kernels`. No op is tuned here yet: every op runs the
+//! portable kernel. Tuned kernels are added under `kernels/` (with `kernels/gencode.txt`) and
+//! listed in `native_ops`, following rtx-5090-32g; see docs/branching.md.
 
-use velox_core::{DeviceProfile, PlanPolicy, VariantInfo};
+use velox_core::{DeviceProfile, GpuArch, PlanPolicy, VariantInfo};
 
 pub static INFO: VariantInfo = VariantInfo {
-    id: "generic",
-    branch: "main",
-    description: "portable kernels for every supported GPU; correct everywhere, tuned nowhere",
-    profiles: &[],
-    archs: &[],
+    id: "rtx-4090",
+    branch: "rtx-4090",
+    description: "RTX 4090 24 GB (AD102, 128 SMs, sm_89): portable kernels; no TMA, no FP4",
+    profiles: &["rtx-4090"],
+    archs: &[GpuArch::Cuda { major: 8, minor: 9 }],
 };
 
 pub fn plan_policy(profile: &DeviceProfile) -> PlanPolicy {
