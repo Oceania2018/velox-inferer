@@ -149,8 +149,17 @@ pub fn elementwise(what: &str, lens: &[usize], len: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn copy(src: usize, dst: usize, dst_offset: usize, len: usize) -> Result<()> {
-    need("copy src", src, len)?;
+pub fn copy(
+    src: usize,
+    src_offset: usize,
+    dst: usize,
+    dst_offset: usize,
+    len: usize,
+) -> Result<()> {
+    let src_end = src_offset
+        .checked_add(len)
+        .ok_or_else(|| Error::Shape("copy range overflows".into()))?;
+    need("copy src", src, src_end)?;
     let end = dst_offset
         .checked_add(len)
         .ok_or_else(|| Error::Shape("copy range overflows".into()))?;
@@ -207,8 +216,10 @@ mod tests {
 
     #[test]
     fn copy_checks_destination_end() {
-        assert!(copy(4, 10, 6, 4).is_ok());
-        assert!(copy(4, 10, 7, 4).is_err());
-        assert!(copy(4, 10, usize::MAX, 4).is_err());
+        assert!(copy(4, 0, 10, 6, 4).is_ok());
+        assert!(copy(4, 0, 10, 7, 4).is_err());
+        assert!(copy(4, 0, 10, usize::MAX, 4).is_err());
+        assert!(copy(6, 2, 10, 0, 4).is_ok());
+        assert!(copy(6, 3, 10, 0, 4).is_err());
     }
 }

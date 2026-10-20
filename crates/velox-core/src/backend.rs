@@ -237,10 +237,11 @@ pub trait Backend {
     fn silu_mul(&self, gate: &mut Self::Buffer, up: &Self::Buffer, len: usize) -> Result<()>;
     /// `acc[i] += x[i]` for the first `len` elements.
     fn add(&self, acc: &mut Self::Buffer, x: &Self::Buffer, len: usize) -> Result<()>;
-    /// `dst[dst_offset ..][.. len] = src[.. len]`.
+    /// `dst[dst_offset ..][.. len] = src[src_offset ..][.. len]`.
     fn copy(
         &self,
         src: &Self::Buffer,
+        src_offset: usize,
         dst: &mut Self::Buffer,
         dst_offset: usize,
         len: usize,

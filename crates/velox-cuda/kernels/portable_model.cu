@@ -83,6 +83,55 @@ __global__ void linear_kernel(const float* __restrict__ x, WDesc w, long long ro
     }
 }
 
+// Tiled y[m, rows] = x . W^T for larger m: each 64x64 output tile decodes its weight tile once
+// into shared memory per K step, so weights are read m/64 times instead of m times.
+constexpr int kTile = 64, kTileK = 16;
+
+__global__ void __launch_bounds__(256)
+linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m, float* __restrict__ y) {
+    __shared__ float Xs[kTileK][kTile + 4];
+    __shared__ float Ws[kTileK][kTile + 4];
+    const int t = threadIdx.x;
+    const int m0 = blockIdx.y * kTile, n0 = blockIdx.x * kTile;
+    const int lr = t / 4, lk = (t % 4) * 4;
+    const int ty = t / 16, tx = t % 16;
+    float acc[4][4] = {};
+    for (long long k0 = 0; k0 < w.k; k0 += kTileK) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const long long kk = k0 + lk + i;
+            const int xm = m0 + lr, wn = n0 + lr;
+            Xs[lk + i][lr] = (xm < m && kk < w.k) ? x[static_cast<size_t>(xm) * w.k + kk] : 0.0f;
+            Ws[lk + i][lr] = (wn < rows && kk < w.k) ? weight_at(w, row_begin + wn, kk) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < kTileK; ++kk) {
+            float a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                a[i] = Xs[kk][ty * 4 + i];
+                b[i] = Ws[kk][tx * 4 + i];
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int r = m0 + ty * 4 + i;
+        if (r >= m) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c = n0 + tx * 4 + j;
+            if (c < rows) y[static_cast<size_t>(r) * rows + c] = acc[i][j];
+        }
+    }
+}
+
 __global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long long row_begin, float* __restrict__ out) {
     const long long row = row_begin + ids[blockIdx.x];
     for (long long c = threadIdx.x; c < w.k; c += blockDim.x) out[blockIdx.x * w.k + c] = weight_at(w, row, c);
@@ -178,9 +227,15 @@ __global__ void gated_delta_net_kernel(const float* __restrict__ qkv, const floa
 
 VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format, long long n, long long k,
                                     long long row_begin, int rows, int m, float* y) {
-    constexpr int kWarps = 8;
-    const dim3 grid((rows + kWarps - 1) / kWarps, m < 65535 ? m : 65535);
-    linear_kernel<<<grid, kWarps * VELOX_WARP>>>(x, WDesc{w, format, n, k}, row_begin, rows, m, y);
+    const WDesc d{w, format, n, k};
+    if (m >= 16 && (m + kTile - 1) / kTile <= 65535) {
+        const dim3 grid((rows + kTile - 1) / kTile, (m + kTile - 1) / kTile);
+        linear_tiled_kernel<<<grid, 256>>>(x, d, row_begin, rows, m, y);
+    } else {
+        constexpr int kWarps = 8;
+        const dim3 grid((rows + kWarps - 1) / kWarps, m < 65535 ? m : 65535);
+        linear_kernel<<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    }
     return velox_launch_status();
 }
 

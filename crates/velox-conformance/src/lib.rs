@@ -252,13 +252,14 @@ impl<B: Backend> Suite<'_, B> {
     }
 
     fn copy(&mut self, len: usize, dst_len: usize, offset: usize) -> Result<()> {
-        let src = self.rng.vec(len, 1.0);
+        // Source carries a 7-element prefix so the source offset is exercised too.
+        let src = self.rng.vec(len + 7, 1.0);
         let dst = self.rng.vec(dst_len, 1.0);
         let mut want = dst.clone();
-        CpuBackend.copy(&src, &mut want, offset, len)?;
+        CpuBackend.copy(&src, 7, &mut want, offset, len)?;
         let sd = self.b.upload(&src)?;
         let mut dd = self.b.upload(&dst)?;
-        self.b.copy(&sd, &mut dd, offset, len)?;
+        self.b.copy(&sd, 7, &mut dd, offset, len)?;
         let got = fetch(self.b, &dd, dst_len)?;
         self.record(
             format!("copy len={len} offset={offset}"),
@@ -410,6 +411,10 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 33, 130, 5, 20, 2)?;
     s.linear(WeightFormat::Fp8RowBf16, 96, 300, 10, 40, 1)?;
     s.linear(WeightFormat::Fp8RowBf16, 64, 512, 0, 64, 9)?;
+    // m >= 16 takes the tiled path, with ragged edges in every dimension.
+    s.linear(WeightFormat::Fp8RowBf16, 200, 300, 17, 150, 70)?;
+    s.linear(WeightFormat::Nvfp4, 256, 320, 0, 256, 33)?;
+    s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 16)?;
     s.linear(WeightFormat::Nvfp4, 256, 128, 0, 256, 1)?;
     s.linear(WeightFormat::Nvfp4, 384, 192, 128, 200, 5)?;
     s.embed(WeightFormat::Fp8RowBf16, 50, 64, &[3, 0, 49, 3])?;

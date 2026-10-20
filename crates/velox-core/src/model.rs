@@ -191,8 +191,8 @@ impl<B: Backend> Stack<B> {
             b.matmul(&ws.h, &l.wv, &mut ws.v, tokens, kvd, hd)?;
             b.rope(&mut ws.q, rope(s.heads))?;
             b.rope(&mut ws.k, rope(s.kv_heads))?;
-            b.copy(&ws.k, &mut l.k_cache, pos0 * kvd, tokens * kvd)?;
-            b.copy(&ws.v, &mut l.v_cache, pos0 * kvd, tokens * kvd)?;
+            b.copy(&ws.k, 0, &mut l.k_cache, pos0 * kvd, tokens * kvd)?;
+            b.copy(&ws.v, 0, &mut l.v_cache, pos0 * kvd, tokens * kvd)?;
             b.attention(&ws.q, &l.k_cache, &l.v_cache, &mut ws.attn, attn_shape)?;
             b.matmul(&ws.attn, &l.wo, &mut ws.proj, tokens, hd, qd)?;
             b.add(x, &ws.proj, tokens * hd)?;

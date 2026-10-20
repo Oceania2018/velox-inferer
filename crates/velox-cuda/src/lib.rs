@@ -303,11 +303,12 @@ pub trait CudaKernels: Send + Sync {
     fn copy(
         &self,
         src: &CudaBuffer,
+        src_offset: usize,
         dst: &mut CudaBuffer,
         dst_offset: usize,
         len: usize,
     ) -> Result<()> {
-        portable::copy(src, dst, dst_offset, len)
+        portable::copy(src, src_offset, dst, dst_offset, len)
     }
 
     fn attention(
@@ -532,12 +533,13 @@ impl Backend for CudaBackend {
     fn copy(
         &self,
         src: &CudaBuffer,
+        src_offset: usize,
         dst: &mut CudaBuffer,
         dst_offset: usize,
         len: usize,
     ) -> Result<()> {
-        check::copy(src.len, dst.len, dst_offset, len)?;
-        self.kernels.copy(src, dst, dst_offset, len)
+        check::copy(src.len, src_offset, dst.len, dst_offset, len)?;
+        self.kernels.copy(src, src_offset, dst, dst_offset, len)
     }
 
     fn attention(

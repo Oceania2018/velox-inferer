@@ -245,15 +245,21 @@ pub fn add(acc: &mut CudaBuffer, x: &CudaBuffer, len: usize) -> Result<()> {
     )
 }
 
-pub fn copy(src: &CudaBuffer, dst: &mut CudaBuffer, dst_offset: usize, len: usize) -> Result<()> {
-    check::copy(src.len(), dst.len(), dst_offset, len)?;
+pub fn copy(
+    src: &CudaBuffer,
+    src_offset: usize,
+    dst: &mut CudaBuffer,
+    dst_offset: usize,
+    len: usize,
+) -> Result<()> {
+    check::copy(src.len(), src_offset, dst.len(), dst_offset, len)?;
     if len == 0 {
         return Ok(());
     }
-    // SAFETY: dst_offset + len <= dst.len() validated above, so the offset pointer is in bounds.
+    // SAFETY: both ranges validated above, so the offset pointers are in bounds.
     dtod(
         unsafe { dst.as_mut_ptr().add(dst_offset) },
-        src.as_ptr(),
+        unsafe { src.as_ptr().add(src_offset) },
         len,
     )
 }

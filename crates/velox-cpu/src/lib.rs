@@ -227,12 +227,13 @@ impl Backend for CpuBackend {
     fn copy(
         &self,
         src: &Vec<f32>,
+        src_offset: usize,
         dst: &mut Vec<f32>,
         dst_offset: usize,
         len: usize,
     ) -> Result<()> {
-        check::copy(src.len(), dst.len(), dst_offset, len)?;
-        dst[dst_offset..dst_offset + len].copy_from_slice(&src[..len]);
+        check::copy(src.len(), src_offset, dst.len(), dst_offset, len)?;
+        dst[dst_offset..dst_offset + len].copy_from_slice(&src[src_offset..src_offset + len]);
         Ok(())
     }
 
