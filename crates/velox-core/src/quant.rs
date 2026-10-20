@@ -112,6 +112,25 @@ pub fn round_f16(x: f32) -> f32 {
     r.copysign(x)
 }
 
+/// Applies the input rounding of `p` to an `attention_full` call's operands in place.
+pub fn round_full_attention_inputs(
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    p: crate::backend::AttnPrecision,
+) {
+    match p {
+        crate::backend::AttnPrecision::Exact => {}
+        crate::backend::AttnPrecision::F16 => {
+            for x in q.iter_mut().chain(k.iter_mut()).chain(v.iter_mut()) {
+                *x = round_f16(*x);
+            }
+        }
+        // No FP8 contract for attention_full; the conformance suite rejects a backend reporting it.
+        crate::backend::AttnPrecision::Fp8QkF16Pv => {}
+    }
+}
+
 /// Applies the input rounding of `p` to a causal attention call's operands in place:
 /// `q` is `[tokens, heads, head_dim]`, `k`/`v` hold at least `kv_len` rows of `[kv_heads, head_dim]`.
 pub fn round_attention_inputs(
@@ -125,6 +144,16 @@ pub fn round_attention_inputs(
         return;
     }
     let kv = s.kv_len() * s.kv_heads * s.head_dim;
+    if p == crate::backend::AttnPrecision::F16 {
+        for x in q
+            .iter_mut()
+            .chain(k[..kv].iter_mut())
+            .chain(v[..kv].iter_mut())
+        {
+            *x = round_f16(*x);
+        }
+        return;
+    }
     quantize_activations(q, s.head_dim, ActQuant::Fp8Row);
     quantize_activations(&mut k[..kv], s.head_dim, ActQuant::Fp8Row);
     for x in &mut v[..kv] {

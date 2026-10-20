@@ -11,7 +11,9 @@ use velox_core::backend::{
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::model::{HostLayer, Stack};
-use velox_core::quant::{quantize_activations, round_attention_inputs};
+use velox_core::quant::{
+    quantize_activations, round_attention_inputs, round_full_attention_inputs,
+};
 use velox_core::rng::Rng;
 use velox_core::{ModelSpec, Op, Result};
 use velox_cpu::CpuBackend;
@@ -426,6 +428,7 @@ impl<B: Backend> Suite<'_, B> {
         let (tag, tol) = match precision {
             AttnPrecision::Exact => ("", 2e-4),
             AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+            AttnPrecision::F16 => (" f16", 2e-3),
         };
         let name = format!(
             "attention t={} h={}/{} d={} pos0={}{tag}",
@@ -511,8 +514,11 @@ impl<B: Backend> Suite<'_, B> {
             self.rng.vec(len, 2.0),
             self.rng.vec(len, 1.0),
         );
+        let precision = self.b.attention_full_precision(s);
+        let (mut qr, mut kr, mut vr) = (q.clone(), k.clone(), v.clone());
+        round_full_attention_inputs(&mut qr, &mut kr, &mut vr, precision);
         let mut want = vec![0.0; len];
-        CpuBackend.attention_full(&q, &k, &v, &mut want, s)?;
+        CpuBackend.attention_full(&qr, &kr, &vr, &mut want, s)?;
         let (qd, kd, vd) = (self.b.upload(&q)?, self.b.upload(&k)?, self.b.upload(&v)?);
         let mut od = self.b.alloc(len)?;
         self.b.attention_full(&qd, &kd, &vd, &mut od, s)?;
@@ -525,7 +531,13 @@ impl<B: Backend> Suite<'_, B> {
             Some(Op::AttentionFull),
             &got,
             &want,
-            2e-4,
+            match precision {
+                AttnPrecision::Exact => 2e-4,
+                // f16 softmax weights are not emulated.
+                AttnPrecision::F16 => 2e-3,
+                // No FP8 contract exists for attention_full.
+                AttnPrecision::Fp8QkF16Pv => -1.0,
+            },
         );
         Ok(())
     }
@@ -847,6 +859,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.attention_full(FullAttnShape {
         tokens: 64,
         heads: 4,
+        head_dim: 72,
+    })?;
+    // A screenshot-sized tower slice for tensor-core kernels: ragged in 64-query tiles.
+    s.attention_full(FullAttnShape {
+        tokens: 300,
+        heads: 3,
         head_dim: 72,
     })?;
     s.attention_full(FullAttnShape {
