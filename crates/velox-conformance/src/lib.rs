@@ -665,6 +665,21 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             head_dim: 256,
             pos0: 20,
         },
+        // Split-KV path: few queries over long caches, ragged last split.
+        AttnShape {
+            tokens: 1,
+            heads: 24,
+            kv_heads: 4,
+            head_dim: 256,
+            pos0: 16_999,
+        },
+        AttnShape {
+            tokens: 3,
+            heads: 6,
+            kv_heads: 2,
+            head_dim: 96,
+            pos0: 1_000,
+        },
     ] {
         s.attention(a)?;
     }

@@ -198,62 +198,137 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __r
     for (int j = 0; j < width - 1; ++j) state[static_cast<size_t>(j) * channels + c] = win[j];
 }
 
-// One block per value head; thread i < v_dim owns state row S[h][i][:]. q/k are normalised in
-// shared memory each step.
-__global__ void gated_delta_net_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
-                                       const float* __restrict__ a_log, const float* __restrict__ dt_bias,
-                                       float* __restrict__ state, float* __restrict__ out, int tokens, int k_heads,
-                                       int v_heads, int k_dim, int v_dim) {
-    extern __shared__ float smem[];
-    float* qs = smem;          // k_dim
-    float* ks = smem + k_dim;  // k_dim
-    __shared__ float scratch[VELOX_WARP];
-    __shared__ float s_alpha, s_beta;
-    const int h = blockIdx.x, kh = h / (v_heads / k_heads), tid = threadIdx.x;
+// Gated DeltaNet: state rows are independent, so one warp owns one row S[h][i][:] (lanes split
+// k_dim, PER elements each, kept in registers for the whole call). Grid: heads x row groups.
+template <int PER>
+__global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
+                                            const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                            float* __restrict__ state, float* __restrict__ out, int tokens,
+                                            int k_heads, int v_heads, int k_dim, int v_dim) {
+    const int warps = blockDim.x / VELOX_WARP;
+    const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    if (i >= v_dim) return;
+    const int kh = h / (v_heads / k_heads);
     const int width = 2 * k_heads * k_dim + v_heads * v_dim;
-    float* S = state + static_cast<size_t>(h) * v_dim * k_dim;
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(k_dim));
-
+    const float neg_a = -expf(a_log[h]), bias = dt_bias[h];
+    float* row_state = state + (static_cast<size_t>(h) * v_dim + i) * k_dim;
+    float s[PER];
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int d = lane + p * VELOX_WARP;
+        s[p] = d < k_dim ? row_state[d] : 0.0f;
+    }
     for (int t = 0; t < tokens; ++t) {
         const float* row = qkv + static_cast<size_t>(t) * width;
-        float qv = 0.0f, kv = 0.0f;
-        if (tid < k_dim) {
-            qv = row[kh * k_dim + tid];
-            kv = row[(k_heads + kh) * k_dim + tid];
+        float q[PER], k[PER], qq = 0.0f, kk = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            q[p] = d < k_dim ? row[kh * k_dim + d] : 0.0f;
+            k[p] = d < k_dim ? row[(k_heads + kh) * k_dim + d] : 0.0f;
+            qq += q[p] * q[p];
+            kk += k[p] * k[p];
         }
-        const float qq = velox_block_sum(qv * qv, scratch);
-        const float kk = velox_block_sum(kv * kv, scratch);
-        if (tid < k_dim) {
-            qs[tid] = qv * rsqrtf(qq + 1e-6f);
-            ks[tid] = kv * rsqrtf(kk + 1e-6f);
+        const float qn = rsqrtf(velox_warp_sum(qq) + 1e-6f), kn = rsqrtf(velox_warp_sum(kk) + 1e-6f);
+        const float a = ab[static_cast<size_t>(t) * 2 * v_heads + h] + bias;
+        const float b = ab[static_cast<size_t>(t) * 2 * v_heads + v_heads + h];
+        const float alpha = expf(neg_a * (a > 20.0f ? a : log1pf(expf(a))));
+        const float beta = 1.0f / (1.0f + expf(-b));
+        float sk = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            s[p] *= alpha;
+            sk += s[p] * k[p] * kn;
         }
-        if (tid == 0) {
-            const float a = ab[static_cast<size_t>(t) * 2 * v_heads + h] + dt_bias[h];
-            const float b = ab[static_cast<size_t>(t) * 2 * v_heads + v_heads + h];
-            const float sp = a > 20.0f ? a : log1pf(expf(a));
-            s_alpha = expf(-expf(a_log[h]) * sp);
-            s_beta = 1.0f / (1.0f + expf(-b));
+        const float delta = beta * (row[2 * k_heads * k_dim + h * v_dim + i] - velox_warp_sum(sk));
+        float o = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            s[p] += delta * k[p] * kn;
+            o += s[p] * q[p] * qn;
         }
-        __syncthreads();
-        if (tid < v_dim) {
-            float* Si = S + static_cast<size_t>(tid) * k_dim;
-            const float alpha = s_alpha;
-            float sk = 0.0f;
-            for (int j = 0; j < k_dim; ++j) {
-                const float sv = Si[j] * alpha;
-                Si[j] = sv;
-                sk += sv * ks[j];
+        o = velox_warp_sum(o);
+        if (lane == 0) out[(static_cast<size_t>(t) * v_heads + h) * v_dim + i] = o * inv_sqrt_dk;
+    }
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int d = lane + p * VELOX_WARP;
+        if (d < k_dim) row_state[d] = s[p];
+    }
+}
+
+// Small-m linear for FP8-row and NVFP4: one warp per output row, codes decoded a group at a time
+// (16 bytes of FP8 codes, or one 16-element NVFP4 group sharing a scale) and applied to all m
+// rows, so each weight is read once.
+constexpr int kGemvMaxM = 8;
+
+__device__ __forceinline__ float fp8_lut(uint8_t b) { return e4m3fn_to_f32(b); }
+
+template <int FMT>
+__global__ void linear_gemv_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m,
+                                   float* __restrict__ y) {
+    const int r = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    const int lane = threadIdx.x % VELOX_WARP;
+    if (r >= rows) return;
+    const long long row = row_begin + r, k = w.k;
+    float acc[kGemvMaxM];
+#pragma unroll
+    for (int i = 0; i < kGemvMaxM; ++i) acc[i] = 0.0f;
+    if (FMT == VELOX_FMT_FP8_ROW_BF16) {
+        const uint8_t* codes = w.base + row * k;
+        for (long long c0 = lane * 16LL; c0 < k; c0 += 16LL * VELOX_WARP) {
+            const int n = static_cast<int>(k - c0 < 16 ? k - c0 : 16);
+            float wv[16];
+#pragma unroll
+            for (int j = 0; j < 16; ++j) wv[j] = j < n ? fp8_lut(codes[c0 + j]) : 0.0f;
+#pragma unroll
+            for (int i = 0; i < kGemvMaxM; ++i) {
+                if (i < m) {
+                    const float* xr = x + static_cast<size_t>(i) * k + c0;
+                    float s = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 16; ++j)
+                        if (j < n) s += wv[j] * xr[j];
+                    acc[i] += s;
+                }
             }
-            const float delta = s_beta * (row[2 * k_heads * k_dim + h * v_dim + tid] - sk);
-            float o = 0.0f;
-            for (int j = 0; j < k_dim; ++j) {
-                const float sv = Si[j] + delta * ks[j];
-                Si[j] = sv;
-                o += sv * qs[j];
-            }
-            out[(static_cast<size_t>(t) * v_heads + h) * v_dim + tid] = o * inv_sqrt_dk;
         }
-        __syncthreads();
+        const uint8_t* sp = w.base + align256(w.n * k) + 2 * row;
+        const float scale = bf16_to_f32(static_cast<uint16_t>(sp[0] | (sp[1] << 8)));
+#pragma unroll
+        for (int i = 0; i < kGemvMaxM; ++i) acc[i] *= scale;
+    } else {  // NVFP4: k % 64 == 0, so groups of 16 never straddle the row end
+        const uint8_t* codes = w.base + row * k / 2;
+        const long long scale_plane = align256(w.n * k / 2);
+        const float inv_div = 1.0f / *reinterpret_cast<const float*>(w.base + scale_plane + w.n * k / 16);
+        for (long long g = lane; g < k / 16; g += VELOX_WARP) {
+            const float scale = e4m3fn_to_f32(w.base[scale_plane + nvfp4_scale_offset(row, g, k)]);
+            float wv[16];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t byte = codes[g * 8 + j];
+                wv[2 * j] = e2m1_to_f32(byte & 0xf) * scale;
+                wv[2 * j + 1] = e2m1_to_f32(byte >> 4) * scale;
+            }
+#pragma unroll
+            for (int i = 0; i < kGemvMaxM; ++i) {
+                if (i < m) {
+                    const float* xr = x + static_cast<size_t>(i) * k + g * 16;
+                    float s = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) s += wv[j] * xr[j];
+                    acc[i] += s;
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kGemvMaxM; ++i) acc[i] *= inv_div;
+    }
+#pragma unroll
+    for (int i = 0; i < kGemvMaxM; ++i) {
+        const float s = velox_warp_sum(acc[i]);
+        if (lane == 0 && i < m) y[static_cast<size_t>(i) * rows + r] = s;
     }
 }
 
@@ -262,6 +337,15 @@ __global__ void gated_delta_net_kernel(const float* __restrict__ qkv, const floa
 VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format, long long n, long long k,
                                     long long row_begin, int rows, int m, float* y) {
     const WDesc d{w, format, n, k};
+    if (m <= kGemvMaxM && (format == VELOX_FMT_FP8_ROW_BF16 || format == VELOX_FMT_NVFP4)) {
+        constexpr int kWarps = 8;
+        const dim3 grid((rows + kWarps - 1) / kWarps);
+        if (format == VELOX_FMT_FP8_ROW_BF16)
+            linear_gemv_kernel<VELOX_FMT_FP8_ROW_BF16><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+        else
+            linear_gemv_kernel<VELOX_FMT_NVFP4><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+        return velox_launch_status();
+    }
     if (m >= 16 && (m + kTile - 1) / kTile <= 65535) {
         const dim3 grid((rows + kTile - 1) / kTile, (m + kTile - 1) / kTile);
         linear_tiled_kernel<<<grid, 256>>>(x, d, row_begin, rows, m, y);
@@ -294,10 +378,17 @@ VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, float* 
 VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, const float* a_log,
                                              const float* dt_bias, float* state, float* out, int tokens, int k_heads,
                                              int v_heads, int k_dim, int v_dim) {
-    const int threads = ((k_dim > v_dim ? k_dim : v_dim) + VELOX_WARP - 1) / VELOX_WARP * VELOX_WARP;
-    if (threads > 1024) return VELOX_ERR_UNSUPPORTED;
-    gated_delta_net_kernel<<<v_heads, threads, 2 * k_dim * sizeof(float)>>>(qkv, ab, a_log, dt_bias, state, out, tokens,
-                                                                         k_heads, v_heads, k_dim, v_dim);
+    constexpr int kWarps = 4;
+    const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps), block(kWarps * VELOX_WARP);
+#define VELOX_GDN(PER)                                                                                     \
+    gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state, out, tokens, k_heads, \
+                                                      v_heads, k_dim, v_dim)
+    if (k_dim <= 32) VELOX_GDN(1);
+    else if (k_dim <= 64) VELOX_GDN(2);
+    else if (k_dim <= 128) VELOX_GDN(4);
+    else if (k_dim <= 256) VELOX_GDN(8);
+    else return VELOX_ERR_UNSUPPORTED;
+#undef VELOX_GDN
     return velox_launch_status();
 }
 
