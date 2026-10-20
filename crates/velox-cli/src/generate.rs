@@ -289,6 +289,7 @@ fn mtp_generate<B: Backend>(
         }
         let next = rows[keep - 1][0].0;
         model.commit(b, s, ws, keep)?;
+        dr.record(keep - 1, window.len() - 1);
         rounds += 1;
         proposed += window.len() - 1;
         accepted += keep - 1;
