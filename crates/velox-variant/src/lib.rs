@@ -14,7 +14,10 @@ pub static INFO: VariantInfo = VariantInfo {
     branch: "rtx-5090-laptop-24g",
     description: "RTX 5090 Laptop GPU 24 GB (GB203, 82 SMs): portable kernels, laptop VRAM policy",
     profiles: &["rtx-5090-laptop"],
-    archs: &[GpuArch::Cuda { major: 12, minor: 0 }],
+    archs: &[GpuArch::Cuda {
+        major: 12,
+        minor: 0,
+    }],
 };
 
 pub fn plan_policy(profile: &DeviceProfile) -> PlanPolicy {
