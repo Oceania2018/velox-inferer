@@ -151,7 +151,8 @@ VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float
         rms_norm_warp_kernel<<<(rows + 7) / 8, 256>>>(x, weight, y, rows, dim, eps, offset ? 1.0f : 0.0f);
         return velox_launch_status();
     }
-    rms_norm_kernel<<<rows, 256>>>(x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
+    // Wide rows: few of them per call (the residual stream), so give each the most threads.
+    rms_norm_kernel<<<rows, 1024>>>(x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
     return velox_launch_status();
 }
 
@@ -276,11 +277,11 @@ float* split_scratch(size_t floats) {
 template <int PER>
 int attention_split(const float* q, const float* k, const float* v, float* out, int tokens, int heads, int kv_heads,
                     int head_dim, int pos0, float scale) {
-    // Aim for >= 512 partial warps so short caches still occupy the GPU, with 32..256 keys each.
+    // Aim for >= 512 partial warps so short caches still occupy the GPU, with 8..256 keys each.
     const int kv = pos0 + tokens;
     const int want = (512 + tokens * heads - 1) / (tokens * heads);
     int split_keys = (kv + want - 1) / want;
-    split_keys = split_keys < 32 ? 32 : split_keys > kSplitKeys ? kSplitKeys : split_keys;
+    split_keys = split_keys < 8 ? 8 : split_keys > kSplitKeys ? kSplitKeys : split_keys;
     const int splits = (kv + split_keys - 1) / split_keys;
     const size_t parts = static_cast<size_t>(tokens) * heads * splits;
     float* scratch = split_scratch(parts * (head_dim + 2));
