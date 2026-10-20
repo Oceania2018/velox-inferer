@@ -7,7 +7,7 @@ velox-inferer ships one build per hardware family. Users pick the branch that ma
 |---|---|---|---|
 | `main` | any | portable (`sm_89`, `sm_120` + PTX) | Generic variant: correct everywhere, tuned nowhere. All feature work lands here. |
 | `rtx-5090-32g` | `rtx-5090` (32 GB desktop) | `sm_120a` | Primary implementation branch (170 SMs). |
-| `rtx-5090-laptop-24g` | `rtx-5090-laptop` (24 GB) | `sm_120a` | 82 SMs, larger VRAM reserve. |
+| `rtx-5090-24g` | `rtx-5090-laptop` (24 GB) | `sm_120a` | 82 SMs, larger VRAM reserve. |
 | `rtx-5060-ti` | `rtx-5060-ti-16g`, `rtx-5060-ti-8g` | `sm_120a` | Small-SM (36) shapes. |
 | `rtx-4090` | `rtx-4090` | `sm_89` | Ada: no TMA, no FP4. |
 
@@ -57,7 +57,7 @@ contract change, and then update every branch in the same release.
 ## Choosing a branch as a user
 
 ```bash
-velox devices            # e.g. "profile rtx-5090-laptop  tuned branch: rtx-5090-laptop-24g"
+velox devices            # e.g. "profile rtx-5090-laptop  tuned branch: rtx-5090-24g"
 git checkout rtx-5090-32g
 cargo build --release --features cuda
 velox plan --model qwen3-32b --weight-bits 4.5 --kv-bits 8
