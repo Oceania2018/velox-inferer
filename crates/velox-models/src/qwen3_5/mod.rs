@@ -24,6 +24,26 @@ pub struct Session<B: Backend> {
     kv: Vec<(B::Buffer, B::Buffer)>,
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
+    /// Speculative-verify state, allocated on first `verify`.
+    spec: Option<Spec<B>>,
+}
+
+/// Most tokens one `verify` call may feed (the anchor plus drafts).
+pub const VERIFY_MAX: usize = 16;
+
+/// What `commit` needs to keep only a prefix of a verified window: the recurrent state before
+/// the window, and per GDN layer the raw projections each token fed to the convolution and the
+/// recurrence. Replaying a prefix runs the same kernels on the same inputs, so the committed
+/// state is bit-identical to the verify trajectory at that point.
+struct Spec<B: Backend> {
+    conv: Vec<B::Buffer>,
+    ssm: Vec<B::Buffer>,
+    /// Per GDN layer: `[VERIFY_MAX, gdn_qkv]` raw qkv and `[VERIFY_MAX, 2 * v_heads]` a/b rows.
+    qkv: Vec<B::Buffer>,
+    ab: Vec<B::Buffer>,
+    pos0: usize,
+    tokens: usize,
+    recording: bool,
 }
 
 /// The recurrent (GDN) state of a session after `pos` tokens. Attention KV needs no copy: rows
@@ -110,6 +130,10 @@ pub struct Workspace<B: Backend> {
     mu: B::Buffer,
     last: B::Buffer,
     last_n: B::Buffer,
+    /// Final-normed hidden rows of the latest `verify` (`[VERIFY_MAX, hidden]`), which condition
+    /// draft models.
+    pub hidden: B::Buffer,
+    logits_rows: B::Buffer,
     logits: B::Buffer,
     /// Row of the last token of the latest `advance`, inside the final chunk.
     last_row: usize,
@@ -155,6 +179,7 @@ impl<B: Backend> Qwen35Text<B> {
             kv,
             conv,
             ssm,
+            spec: None,
         })
     }
 
@@ -184,6 +209,8 @@ impl<B: Backend> Qwen35Text<B> {
             last: b.alloc(c.hidden)?,
             last_n: b.alloc(c.hidden)?,
             logits: b.alloc(c.vocab)?,
+            hidden: b.alloc(VERIFY_MAX * c.hidden)?,
+            logits_rows: b.alloc(VERIFY_MAX * c.vocab)?,
             last_row: 0,
         })
     }
@@ -312,6 +339,10 @@ impl<B: Backend> Qwen35Text<B> {
                     b.linear(&ws.h, &w.view(qkv), &mut ws.qkv, t)?;
                     b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
                     b.linear(&ws.h, &w.view(ab), &mut ws.ab, t)?;
+                    if let Some(sp) = s.spec.as_mut().filter(|sp| sp.recording) {
+                        b.copy(&ws.qkv, 0, &mut sp.qkv[gi], 0, t * c.gdn_qkv())?;
+                        b.copy(&ws.ab, 0, &mut sp.ab[gi], 0, t * 2 * c.gdn_v_heads)?;
+                    }
                     let cs = ConvShape {
                         tokens: t,
                         channels: c.gdn_qkv(),
@@ -472,6 +503,176 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(b.top_k(&ws.logits, 1, v, limit.min(v), k)?
             .pop()
             .unwrap_or_default())
+    }
+
+    /// Speculative verify: feeds `ids` (the pending token, then drafts; at most [`VERIFY_MAX`] and
+    /// one workspace chunk) at rotary positions `cache position + rope_delta`, recording what
+    /// [`Self::commit`] needs, and returns the `k` best candidates (ids below `limit`) after each
+    /// of them. The final-normed hidden rows stay in `ws.hidden` for draft models.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        ids: &[u32],
+        k: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        let t = ids.len();
+        if t == 0 || t > VERIFY_MAX || t > ws.max_tokens {
+            return Err(Error::Shape(format!(
+                "verify takes 1..={} tokens, got {t}",
+                VERIFY_MAX.min(ws.max_tokens)
+            )));
+        }
+        self.ensure_spec(b, s)?;
+        {
+            let Session {
+                spec,
+                conv,
+                ssm,
+                pos,
+                ..
+            } = &mut *s;
+            let sp = spec.as_mut().expect("allocated above");
+            for (dst, src) in sp
+                .conv
+                .iter_mut()
+                .zip(conv.iter())
+                .chain(sp.ssm.iter_mut().zip(ssm.iter()))
+            {
+                b.copy(src, 0, dst, 0, b.len(src))?;
+            }
+            sp.pos0 = *pos;
+            sp.tokens = t;
+            sp.recording = true;
+        }
+        let r = self.advance(b, s, ws, ids, None, &[]);
+        if let Some(sp) = s.spec.as_mut() {
+            sp.recording = false;
+        }
+        r?;
+        let (c, w) = (&self.cfg, &self.w);
+        b.rms_norm(
+            &ws.x,
+            w.param(w.final_norm),
+            &mut ws.hidden,
+            t,
+            c.hidden,
+            c.eps,
+            NormKind::Offset,
+        )?;
+        b.linear(&ws.hidden, &w.view(&w.head), &mut ws.logits_rows, t)?;
+        b.top_k(&ws.logits_rows, t, c.vocab, limit.min(c.vocab), k)
+    }
+
+    /// Keeps the first `keep` tokens of the last `verify` window and discards the rest: the
+    /// session ends at `window start + keep`. Attention rows past that are simply overwritten
+    /// later; the recurrent state is restored and the kept prefix replayed from the recorded
+    /// projections.
+    pub fn commit(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        keep: usize,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let Session {
+            spec,
+            conv,
+            ssm,
+            pos,
+            ..
+        } = &mut *s;
+        let sp = spec
+            .as_ref()
+            .ok_or_else(|| Error::Config("commit without verify".into()))?;
+        if keep > sp.tokens {
+            return Err(Error::Shape(format!(
+                "commit {keep} of a {}-token window",
+                sp.tokens
+            )));
+        }
+        if keep < sp.tokens {
+            for (dst, src) in conv
+                .iter_mut()
+                .zip(&sp.conv)
+                .chain(ssm.iter_mut().zip(&sp.ssm))
+            {
+                b.copy(src, 0, dst, 0, b.len(src))?;
+            }
+            if keep > 0 {
+                let mut gi = 0;
+                for l in &self.w.layers {
+                    if let Mixer::Gdn {
+                        conv: cw,
+                        a_log,
+                        dt_bias,
+                        ..
+                    } = &l.mixer
+                    {
+                        let cs = ConvShape {
+                            tokens: keep,
+                            channels: c.gdn_qkv(),
+                            width: c.conv_width,
+                        };
+                        b.conv1d_silu(
+                            &sp.qkv[gi],
+                            self.w.param(*cw),
+                            &mut conv[gi],
+                            &mut ws.conv_out,
+                            cs,
+                        )?;
+                        let gs = GdnShape {
+                            tokens: keep,
+                            k_heads: c.gdn_k_heads,
+                            v_heads: c.gdn_v_heads,
+                            k_dim: c.gdn_k_dim,
+                            v_dim: c.gdn_v_dim,
+                        };
+                        b.gated_delta_net(
+                            &ws.conv_out,
+                            &sp.ab[gi],
+                            self.w.param(*a_log),
+                            self.w.param(*dt_bias),
+                            &mut ssm[gi],
+                            &mut ws.o,
+                            gs,
+                        )?;
+                        gi += 1;
+                    }
+                }
+            }
+        }
+        *pos = sp.pos0 + keep;
+        Ok(())
+    }
+
+    fn ensure_spec(&self, b: &B, s: &mut Session<B>) -> Result<()> {
+        if s.spec.is_some() {
+            return Ok(());
+        }
+        let c = &self.cfg;
+        let like = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
+            bufs.iter().map(|x| b.alloc(b.len(x))).collect()
+        };
+        let gdn = s.ssm.len();
+        s.spec = Some(Spec {
+            conv: like(&s.conv)?,
+            ssm: like(&s.ssm)?,
+            qkv: (0..gdn)
+                .map(|_| b.alloc(VERIFY_MAX * c.gdn_qkv()))
+                .collect::<Result<_>>()?,
+            ab: (0..gdn)
+                .map(|_| b.alloc(VERIFY_MAX * 2 * c.gdn_v_heads))
+                .collect::<Result<_>>()?,
+            pos0: 0,
+            tokens: 0,
+            recording: false,
+        });
+        Ok(())
     }
 
     /// Final norm and output head for the last advanced row, into `ws.logits`.

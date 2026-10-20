@@ -115,6 +115,18 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             Input::Ids(ids) => (None, ids),
         };
         let mut session = model.session(b, capacity)?;
+        if a.get("spec-check").is_some() {
+            spec_check(
+                b,
+                &model,
+                &mut session,
+                &mut ws,
+                &ids,
+                max_tokens,
+                fe.public_vocab,
+            )?;
+            continue;
+        }
         let t1 = Instant::now();
         let mut logits = model.forward(b, &mut session, &mut ws, &ids)?;
         let prefill = t1.elapsed().as_secs_f64();
@@ -157,4 +169,66 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `--spec-check`: speculative verify/commit must reproduce sequential decoding. Decodes greedily
+/// token by token, rewinds to the prefill checkpoint, then replays the same tokens through
+/// `verify` windows of 4 with a deliberately wrong draft every third position (forcing
+/// rollbacks), comparing each verified row's best candidate with the sequential step.
+fn spec_check<B: Backend>(
+    b: &B,
+    model: &Qwen35Text<B>,
+    s: &mut velox_models::qwen3_5::Session<B>,
+    ws: &mut velox_models::qwen3_5::Workspace<B>,
+    ids: &[u32],
+    steps: usize,
+    limit: usize,
+) -> Result<()> {
+    model.advance(b, s, ws, ids, None, &[])?;
+    let cp = s.checkpoint(b)?;
+    // Sequential reference: (token, logit) after each step.
+    let mut want = Vec::new();
+    let mut c = model.candidates(b, ws, 1, limit)?[0];
+    for _ in 0..steps {
+        want.push(c);
+        model.advance(b, s, ws, &[c.0], None, &[])?;
+        c = model.candidates(b, ws, 1, limit)?[0];
+    }
+    want.push(c);
+    s.restore(b, &cp)?;
+    // want[i] is the token generated at step i; the pending anchor starts as want[0].
+    let (mut done, mut rounds, mut accepted_total, mut max_err, mut mismatches) =
+        (0usize, 0, 0, 0f32, 0);
+    while done < steps {
+        let mut window = vec![want[done].0];
+        for j in 1..4.min(steps - done) {
+            let good = want[done + j].0;
+            window.push(if (done + j) % 3 == 0 { good + 1 } else { good });
+        }
+        let rows = model.verify(b, s, ws, &window, 1, limit)?;
+        // Row j predicts the token after window[j]; drafts are accepted while they match.
+        let mut keep = 1;
+        for j in 0..window.len() {
+            let got = rows[j][0];
+            let reference = want[done + j + 1];
+            if got.0 != reference.0 {
+                mismatches += 1;
+            }
+            max_err = max_err.max((got.1 - reference.1).abs() / (1.0 + reference.1.abs()));
+            if j + 1 < window.len() && window[j + 1] == got.0 {
+                keep += 1;
+            } else {
+                break;
+            }
+        }
+        model.commit(b, s, ws, keep)?;
+        done += keep;
+        accepted_total += keep - 1;
+        rounds += 1;
+    }
+    println!(
+        "spec-check: {steps} steps in {rounds} rounds ({accepted_total} drafts accepted), \
+         top-1 mismatches {mismatches}, max logit rel. err {max_err:.2e}"
+    );
+    Ok(())
 }
