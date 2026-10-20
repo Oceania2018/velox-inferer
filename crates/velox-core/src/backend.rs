@@ -101,6 +101,65 @@ pub struct GdnShape {
     pub v_dim: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FullAttnShape {
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeluKind {
+    /// `0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715x^3)))`
+    Tanh,
+    /// `0.5x(1 + erf(x / sqrt 2))`
+    Erf,
+}
+
+/// Which position axis and frequency each rotary pair uses, for `R = rotary_dim` and
+/// `P = R / 2` pairs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeLayout {
+    /// Pair `i` uses axis `i % axes` and frequency `theta^(-2i/R)` (Qwen MRoPE).
+    Interleaved,
+    /// Pairs split into `axes` equal blocks; pair `i` uses axis `i / (P/axes)` and frequency
+    /// `theta^(-2(i % (P/axes)) / (R/axes))` (Qwen vision 2D RoPE).
+    Blocked,
+}
+
+/// Rotate-half rotary over the first `rotary_dim` dims of each head of `[tokens, heads, head_dim]`,
+/// pair `(i, i + R/2)` rotated by `positions[axis(i)][t] * freq(i)`; see [`RopeLayout`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopePosShape {
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f32,
+    pub axes: usize,
+    pub layout: RopeLayout,
+}
+
+impl RopePosShape {
+    /// (axis, inverse frequency) of rotary pair `i`.
+    pub fn pair(&self, i: usize) -> (usize, f64) {
+        let r = self.rotary_dim as f64;
+        match self.layout {
+            RopeLayout::Interleaved => (
+                i % self.axes,
+                f64::from(self.theta).powf(-2.0 * i as f64 / r),
+            ),
+            RopeLayout::Blocked => {
+                let per = self.rotary_dim / 2 / self.axes;
+                (
+                    i / per,
+                    f64::from(self.theta).powf(-2.0 * (i % per) as f64 / (r / self.axes as f64)),
+                )
+            }
+        }
+    }
+}
+
 impl GdnShape {
     pub fn qkv_width(&self) -> usize {
         2 * self.k_heads * self.k_dim + self.v_heads * self.v_dim
@@ -259,5 +318,45 @@ pub trait Backend {
         v: &Self::Buffer,
         out: &mut Self::Buffer,
         shape: AttnShape,
+    ) -> Result<()>;
+    /// Non-causal multi-head attention: every token attends to all `shape.tokens` keys.
+    /// `q`, `k`, `v`, `out` are `[tokens, heads, head_dim]`.
+    fn attention_full(
+        &self,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: FullAttnShape,
+    ) -> Result<()>;
+    /// `y = (x - mean) / sqrt(var + eps) * w + b` per row (population variance).
+    #[allow(clippy::too_many_arguments)]
+    fn layer_norm(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        bias: &Self::Buffer,
+        y: &mut Self::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()>;
+    /// `x[r, c] += bias[c]` for `rows` rows of width `dim`.
+    fn add_bias(
+        &self,
+        x: &mut Self::Buffer,
+        bias: &Self::Buffer,
+        rows: usize,
+        dim: usize,
+    ) -> Result<()>;
+    /// `x[i] = gelu(x[i])` for the first `len` elements.
+    fn gelu(&self, x: &mut Self::Buffer, len: usize, kind: GeluKind) -> Result<()>;
+    /// Rotary embedding with explicit per-axis positions (`[axes, tokens]`, host); see
+    /// [`RopePosShape`].
+    fn rope_positions(
+        &self,
+        x: &mut Self::Buffer,
+        positions: &[u32],
+        shape: RopePosShape,
     ) -> Result<()>;
 }

@@ -5,7 +5,8 @@
 //! change its numerics.
 
 use velox_core::backend::{
-    AttnShape, Backend, BackendKind, ConvShape, GdnShape, NormKind, RopeShape, WeightView,
+    AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind,
+    RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::decode_rows;
 use velox_core::{check, DeviceProfile, Op, Result};
@@ -361,12 +362,165 @@ impl Backend for CpuBackend {
         }
         Ok(())
     }
+
+    fn attention_full(
+        &self,
+        q: &Vec<f32>,
+        k: &Vec<f32>,
+        v: &Vec<f32>,
+        out: &mut Vec<f32>,
+        s: FullAttnShape,
+    ) -> Result<()> {
+        check::attention_full(q.len(), k.len(), v.len(), out.len(), &s)?;
+        let (n, h, d) = (s.tokens, s.heads, s.head_dim);
+        let scale = 1.0 / (d as f64).sqrt();
+        let mut scores = vec![0f64; n];
+        for t in 0..n {
+            for hh in 0..h {
+                let qv = &q[(t * h + hh) * d..][..d];
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    *sc = dot(qv, &k[(j * h + hh) * d..][..d]) * scale;
+                }
+                let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let denom: f64 = scores
+                    .iter_mut()
+                    .map(|sc| {
+                        *sc = (*sc - max).exp();
+                        *sc
+                    })
+                    .sum();
+                for c in 0..d {
+                    let acc: f64 = (0..n)
+                        .map(|j| scores[j] * f64::from(v[(j * h + hh) * d + c]))
+                        .sum();
+                    out[(t * h + hh) * d + c] = (acc / denom) as f32;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn layer_norm(
+        &self,
+        x: &Vec<f32>,
+        weight: &Vec<f32>,
+        bias: &Vec<f32>,
+        y: &mut Vec<f32>,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        check::layer_norm(x.len(), weight.len(), bias.len(), y.len(), rows, dim)?;
+        for r in 0..rows {
+            let xr = &x[r * dim..(r + 1) * dim];
+            let mean = xr.iter().map(|&v| f64::from(v)).sum::<f64>() / dim as f64;
+            let var = xr
+                .iter()
+                .map(|&v| (f64::from(v) - mean).powi(2))
+                .sum::<f64>()
+                / dim as f64;
+            let inv = 1.0 / (var + f64::from(eps)).sqrt();
+            for c in 0..dim {
+                y[r * dim + c] = ((f64::from(xr[c]) - mean) * inv * f64::from(weight[c])
+                    + f64::from(bias[c])) as f32;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_bias(&self, x: &mut Vec<f32>, bias: &Vec<f32>, rows: usize, dim: usize) -> Result<()> {
+        check::add_bias(x.len(), bias.len(), rows, dim)?;
+        for r in 0..rows {
+            for c in 0..dim {
+                x[r * dim + c] += bias[c];
+            }
+        }
+        Ok(())
+    }
+
+    fn gelu(&self, x: &mut Vec<f32>, len: usize, kind: GeluKind) -> Result<()> {
+        check::elementwise("gelu", &[x.len()], len)?;
+        for v in &mut x[..len] {
+            let a = f64::from(*v);
+            let g = match kind {
+                GeluKind::Tanh => {
+                    0.5 * a
+                        * (1.0
+                            + ((2.0 / std::f64::consts::PI).sqrt() * (a + 0.044715 * a * a * a))
+                                .tanh())
+                }
+                GeluKind::Erf => 0.5 * a * (1.0 + erf(a / std::f64::consts::SQRT_2)),
+            };
+            *v = g as f32;
+        }
+        Ok(())
+    }
+
+    fn rope_positions(&self, x: &mut Vec<f32>, positions: &[u32], s: RopePosShape) -> Result<()> {
+        check::rope_positions(x.len(), positions, &s)?;
+        let half = s.rotary_dim / 2;
+        for t in 0..s.tokens {
+            for h in 0..s.heads {
+                let base = (t * s.heads + h) * s.head_dim;
+                for i in 0..half {
+                    let (axis, freq) = s.pair(i);
+                    let (sin, cos) = (f64::from(positions[axis * s.tokens + t]) * freq).sin_cos();
+                    let a = f64::from(x[base + i]);
+                    let b = f64::from(x[base + i + half]);
+                    x[base + i] = (a * cos - b * sin) as f32;
+                    x[base + i + half] = (a * sin + b * cos) as f32;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// f64 error function: Maclaurin series below 2.5, erfc continued fraction above (both ~1e-15).
+fn erf(x: f64) -> f64 {
+    // Series for |x| < 2.5, continued fraction for the tail; both accurate to ~1e-15.
+    let ax = x.abs();
+    let r = if ax < 2.5 {
+        let (mut term, mut sum, x2) = (ax, ax, ax * ax);
+        let mut n = 0.0;
+        while term.abs() > 1e-17 * sum.abs() {
+            n += 1.0;
+            term *= -x2 / n;
+            sum += term / (2.0 * n + 1.0);
+        }
+        2.0 / std::f64::consts::PI.sqrt() * sum
+    } else {
+        // erfc continued fraction (Lentz), then erf = 1 - erfc.
+        let mut f = ax;
+        for k in (1..60).rev() {
+            f = ax + (k as f64 / 2.0) / f;
+        }
+        1.0 - (-ax * ax).exp() / (std::f64::consts::PI.sqrt() * f)
+    };
+    if x < 0.0 {
+        -r
+    } else {
+        r
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use velox_core::WeightFormat;
+
+    #[test]
+    fn erf_reference_values() {
+        for (x, want) in [
+            (0.0, 0.0),
+            (0.5, 0.520_499_877_813_046_5),
+            (1.0, 0.842_700_792_949_714_9),
+            (-2.0, -0.995_322_265_018_952_7),
+            (3.0, 0.999_977_909_503_001_4),
+        ] {
+            assert!((erf(x) - want).abs() < 1e-13, "erf({x}) = {}", erf(x));
+        }
+    }
 
     #[test]
     fn matmul_small() {

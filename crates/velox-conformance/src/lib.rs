@@ -6,7 +6,8 @@
 //! must fall back correctly.
 
 use velox_core::backend::{
-    AttnShape, Backend, ConvShape, GdnShape, NormKind, RopeShape, WeightView,
+    AttnShape, Backend, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopeLayout,
+    RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::model::{HostLayer, Stack};
@@ -425,6 +426,101 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn attention_full(&mut self, s: FullAttnShape) -> Result<()> {
+        let len = s.tokens * s.heads * s.head_dim;
+        let (q, k, v) = (
+            self.rng.vec(len, 2.0),
+            self.rng.vec(len, 2.0),
+            self.rng.vec(len, 1.0),
+        );
+        let mut want = vec![0.0; len];
+        CpuBackend.attention_full(&q, &k, &v, &mut want, s)?;
+        let (qd, kd, vd) = (self.b.upload(&q)?, self.b.upload(&k)?, self.b.upload(&v)?);
+        let mut od = self.b.alloc(len)?;
+        self.b.attention_full(&qd, &kd, &vd, &mut od, s)?;
+        let got = fetch(self.b, &od, len)?;
+        self.record(
+            format!(
+                "attention_full t={} h={} d={}",
+                s.tokens, s.heads, s.head_dim
+            ),
+            Some(Op::AttentionFull),
+            &got,
+            &want,
+            2e-4,
+        );
+        Ok(())
+    }
+
+    fn vision_elementwise(&mut self, rows: usize, dim: usize) -> Result<()> {
+        let len = rows * dim;
+        let (x, w, b) = (
+            self.rng.vec(len, 3.0),
+            self.rng.vec(dim, 1.0),
+            self.rng.vec(dim, 0.5),
+        );
+        let (xd, wd, bd) = (self.b.upload(&x)?, self.b.upload(&w)?, self.b.upload(&b)?);
+        let mut want = vec![0.0; len];
+        CpuBackend.layer_norm(&x, &w, &b, &mut want, rows, dim, 1e-6)?;
+        let mut yd = self.b.alloc(len)?;
+        self.b.layer_norm(&xd, &wd, &bd, &mut yd, rows, dim, 1e-6)?;
+        let got = fetch(self.b, &yd, len)?;
+        self.record(
+            format!("layer_norm rows={rows} dim={dim}"),
+            Some(Op::LayerNorm),
+            &got,
+            &want,
+            1e-5,
+        );
+
+        let mut want = x.clone();
+        CpuBackend.add_bias(&mut want, &b, rows, dim)?;
+        let mut d = self.b.upload(&x)?;
+        self.b.add_bias(&mut d, &bd, rows, dim)?;
+        let got = fetch(self.b, &d, len)?;
+        self.record(
+            format!("add_bias rows={rows} dim={dim}"),
+            Some(Op::AddBias),
+            &got,
+            &want,
+            1e-6,
+        );
+
+        for kind in [GeluKind::Tanh, GeluKind::Erf] {
+            let mut want = x.clone();
+            CpuBackend.gelu(&mut want, len, kind)?;
+            let mut d = self.b.upload(&x)?;
+            self.b.gelu(&mut d, len, kind)?;
+            let got = fetch(self.b, &d, len)?;
+            self.record(
+                format!("gelu {kind:?} len={len}"),
+                Some(Op::Gelu),
+                &got,
+                &want,
+                1e-5,
+            );
+        }
+        Ok(())
+    }
+
+    fn rope_positions(&mut self, s: RopePosShape) -> Result<()> {
+        let len = s.tokens * s.heads * s.head_dim;
+        let positions: Vec<u32> = (0..s.axes * s.tokens)
+            .map(|_| (self.rng.next_u64() % 5000) as u32)
+            .collect();
+        let mut want = self.rng.vec(len, 1.0);
+        let mut xd = self.b.upload(&want)?;
+        CpuBackend.rope_positions(&mut want, &positions, s)?;
+        self.b.rope_positions(&mut xd, &positions, s)?;
+        let got = fetch(self.b, &xd, len)?;
+        let name = format!(
+            "rope_positions {:?} axes={} t={} d={} r={}",
+            s.layout, s.axes, s.tokens, s.head_dim, s.rotary_dim
+        );
+        self.record(name, Some(Op::RopePositions), &got, &want, 1e-5);
+        Ok(())
+    }
+
     /// Prefill then two decode steps through a two-layer stack, compared step by step.
     fn stack(&mut self, spec: &ModelSpec) -> Result<()> {
         let layers: Vec<HostLayer> = (0..spec.layers)
@@ -577,6 +673,39 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.gdn(1, 3, 32, 32, [4, 1])?;
     // Qwen3.5 GDN head geometry (16/48 heads scaled down to 2/6), Dk = Dv = 128.
     s.gdn(2, 6, 128, 128, [6, 1])?;
+    // Vision tower geometry: 16 heads x 72, hidden 1152.
+    s.attention_full(FullAttnShape {
+        tokens: 64,
+        heads: 4,
+        head_dim: 72,
+    })?;
+    s.attention_full(FullAttnShape {
+        tokens: 9,
+        heads: 2,
+        head_dim: 64,
+    })?;
+    s.vision_elementwise(5, 1152)?;
+    s.vision_elementwise(3, 4304)?;
+    // Text MRoPE (3 interleaved axes, 64 of 256 dims, theta 1e7) and vision 2D RoPE (2 blocked
+    // axes over all 72 dims, theta 1e4).
+    s.rope_positions(RopePosShape {
+        tokens: 5,
+        heads: 3,
+        head_dim: 256,
+        rotary_dim: 64,
+        theta: 10_000_000.0,
+        axes: 3,
+        layout: RopeLayout::Interleaved,
+    })?;
+    s.rope_positions(RopePosShape {
+        tokens: 8,
+        heads: 2,
+        head_dim: 72,
+        rotary_dim: 72,
+        theta: 10_000.0,
+        axes: 2,
+        layout: RopeLayout::Blocked,
+    })?;
     s.stack(&ModelSpec::preset("tiny")?)?;
     Ok(s.results)
 }

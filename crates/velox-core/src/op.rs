@@ -19,6 +19,11 @@ pub enum Op {
     Attention,
     Conv1dSilu,
     GatedDeltaNet,
+    AttentionFull,
+    LayerNorm,
+    AddBias,
+    Gelu,
+    RopePositions,
 }
 
 impl Op {
@@ -35,6 +40,11 @@ impl Op {
         Op::Attention,
         Op::Conv1dSilu,
         Op::GatedDeltaNet,
+        Op::AttentionFull,
+        Op::LayerNorm,
+        Op::AddBias,
+        Op::Gelu,
+        Op::RopePositions,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -51,6 +61,11 @@ impl Op {
             Op::Attention => "attention",
             Op::Conv1dSilu => "conv1d_silu",
             Op::GatedDeltaNet => "gated_delta_net",
+            Op::AttentionFull => "attention_full",
+            Op::LayerNorm => "layer_norm",
+            Op::AddBias => "add_bias",
+            Op::Gelu => "gelu",
+            Op::RopePositions => "rope_positions",
         }
     }
 }

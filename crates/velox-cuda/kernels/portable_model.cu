@@ -300,3 +300,148 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
                                                                          k_heads, v_heads, k_dim, v_dim);
     return velox_launch_status();
 }
+
+// ---- Vision-tower ops ------------------------------------------------------------------------
+
+namespace {
+
+// Non-causal MHA: one warp per (token, head), keys visited in order with an online softmax.
+template <int PER>
+__global__ void attention_full_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                      const float* __restrict__ v, float* __restrict__ out, int tokens, int heads,
+                                      int head_dim, float scale) {
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const size_t q_off = (static_cast<size_t>(t) * heads + h) * head_dim;
+    float qr[PER], acc[PER];
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int d = lane + p * VELOX_WARP;
+        qr[p] = d < head_dim ? q[q_off + d] * scale : 0.0f;
+        acc[p] = 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+    for (int j = 0; j < tokens; ++j) {
+        const size_t kv_off = (static_cast<size_t>(j) * heads + h) * head_dim;
+        float s = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            if (d < head_dim) s += qr[p] * k[kv_off + d];
+        }
+        s = velox_warp_sum(s);
+        const float m_new = fmaxf(m, s);
+        const float corr = expf(m - m_new), pj = expf(s - m_new);
+        l = l * corr + pj;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            if (d < head_dim) acc[p] = acc[p] * corr + pj * v[kv_off + d];
+        }
+        m = m_new;
+    }
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int d = lane + p * VELOX_WARP;
+        if (d < head_dim) out[q_off + d] = acc[p] / l;
+    }
+}
+
+__global__ void layer_norm_kernel(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ b,
+                                  float* __restrict__ y, int dim, float eps) {
+    __shared__ float scratch[VELOX_WARP];
+    const float* xr = x + static_cast<size_t>(blockIdx.x) * dim;
+    float* yr = y + static_cast<size_t>(blockIdx.x) * dim;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) s += xr[i];
+    const float mean = velox_block_sum(s, scratch) / dim;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float d = xr[i] - mean;
+        ss += d * d;
+    }
+    const float inv = rsqrtf(velox_block_sum(ss, scratch) / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+}
+
+__global__ void add_bias_kernel(float* __restrict__ x, const float* __restrict__ bias, long long len, int dim) {
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < len;
+         i += static_cast<long long>(gridDim.x) * blockDim.x)
+        x[i] += bias[i % dim];
+}
+
+__global__ void gelu_kernel(float* __restrict__ x, long long len, int erf_kind) {
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < len;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const float a = x[i];
+        x[i] = erf_kind ? 0.5f * a * (1.0f + erff(a * 0.70710678118654752f))
+                        : 0.5f * a * (1.0f + tanhf(0.79788456080286536f * (a + 0.044715f * a * a * a)));
+    }
+}
+
+// layout 0: interleaved (axis i % axes, freq theta^(-2i/R)); 1: blocked (see RopeLayout).
+__global__ void rope_positions_kernel(float* __restrict__ x, const uint32_t* __restrict__ pos, long long pairs_total,
+                                      int tokens, int heads, int head_dim, int rotary_dim, float theta, int axes,
+                                      int layout) {
+    const int half = rotary_dim / 2;
+    for (long long p = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; p < pairs_total;
+         p += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const int i = static_cast<int>(p % half);
+        const long long row = p / half;  // token * heads + head
+        const int t = static_cast<int>(row / heads);
+        int axis;
+        double freq;
+        if (layout == 0) {
+            axis = i % axes;
+            freq = pow(static_cast<double>(theta), -2.0 * i / rotary_dim);
+        } else {
+            const int per = half / axes;
+            axis = i / per;
+            freq = pow(static_cast<double>(theta), -2.0 * (i % per) / (static_cast<double>(rotary_dim) / axes));
+        }
+        double s, c;
+        sincos(static_cast<double>(pos[static_cast<size_t>(axis) * tokens + t]) * freq, &s, &c);
+        float* base = x + row * head_dim;
+        const float a = base[i], b = base[i + half];
+        base[i] = static_cast<float>(a * c - b * s);
+        base[i + half] = static_cast<float>(a * s + b * c);
+    }
+}
+
+}  // namespace
+
+VELOX_API int velox_portable_attention_full(const float* q, const float* k, const float* v, float* out, int tokens,
+                                            int heads, int head_dim) {
+    if (tokens > 65535) return VELOX_ERR_UNSUPPORTED;
+    const dim3 grid(heads, tokens);
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    if (head_dim <= 32) attention_full_kernel<1><<<grid, VELOX_WARP>>>(q, k, v, out, tokens, heads, head_dim, scale);
+    else if (head_dim <= 64) attention_full_kernel<2><<<grid, VELOX_WARP>>>(q, k, v, out, tokens, heads, head_dim, scale);
+    else if (head_dim <= 128) attention_full_kernel<4><<<grid, VELOX_WARP>>>(q, k, v, out, tokens, heads, head_dim, scale);
+    else if (head_dim <= 256) attention_full_kernel<8><<<grid, VELOX_WARP>>>(q, k, v, out, tokens, heads, head_dim, scale);
+    else return VELOX_ERR_UNSUPPORTED;
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_layer_norm(const float* x, const float* w, const float* b, float* y, int rows, int dim,
+                                        float eps) {
+    layer_norm_kernel<<<rows, 256>>>(x, w, b, y, dim, eps);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_add_bias(float* x, const float* bias, long long len, int dim) {
+    add_bias_kernel<<<velox_grid_1d(len, 256), 256>>>(x, bias, len, dim);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_gelu(float* x, long long len, int erf_kind) {
+    gelu_kernel<<<velox_grid_1d(len, 256), 256>>>(x, len, erf_kind);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_rope_positions(float* x, const uint32_t* pos, int tokens, int heads, int head_dim,
+                                            int rotary_dim, float theta, int axes, int layout) {
+    const long long pairs = static_cast<long long>(tokens) * heads * (rotary_dim / 2);
+    rope_positions_kernel<<<velox_grid_1d(pairs, 256), 256>>>(x, pos, pairs, tokens, heads, head_dim, rotary_dim, theta,
+                                                              axes, layout);
+    return velox_launch_status();
+}

@@ -1,8 +1,77 @@
 //! Shared shape validation. Every backend calls these before launching work, so a malformed call
 //! fails identically on CPU, CUDA and future backends instead of reading out of bounds.
 
-use crate::backend::{AttnShape, ConvShape, GdnShape, RopeShape, WeightView};
+use crate::backend::{
+    AttnShape, ConvShape, FullAttnShape, GdnShape, RopePosShape, RopeShape, WeightView,
+};
 use crate::error::{Error, Result};
+
+pub fn attention_full(q: usize, k: usize, v: usize, out: usize, s: &FullAttnShape) -> Result<()> {
+    if s.tokens == 0 || s.heads == 0 || s.head_dim == 0 {
+        return Err(Error::Shape(format!(
+            "attention_full dims must be non-zero: {s:?}"
+        )));
+    }
+    let len = product(&[s.tokens, s.heads, s.head_dim])?;
+    for (what, have) in [("q", q), ("k", k), ("v", v), ("out", out)] {
+        need(&format!("attention_full {what}"), have, len)?;
+    }
+    Ok(())
+}
+
+pub fn layer_norm(
+    x: usize,
+    weight: usize,
+    bias: usize,
+    y: usize,
+    rows: usize,
+    dim: usize,
+) -> Result<()> {
+    rms_norm(x, weight, y, rows, dim)?;
+    need("layer_norm bias", bias, dim)
+}
+
+pub fn add_bias(x: usize, bias: usize, rows: usize, dim: usize) -> Result<()> {
+    if rows == 0 || dim == 0 {
+        return Err(Error::Shape(
+            "add_bias rows and dim must be non-zero".into(),
+        ));
+    }
+    need("add_bias x", x, product(&[rows, dim])?)?;
+    need("add_bias bias", bias, dim)
+}
+
+pub fn rope_positions(x: usize, positions: &[u32], s: &RopePosShape) -> Result<()> {
+    let pairs = s.rotary_dim / 2;
+    if s.rotary_dim == 0
+        || !s.rotary_dim.is_multiple_of(2)
+        || s.rotary_dim > s.head_dim
+        || s.axes == 0
+    {
+        return Err(Error::Shape(format!(
+            "rope_positions: bad rotary geometry {s:?}"
+        )));
+    }
+    if s.layout == crate::backend::RopeLayout::Blocked && !pairs.is_multiple_of(s.axes) {
+        return Err(Error::Shape(format!(
+            "rope_positions: {pairs} pairs do not split into {} axes",
+            s.axes
+        )));
+    }
+    if positions.len() != s.axes * s.tokens {
+        return Err(Error::Shape(format!(
+            "rope_positions: {} positions for {} axes x {} tokens",
+            positions.len(),
+            s.axes,
+            s.tokens
+        )));
+    }
+    need(
+        "rope_positions x",
+        x,
+        product(&[s.tokens, s.heads, s.head_dim])?,
+    )
+}
 
 /// A weight view against its buffer (`buf_slots` f32 slots): layout shape rules, row range, and
 /// that the buffer holds the parent's full encoded payload.

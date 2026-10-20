@@ -17,7 +17,8 @@ pub mod rng;
 pub mod variant;
 
 pub use backend::{
-    AttnShape, Backend, BackendKind, ConvShape, GdnShape, NormKind, RopeShape, WeightView,
+    AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind,
+    RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 pub use error::{Error, Result};
 pub use format::WeightFormat;

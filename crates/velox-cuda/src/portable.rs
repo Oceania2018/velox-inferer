@@ -1,7 +1,10 @@
 //! Safe wrappers over the portable kernels. Variants call these as the fallback for shapes their
 //! tuned kernels do not cover. Each wrapper re-validates, so it is safe to call directly.
 
-use velox_core::backend::{AttnShape, ConvShape, GdnShape, NormKind, RopeShape, WeightView};
+use velox_core::backend::{
+    AttnShape, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopeLayout, RopePosShape,
+    RopeShape, WeightView,
+};
 use velox_core::check::{self, to_i32};
 use velox_core::{Result, WeightFormat};
 
@@ -359,5 +362,142 @@ pub fn gated_delta_net(
             )
         },
         "portable gated_delta_net",
+    )
+}
+
+extern "C" {
+    fn velox_portable_attention_full(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+    ) -> i32;
+    fn velox_portable_layer_norm(
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        y: *mut f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+    ) -> i32;
+    fn velox_portable_add_bias(x: *mut f32, bias: *const f32, len: i64, dim: i32) -> i32;
+    fn velox_portable_gelu(x: *mut f32, len: i64, erf_kind: i32) -> i32;
+    fn velox_portable_rope_positions(
+        x: *mut f32,
+        pos: *const u32,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        theta: f32,
+        axes: i32,
+        layout: i32,
+    ) -> i32;
+}
+
+pub fn attention_full(
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: FullAttnShape,
+) -> Result<()> {
+    check::attention_full(q.len(), k.len(), v.len(), out.len(), &s)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_attention_full(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                out.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("heads", s.heads)?,
+                to_i32("head_dim", s.head_dim)?,
+            )
+        },
+        "portable attention_full",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn layer_norm(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    bias: &CudaBuffer,
+    y: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<()> {
+    check::layer_norm(x.len(), weight.len(), bias.len(), y.len(), rows, dim)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_layer_norm(
+                x.as_ptr(),
+                weight.as_ptr(),
+                bias.as_ptr(),
+                y.as_mut_ptr(),
+                to_i32("rows", rows)?,
+                to_i32("dim", dim)?,
+                eps,
+            )
+        },
+        "portable layer_norm",
+    )
+}
+
+pub fn add_bias(x: &mut CudaBuffer, bias: &CudaBuffer, rows: usize, dim: usize) -> Result<()> {
+    check::add_bias(x.len(), bias.len(), rows, dim)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_add_bias(
+                x.as_mut_ptr(),
+                bias.as_ptr(),
+                (rows * dim) as i64,
+                to_i32("dim", dim)?,
+            )
+        },
+        "portable add_bias",
+    )
+}
+
+pub fn gelu(x: &mut CudaBuffer, len: usize, kind: GeluKind) -> Result<()> {
+    check::elementwise("gelu", &[x.len()], len)?;
+    // SAFETY: buffer extent validated above.
+    status(
+        unsafe {
+            velox_portable_gelu(x.as_mut_ptr(), len as i64, i32::from(kind == GeluKind::Erf))
+        },
+        "portable gelu",
+    )
+}
+
+pub fn rope_positions(x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) -> Result<()> {
+    check::rope_positions(x.len(), positions, &s)?;
+    let bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let pos = upload_raw(&bytes)?;
+    // SAFETY: buffer extents validated above; pos holds axes * tokens u32 values.
+    status(
+        unsafe {
+            velox_portable_rope_positions(
+                x.as_mut_ptr(),
+                pos.as_ptr().cast(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("heads", s.heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                to_i32("rotary_dim", s.rotary_dim)?,
+                s.theta,
+                to_i32("axes", s.axes)?,
+                i32::from(s.layout == RopeLayout::Blocked),
+            )
+        },
+        "portable rope_positions",
     )
 }

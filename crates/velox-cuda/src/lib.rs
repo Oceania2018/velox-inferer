@@ -8,7 +8,8 @@ use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
 use velox_core::backend::{
-    AttnShape, Backend, BackendKind, ConvShape, GdnShape, NormKind, RopeShape, WeightView,
+    AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind,
+    RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{check, profile, DeviceProfile, Error, GpuArch, Op, Result, VariantInfo};
 
@@ -345,6 +346,48 @@ pub trait CudaKernels: Send + Sync {
     ) -> Result<()> {
         portable::gated_delta_net(qkv, ab, a_log, dt_bias, state, out, s)
     }
+
+    fn attention_full(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: FullAttnShape,
+    ) -> Result<()> {
+        portable::attention_full(q, k, v, out, s)
+    }
+
+    fn layer_norm(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        bias: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        portable::layer_norm(x, weight, bias, y, rows, dim, eps)
+    }
+
+    fn add_bias(
+        &self,
+        x: &mut CudaBuffer,
+        bias: &CudaBuffer,
+        rows: usize,
+        dim: usize,
+    ) -> Result<()> {
+        portable::add_bias(x, bias, rows, dim)
+    }
+
+    fn gelu(&self, x: &mut CudaBuffer, len: usize, kind: GeluKind) -> Result<()> {
+        portable::gelu(x, len, kind)
+    }
+
+    fn rope_positions(&self, x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) -> Result<()> {
+        portable::rope_positions(x, positions, s)
+    }
 }
 
 /// Every op on the portable kernels; the CUDA kernel set of the generic variant on main.
@@ -595,6 +638,53 @@ impl Backend for CudaBackend {
         )?;
         self.kernels
             .gated_delta_net(qkv, ab, a_log, dt_bias, state, out, s)
+    }
+
+    fn attention_full(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: FullAttnShape,
+    ) -> Result<()> {
+        check::attention_full(q.len, k.len, v.len, out.len, &s)?;
+        self.kernels.attention_full(q, k, v, out, s)
+    }
+
+    fn layer_norm(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        bias: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        check::layer_norm(x.len, weight.len, bias.len, y.len, rows, dim)?;
+        self.kernels.layer_norm(x, weight, bias, y, rows, dim, eps)
+    }
+
+    fn add_bias(
+        &self,
+        x: &mut CudaBuffer,
+        bias: &CudaBuffer,
+        rows: usize,
+        dim: usize,
+    ) -> Result<()> {
+        check::add_bias(x.len, bias.len, rows, dim)?;
+        self.kernels.add_bias(x, bias, rows, dim)
+    }
+
+    fn gelu(&self, x: &mut CudaBuffer, len: usize, kind: GeluKind) -> Result<()> {
+        check::elementwise("gelu", &[x.len], len)?;
+        self.kernels.gelu(x, len, kind)
+    }
+
+    fn rope_positions(&self, x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) -> Result<()> {
+        check::rope_positions(x.len, positions, &s)?;
+        self.kernels.rope_positions(x, positions, s)
     }
 }
 
