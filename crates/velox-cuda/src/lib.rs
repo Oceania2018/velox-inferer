@@ -4,8 +4,9 @@
 //! `CudaKernels` method defaults to the portable kernel, so a hardware branch overrides only the
 //! ops it has tuned and inherits everything new that lands on main.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
@@ -47,6 +48,9 @@ mod ffi {
         pub fn velox_cuda_error_string(code: i32) -> *const c_char;
         pub fn velox_cuda_runtime_version(v: *mut i32) -> i32;
         pub fn velox_cuda_driver_version(v: *mut i32) -> i32;
+        pub fn velox_cuda_graph_begin() -> i32;
+        pub fn velox_cuda_graph_end_launch(slot: i32) -> i32;
+        pub fn velox_cuda_graph_abort() -> i32;
     }
 }
 
@@ -499,7 +503,19 @@ pub struct CudaBackend {
     variant: &'static VariantInfo,
     kernels: Arc<dyn CudaKernels>,
     timing: Option<timing::Timing>,
+    /// CUDA graph slots by key, and keys seen once (run eagerly as warm-up); `None` when graphs
+    /// are off (op timing, or `VELOX_NO_GRAPHS`).
+    graphs: Option<Mutex<GraphKeys>>,
 }
+
+#[derive(Default)]
+struct GraphKeys {
+    slots: HashMap<u32, i32>,
+    seen: HashSet<u32>,
+}
+
+/// Graph slots the shim keeps (`kGraphSlots`).
+const GRAPH_SLOTS: i32 = 256;
 
 impl CudaBackend {
     /// Makes `device` current and binds the variant's kernels to it.
@@ -514,12 +530,15 @@ impl CudaBackend {
             unsafe { ffi::velox_cuda_set_device(device.index) },
             "cudaSetDevice",
         )?;
+        let timing = timing::Timing::from_env();
         Ok(CudaBackend {
             device,
             profile,
             variant,
             kernels,
-            timing: timing::Timing::from_env(),
+            graphs: (timing.is_none() && std::env::var_os("VELOX_NO_GRAPHS").is_none())
+                .then(|| Mutex::new(GraphKeys::default())),
+            timing,
         })
     }
 
@@ -616,6 +635,39 @@ impl Backend for CudaBackend {
             self.kernels
                 .swiglu(src, rows, src_cols, gate, up, width, out)
         })
+    }
+
+    fn graph(&self, key: u32, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let Some(graphs) = &self.graphs else {
+            return f();
+        };
+        // The first run of a key is eager: lazy allocations and caches settle outside capture.
+        let slot = {
+            let mut g = graphs
+                .lock()
+                .map_err(|_| Error::Backend("graph keys poisoned".into()))?;
+            if g.seen.insert(key) {
+                None
+            } else {
+                let next = g.slots.len() as i32;
+                Some(*g.slots.entry(key).or_insert(next))
+            }
+        };
+        let Some(slot) = slot.filter(|&s| s < GRAPH_SLOTS) else {
+            return f();
+        };
+        // SAFETY: no arguments; the shim checks its own state.
+        status(unsafe { ffi::velox_cuda_graph_begin() }, "graph capture")?;
+        if let Err(e) = f() {
+            // SAFETY: ends the capture begun above.
+            unsafe { ffi::velox_cuda_graph_abort() };
+            return Err(e);
+        }
+        // SAFETY: slot is in the shim's range (checked above).
+        status(
+            unsafe { ffi::velox_cuda_graph_end_launch(slot) },
+            "graph launch",
+        )
     }
 
     fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {

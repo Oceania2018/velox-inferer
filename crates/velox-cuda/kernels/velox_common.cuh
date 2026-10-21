@@ -47,3 +47,26 @@ static inline unsigned velox_grid_1d(long long n, int block) {
     long long g = (n + block - 1) / block;
     return static_cast<unsigned>(g < 65535LL * 32 ? g : 65535LL * 32);
 }
+
+#include <mutex>
+
+// Grow-only device scratch for one kernel family (engine work is serialized). Old buffers are never
+// freed: a recorded CUDA graph may still reference them, and geometric growth bounds the total.
+struct VeloxScratch {
+    std::mutex mu;
+    void* ptr = nullptr;
+    size_t cap = 0;
+
+    void* get(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (bytes > cap) {
+            size_t n = cap * 2 > bytes ? cap * 2 : bytes;
+            if (n < (1u << 20)) n = 1u << 20;
+            void* p = nullptr;
+            if (cudaMalloc(&p, n) != cudaSuccess) return nullptr;
+            ptr = p;
+            cap = n;
+        }
+        return ptr;
+    }
+};

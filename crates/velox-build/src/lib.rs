@@ -122,8 +122,16 @@ impl CudaBuild {
             let stem = src.file_stem().unwrap().to_string_lossy();
             let obj = out.join(format!("{}_{stem}.o", self.lib));
             let mut cmd = Command::new(&nvcc);
-            cmd.args(["-c", "-O3", "-std=c++17", "-lineinfo"])
-                .args(&self.flags);
+            // Per-thread default stream: kernels launched without a stream can be graph-captured.
+            cmd.args([
+                "-c",
+                "-O3",
+                "-std=c++17",
+                "-lineinfo",
+                "--default-stream",
+                "per-thread",
+            ])
+            .args(&self.flags);
             if !cfg!(windows) {
                 cmd.args(["-Xcompiler", "-fPIC"]);
             }
