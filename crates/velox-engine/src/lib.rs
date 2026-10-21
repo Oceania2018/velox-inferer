@@ -36,7 +36,8 @@ use velox_frontend::image::{
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
     shift_inserts, BatchWorkspace, Checkpoint, DFlashModel, DFlashState, DFlashWorkspace,
-    EmbedInsert, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace, DRAFT_PAGE_ROWS,
+    EmbedInsert, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
+    DRAFT_PAGE_ROWS,
 };
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
 
@@ -81,6 +82,10 @@ pub struct EngineConfig {
     pub dflash_drafts: usize,
     /// Storage format of the target model's attention KV caches.
     pub kv_format: KvFormat,
+    /// Page the lanes' attention caches in virtual memory when the backend can: backed as each
+    /// sequence grows instead of at full capacity, with identical prefix chunks (system prompt,
+    /// task) mapped once for every lane that holds them.
+    pub kv_paging: bool,
 }
 
 /// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
@@ -118,6 +123,8 @@ struct Lanes<B: Backend> {
     /// Device checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
     /// prefills snapshot into it instead of allocating, which would synchronize the device.
     spare: Vec<Checkpoint<B>>,
+    /// Published prefix chunks of the lanes' paged attention caches.
+    share: KvShare<B>,
 }
 
 /// Device checkpoint storage kept for reuse across lanes.
@@ -440,6 +447,7 @@ impl<B> QwenEngine<B>
 where
     B: Backend + Send + Sync + 'static,
     B::Buffer: Send + Sync + 'static,
+    B::Chunk: Send + Sync + 'static,
 {
     pub fn new(
         b: B,
@@ -458,7 +466,11 @@ where
         let n_lanes = cfg.lanes.max(1);
         let mut lanes = Vec::with_capacity(n_lanes);
         for i in 0..n_lanes {
-            let mut session = model.session_with(&b, cfg.capacity, cfg.kv_format)?;
+            let mut session = if cfg.kv_paging {
+                model.session_paged(&b, cfg.capacity, cfg.kv_format)?
+            } else {
+                model.session_with(&b, cfg.capacity, cfg.kv_format)?
+            };
             if dflash.is_some() || cfg.mtp_drafts > 0 {
                 model.reserve_verify(&b, &mut session, &mut ws)?;
             }
@@ -534,6 +546,7 @@ where
             bw,
             clock: 0,
             spare: Vec::new(),
+            share: KvShare::default(),
         };
         let core = Arc::new(Core {
             b,
@@ -546,6 +559,25 @@ where
         });
         let mut state = state;
         core.warm_up(&mut state)?;
+        // Warm-up wrote near the end of the caches; paged lanes start empty.
+        for lane in &mut state.lanes {
+            lane.session.trim_kv(&core.b, 0)?;
+        }
+        eprintln!(
+            "attention caches: {} lanes, {:.2} GB backed ({})",
+            state.lanes.len(),
+            state
+                .lanes
+                .iter()
+                .map(|l| l.session.kv_bytes(&core.b))
+                .sum::<usize>() as f64
+                / 1e9,
+            if state.lanes.iter().any(|l| l.session.kv_paged()) {
+                "paged"
+            } else {
+                "whole"
+            }
+        );
         let queue = Arc::new(JobQueue {
             jobs: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -844,6 +876,7 @@ impl<B: Backend> Core<B> {
             store,
             clock,
             spare: pool,
+            share,
             ..
         } = st;
         *clock += 1;
@@ -878,7 +911,7 @@ impl<B: Backend> Core<B> {
             if store.enabled() {
                 self.capture_head(lane, store, shared.min(p.keys.len() - 1))?;
             }
-            let (start, adopted) = self.reuse(lane, store, &p.keys)?;
+            let (start, adopted) = self.reuse(lane, store, share, &p.keys)?;
             lane.chain = store.resumed(&p.keys, start, adopted);
             if adopted.is_some() && debug {
                 eprintln!(
@@ -942,12 +975,15 @@ impl<B: Backend> Core<B> {
             lanes,
             store,
             spare: pool,
+            share,
             ..
         } = st;
         let lane = &mut lanes[a.lane];
         let p = &a.job.p;
         lane.spare.append(pool);
         lane.keys.extend_from_slice(&p.keys[pre.start..]);
+        // The prompt's full chunks become mappable by other lanes on the same prefix.
+        lane.session.publish_kv(share, &p.keys);
         lane.checkpoints.extend(pre.snaps);
         let placed = if self.cfg.host_checkpoints {
             self.place_checkpoints(lane, store, &pre.anchors, p.keys.len() - 1, pre.start)
@@ -1710,6 +1746,7 @@ impl<B: Backend> Core<B> {
         &self,
         lane: &mut Lane<B>,
         store: &mut ContextStore<B>,
+        share: &KvShare<B>,
         keys: &[u32],
     ) -> Result<(usize, Option<u64>), CoreError> {
         // At least the last prompt token must be fed to produce logits.
@@ -1744,6 +1781,13 @@ impl<B: Backend> Core<B> {
         if let Some(e) = store.best(keys, reach) {
             if e.pos() >= own + STORE_GAIN {
                 lane.session.restore(&self.b, &e.state)?;
+                // Paged caches: chunks of this prefix other lanes hold are mapped instead of
+                // copied (load_kv skips them).
+                lane.session.retarget_kv(&self.b, keys, e.pos())?;
+                let adopted = lane.session.adopt_kv(&self.b, share, keys, e.pos())?;
+                if adopted > 0 && std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+                    eprintln!("[kv] mapped {adopted} shared prefix chunks");
+                }
                 // KV rows below the shared prefix are already the same.
                 for seg in &e.kv {
                     lane.session.load_kv(&self.b, seg, shared)?;
@@ -1935,6 +1979,7 @@ impl<B> ChatEngine for QwenEngine<B>
 where
     B: Backend + Send + Sync,
     B::Buffer: Send + Sync,
+    B::Chunk: Send + Sync,
 {
     fn architecture(&self) -> &str {
         "Qwen3_5ForCausalLM"

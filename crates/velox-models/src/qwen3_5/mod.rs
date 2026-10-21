@@ -4,6 +4,7 @@
 mod config;
 mod dflash;
 mod mtp;
+mod paging;
 mod vision;
 mod weights;
 
@@ -19,6 +20,7 @@ pub use dflash::{
     DRAFT_PAGE_ROWS,
 };
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
+pub use paging::{KvChunkSet, KvShare};
 pub use vision::{Qwen35Vision, VisionConfig};
 pub use weights::{Layer, Mixer, TextWeights, WDesc};
 
@@ -42,6 +44,8 @@ pub struct Session<B: Backend> {
     id: u64,
     /// Flips whenever a committed verify swaps the recurrent state with the speculative buffers.
     parity: bool,
+    /// Virtual-memory backing of the caches (see `paging`); `None`: allocated whole.
+    paging: Option<paging::KvPaging<B>>,
 }
 
 /// Up to this many tokens (decode, verify) adjacent projections run as one fused linear; larger
@@ -313,41 +317,6 @@ impl<B: Backend> Session<B> {
         Ok(seg)
     }
 
-    /// Writes the rows of `seg` at or after `from` back into the session's KV caches.
-    pub fn load_kv(&mut self, b: &B, seg: &KvSegment<B>, from: usize) -> Result<()> {
-        if seg.hi > self.capacity {
-            return Err(Error::Config("KV segment beyond session capacity".into()));
-        }
-        let row = self.kv_row;
-        // One submission; destinations are the caches in layer order, K then V.
-        let mut ops = Vec::new();
-        for (p, buf) in seg.pages.iter().enumerate() {
-            let r0 = seg.lo + p * KV_PAGE_ROWS;
-            let r1 = (r0 + KV_PAGE_ROWS).min(seg.hi);
-            let a = r0.max(from);
-            if a >= r1 {
-                continue;
-            }
-            if b.len(buf) < self.kv_page_len() {
-                return Err(Error::Config("KV segment does not fit this session".into()));
-            }
-            let n = (r1 - a) * row;
-            for l in 0..self.kv.len() {
-                for side in 0..2 {
-                    ops.push(CopySpec {
-                        src: buf,
-                        src_offset: ((2 * l + side) * KV_PAGE_ROWS + a - r0) * row,
-                        dst: 2 * l + side,
-                        dst_offset: a * row,
-                        len: n,
-                    });
-                }
-            }
-        }
-        let mut dsts: Vec<&mut B::Buffer> = self.kv.iter_mut().flat_map(|(k, v)| [k, v]).collect();
-        b.copy_batch(&mut dsts, &ops)
-    }
-
     /// Device copy of the recurrent state at the current position.
     pub fn checkpoint(&self, b: &B) -> Result<Checkpoint<B>> {
         self.checkpoint_in(b, false)
@@ -548,6 +517,23 @@ impl<B: Backend> Qwen35Text<B> {
 
     /// A session whose attention KV caches store rows in `kv_format`.
     pub fn session_with(&self, b: &B, capacity: usize, kv_format: KvFormat) -> Result<Session<B>> {
+        self.session_in(b, capacity, kv_format, false)
+    }
+
+    /// [`Self::session_with`] whose attention caches are paged when the backend has virtual
+    /// memory: backed as the sequence grows, prefix chunks shareable between sessions (see
+    /// [`KvShare`]).
+    pub fn session_paged(&self, b: &B, capacity: usize, kv_format: KvFormat) -> Result<Session<B>> {
+        self.session_in(b, capacity, kv_format, b.vm_chunk_len() > 0)
+    }
+
+    fn session_in(
+        &self,
+        b: &B,
+        capacity: usize,
+        kv_format: KvFormat,
+        paged: bool,
+    ) -> Result<Session<B>> {
         let c = &self.cfg;
         kv_format.check_head_dim(c.head_dim)?;
         let kv_len = kv_format
@@ -564,6 +550,9 @@ impl<B: Backend> Qwen35Text<B> {
         let mut ssm = Vec::new();
         for kind in &c.layers {
             match kind {
+                LayerKind::FullAttention if paged => {
+                    kv.push((b.alloc_virtual(kv_len)?, b.alloc_virtual(kv_len)?))
+                }
                 LayerKind::FullAttention => kv.push((b.alloc(kv_len)?, b.alloc(kv_len)?)),
                 LayerKind::Gdn => {
                     conv.push(b.alloc((c.conv_width - 1) * c.gdn_qkv())?);
@@ -583,6 +572,10 @@ impl<B: Backend> Qwen35Text<B> {
             spec: None,
             id: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             parity: false,
+            paging: paged.then(|| {
+                let chunk = b.vm_chunk_len();
+                paging::KvPaging::new(chunk, kv_len.div_ceil(chunk))
+            }),
         })
     }
 
@@ -718,6 +711,7 @@ impl<B: Backend> Qwen35Text<B> {
             )));
         }
         let t = ids.len();
+        s.prepare_kv(b, s.pos, s.pos + t)?;
         if t <= FUSE_MAX_TOKENS
             && t <= ws.max_tokens
             && positions.is_none()
@@ -1273,6 +1267,7 @@ impl<B: Backend> Qwen35Text<B> {
                 s.pos, s.capacity
             )));
         }
+        s.prepare_kv(b, s.pos, s.pos + t)?;
         let (c, w) = (&self.cfg, &self.w);
         // Snapshot, forward and output head are one recorded step per window length.
         let shape = t as u64 | u64::from(!ws.capture.is_empty()) << 9;
@@ -1506,6 +1501,7 @@ impl<B: Backend> Qwen35Text<B> {
                 ));
             }
             self.ensure_spec(b, s)?;
+            s.prepare_kv(b, s.pos, s.pos + w.len())?;
             rows.push((ids.len(), w.len()));
             ids.extend_from_slice(w);
         }
@@ -1675,6 +1671,7 @@ impl<B: Backend> Qwen35Text<B> {
                 ps.pos, ps.capacity
             )));
         }
+        ps.prepare_kv(b, ps.pos, ps.pos + tp)?;
         let mut ids = prefill.ids.to_vec();
         let mut rows = Vec::with_capacity(n);
         for (s, win) in sessions.iter_mut().zip(windows) {
@@ -1689,6 +1686,7 @@ impl<B: Backend> Qwen35Text<B> {
                 ));
             }
             self.ensure_spec(b, s)?;
+            s.prepare_kv(b, s.pos, s.pos + win.len())?;
             rows.push((ids.len() - tp, win.len()));
             ids.extend_from_slice(win);
         }
