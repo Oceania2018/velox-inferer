@@ -1586,6 +1586,7 @@ impl<B: Backend> Core<B> {
             .map(|c| c.pos)
             .filter(|&p| p != tail)
             .max();
+        let mut behind = None;
         for cp in std::mem::take(&mut lane.checkpoints) {
             if cp.pos == tail && store.enabled() {
                 // The prompt's end goes straight to system RAM: only an exact retry resumes there.
@@ -1617,14 +1618,21 @@ impl<B: Backend> Core<B> {
             }
             // The point this request resumed from (the previous step's history point) is behind
             // the new head now: the store keeps it superseded, for a retry or rewind of this step.
-            if store.enabled()
-                && self.cfg.chain_superseded > 0
+            if self.cfg.chain_superseded > 0
                 && cp.pos == resumed
                 && head.is_some_and(|h| h > cp.pos)
                 && cp.pos >= MIN_CAPTURE
                 && !anchors.contains(&cp.pos)
-                && !store.holds(&lane.keys[..cp.pos])
             {
+                behind = Some(cp);
+                continue;
+            }
+            lane.spare.push(cp);
+        }
+        if let Some(cp) = behind {
+            // Last, and only when a state is ready for it: a fallback is not worth pinning memory
+            // mid-request, nor taking the state another capture of this request needs.
+            if store.has_spare_state() && !store.holds(&lane.keys[..cp.pos]) {
                 let drafter = self.drafter_context(lane);
                 let id = store.insert(
                     &self.b,
