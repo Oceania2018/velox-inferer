@@ -30,7 +30,9 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 use velox_core::{Backend, Error as CoreError, KvFormat};
-use velox_frontend::image::{decode_data_url, preprocess, ImagePatches};
+use velox_frontend::image::{
+    decode_data_url, preprocess, smart_resize, ImagePatches, MERGE, PATCH, TEMPORAL,
+};
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
     BatchWorkspace, Checkpoint, DFlashModel, DFlashState, DFlashWorkspace, EmbedInsert, Qwen35Text,
@@ -465,6 +467,8 @@ where
             cfg,
             special,
         });
+        let mut state = state;
+        core.warm_up(&mut state)?;
         let queue = Arc::new(JobQueue {
             jobs: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -496,6 +500,94 @@ impl<B: Backend> Drop for QwenEngine<B> {
 }
 
 impl<B: Backend> Core<B> {
+    /// Runs the largest shapes once (a prefill chunk at the end of the window, the longest verify
+    /// window and draft block, a verify batch over every lane, the largest image) so the kernels'
+    /// grow-only device workspaces reach their final size before serving. Memory then stays flat
+    /// under load: growing scratch keeps every smaller buffer (recorded graphs may hold them), and
+    /// past the card's memory WDDM spills to system RAM and everything crawls. The lanes are reset
+    /// afterwards.
+    fn warm_up(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
+        use velox_models::qwen3_5::VERIFY_MAX;
+        let (b, model) = (&self.b, &self.model);
+        let limit = self.fe.public_vocab;
+        let chunk = self.cfg.chunk;
+        let Lanes {
+            ws, lanes, dw, bw, ..
+        } = st;
+        {
+            let lane = &mut lanes[0];
+            let pos = lane.session.capacity.saturating_sub(chunk + VERIFY_MAX + 1);
+            lane.session.pos = pos;
+            let ids = vec![0u32; chunk.min(lane.session.capacity - pos)];
+            match (lane.drafter.as_mut(), self.dflash.as_ref(), dw.as_mut()) {
+                (Some(Drafter::DFlash(d)), Some(dm), Some(dw)) => {
+                    model.advance_rows(
+                        b,
+                        &mut lane.session,
+                        ws,
+                        &ids,
+                        None,
+                        &[],
+                        &mut [],
+                        &mut |ws, base, t| d.prefill_chunk(b, dm, dw, ws, pos + base, t),
+                    )?;
+                }
+                _ => model.advance(b, &mut lane.session, ws, &ids, None, &[])?,
+            }
+            model.candidates(b, ws, CANDIDATES, limit)?;
+            if lane.drafter.is_some() {
+                let window = vec![0u32; VERIFY_MAX.min(lane.session.capacity - lane.session.pos)];
+                model.verify(b, &mut lane.session, ws, &window, CANDIDATES, limit)?;
+                model.commit(b, &mut lane.session, ws, 1)?;
+            }
+            if let (Some(Drafter::DFlash(d)), Some(dm), Some(dw)) =
+                (lane.drafter.as_mut(), self.dflash.as_ref(), dw.as_mut())
+            {
+                d.drafts = d.long_block();
+                d.draft(b, dm, dw, model, ws, 0, 0, lane.session.pos, 0, limit, 0.0)?;
+            }
+        }
+        if let Some(bw) = bw.as_mut() {
+            let m = 8usize;
+            let mut sessions: Vec<&mut Session<B>> =
+                lanes.iter_mut().map(|l| &mut l.session).collect();
+            for s in sessions.iter_mut() {
+                s.pos = s.capacity.saturating_sub(m + 1);
+            }
+            let window = vec![0u32; m];
+            let windows: Vec<&[u32]> = vec![&window[..]; sessions.len().min(bw.max_seqs())];
+            sessions.truncate(windows.len());
+            model.verify_batch(b, &mut sessions, ws, bw, &windows, CANDIDATES, limit)?;
+            for s in sessions {
+                model.commit_batched(b, s, bw, 1)?;
+            }
+        }
+        if let (Some(v), Some((min_px, max_px))) = (&self.vision, self.fe.vision_pixels) {
+            // A square image at the pixel budget: the most patches the tower sees.
+            let side = ((max_px.min(1 << 26)) as f64).sqrt() as usize;
+            if let Ok((rh, rw)) = smart_resize(side, side, min_px, max_px) {
+                let (gh, gw) = (rh / PATCH, rw / PATCH);
+                if gh % MERGE == 0 && gw % MERGE == 0 {
+                    let patches = vec![0.0f32; gh * gw * 3 * TEMPORAL * PATCH * PATCH];
+                    v.encode(b, &patches, gh, gw)?;
+                }
+            }
+        }
+        b.synchronize()?;
+        for lane in lanes.iter_mut() {
+            lane.session.restore(b, &lane.zero)?;
+            lane.keys.clear();
+            lane.checkpoints.clear();
+            if let (Some(Drafter::DFlash(d)), Some(dm)) =
+                (lane.drafter.as_mut(), self.dflash.as_ref())
+            {
+                d.forget(dm, 0);
+                d.reset();
+            }
+        }
+        b.synchronize()
+    }
+
     /// MTP and plain decoding keep per-step rows in the shared workspace between rounds, so only
     /// DFlash requests decode side by side.
     fn batchable(&self) -> bool {
