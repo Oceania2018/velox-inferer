@@ -1155,7 +1155,7 @@ impl<B: Backend> Core<B> {
             if cp.pos == tail && store.enabled() {
                 // The prompt's end goes straight to system RAM: only an exact retry resumes there.
                 let drafter = self.drafter_context(lane);
-                store.insert(
+                let id = store.insert(
                     &self.b,
                     &lane.session,
                     &lane.keys,
@@ -1164,6 +1164,7 @@ impl<B: Backend> Core<B> {
                     None,
                     drafter,
                 )?;
+                store.mark_tail(id);
                 lane.spare.push(cp);
                 continue;
             }
