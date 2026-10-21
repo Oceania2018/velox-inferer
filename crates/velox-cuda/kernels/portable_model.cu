@@ -878,7 +878,7 @@ namespace {
 // Few output rows (e.g. a 96-row gate projection) over a few tokens, bf16 weights, exact f32
 // activations: a block computes kSnRows rows for every token, its threads splitting K, so the
 // activations are read once per row group rather than once per row. Fixed-order reductions.
-constexpr int kSnRows = 4, kSnThreads = 512, kSnMaxM = 8;
+constexpr int kSnRows = 4, kSnThreads = 512, kSnMaxM = 16;
 
 template <int M>
 __global__ void __launch_bounds__(kSnThreads) linear_small_n_bf16_kernel(const float* __restrict__ x,
@@ -939,11 +939,12 @@ int launch_small_n(const float* x, const uint8_t* w, long long k, long long row_
 VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format, long long n, long long k,
                                     long long row_begin, int rows, int m, float* y) {
     const WDesc d{w, format, n, k};
-    if (format == VELOX_FMT_BF16 && m >= 2 && m <= kSnMaxM && rows <= 256 && k % 4 == 0 &&
+    if (format == VELOX_FMT_BF16 && m >= 2 && m <= kSnMaxM && rows <= 4096 && k % 4 == 0 &&
         reinterpret_cast<uintptr_t>(x) % 16 == 0 && reinterpret_cast<uintptr_t>(w) % 8 == 0) {
         if (m <= 2) return launch_small_n<2>(x, w, k, row_begin, rows, m, y);
         if (m <= 4) return launch_small_n<4>(x, w, k, row_begin, rows, m, y);
-        return launch_small_n<8>(x, w, k, row_begin, rows, m, y);
+        if (m <= 8) return launch_small_n<8>(x, w, k, row_begin, rows, m, y);
+        return launch_small_n<16>(x, w, k, row_begin, rows, m, y);
     }
     // x rows are read as float4, so k must keep them 16-byte aligned too.
     if (m <= kGemvMaxM && k % 16 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0) {
