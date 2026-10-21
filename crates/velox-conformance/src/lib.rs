@@ -1220,6 +1220,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 33, 130, 5, 20, 2)?;
     s.linear(WeightFormat::Fp8RowBf16, 96, 300, 10, 40, 1)?;
     s.linear(WeightFormat::Fp8RowBf16, 64, 512, 0, 64, 9)?;
+    // Batched speculative verify: several sequences' windows in one pass (17..96 rows).
+    s.linear(WeightFormat::Fp8RowBf16, 160, 1024, 16, 128, 24)?;
+    s.linear(WeightFormat::Fp8RowBf16, 96, 512, 0, 96, 40)?;
+    s.linear(WeightFormat::Fp8RowBf16, 64, 768, 0, 64, 64)?;
+    s.linear(WeightFormat::Fp8RowBf16, 64, 512, 0, 64, 90)?;
     // m >= 16 takes the tiled path, with ragged edges in every dimension.
     s.linear(WeightFormat::Fp8RowBf16, 200, 300, 17, 150, 70)?;
     s.linear(WeightFormat::Nvfp4, 256, 320, 0, 256, 33)?;
