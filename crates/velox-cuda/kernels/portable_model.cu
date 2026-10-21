@@ -333,10 +333,10 @@ __global__ void gdn_replay_conv_kernel(const __grid_constant__ GdnReplayTable t,
 // so D = T R with T = (I + A)^-1, and then
 //   o_r = gamma_r S0 q_r + sum_{s<=r} exp(G_r - G_s) (q_r.k_s) D_s
 //   S_C = gamma_{C-1} S0 + sum_s exp(G_{C-1} - G_s) D_s k_s^T.
-// One block owns head h and kGdnVt state rows (kept in registers across chunks; chunks run in
-// order) and recomputes the head's key-side matrices (A, T, P) itself, so no global scratch. The
-// chunk loop is latency-bound, so chunks and tiles are small: more, lighter blocks per SM and a
-// short serial T solve.
+// The key-side quantities (gates, T = (I + A)^-1, P) do not depend on the state, so a prepare pass
+// computes them for every (head, chunk) in parallel into scratch; the recurrence then owns head h
+// and kGdnVt state rows (kept in registers across chunks; chunks run in order) and only does the
+// state-dependent products.
 constexpr int kGdnChunk = 16;
 constexpr int kGdnVt = 16;
 constexpr int kGdnThreads = 128;
@@ -363,35 +363,148 @@ __device__ __forceinline__ void gdn_reduce_scatter8(float (&v)[8], int g) {
     v[0] = keep + __shfl_xor_sync(0xffffffffu, send, 1);
 }
 
-template <int DK>
-__global__ void __launch_bounds__(kGdnThreads, 3)
-    gated_delta_net_chunk_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
-                                 const float* __restrict__ a_log, const float* __restrict__ dt_bias,
-                                 float* __restrict__ state, float* __restrict__ out, int tokens, int k_heads,
-                                 int v_heads, int v_dim) {
-    constexpr int C = kGdnChunk, VT = kGdnVt, KS = DK + 4, AS = C + 4, PS = C + 4, RS = VT + 1, NJ = DK / 32;
-    constexpr int NV = C * VT / kGdnThreads;
-    static_assert(C <= VELOX_WARP && C % 8 == 0, "gate scan and T inversion use one warp per chunk");
-    static_assert(kGdnThreads == VT * 8 && kGdnThreads == C * 8, "8 threads per state row and per chunk row");
-    // T and D reuse the Q tile once Q is consumed.
-    constexpr int QSZ = C * KS > C * PS + C * RS ? C * KS : C * PS + C * RS;
-    __shared__ __align__(16) float ks[C * KS];  // normalized keys
-    __shared__ __align__(16) float qs[QSZ];     // normalized queries; then T and D
-    __shared__ __align__(16) float at[C * AS];  // A transposed: at[s][r] = A[r][s]
-    __shared__ __align__(16) float ps[C * PS];  // P[r][s] = exp(G_r - G_s) q_r.k_s for s <= r, else 0
-    __shared__ float rs[C * RS];                // V, then R in place
-    __shared__ float gs[C], gam[C], decay_last[C], betas[C];
-    float* ts = qs;           // [C][PS]
-    float* ds = qs + C * PS;  // [C][RS]
+// Per chunk in scratch: T[C][C] (row-major), P[C][C], gamma[C], decay_last[C], beta[C].
+constexpr int kGdnPrep = 2 * kGdnChunk * kGdnChunk + 3 * kGdnChunk;
 
-    const int h = blockIdx.x, i0 = blockIdx.y * VT, tid = threadIdx.x;
+// One block per (value head, chunk): L2-normalized q/k of the chunk, gates and their scan,
+// A[r][s] = beta_r exp(G_r - G_s) k_r.k_s (s < r), P[r][s] = exp(G_r - G_s) q_r.k_s (s <= r), and
+// T = (I + A)^-1 by forward substitution.
+template <int DK>
+__global__ void __launch_bounds__(kGdnThreads)
+    gated_delta_net_prepare_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
+                                   const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                   float* __restrict__ prep, int tokens, int k_heads, int v_heads, int v_dim) {
+    constexpr int C = kGdnChunk, KS = DK + 4, AS = C + 4;
+    __shared__ __align__(16) float ks[C * KS], qs[C * KS];
+    __shared__ __align__(16) float at[C * AS];  // A transposed: at[s][r] = A[r][s]
+    __shared__ float gs[C], betas[C];
+    const int h = blockIdx.x, ci = blockIdx.y, t0 = ci * C, tid = threadIdx.x;
     const int lane = tid % VELOX_WARP, warp = tid / VELOX_WARP;
     const int kh = h / (v_heads / k_heads);
+    const int n = tokens - t0 < C ? tokens - t0 : C;
+    const size_t width = static_cast<size_t>(2 * k_heads * DK + v_heads * v_dim);
+    float* out = prep + (static_cast<size_t>(h) * gridDim.y + ci) * kGdnPrep;
+
+    // Rows: 8 threads per chunk row, each 4-wide pieces at dc * 4 + 32 j.
+    {
+        constexpr int NJ = DK / 32;
+        const int r = tid / 8, dc = tid % 8;
+        float q[NJ][4], k[NJ][4], qq = 0.0f, kk = 0.0f;
+        const float* row = qkv + static_cast<size_t>(t0 + r) * width;
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                q[j][e] = r < n ? row[kh * DK + dc * 4 + 32 * j + e] : 0.0f;
+                k[j][e] = r < n ? row[(k_heads + kh) * DK + dc * 4 + 32 * j + e] : 0.0f;
+                qq += q[j][e] * q[j][e];
+                kk += k[j][e] * k[j][e];
+            }
+#pragma unroll
+        for (int o = 1; o < 8; o <<= 1) {
+            qq += __shfl_xor_sync(0xffffffffu, qq, o);
+            kk += __shfl_xor_sync(0xffffffffu, kk, o);
+        }
+        const float qn = rsqrtf(qq + 1e-6f), kn = rsqrtf(kk + 1e-6f);
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            *reinterpret_cast<float4*>(&qs[r * KS + dc * 4 + 32 * j]) =
+                make_float4(q[j][0] * qn, q[j][1] * qn, q[j][2] * qn, q[j][3] * qn);
+            *reinterpret_cast<float4*>(&ks[r * KS + dc * 4 + 32 * j]) =
+                make_float4(k[j][0] * kn, k[j][1] * kn, k[j][2] * kn, k[j][3] * kn);
+        }
+    }
+    // Gates (padded rows: g = 0, beta = 0, so they change nothing) and their in-chunk scan.
+    if (warp == 0) {
+        float g = 0.0f, beta = 0.0f;
+        if (lane < n) {
+            const float* abr = ab + static_cast<size_t>(t0 + lane) * 2 * v_heads;
+            const float a = abr[h] + dt_bias[h];
+            g = -expf(a_log[h]) * (a > 20.0f ? a : log1pf(expf(a)));
+            beta = 1.0f / (1.0f + expf(-abr[v_heads + h]));
+        }
+#pragma unroll
+        for (int o = 1; o < VELOX_WARP; o <<= 1) {
+            const float u = __shfl_up_sync(0xffffffffu, g, o);
+            if (lane >= o) g += u;
+        }
+        const float last = __shfl_sync(0xffffffffu, g, C - 1);
+        if (lane < C) {
+            gs[lane] = g;
+            betas[lane] = beta;
+            out[2 * C * C + lane] = expf(g);
+            out[2 * C * C + C + lane] = expf(last - g);
+            out[2 * C * C + 2 * C + lane] = beta;
+        }
+    }
+    __syncthreads();
+
+    // A and P: one (r, s) pair per thread and step.
+    for (int idx = tid; idx < C * C; idx += kGdnThreads) {
+        const int r = idx / C, c = idx % C;
+        float kk = 0.0f, qk = 0.0f;
+        if (c <= r) {
+#pragma unroll 8
+            for (int d = 0; d < DK; d += 4) {
+                const float4 kc = *reinterpret_cast<const float4*>(&ks[c * KS + d]);
+                const float4 kr = *reinterpret_cast<const float4*>(&ks[r * KS + d]);
+                const float4 qr = *reinterpret_cast<const float4*>(&qs[r * KS + d]);
+                kk += kc.x * kr.x + kc.y * kr.y + kc.z * kr.z + kc.w * kr.w;
+                qk += kc.x * qr.x + kc.y * qr.y + kc.z * qr.z + kc.w * qr.w;
+            }
+        }
+        const float dec = c <= r ? expf(gs[r] - gs[c]) : 0.0f;
+        at[c * AS + r] = c < r ? betas[r] * dec * kk : 0.0f;
+        out[C * C + r * C + c] = dec * qk;
+    }
+    __syncthreads();
+
+    // T = (I + A)^-1; lane j owns column j.
+    if (warp == 0) {
+        float tc[C];
+#pragma unroll
+        for (int r = 0; r < C; ++r) tc[r] = r == lane ? 1.0f : 0.0f;
+#pragma unroll
+        for (int c = 0; c < C - 1; ++c) {
+#pragma unroll
+            for (int r = (c + 1) & ~3; r < C; r += 4) {
+                const float4 a4 = *reinterpret_cast<const float4*>(&at[c * AS + r]);
+                tc[r] -= a4.x * tc[c];
+                tc[r + 1] -= a4.y * tc[c];
+                tc[r + 2] -= a4.z * tc[c];
+                tc[r + 3] -= a4.w * tc[c];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < C; ++r)
+            if (lane < C) out[r * C + lane] = tc[r];
+    }
+}
+
+// The state-dependent part, chunks in order, from the prepare pass's per-chunk matrices.
+template <int DK>
+__global__ void __launch_bounds__(kGdnThreads, 3)
+    gated_delta_net_chunk_kernel(const float* __restrict__ qkv, const float* __restrict__ prep,
+                                 float* __restrict__ state, float* __restrict__ out, int tokens, int k_heads,
+                                 int v_heads, int v_dim) {
+    constexpr int C = kGdnChunk, VT = kGdnVt, KS = DK + 4, PS = C + 4, RS = VT + 1, NJ = DK / 32;
+    constexpr int NV = C * VT / kGdnThreads;
+    static_assert(kGdnThreads == VT * 8 && kGdnThreads == C * 8, "8 threads per state row and per chunk row");
+    __shared__ __align__(16) float ks[C * KS];  // normalized keys
+    __shared__ __align__(16) float qs[C * KS];  // normalized queries
+    __shared__ __align__(16) float ts[C * PS];  // T
+    __shared__ __align__(16) float ps[C * PS];  // P
+    __shared__ float rs[C * RS];                // V, then R in place
+    __shared__ float ds[C * RS];                // D
+    __shared__ float gam[C], decay_last[C], betas[C];
+
+    const int h = blockIdx.x, i0 = blockIdx.y * VT, tid = threadIdx.x;
+    const int kh = h / (v_heads / k_heads);
+    const int chunks = (tokens + C - 1) / C;
     const size_t width = static_cast<size_t>(2 * k_heads * DK + v_heads * v_dim);
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(DK));
-    const float neg_a = -expf(a_log[h]), bias = dt_bias[h];
 
-    // Thread (si, dc) owns state row si (and chunk row si for A and P) over columns
+    // Thread (si, dc) owns state row si (and chunk row si for loads) over columns
     // dc * 4 + 32 * j + e; its 8-thread group is lane-aligned within the warp.
     const int si = tid / 8, dc = tid % 8;
     const bool row_ok = i0 + si < v_dim;
@@ -402,12 +515,10 @@ __global__ void __launch_bounds__(kGdnThreads, 3)
 #pragma unroll
         for (int e = 0; e < 4; ++e) s[j][e] = row_ok ? row_state[dc * 4 + 32 * j + e] : 0.0f;
 
-    // Raw inputs of a chunk, loaded into registers while the previous chunk finishes (after T, when
-    // few registers are live). q and k use the state-row layout: chunk row si, columns
-    // dc * 4 + 32 * j + e. Rows past the end load as zero.
-    float rq[NJ][4], rk[NJ][4], rv[NV], ga = 0.0f, gb = 0.0f;
-    auto load = [&](int t0) {
-        const int n = tokens - t0 < C ? tokens - t0 : C;
+    // Raw inputs of a chunk, loaded into registers while the previous chunk finishes.
+    float rq[NJ][4], rk[NJ][4], rv[NV], rt[2], rp[2], rg = 0.0f;
+    auto load = [&](int ci) {
+        const int t0 = ci * C, n = tokens - t0 < C ? tokens - t0 : C;
         const float* row = qkv + static_cast<size_t>(t0 + si) * width;
 #pragma unroll
         for (int j = 0; j < NJ; ++j)
@@ -422,17 +533,19 @@ __global__ void __launch_bounds__(kGdnThreads, 3)
             const float* vrow = qkv + static_cast<size_t>(t0 + c) * width;
             rv[m] = c < n && i0 + i < v_dim ? vrow[2 * k_heads * DK + h * v_dim + i0 + i] : 0.0f;
         }
-        if (warp == 0 && lane < n) {
-            const float* abr = ab + static_cast<size_t>(t0 + lane) * 2 * v_heads;
-            ga = abr[h];
-            gb = abr[v_heads + h];
+        const float* pr = prep + (static_cast<size_t>(h) * chunks + ci) * kGdnPrep;
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+            rt[m] = pr[tid + kGdnThreads * m];
+            rp[m] = pr[C * C + tid + kGdnThreads * m];
         }
+        if (tid < 3 * C) rg = pr[2 * C * C + tid];
     };
     load(0);
 
-    for (int t0 = 0; t0 < tokens; t0 += C) {
-        const int n = tokens - t0 < C ? tokens - t0 : C;
-        // L2-normalize q and k of chunk row si (8-lane group reduction) and publish them.
+    for (int ci = 0; ci < chunks; ++ci) {
+        const int t0 = ci * C, n = tokens - t0 < C ? tokens - t0 : C;
+        // L2-normalize q and k of chunk row si (8-lane group reduction) and publish the chunk.
         {
             float qq = 0.0f, kk = 0.0f;
 #pragma unroll
@@ -450,114 +563,54 @@ __global__ void __launch_bounds__(kGdnThreads, 3)
             const float qn = rsqrtf(qq + 1e-6f), kn = rsqrtf(kk + 1e-6f);
 #pragma unroll
             for (int j = 0; j < NJ; ++j) {
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    rq[j][e] *= qn;
-                    rk[j][e] *= kn;
-                }
                 *reinterpret_cast<float4*>(&qs[si * KS + dc * 4 + 32 * j]) =
-                    make_float4(rq[j][0], rq[j][1], rq[j][2], rq[j][3]);
+                    make_float4(rq[j][0] * qn, rq[j][1] * qn, rq[j][2] * qn, rq[j][3] * qn);
                 *reinterpret_cast<float4*>(&ks[si * KS + dc * 4 + 32 * j]) =
-                    make_float4(rk[j][0], rk[j][1], rk[j][2], rk[j][3]);
+                    make_float4(rk[j][0] * kn, rk[j][1] * kn, rk[j][2] * kn, rk[j][3] * kn);
             }
 #pragma unroll
             for (int m = 0; m < NV; ++m) {
                 const int e = tid + kGdnThreads * m;
                 rs[(e / VT) * RS + e % VT] = rv[m];
             }
-            // Gates (padded rows: g = 0, beta = 0, so they change nothing) and their in-chunk scan.
-            if (warp == 0) {
-                float g = 0.0f, beta = 0.0f;
-                if (lane < n) {
-                    const float a = ga + bias;
-                    g = neg_a * (a > 20.0f ? a : log1pf(expf(a)));
-                    beta = 1.0f / (1.0f + expf(-gb));
-                }
 #pragma unroll
-                for (int o = 1; o < VELOX_WARP; o <<= 1) {
-                    const float u = __shfl_up_sync(0xffffffffu, g, o);
-                    if (lane >= o) g += u;
-                }
-                const float last = __shfl_sync(0xffffffffu, g, C - 1);
-                if (lane < C) {
-                    gs[lane] = g;
-                    gam[lane] = expf(g);
-                    decay_last[lane] = expf(last - g);
-                    betas[lane] = beta;
-                }
+            for (int m = 0; m < 2; ++m) {
+                const int e = tid + kGdnThreads * m;
+                ts[(e / C) * PS + e % C] = rt[m];
+                ps[(e / C) * PS + e % C] = rp[m];
             }
+            if (tid < C) gam[tid] = rg;
+            else if (tid < 2 * C) decay_last[tid - C] = rg;
+            else if (tid < 3 * C) betas[tid - 2 * C] = rg;
         }
         __syncthreads();
+        if (ci + 1 < chunks) load(ci + 1);
 
-        // One pass over chunk rows c, 8 at a time (lane dc ends up owning c = 8 g + dc):
-        //   x = S0[si].k_c, y = S0[si].q_c  -> R[c][si], gamma_c y kept for o
-        //   kk = k_si.k_c, qk = q_si.k_c    -> A[si][c], P[si][c] (lower triangle only)
+        // x = S0[si].k_c, y = S0[si].q_c for chunk rows c, 8 at a time (lane dc ends up owning
+        // c = 8 g + dc): R[c][si] = beta_c (v_c - gamma_c x), and gamma_c y kept for o.
         float ys[C / 8];
-        {
-            const auto& kr = rk;
-            const auto& qr = rq;
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) {
-                // Warp-uniform: does any chunk row of this warp (4 * warp .. 4 * warp + 3) need A/P here?
-                const bool tri = 8 * g <= 4 * warp + 3;
-                float x[8], y[8], kk[8], qk[8];
+        for (int g = 0; g < C / 8; ++g) {
+            float x[8], y[8];
 #pragma unroll
-                for (int u = 0; u < 8; ++u) {
-                    const int c = 8 * g + u;
-                    x[u] = y[u] = kk[u] = qk[u] = 0.0f;
+            for (int u = 0; u < 8; ++u) {
+                const int c = 8 * g + u;
+                x[u] = y[u] = 0.0f;
 #pragma unroll
-                    for (int j = 0; j < NJ; ++j) {
-                        const float4 kv = *reinterpret_cast<const float4*>(&ks[c * KS + dc * 4 + 32 * j]);
-                        const float4 qv = *reinterpret_cast<const float4*>(&qs[c * KS + dc * 4 + 32 * j]);
-                        x[u] += kv.x * s[j][0] + kv.y * s[j][1] + kv.z * s[j][2] + kv.w * s[j][3];
-                        y[u] += qv.x * s[j][0] + qv.y * s[j][1] + qv.z * s[j][2] + qv.w * s[j][3];
-                        if (tri) {
-                            kk[u] += kv.x * kr[j][0] + kv.y * kr[j][1] + kv.z * kr[j][2] + kv.w * kr[j][3];
-                            qk[u] += kv.x * qr[j][0] + kv.y * qr[j][1] + kv.z * qr[j][2] + kv.w * qr[j][3];
-                        }
-                    }
-                }
-                gdn_reduce_scatter8(x, dc);
-                gdn_reduce_scatter8(y, dc);
-                const int c = 8 * g + dc;
-                rs[c * RS + si] = betas[c] * (rs[c * RS + si] - gam[c] * x[0]);
-                ys[g] = gam[c] * y[0];
-                float a = 0.0f, p = 0.0f;
-                if (tri) {
-                    gdn_reduce_scatter8(kk, dc);
-                    gdn_reduce_scatter8(qk, dc);
-                    const float dec = c <= si ? expf(gs[si] - gs[c]) : 0.0f;
-                    a = c < si ? betas[si] * dec * kk[0] : 0.0f;
-                    p = dec * qk[0];
-                }
-                at[c * AS + si] = a;
-                ps[si * PS + c] = p;
-            }
-        }
-        __syncthreads();
-
-        // T = (I + A)^-1 by forward substitution; lane j owns column j (Q is dead, T overwrites it).
-        if (warp == 0) {
-            float tc[C];
-#pragma unroll
-            for (int r = 0; r < C; ++r) tc[r] = r == lane ? 1.0f : 0.0f;
-#pragma unroll
-            for (int c = 0; c < C - 1; ++c) {
-#pragma unroll
-                for (int r = (c + 1) & ~3; r < C; r += 4) {
-                    const float4 a4 = *reinterpret_cast<const float4*>(&at[c * AS + r]);
-                    tc[r] -= a4.x * tc[c];
-                    tc[r + 1] -= a4.y * tc[c];
-                    tc[r + 2] -= a4.z * tc[c];
-                    tc[r + 3] -= a4.w * tc[c];
+                for (int j = 0; j < NJ; ++j) {
+                    const float4 kv = *reinterpret_cast<const float4*>(&ks[c * KS + dc * 4 + 32 * j]);
+                    const float4 qv = *reinterpret_cast<const float4*>(&qs[c * KS + dc * 4 + 32 * j]);
+                    x[u] += kv.x * s[j][0] + kv.y * s[j][1] + kv.z * s[j][2] + kv.w * s[j][3];
+                    y[u] += qv.x * s[j][0] + qv.y * s[j][1] + qv.z * s[j][2] + qv.w * s[j][3];
                 }
             }
-#pragma unroll
-            for (int r = 0; r < C; ++r)
-                if (lane < C) ts[r * PS + lane] = tc[r];
+            gdn_reduce_scatter8(x, dc);
+            gdn_reduce_scatter8(y, dc);
+            const int c = 8 * g + dc;
+            rs[c * RS + si] = betas[c] * (rs[c * RS + si] - gam[c] * x[0]);
+            ys[g] = gam[c] * y[0];
         }
         __syncthreads();
-        if (t0 + C < tokens) load(t0 + C);
 
         // D = T R, o = gamma S0 q + P D, and the state update for state row si (T and P are lower
         // triangular with explicit zeros).
@@ -1073,13 +1126,22 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
             if (cudaError_t e = cudaMemcpyAsync(state, state_in, n * sizeof(float), cudaMemcpyDeviceToDevice, 0))
                 return static_cast<int>(e);
         }
-        const dim3 grid(v_heads, (v_dim + kGdnVt - 1) / kGdnVt), block(kGdnThreads);
-#define VELOX_GDN_CHUNK(DK)                                                                                 \
-    gated_delta_net_chunk_kernel<DK><<<grid, block>>>(qkv, ab, a_log, dt_bias, state, out, tokens, k_heads, \
-                                                      v_heads, v_dim)
-        if (k_dim == 32) VELOX_GDN_CHUNK(32);
-        else if (k_dim == 64) VELOX_GDN_CHUNK(64);
-        else VELOX_GDN_CHUNK(128);
+        const int chunks = (tokens + kGdnChunk - 1) / kGdnChunk;
+        static VeloxScratch scratch;
+        float* prep = static_cast<float*>(scratch.get(static_cast<size_t>(v_heads) * chunks * kGdnPrep * sizeof(float)));
+        if (prep == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+        const dim3 pgrid(v_heads, chunks), grid(v_heads, (v_dim + kGdnVt - 1) / kGdnVt), block(kGdnThreads);
+#define VELOX_GDN_CHUNK(DK)                                                                                         \
+    gated_delta_net_prepare_kernel<DK><<<pgrid, block>>>(qkv, ab, a_log, dt_bias, prep, tokens, k_heads, v_heads,   \
+                                                         v_dim);                                                    \
+    gated_delta_net_chunk_kernel<DK><<<grid, block>>>(qkv, prep, state, out, tokens, k_heads, v_heads, v_dim)
+        if (k_dim == 32) {
+            VELOX_GDN_CHUNK(32);
+        } else if (k_dim == 64) {
+            VELOX_GDN_CHUNK(64);
+        } else {
+            VELOX_GDN_CHUNK(128);
+        }
 #undef VELOX_GDN_CHUNK
         return velox_launch_status();
     }

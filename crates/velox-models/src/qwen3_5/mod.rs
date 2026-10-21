@@ -9,8 +9,7 @@ mod weights;
 
 use velox_core::backend::{
     AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, NormKind, RopeLayout,
-    RopePosShape,
-    RopeShape,
+    RopePosShape, RopeShape,
 };
 use velox_core::{Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
@@ -578,14 +577,7 @@ impl<B: Backend> Qwen35Text<B> {
                             Some((sc, ss, so)) => {
                                 b.conv1d_silu_from(qkv_buf, cw, &s_conv[gi], sc, so, cs)?;
                                 b.gated_delta_net_from(
-                                    so,
-                                    ab_buf,
-                                    al,
-                                    dt,
-                                    &s_ssm[gi],
-                                    ss,
-                                    &mut ws.o,
-                                    gs,
+                                    so, ab_buf, al, dt, &s_ssm[gi], ss, &mut ws.o, gs,
                                 )?;
                             }
                             None => {
