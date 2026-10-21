@@ -161,20 +161,6 @@ pub static CATALOG: &[DeviceProfile] = &[
         tuned_branch: Some("rtx-5060-ti"),
     },
     DeviceProfile {
-        id: "rtx-5060-ti-8g",
-        name: "NVIDIA GeForce RTX 5060 Ti 8GB",
-        arch: GpuArch::Cuda {
-            major: 12,
-            minor: 0,
-        },
-        form_factor: FormFactor::Desktop,
-        vram_gib: 8,
-        sm_count: 36,
-        mem_bandwidth_gbs: 448,
-        reserved_mib: 640,
-        tuned_branch: Some("rtx-5060-ti"),
-    },
-    DeviceProfile {
         id: "rtx-4090",
         name: "NVIDIA GeForce RTX 4090",
         arch: GpuArch::Cuda { major: 8, minor: 9 },
@@ -203,9 +189,14 @@ pub fn by_id(id: &str) -> Option<&'static DeviceProfile> {
     CATALOG.iter().find(|p| p.id.eq_ignore_ascii_case(id))
 }
 
+/// Reported VRAM may differ from a profile's nominal size by at most this much. Drivers report
+/// slightly less than nominal; a larger gap is a different SKU on the same die.
+const VRAM_TOLERANCE_MIB: i64 = 1024;
+
 /// Matches a physical device to a profile by architecture and SM count, then by the nearest VRAM
-/// size (SKUs such as the 8 GB and 16 GB RTX 5060 Ti share a die). Device names are not used:
-/// they vary across drivers and OEMs.
+/// size within [`VRAM_TOLERANCE_MIB`]. A SKU that shares a die with a profile but differs in VRAM
+/// (such as the unsupported 8 GB RTX 5060 Ti) matches nothing rather than the nearest profile.
+/// Device names are not used: they vary across drivers and OEMs.
 pub fn detect(
     arch: GpuArch,
     sm_count: u32,
@@ -215,7 +206,10 @@ pub fn detect(
     CATALOG
         .iter()
         .filter(|p| p.arch == arch && p.sm_count == sm_count)
-        .min_by_key(|p| (i64::from(p.vram_gib) * 1024 - total_mib).abs())
+        .map(|p| (p, (i64::from(p.vram_gib) * 1024 - total_mib).abs()))
+        .filter(|&(_, gap)| gap <= VRAM_TOLERANCE_MIB)
+        .min_by_key(|&(_, gap)| gap)
+        .map(|(p, _)| p)
 }
 
 #[cfg(test)]
@@ -249,12 +243,13 @@ mod tests {
     }
 
     #[test]
-    fn detects_5060_ti_by_vram() {
+    fn detects_5060_ti_16g_only() {
         assert_eq!(
             detect(SM120, 36, 16311 << 20).unwrap().id,
             "rtx-5060-ti-16g"
         );
-        assert_eq!(detect(SM120, 36, 8151 << 20).unwrap().id, "rtx-5060-ti-8g");
+        // The 8 GB SKU shares the die but is not supported.
+        assert!(detect(SM120, 36, 8151 << 20).is_none());
     }
 
     #[test]

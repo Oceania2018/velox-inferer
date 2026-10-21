@@ -18,6 +18,7 @@ fn build<B>(b: B, art: &Artifact, a: &Args) -> Result<Box<dyn ChatEngine>>
 where
     B: Backend + Send + Sync + 'static,
     B::Buffer: Send + Sync + 'static,
+    B::Chunk: Send + Sync + 'static,
 {
     let template = match a.get("chat-template") {
         Some(p) => {
@@ -75,6 +76,9 @@ where
             .is_none_or(|v| v != "off"),
         // --host-context-mib N (ninfer's name): system RAM for prefixes any request can resume.
         host_context_bytes: a.parse::<usize>("host-context-mib", 16384)? << 20,
+        // --kv-paging on|off (default on): lanes' attention caches in virtual memory, backed as
+        // they grow, with identical prefix chunks shared between lanes.
+        kv_paging: a.get("kv-paging").is_none_or(|v| v != "off"),
         // --ctx-lrfu-lambda F: LRFU decay per request of that store (0: LRU).
         lrfu_lambda: a.parse("ctx-lrfu-lambda", 0.1)?,
         // --disk-context-mib N (default 0: off) and --disk-context-dir DIR: NVMe tier below RAM.

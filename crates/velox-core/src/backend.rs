@@ -401,6 +401,8 @@ impl<'a, Buf> WeightView<'a, Buf> {
 
 pub trait Backend {
     type Buffer;
+    /// Physical device memory that virtual buffers map (see [`Self::alloc_virtual`]).
+    type Chunk;
 
     fn kind(&self) -> BackendKind;
     /// Human-readable description, e.g. "cuda:0 NVIDIA GeForce RTX 5090 [variant rtx-5090]".
@@ -495,6 +497,37 @@ pub trait Backend {
     /// no device memory, slower access. Backends without such memory return device storage.
     fn alloc_host(&self, len: usize) -> Result<Self::Buffer> {
         self.alloc(len)
+    }
+    /// f32 slots of one physical chunk of virtual memory; 0 when the backend has none (callers
+    /// then allocate whole buffers).
+    fn vm_chunk_len(&self) -> usize {
+        0
+    }
+    /// A buffer of `len` f32 slots (rounded up to whole chunks) whose address range is reserved
+    /// but backed by nothing: chunk `i` (slots `i * vm_chunk_len()` onward) must be mapped
+    /// ([`Self::map_chunk`]) before an op touches it. The address never moves, so recorded
+    /// graphs stay valid across remaps.
+    fn alloc_virtual(&self, _len: usize) -> Result<Self::Buffer> {
+        Err(crate::Error::Unsupported("virtual memory".into()))
+    }
+    /// One chunk of physical memory (contents undefined).
+    fn alloc_chunk(&self) -> Result<Self::Chunk> {
+        Err(crate::Error::Unsupported("virtual memory".into()))
+    }
+    /// Backs chunk `index` of the virtual buffer `buf` with `chunk`, which may back other
+    /// buffers' chunks at the same time (they then share contents). The index must be unmapped.
+    fn map_chunk(
+        &self,
+        _buf: &mut Self::Buffer,
+        _index: usize,
+        _chunk: &Self::Chunk,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported("virtual memory".into()))
+    }
+    /// Removes chunk `index`'s backing. Queued work touching it must have completed
+    /// ([`Self::synchronize`]).
+    fn unmap_chunk(&self, _buf: &mut Self::Buffer, _index: usize) -> Result<()> {
+        Err(crate::Error::Unsupported("virtual memory".into()))
     }
     /// [`Self::alloc_host`] for another thread, when the backend has pinned memory (else `None`).
     fn host_alloc(&self) -> Option<HostAlloc<Self::Buffer>> {
