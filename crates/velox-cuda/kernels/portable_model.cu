@@ -275,6 +275,308 @@ __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const
     }
 }
 
+// Chunkwise-parallel Gated DeltaNet for prefill (the chunked delta rule in WY form). Within a chunk
+// of C tokens let G be the in-chunk cumulative log decay and gamma = exp(G). The per-token deltas
+// D_r = beta_r (v_r - S'_r k_r) (S'_r = decayed state before token r) solve (I + A) D = R with
+//   A[r][s] = beta_r exp(G_r - G_s) k_r.k_s (s < r),   R_r = beta_r (v_r - gamma_r S0 k_r),
+// so D = T R with T = (I + A)^-1, and then
+//   o_r = gamma_r S0 q_r + sum_{s<=r} exp(G_r - G_s) (q_r.k_s) D_s
+//   S_C = gamma_{C-1} S0 + sum_s exp(G_{C-1} - G_s) D_s k_s^T.
+// One block owns head h and kGdnVt state rows (kept in registers across chunks; chunks run in
+// order) and recomputes the head's key-side matrices (A, T, P) itself, so no global scratch. The
+// chunk loop is latency-bound, so chunks and tiles are small: more, lighter blocks per SM and a
+// short serial T solve.
+constexpr int kGdnChunk = 16;
+constexpr int kGdnVt = 16;
+constexpr int kGdnThreads = 128;
+// Below this many tokens the per-row recurrence is as fast (decode and MTP verify stay on it).
+constexpr int kGdnChunkMinTokens = 16;
+
+// Reduce-scatter over the 8 lanes of an aligned lane group: on return v[0] of lane g (g = lane % 8)
+// holds the group sum of v[g].
+__device__ __forceinline__ void gdn_reduce_scatter8(float (&v)[8], int g) {
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const bool hi = g & 4;
+        const float send = hi ? v[k] : v[k + 4], keep = hi ? v[k + 4] : v[k];
+        v[k] = keep + __shfl_xor_sync(0xffffffffu, send, 4);
+    }
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const bool hi = g & 2;
+        const float send = hi ? v[k] : v[k + 2], keep = hi ? v[k + 2] : v[k];
+        v[k] = keep + __shfl_xor_sync(0xffffffffu, send, 2);
+    }
+    const bool hi = g & 1;
+    const float send = hi ? v[0] : v[1], keep = hi ? v[1] : v[0];
+    v[0] = keep + __shfl_xor_sync(0xffffffffu, send, 1);
+}
+
+template <int DK>
+__global__ void __launch_bounds__(kGdnThreads, 3)
+    gated_delta_net_chunk_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
+                                 const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                 float* __restrict__ state, float* __restrict__ out, int tokens, int k_heads,
+                                 int v_heads, int v_dim) {
+    constexpr int C = kGdnChunk, VT = kGdnVt, KS = DK + 4, AS = C + 4, PS = C + 4, RS = VT + 1, NJ = DK / 32;
+    constexpr int NV = C * VT / kGdnThreads;
+    static_assert(C <= VELOX_WARP && C % 8 == 0, "gate scan and T inversion use one warp per chunk");
+    static_assert(kGdnThreads == VT * 8 && kGdnThreads == C * 8, "8 threads per state row and per chunk row");
+    // T and D reuse the Q tile once Q is consumed.
+    constexpr int QSZ = C * KS > C * PS + C * RS ? C * KS : C * PS + C * RS;
+    __shared__ __align__(16) float ks[C * KS];  // normalized keys
+    __shared__ __align__(16) float qs[QSZ];     // normalized queries; then T and D
+    __shared__ __align__(16) float at[C * AS];  // A transposed: at[s][r] = A[r][s]
+    __shared__ __align__(16) float ps[C * PS];  // P[r][s] = exp(G_r - G_s) q_r.k_s for s <= r, else 0
+    __shared__ float rs[C * RS];                // V, then R in place
+    __shared__ float gs[C], gam[C], decay_last[C], betas[C];
+    float* ts = qs;           // [C][PS]
+    float* ds = qs + C * PS;  // [C][RS]
+
+    const int h = blockIdx.x, i0 = blockIdx.y * VT, tid = threadIdx.x;
+    const int lane = tid % VELOX_WARP, warp = tid / VELOX_WARP;
+    const int kh = h / (v_heads / k_heads);
+    const size_t width = static_cast<size_t>(2 * k_heads * DK + v_heads * v_dim);
+    const float inv_sqrt_dk = rsqrtf(static_cast<float>(DK));
+    const float neg_a = -expf(a_log[h]), bias = dt_bias[h];
+
+    // Thread (si, dc) owns state row si (and chunk row si for A and P) over columns
+    // dc * 4 + 32 * j + e; its 8-thread group is lane-aligned within the warp.
+    const int si = tid / 8, dc = tid % 8;
+    const bool row_ok = i0 + si < v_dim;
+    float* row_state = state + (static_cast<size_t>(h) * v_dim + i0 + si) * DK;
+    float s[NJ][4];
+#pragma unroll
+    for (int j = 0; j < NJ; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) s[j][e] = row_ok ? row_state[dc * 4 + 32 * j + e] : 0.0f;
+
+    // Raw inputs of a chunk, loaded into registers while the previous chunk finishes (after T, when
+    // few registers are live). q and k use the state-row layout: chunk row si, columns
+    // dc * 4 + 32 * j + e. Rows past the end load as zero.
+    float rq[NJ][4], rk[NJ][4], rv[NV], ga = 0.0f, gb = 0.0f;
+    auto load = [&](int t0) {
+        const int n = tokens - t0 < C ? tokens - t0 : C;
+        const float* row = qkv + static_cast<size_t>(t0 + si) * width;
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                rq[j][e] = si < n ? row[kh * DK + dc * 4 + 32 * j + e] : 0.0f;
+                rk[j][e] = si < n ? row[(k_heads + kh) * DK + dc * 4 + 32 * j + e] : 0.0f;
+            }
+#pragma unroll
+        for (int m = 0; m < NV; ++m) {
+            const int e = tid + kGdnThreads * m, c = e / VT, i = e % VT;
+            const float* vrow = qkv + static_cast<size_t>(t0 + c) * width;
+            rv[m] = c < n && i0 + i < v_dim ? vrow[2 * k_heads * DK + h * v_dim + i0 + i] : 0.0f;
+        }
+        if (warp == 0 && lane < n) {
+            const float* abr = ab + static_cast<size_t>(t0 + lane) * 2 * v_heads;
+            ga = abr[h];
+            gb = abr[v_heads + h];
+        }
+    };
+    load(0);
+
+    for (int t0 = 0; t0 < tokens; t0 += C) {
+        const int n = tokens - t0 < C ? tokens - t0 : C;
+        // L2-normalize q and k of chunk row si (8-lane group reduction) and publish them.
+        {
+            float qq = 0.0f, kk = 0.0f;
+#pragma unroll
+            for (int j = 0; j < NJ; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    qq += rq[j][e] * rq[j][e];
+                    kk += rk[j][e] * rk[j][e];
+                }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+                qq += __shfl_xor_sync(0xffffffffu, qq, o);
+                kk += __shfl_xor_sync(0xffffffffu, kk, o);
+            }
+            const float qn = rsqrtf(qq + 1e-6f), kn = rsqrtf(kk + 1e-6f);
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    rq[j][e] *= qn;
+                    rk[j][e] *= kn;
+                }
+                *reinterpret_cast<float4*>(&qs[si * KS + dc * 4 + 32 * j]) =
+                    make_float4(rq[j][0], rq[j][1], rq[j][2], rq[j][3]);
+                *reinterpret_cast<float4*>(&ks[si * KS + dc * 4 + 32 * j]) =
+                    make_float4(rk[j][0], rk[j][1], rk[j][2], rk[j][3]);
+            }
+#pragma unroll
+            for (int m = 0; m < NV; ++m) {
+                const int e = tid + kGdnThreads * m;
+                rs[(e / VT) * RS + e % VT] = rv[m];
+            }
+            // Gates (padded rows: g = 0, beta = 0, so they change nothing) and their in-chunk scan.
+            if (warp == 0) {
+                float g = 0.0f, beta = 0.0f;
+                if (lane < n) {
+                    const float a = ga + bias;
+                    g = neg_a * (a > 20.0f ? a : log1pf(expf(a)));
+                    beta = 1.0f / (1.0f + expf(-gb));
+                }
+#pragma unroll
+                for (int o = 1; o < VELOX_WARP; o <<= 1) {
+                    const float u = __shfl_up_sync(0xffffffffu, g, o);
+                    if (lane >= o) g += u;
+                }
+                const float last = __shfl_sync(0xffffffffu, g, C - 1);
+                if (lane < C) {
+                    gs[lane] = g;
+                    gam[lane] = expf(g);
+                    decay_last[lane] = expf(last - g);
+                    betas[lane] = beta;
+                }
+            }
+        }
+        __syncthreads();
+
+        // One pass over chunk rows c, 8 at a time (lane dc ends up owning c = 8 g + dc):
+        //   x = S0[si].k_c, y = S0[si].q_c  -> R[c][si], gamma_c y kept for o
+        //   kk = k_si.k_c, qk = q_si.k_c    -> A[si][c], P[si][c] (lower triangle only)
+        float ys[C / 8];
+        {
+            const auto& kr = rk;
+            const auto& qr = rq;
+#pragma unroll
+            for (int g = 0; g < C / 8; ++g) {
+                // Warp-uniform: does any chunk row of this warp (4 * warp .. 4 * warp + 3) need A/P here?
+                const bool tri = 8 * g <= 4 * warp + 3;
+                float x[8], y[8], kk[8], qk[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const int c = 8 * g + u;
+                    x[u] = y[u] = kk[u] = qk[u] = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        const float4 kv = *reinterpret_cast<const float4*>(&ks[c * KS + dc * 4 + 32 * j]);
+                        const float4 qv = *reinterpret_cast<const float4*>(&qs[c * KS + dc * 4 + 32 * j]);
+                        x[u] += kv.x * s[j][0] + kv.y * s[j][1] + kv.z * s[j][2] + kv.w * s[j][3];
+                        y[u] += qv.x * s[j][0] + qv.y * s[j][1] + qv.z * s[j][2] + qv.w * s[j][3];
+                        if (tri) {
+                            kk[u] += kv.x * kr[j][0] + kv.y * kr[j][1] + kv.z * kr[j][2] + kv.w * kr[j][3];
+                            qk[u] += kv.x * qr[j][0] + kv.y * qr[j][1] + kv.z * qr[j][2] + kv.w * qr[j][3];
+                        }
+                    }
+                }
+                gdn_reduce_scatter8(x, dc);
+                gdn_reduce_scatter8(y, dc);
+                const int c = 8 * g + dc;
+                rs[c * RS + si] = betas[c] * (rs[c * RS + si] - gam[c] * x[0]);
+                ys[g] = gam[c] * y[0];
+                float a = 0.0f, p = 0.0f;
+                if (tri) {
+                    gdn_reduce_scatter8(kk, dc);
+                    gdn_reduce_scatter8(qk, dc);
+                    const float dec = c <= si ? expf(gs[si] - gs[c]) : 0.0f;
+                    a = c < si ? betas[si] * dec * kk[0] : 0.0f;
+                    p = dec * qk[0];
+                }
+                at[c * AS + si] = a;
+                ps[si * PS + c] = p;
+            }
+        }
+        __syncthreads();
+
+        // T = (I + A)^-1 by forward substitution; lane j owns column j (Q is dead, T overwrites it).
+        if (warp == 0) {
+            float tc[C];
+#pragma unroll
+            for (int r = 0; r < C; ++r) tc[r] = r == lane ? 1.0f : 0.0f;
+#pragma unroll
+            for (int c = 0; c < C - 1; ++c) {
+#pragma unroll
+                for (int r = (c + 1) & ~3; r < C; r += 4) {
+                    const float4 a4 = *reinterpret_cast<const float4*>(&at[c * AS + r]);
+                    tc[r] -= a4.x * tc[c];
+                    tc[r + 1] -= a4.y * tc[c];
+                    tc[r + 2] -= a4.z * tc[c];
+                    tc[r + 3] -= a4.w * tc[c];
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < C; ++r)
+                if (lane < C) ts[r * PS + lane] = tc[r];
+        }
+        __syncthreads();
+        if (t0 + C < tokens) load(t0 + C);
+
+        // D = T R, o = gamma S0 q + P D, and the state update for state row si (T and P are lower
+        // triangular with explicit zeros).
+        {
+            float acc[C / 8];
+#pragma unroll
+            for (int g = 0; g < C / 8; ++g) acc[g] = 0.0f;
+#pragma unroll 2
+            for (int u = 0; u < C; u += 4) {
+                const float r0 = rs[u * RS + si], r1 = rs[(u + 1) * RS + si], r2 = rs[(u + 2) * RS + si],
+                            r3 = rs[(u + 3) * RS + si];
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) {
+                    const float4 t4 = *reinterpret_cast<const float4*>(&ts[(8 * g + dc) * PS + u]);
+                    acc[g] += t4.x * r0 + t4.y * r1 + t4.z * r2 + t4.w * r3;
+                }
+            }
+#pragma unroll
+            for (int g = 0; g < C / 8; ++g) ds[(8 * g + dc) * RS + si] = acc[g];
+        }
+        __syncthreads();
+        {
+            float acc[C / 8];
+#pragma unroll
+            for (int g = 0; g < C / 8; ++g) acc[g] = ys[g];
+#pragma unroll 2
+            for (int u = 0; u < C; u += 4) {
+                const float d0 = ds[u * RS + si], d1 = ds[(u + 1) * RS + si], d2 = ds[(u + 2) * RS + si],
+                            d3 = ds[(u + 3) * RS + si];
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) {
+                    const float4 p4 = *reinterpret_cast<const float4*>(&ps[(8 * g + dc) * PS + u]);
+                    acc[g] += p4.x * d0 + p4.y * d1 + p4.z * d2 + p4.w * d3;
+                }
+            }
+#pragma unroll
+            for (int g = 0; g < C / 8; ++g) {
+                const int c = 8 * g + dc;
+                if (c < n && row_ok)
+                    out[(static_cast<size_t>(t0 + c) * v_heads + h) * v_dim + i0 + si] = acc[g] * inv_sqrt_dk;
+            }
+        }
+        {
+            const float gl = gam[C - 1];
+#pragma unroll
+            for (int j = 0; j < NJ; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) s[j][e] *= gl;
+            for (int c = 0; c < n; ++c) {
+                const float dv = ds[c * RS + si] * decay_last[c];
+#pragma unroll
+                for (int j = 0; j < NJ; ++j) {
+                    const float4 kv = *reinterpret_cast<const float4*>(&ks[c * KS + dc * 4 + 32 * j]);
+                    s[j][0] += dv * kv.x;
+                    s[j][1] += dv * kv.y;
+                    s[j][2] += dv * kv.z;
+                    s[j][3] += dv * kv.w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row_ok) {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) row_state[dc * 4 + 32 * j + e] = s[j][e];
+    }
+}
+
 // Small-m linear for FP8-row and NVFP4: one warp per output row, codes decoded a group at a time
 // (16 bytes of FP8 codes, or one 16-element NVFP4 group sharing a scale) and applied to all m
 // rows, so each weight is read once.
@@ -642,6 +944,17 @@ VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, float* 
 VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, const float* a_log,
                                              const float* dt_bias, float* state, float* out, int tokens, int k_heads,
                                              int v_heads, int k_dim, int v_dim) {
+    if (tokens >= kGdnChunkMinTokens && (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
+        const dim3 grid(v_heads, (v_dim + kGdnVt - 1) / kGdnVt), block(kGdnThreads);
+#define VELOX_GDN_CHUNK(DK)                                                                                 \
+    gated_delta_net_chunk_kernel<DK><<<grid, block>>>(qkv, ab, a_log, dt_bias, state, out, tokens, k_heads, \
+                                                      v_heads, v_dim)
+        if (k_dim == 32) VELOX_GDN_CHUNK(32);
+        else if (k_dim == 64) VELOX_GDN_CHUNK(64);
+        else VELOX_GDN_CHUNK(128);
+#undef VELOX_GDN_CHUNK
+        return velox_launch_status();
+    }
     constexpr int kWarps = 4;
     const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps), block(kWarps * VELOX_WARP);
 #define VELOX_GDN(PER)                                                                                     \
