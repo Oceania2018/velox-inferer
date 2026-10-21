@@ -675,6 +675,12 @@ impl<B: Backend> Core<B> {
             let cands = self
                 .model
                 .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)?;
+            if debug {
+                eprintln!(
+                    "[candidates] {:.1} ms",
+                    t0.elapsed().as_secs_f64() * 1e3 - t_fill
+                );
+            }
             lane.keys.extend_from_slice(&p.keys[start..]);
             if self.cfg.host_checkpoints {
                 self.place_checkpoints(lane, store, &anchors, p.keys.len() - 1)?;
