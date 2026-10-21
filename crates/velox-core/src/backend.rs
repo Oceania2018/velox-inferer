@@ -530,7 +530,9 @@ pub trait Backend {
     /// Advances several GDN layers over the first `gdn.tokens` rows of a window whose conv outputs
     /// are known (a speculative window replayed after a partial accept): each layer's conv state
     /// as [`Self::conv1d_silu`] and its recurrent state as [`Self::gated_delta_net`] would leave
-    /// them; nothing else is written. `conv.tokens == gdn.tokens`, `row0 == 0` in both.
+    /// them; nothing else is written. `conv.tokens == gdn.tokens` and `conv.row0 == gdn.row0`: the
+    /// window's rows start at `row0` of `qkv`, `conv_out` and `ab` (several windows can share
+    /// those buffers).
     fn gdn_replay(
         &self,
         layers: &mut [GdnReplayLayer<'_, Self::Buffer>],
@@ -539,7 +541,7 @@ pub trait Backend {
     ) -> Result<()> {
         let (ch, w1) = (conv.channels, conv.width - 1);
         let mut rows = self.alloc(w1 * ch)?;
-        let mut out = self.alloc(gdn.tokens * gdn.v_heads * gdn.v_dim)?;
+        let mut out = self.alloc((gdn.row0 + gdn.tokens) * gdn.v_heads * gdn.v_dim)?;
         for l in layers.iter_mut() {
             crate::check::gdn_replay_layer(
                 self.len(l.qkv),
@@ -558,7 +560,7 @@ pub trait Backend {
                 if r < w1 {
                     self.copy(l.conv_state, r * ch, &mut rows, j * ch, ch)?;
                 } else {
-                    self.copy(l.qkv, (r - w1) * ch, &mut rows, j * ch, ch)?;
+                    self.copy(l.qkv, (conv.row0 + r - w1) * ch, &mut rows, j * ch, ch)?;
                 }
             }
             self.copy(&rows, 0, l.conv_state, 0, w1 * ch)?;

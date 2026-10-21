@@ -92,6 +92,35 @@ struct Spec<B: Backend> {
     pos0: usize,
     tokens: usize,
     recording: bool,
+    /// Set by [`Qwen35Text::verify_batch`]: the window's replay inputs are rows `row0 ..` of the
+    /// batch workspace rather than `qkv` / `conv_out` / `ab` above.
+    batch_row0: Option<usize>,
+}
+
+/// Buffers for [`Qwen35Text::verify_batch`]: several sequences' windows (at most
+/// [`VERIFY_MAX`] rows each) share one forward pass, so every weight is read once per round.
+pub struct BatchWorkspace<B: Backend> {
+    max_seqs: usize,
+    /// Per GDN layer, `[max_seqs * VERIFY_MAX, *]` rows: what each sequence's commit replays.
+    qkv: Vec<B::Buffer>,
+    conv_out: Vec<B::Buffer>,
+    ab: Vec<B::Buffer>,
+    /// One sequence's attention rows (queries, keys, values, output), staged for the per-sequence
+    /// cache.
+    q: B::Buffer,
+    k: B::Buffer,
+    v: B::Buffer,
+    attn: B::Buffer,
+    /// Final-normed rows and their logits.
+    hidden: B::Buffer,
+    logits: B::Buffer,
+}
+
+impl<B: Backend> BatchWorkspace<B> {
+    /// Most sequences one batch takes.
+    pub fn max_seqs(&self) -> usize {
+        self.max_seqs
+    }
 }
 
 /// The recurrent (GDN) state of a session after `pos` tokens. Attention KV needs no copy: rows
@@ -1169,6 +1198,11 @@ impl<B: Backend> Qwen35Text<B> {
         let sp = spec
             .as_mut()
             .ok_or_else(|| Error::Config("commit without verify".into()))?;
+        if sp.batch_row0.is_some() {
+            return Err(Error::Config(
+                "commit after verify_batch (use commit_batched)".into(),
+            ));
+        }
         if keep > sp.tokens {
             return Err(Error::Shape(format!(
                 "commit {keep} of a {}-token window",
@@ -1255,7 +1289,437 @@ impl<B: Backend> Qwen35Text<B> {
             pos0: 0,
             tokens: 0,
             recording: false,
+            batch_row0: None,
         });
+        Ok(())
+    }
+
+    /// Buffers for batches of up to `max_seqs` sequences (see [`Self::verify_batch`]).
+    pub fn batch_workspace(&self, b: &B, max_seqs: usize) -> Result<BatchWorkspace<B>> {
+        let c = &self.cfg;
+        let rows = max_seqs * VERIFY_MAX;
+        let gdn = c.layers.iter().filter(|l| **l == LayerKind::Gdn).count();
+        let per_layer =
+            |w: usize| -> Result<Vec<B::Buffer>> { (0..gdn).map(|_| b.alloc(rows * w)).collect() };
+        Ok(BatchWorkspace {
+            max_seqs,
+            qkv: per_layer(c.gdn_qkv())?,
+            conv_out: per_layer(c.gdn_qkv())?,
+            ab: per_layer(2 * c.gdn_v_heads)?,
+            q: b.alloc(VERIFY_MAX * c.q_dim())?,
+            k: b.alloc(VERIFY_MAX * c.kv_dim())?,
+            v: b.alloc(VERIFY_MAX * c.kv_dim())?,
+            attn: b.alloc(VERIFY_MAX * c.q_dim())?,
+            hidden: b.alloc(rows * c.hidden)?,
+            logits: b.alloc(rows * c.vocab)?,
+        })
+    }
+
+    /// [`Self::verify`] for several sequences at once: `windows[i]` (at most [`VERIFY_MAX`]
+    /// tokens) is fed to `sessions[i]`. Every projection runs once over all rows; attention and
+    /// the recurrences run per sequence on its own cache and state. Returns, per sequence, the `k`
+    /// best candidates after each of its tokens. Each session must then be committed with
+    /// [`Self::commit_batched`] before `bw` or `ws` is used again. DFlash features of sequence
+    /// `i` are left in `ws` at rows starting at the sum of the earlier windows' lengths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch(
+        &self,
+        b: &B,
+        sessions: &mut [&mut Session<B>],
+        ws: &mut Workspace<B>,
+        bw: &mut BatchWorkspace<B>,
+        windows: &[&[u32]],
+        k: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<Vec<(u32, f32)>>>> {
+        let n = windows.len();
+        if n != sessions.len() || n == 0 || n > bw.max_seqs {
+            return Err(Error::Shape(format!(
+                "verify_batch: {n} windows for {} sessions (at most {})",
+                sessions.len(),
+                bw.max_seqs
+            )));
+        }
+        let mut rows = Vec::with_capacity(n);
+        let mut ids = Vec::new();
+        for (s, w) in sessions.iter_mut().zip(windows) {
+            if w.is_empty() || w.len() > VERIFY_MAX {
+                return Err(Error::Shape(format!(
+                    "verify takes 1..={VERIFY_MAX} tokens per sequence"
+                )));
+            }
+            if s.pos + w.len() > s.capacity {
+                return Err(Error::Config(
+                    "verify window exceeds session capacity".into(),
+                ));
+            }
+            self.ensure_spec(b, s)?;
+            rows.push((ids.len(), w.len()));
+            ids.extend_from_slice(w);
+        }
+        let t = ids.len();
+        if t > ws.max_tokens {
+            return Err(Error::Shape("verify batch exceeds the workspace".into()));
+        }
+        self.chunk_batch(b, sessions, ws, bw, &ids, &rows)?;
+        let (c, w) = (&self.cfg, &self.w);
+        b.rms_norm(
+            &ws.x,
+            w.param(w.final_norm),
+            &mut bw.hidden,
+            t,
+            c.hidden,
+            c.eps,
+            NormKind::Offset,
+        )?;
+        b.linear(&bw.hidden, &w.view(&w.head), &mut bw.logits, t)?;
+        let mut all = b.top_k(&bw.logits, t, c.vocab, limit.min(c.vocab), k)?;
+        let mut out = Vec::with_capacity(n);
+        for &(_, m) in rows.iter().rev() {
+            out.push(all.split_off(all.len() - m));
+        }
+        out.reverse();
+        for (s, &(r0, m)) in sessions.iter_mut().zip(&rows) {
+            let pos = s.pos;
+            let sp = s.spec.as_mut().expect("allocated above");
+            sp.pos0 = pos;
+            sp.tokens = m;
+            sp.batch_row0 = Some(r0);
+            s.pos += m;
+        }
+        Ok(out)
+    }
+
+    /// [`Self::commit`] for a session verified in a batch (replaying from `bw`).
+    pub fn commit_batched(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        bw: &BatchWorkspace<B>,
+        keep: usize,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let Session {
+            spec,
+            conv,
+            ssm,
+            pos,
+            parity,
+            ..
+        } = &mut *s;
+        let sp = spec
+            .as_mut()
+            .ok_or_else(|| Error::Config("commit without verify".into()))?;
+        let row0 = sp
+            .batch_row0
+            .take()
+            .ok_or_else(|| Error::Config("commit_batched after a single verify".into()))?;
+        if keep > sp.tokens {
+            return Err(Error::Shape(format!(
+                "commit {keep} of a {}-token window",
+                sp.tokens
+            )));
+        }
+        if keep == sp.tokens {
+            std::mem::swap(conv, &mut sp.conv);
+            std::mem::swap(ssm, &mut sp.ssm);
+            *parity = !*parity;
+        } else if keep > 0 {
+            let gdn_params = self.w.layers.iter().filter_map(|l| match &l.mixer {
+                Mixer::Gdn { a_log, dt_bias, .. } => Some((*a_log, *dt_bias)),
+                _ => None,
+            });
+            let mut layers: Vec<GdnReplayLayer<'_, B::Buffer>> = conv
+                .iter_mut()
+                .zip(ssm.iter_mut())
+                .zip(gdn_params)
+                .enumerate()
+                .map(|(gi, ((cs, ss), (a_log, dt_bias)))| GdnReplayLayer {
+                    qkv: &bw.qkv[gi],
+                    conv_out: &bw.conv_out[gi],
+                    ab: &bw.ab[gi],
+                    a_log: self.w.param(a_log),
+                    dt_bias: self.w.param(dt_bias),
+                    conv_state: cs,
+                    ssm: ss,
+                })
+                .collect();
+            b.gdn_replay(
+                &mut layers,
+                ConvShape {
+                    tokens: keep,
+                    channels: c.gdn_qkv(),
+                    width: c.conv_width,
+                    row0,
+                },
+                GdnShape {
+                    tokens: keep,
+                    k_heads: c.gdn_k_heads,
+                    v_heads: c.gdn_v_heads,
+                    k_dim: c.gdn_k_dim,
+                    v_dim: c.gdn_v_dim,
+                    row0,
+                },
+            )?;
+        }
+        *pos = sp.pos0 + keep;
+        Ok(())
+    }
+
+    /// The forward pass of [`Self::verify_batch`]: `ids` holds every window, sequence `i` at
+    /// rows `rows[i]` (start, length). GDN state advances into each session's spec buffers (the
+    /// state to roll back to stays in place); attention appends to each session's cache.
+    fn chunk_batch(
+        &self,
+        b: &B,
+        sessions: &mut [&mut Session<B>],
+        ws: &mut Workspace<B>,
+        bw: &mut BatchWorkspace<B>,
+        ids: &[u32],
+        rows: &[(usize, usize)],
+    ) -> Result<()> {
+        let (c, w) = (&self.cfg, &self.w);
+        let t = ids.len();
+        let hd = c.hidden;
+        b.embed(ids, &w.view(&w.embed), &mut ws.x)?;
+        let (mut ai, mut gi) = (0, 0);
+        for (li, l) in w.layers.iter().enumerate() {
+            if li == 0 {
+                b.rms_norm(
+                    &ws.x,
+                    w.param(l.input_norm),
+                    &mut ws.h,
+                    t,
+                    hd,
+                    c.eps,
+                    NormKind::Offset,
+                )?;
+            } else {
+                b.add_rms_norm(
+                    &mut ws.x,
+                    &ws.y,
+                    w.param(l.input_norm),
+                    &mut ws.h,
+                    t,
+                    hd,
+                    c.eps,
+                    NormKind::Offset,
+                )?;
+                self.capture_features(b, ws, li - 1, t)?;
+            }
+            match &l.mixer {
+                Mixer::Gdn {
+                    qkv,
+                    z,
+                    qkvz,
+                    ab,
+                    out,
+                    conv,
+                    a_log,
+                    dt_bias,
+                    norm,
+                } => {
+                    let (qkv_buf, ab_buf, co_buf) =
+                        (&mut bw.qkv[gi], &mut bw.ab[gi], &mut bw.conv_out[gi]);
+                    match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
+                        Some(f) => {
+                            b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
+                            b.split_cols(
+                                &ws.fused,
+                                t,
+                                f.rows,
+                                &mut [
+                                    (&mut *qkv_buf, qkv.row_begin - f.row_begin, qkv.rows),
+                                    (&mut ws.z, z.row_begin - f.row_begin, z.rows),
+                                ],
+                            )?;
+                        }
+                        None => {
+                            b.linear(&ws.h, &w.view(qkv), qkv_buf, t)?;
+                            b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
+                        }
+                    }
+                    b.linear(&ws.h, &w.view(ab), ab_buf, t)?;
+                    let (cw, al, dt) = (w.param(*conv), w.param(*a_log), w.param(*dt_bias));
+                    for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
+                        let Session {
+                            spec,
+                            conv: s_conv,
+                            ssm: s_ssm,
+                            ..
+                        } = &mut **s;
+                        let sp = spec.as_mut().expect("ensure_spec ran");
+                        let cs = ConvShape {
+                            tokens: m,
+                            channels: c.gdn_qkv(),
+                            width: c.conv_width,
+                            row0: r0,
+                        };
+                        let gs = GdnShape {
+                            tokens: m,
+                            k_heads: c.gdn_k_heads,
+                            v_heads: c.gdn_v_heads,
+                            k_dim: c.gdn_k_dim,
+                            v_dim: c.gdn_v_dim,
+                            row0: r0,
+                        };
+                        b.conv1d_silu_from(qkv_buf, cw, &s_conv[gi], &mut sp.conv[gi], co_buf, cs)?;
+                        b.gated_delta_net_from(
+                            co_buf,
+                            ab_buf,
+                            al,
+                            dt,
+                            &s_ssm[gi],
+                            &mut sp.ssm[gi],
+                            &mut ws.o,
+                            gs,
+                        )?;
+                    }
+                    b.rms_norm_gated(
+                        &ws.o,
+                        w.param(*norm),
+                        &mut ws.z,
+                        t * c.gdn_v_heads,
+                        c.gdn_v_dim,
+                        c.eps,
+                        NormKind::Plain,
+                    )?;
+                    b.linear(&ws.z, &w.view(out), &mut ws.y, t)?;
+                    gi += 1;
+                }
+                Mixer::Attention { .. } => {
+                    self.attention_batch(b, sessions, ws, bw, &l.mixer, ai, rows)?;
+                    ai += 1;
+                }
+            }
+            b.add_rms_norm(
+                &mut ws.x,
+                &ws.y,
+                w.param(l.post_norm),
+                &mut ws.h,
+                t,
+                hd,
+                c.eps,
+                NormKind::Offset,
+            )?;
+            self.mlp(b, ws, l, t)?;
+        }
+        b.add(&mut ws.x, &ws.y, t * hd)?;
+        self.capture_features(b, ws, w.layers.len() - 1, t)?;
+        Ok(())
+    }
+
+    /// The attention mixer of layer `ai` (attention-layer index) for a batch: projections and
+    /// norms over all rows, then per sequence its rows are staged, rotated at its positions,
+    /// appended to its cache and attended, and the outputs gathered back.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_batch(
+        &self,
+        b: &B,
+        sessions: &mut [&mut Session<B>],
+        ws: &mut Workspace<B>,
+        bw: &mut BatchWorkspace<B>,
+        mixer: &Mixer,
+        ai: usize,
+        rows: &[(usize, usize)],
+    ) -> Result<()> {
+        let (c, w) = (&self.cfg, &self.w);
+        let t: usize = rows.iter().map(|r| r.1).sum();
+        let Mixer::Attention {
+            query,
+            gate,
+            key,
+            value,
+            fused,
+            output,
+            q_norm,
+            k_norm,
+        } = mixer
+        else {
+            return Err(Error::Config("attention_batch on a GDN layer".into()));
+        };
+        match fused.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
+            Some(f) => {
+                b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
+                let col = |d: &WDesc| d.row_begin - f.row_begin;
+                b.split_cols(
+                    &ws.fused,
+                    t,
+                    f.rows,
+                    &mut [
+                        (&mut ws.q, col(query), query.rows),
+                        (&mut ws.g, col(gate), gate.rows),
+                        (&mut ws.k, col(key), key.rows),
+                        (&mut ws.v, col(value), value.rows),
+                    ],
+                )?;
+            }
+            None => {
+                b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
+                b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
+                b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
+                b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
+            }
+        }
+        b.rms_norm(
+            &ws.q,
+            w.param(*q_norm),
+            &mut ws.qn,
+            t * c.heads,
+            c.head_dim,
+            c.eps,
+            NormKind::Offset,
+        )?;
+        b.rms_norm(
+            &ws.k,
+            w.param(*k_norm),
+            &mut ws.kn,
+            t * c.kv_heads,
+            c.head_dim,
+            c.eps,
+            NormKind::Offset,
+        )?;
+        let (qd, kd) = (c.q_dim(), c.kv_dim());
+        for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
+            b.copy(&ws.qn, r0 * qd, &mut bw.q, 0, m * qd)?;
+            b.copy(&ws.kn, r0 * kd, &mut bw.k, 0, m * kd)?;
+            b.copy(&ws.v, r0 * kd, &mut bw.v, 0, m * kd)?;
+            let pos0 = s.pos;
+            let rope_pos0 = usize::try_from(pos0 as i64 + s.rope_delta)
+                .map_err(|_| Error::Shape("negative rotary position".into()))?;
+            let rope = |heads| RopeShape {
+                tokens: m,
+                heads,
+                head_dim: c.head_dim,
+                rotary_dim: c.rotary_dim,
+                pos0: rope_pos0,
+                theta: c.rope_theta,
+            };
+            b.rope(&mut bw.q, rope(c.heads))?;
+            b.rope(&mut bw.k, rope(c.kv_heads))?;
+            let kv_format = s.kv_format;
+            let (kc, vc) = &mut s.kv[ai];
+            let store = KvStoreShape {
+                tokens: m,
+                kv_heads: c.kv_heads,
+                head_dim: c.head_dim,
+                pos0,
+                format: kv_format,
+            };
+            b.kv_store(&bw.k, &bw.v, kc, vc, store)?;
+            let shape = AttnShape {
+                tokens: m,
+                heads: c.heads,
+                kv_heads: c.kv_heads,
+                head_dim: c.head_dim,
+                pos0,
+                kv: kv_format,
+            };
+            b.attention(&bw.q, kc, vc, &mut bw.attn, shape)?;
+            b.copy(&bw.attn, 0, &mut ws.attn, r0 * qd, m * qd)?;
+        }
+        b.sigmoid_mul(&mut ws.attn, &ws.g, t * qd)?;
+        b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
         Ok(())
     }
 

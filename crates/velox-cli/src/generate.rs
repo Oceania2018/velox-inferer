@@ -364,11 +364,12 @@ fn dflash_generate<B: Backend>(
     let dm = DFlashModel::load(b, art, model.cfg.hidden)?
         .ok_or_else(|| Error::Config("artifact has no dflash2 component".into()))?;
     model.enable_capture(b, ws, &dm.cfg.target_layers)?;
-    let mut dr = DFlashDrafter::new(b, &dm, model, chunk, drafts_per_block)?;
+    let mut dr = DFlashDrafter::new(b, &dm, drafts_per_block)?;
+    let mut dw = DFlashDrafter::workspace(b, &dm, model, chunk, drafts_per_block)?;
     let row0 = s.pos;
     let t0 = Instant::now();
     model.advance_rows(b, s, ws, ids, None, &[], &mut [], &mut |ws, base, t| {
-        dr.prefill_chunk(b, &dm, ws, row0 + base, t)
+        dr.prefill_chunk(b, &dm, &mut dw, ws, row0 + base, t)
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;
     let prefill = t0.elapsed().as_secs_f64();
@@ -391,7 +392,7 @@ fn dflash_generate<B: Backend>(
             }
         }
         let td = Instant::now();
-        let (drafts, _) = dr.draft(b, &dm, model, ws, row, kept, s.pos, c, limit, 0.0)?;
+        let (drafts, _) = dr.draft(b, &dm, &mut dw, model, ws, row, kept, s.pos, c, limit, 0.0)?;
         draft_s += td.elapsed().as_secs_f64();
         let mut window = vec![c];
         window.extend(drafts.iter().copied().take(max_tokens - out.len()));

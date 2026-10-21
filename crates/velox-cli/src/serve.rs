@@ -75,7 +75,8 @@ where
                 .unwrap_or_else(std::env::temp_dir)
                 .join("velox/disk-context"),
         },
-        scratch_capacity: a.parse("scratch-context", 8192)?,
+        // --max-concurrency N: lanes decoding at once (default 6, as ninfer on this machine).
+        lanes: a.parse("max-concurrency", 6)?,
         mtp_drafts: a.parse("mtp-drafts", 7)?,
         dflash_drafts,
         kv_format: KvFormat::parse(a.get("kv-format").unwrap_or("f32"))?,
@@ -149,10 +150,10 @@ pub fn run(a: &Args) -> Result<ExitCode> {
             architecture: architecture.clone(),
         })
     };
-    // One generation lane today; concurrent requests queue on it.
+    // As many concurrent generations as engine lanes (more wait for one here).
     let cfg = Config {
         model_id: model_id.clone(),
-        max_concurrency: 1,
+        max_concurrency: a.parse("max-concurrency", 6u32)?,
         info: vec![
             ("variant".into(), velox_variant::INFO.id.into()),
             ("branch".into(), velox_variant::INFO.branch.into()),
