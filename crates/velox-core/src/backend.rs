@@ -464,6 +464,15 @@ pub trait Backend {
         self.rms_norm(x, weight, &mut y, rows, dim, eps, kind)?;
         self.silu_mul(gate, &y, rows * dim)
     }
+    /// Zeroed storage in system RAM that kernels read and write directly (pinned and mapped):
+    /// no device memory, slower access. Backends without such memory return device storage.
+    fn alloc_host(&self, len: usize) -> Result<Self::Buffer> {
+        self.alloc(len)
+    }
+    /// [`Self::upload_bytes`] into storage from [`Self::alloc_host`].
+    fn upload_bytes_host(&self, data: &[u8]) -> Result<Self::Buffer> {
+        self.upload_bytes(data)
+    }
     /// `x[i] *= sigmoid(gate[i])` for the first `len` elements.
     fn sigmoid_mul(&self, x: &mut Self::Buffer, gate: &Self::Buffer, len: usize) -> Result<()>;
     /// Causal depthwise convolution + SiLU with a rolling state; see [`ConvShape`].

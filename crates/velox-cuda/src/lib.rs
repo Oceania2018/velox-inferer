@@ -38,6 +38,8 @@ mod ffi {
         pub fn velox_cuda_mem_info(free: *mut usize, total: *mut usize) -> i32;
         pub fn velox_cuda_profiler(on: i32) -> i32;
         pub fn velox_cuda_malloc_zeroed(ptr: *mut *mut c_void, bytes: usize) -> i32;
+        pub fn velox_cuda_host_alloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
+        pub fn velox_cuda_free_host(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_free(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_htod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_dtoh(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
@@ -204,6 +206,8 @@ pub fn require_arch(dev: &DeviceInfo, variant: &VariantInfo) -> Result<()> {
 pub struct CudaBuffer {
     ptr: *mut f32,
     len: usize,
+    /// Pinned, mapped system memory (see `Backend::alloc_host`) rather than device memory.
+    host: bool,
 }
 
 // SAFETY: a device pointer is a plain address; synchronisation is CUDA's stream ordering.
@@ -226,6 +230,7 @@ impl CudaBuffer {
         Ok(CudaBuffer {
             ptr: ptr.cast(),
             len,
+            host: false,
         })
     }
 
@@ -249,10 +254,38 @@ impl CudaBuffer {
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            // SAFETY: ptr came from cudaMalloc and is freed exactly once. Errors at teardown
-            // (e.g. after a sticky kernel fault) cannot be reported from Drop.
-            unsafe { ffi::velox_cuda_free(self.ptr.cast()) };
+            // SAFETY: ptr came from cudaMalloc (or cudaHostAlloc) and is freed exactly once.
+            // Errors at teardown (e.g. after a sticky kernel fault) cannot be reported from Drop.
+            unsafe {
+                if self.host {
+                    ffi::velox_cuda_free_host(self.ptr.cast());
+                } else {
+                    ffi::velox_cuda_free(self.ptr.cast());
+                }
+            }
         }
+    }
+}
+
+impl CudaBuffer {
+    /// Zeroed pinned host memory the device addresses directly.
+    fn new_host(len: usize) -> Result<Self> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        if len > 0 {
+            let bytes = len
+                .checked_mul(4)
+                .ok_or_else(|| Error::Shape("allocation size overflows".into()))?;
+            // SAFETY: out-pointer to a live local.
+            status(
+                unsafe { ffi::velox_cuda_host_alloc(&mut ptr, bytes) },
+                "cudaHostAlloc (mapped)",
+            )?;
+        }
+        Ok(CudaBuffer {
+            ptr: ptr.cast(),
+            len,
+            host: true,
+        })
     }
 }
 
@@ -957,6 +990,21 @@ impl Backend for CudaBackend {
 
     fn upload_bytes(&self, data: &[u8]) -> Result<CudaBuffer> {
         upload_raw(data)
+    }
+
+    fn alloc_host(&self, len: usize) -> Result<CudaBuffer> {
+        CudaBuffer::new_host(len)
+    }
+
+    fn upload_bytes_host(&self, data: &[u8]) -> Result<CudaBuffer> {
+        let buf = CudaBuffer::new_host(data.len().div_ceil(4))?;
+        if !data.is_empty() {
+            // SAFETY: buf is host memory of at least data.len() bytes, not yet used by the device.
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), buf.ptr.cast::<u8>(), data.len())
+            };
+        }
+        Ok(buf)
     }
 
     fn download(&self, buf: &CudaBuffer, out: &mut [f32]) -> Result<()> {
