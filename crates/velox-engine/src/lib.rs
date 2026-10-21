@@ -36,7 +36,7 @@ use velox_frontend::image::{
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
     shift_inserts, BatchWorkspace, Checkpoint, DFlashModel, DFlashState, DFlashWorkspace,
-    EmbedInsert, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
+    EmbedInsert, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace, DRAFT_PAGE_ROWS,
 };
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
 
@@ -680,7 +680,15 @@ impl<B: Backend> Core<B> {
                     break;
                 }
                 drop(q);
-                let more = match st.store.top_up(&self.b, &st.lanes[0].session) {
+                // One drafter window of context pages: a capture that saves the drafter context
+                // does not allocate pinned memory on the request path.
+                let draft = self.dflash.as_ref().map(|dm| {
+                    (
+                        dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
+                        dm.context_page_len(),
+                    )
+                });
+                let more = match st.store.top_up(&self.b, &st.lanes[0].session, draft) {
                     Ok(m) => m,
                     Err(e) => {
                         eprintln!("context store: reserve allocation failed: {e}");
