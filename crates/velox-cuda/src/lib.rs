@@ -361,6 +361,18 @@ pub trait CudaKernels: Send + Sync {
         portable::kv_store(k, v, k_cache, v_cache, s)
     }
 
+    /// Decodes cache rows to f32; see [`Backend::kv_load`].
+    fn kv_load(
+        &self,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        k: &mut CudaBuffer,
+        v: &mut CudaBuffer,
+        s: KvStoreShape,
+    ) -> Result<()> {
+        portable::kv_load(k_cache, v_cache, k, v, s)
+    }
+
     fn conv1d_silu(
         &self,
         x: &CudaBuffer,
@@ -1025,6 +1037,20 @@ impl Backend for CudaBackend {
         check::kv_store(k.len, v.len, k_cache.len, v_cache.len, &s)?;
         self.staged("kv_store", || {
             self.kernels.kv_store(k, v, k_cache, v_cache, s)
+        })
+    }
+
+    fn kv_load(
+        &self,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        k: &mut CudaBuffer,
+        v: &mut CudaBuffer,
+        s: KvStoreShape,
+    ) -> Result<()> {
+        check::kv_load(k_cache.len, v_cache.len, k.len, v.len, &s)?;
+        self.timed("kv_load", || {
+            self.kernels.kv_load(k_cache, v_cache, k, v, s)
         })
     }
 
