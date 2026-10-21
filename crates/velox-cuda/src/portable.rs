@@ -80,6 +80,7 @@ extern "C" {
     fn velox_portable_conv1d_silu(
         x: *const f32,
         w: *const f32,
+        state_in: *const f32,
         state: *mut f32,
         out: *mut f32,
         tokens: i32,
@@ -91,6 +92,7 @@ extern "C" {
         ab: *const f32,
         a_log: *const f32,
         dt_bias: *const f32,
+        state_in: *const f32,
         state: *mut f32,
         out: *mut f32,
         tokens: i32,
@@ -452,20 +454,27 @@ pub fn kv_store(
     )
 }
 
+/// `state_in`: the state to advance from when it is not `state` itself (which receives the result).
 pub fn conv1d_silu(
     x: &CudaBuffer,
     weight: &CudaBuffer,
+    state_in: Option<&CudaBuffer>,
     state: &mut CudaBuffer,
     out: &mut CudaBuffer,
     s: ConvShape,
 ) -> Result<()> {
     check::conv1d(x.len(), weight.len(), state.len(), out.len(), &s)?;
+    if let Some(si) = state_in {
+        check::conv1d(x.len(), weight.len(), si.len(), out.len(), &s)?;
+    }
+    let state_in = state_in.map_or(state.as_ptr(), CudaBuffer::as_ptr);
     // SAFETY: buffer extents validated above.
     status(
         unsafe {
             velox_portable_conv1d_silu(
                 x.as_ptr().add(s.row0 * s.channels),
                 weight.as_ptr(),
+                state_in,
                 state.as_mut_ptr(),
                 out.as_mut_ptr().add(s.row0 * s.channels),
                 to_i32("tokens", s.tokens)?,
@@ -478,11 +487,13 @@ pub fn conv1d_silu(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `state_in`: the state to update from when it is not `state` itself (which receives the result).
 pub fn gated_delta_net(
     qkv: &CudaBuffer,
     ab: &CudaBuffer,
     a_log: &CudaBuffer,
     dt_bias: &CudaBuffer,
+    state_in: Option<&CudaBuffer>,
     state: &mut CudaBuffer,
     out: &mut CudaBuffer,
     s: GdnShape,
@@ -496,6 +507,18 @@ pub fn gated_delta_net(
         out.len(),
         &s,
     )?;
+    if let Some(si) = state_in {
+        check::gdn(
+            qkv.len(),
+            ab.len(),
+            a_log.len(),
+            dt_bias.len(),
+            si.len(),
+            out.len(),
+            &s,
+        )?;
+    }
+    let state_in = state_in.map_or(state.as_ptr(), CudaBuffer::as_ptr);
     // SAFETY: buffer extents validated above.
     status(
         unsafe {
@@ -504,6 +527,7 @@ pub fn gated_delta_net(
                 ab.as_ptr().add(s.row0 * 2 * s.v_heads),
                 a_log.as_ptr(),
                 dt_bias.as_ptr(),
+                state_in,
                 state.as_mut_ptr(),
                 out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
                 to_i32("tokens", s.tokens)?,
