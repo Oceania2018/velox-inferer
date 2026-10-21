@@ -304,6 +304,11 @@ impl<B: Backend> DFlashDrafter<B> {
         dm.rewind(&mut self.state, pos);
     }
 
+    /// Drafts in the long block.
+    pub fn long_block(&self) -> usize {
+        self.max
+    }
+
     /// Drafts in the short block.
     pub fn short_block(&self) -> usize {
         self.low
