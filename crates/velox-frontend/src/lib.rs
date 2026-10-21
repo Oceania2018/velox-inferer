@@ -5,6 +5,9 @@ pub mod image;
 pub mod template;
 pub mod tool_calls;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use serde_json::Value;
 use tokenizers::Tokenizer;
 use velox_core::{Error, Result};
@@ -15,6 +18,8 @@ pub use tool_calls::{parse_output, ParsedOutput};
 
 pub struct Frontend {
     tokenizer: Tokenizer,
+    /// Encodings of prompt segments (see [`Frontend::encode`]), keyed by their text.
+    segments: Mutex<HashMap<String, Vec<u32>>>,
     pub template: ChatTemplate,
     /// Stop ids from `generation_config.json` `eos_token_id`.
     pub eos: Vec<u32>,
@@ -64,6 +69,7 @@ impl Frontend {
         let vision_pixels = vision_pixels(art)?;
         Ok(Frontend {
             tokenizer,
+            segments: Mutex::new(HashMap::new()),
             template: ChatTemplate::new(source)?,
             eos,
             public_vocab,
@@ -72,7 +78,48 @@ impl Frontend {
     }
 
     /// Token ids of rendered prompt text; special tokens in the text are recognised.
+    ///
+    /// The tokenizer splits on special tokens before anything else, so text cut just before a
+    /// special token encodes piecewise to the same ids. Chat prompts are cut before each
+    /// `<|im_start|>` and every message's ids are cached: an agent's next request repeats all but
+    /// its last turns, and re-tokenizing a 16k-token history costs ~20 ms.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        const CUT: &str = "<|im_start|>";
+        const MAX_SEGMENTS: usize = 4096;
+        let mut ids = Vec::new();
+        let mut cache = self
+            .segments
+            .lock()
+            .map_err(|_| Error::Backend("tokenizer cache poisoned".into()))?;
+        if cache.len() > MAX_SEGMENTS {
+            cache.clear();
+        }
+        let mut rest = text;
+        while !rest.is_empty() {
+            // The segment runs to the next cut after its own leading one.
+            let skip = if rest.starts_with(CUT) { CUT.len() } else { 0 };
+            let end = rest[skip..].find(CUT).map_or(rest.len(), |i| i + skip);
+            let seg = &rest[..end];
+            match cache.get(seg) {
+                Some(v) => ids.extend_from_slice(v),
+                None => {
+                    let v = self.encode_whole(seg)?;
+                    ids.extend_from_slice(&v);
+                    cache.insert(seg.to_string(), v);
+                }
+            }
+            rest = &rest[end..];
+        }
+        drop(cache);
+        if std::env::var_os("VELOX_CHECK_TOKENIZE").is_some() && ids != self.encode_whole(text)? {
+            return Err(Error::Backend(
+                "segmented tokenization differs from whole-text".into(),
+            ));
+        }
+        Ok(ids)
+    }
+
+    fn encode_whole(&self, text: &str) -> Result<Vec<u32>> {
         let enc = self
             .tokenizer
             .encode(text, false)
