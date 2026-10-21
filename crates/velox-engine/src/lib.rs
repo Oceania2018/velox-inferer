@@ -1,10 +1,15 @@
 //! Chat engine for Qwen3.5 text + vision models behind the OpenAI-compatible server.
 //!
-//! One generation lane. Agent loops resend almost the same prompt every step, so the lane keeps
-//! the keys of the tokens its state holds plus recurrent-state checkpoints taken where the next
-//! request is likely to diverge (before the last image and before the generation prompt). A new
-//! request restores the latest checkpoint inside the common prefix and prefills only the rest;
-//! the vision tower runs only for images in that remainder.
+//! Several lanes (`--max-concurrency`), each a sequence slot with its own KV cache and recurrent
+//! state, served by one worker thread: queued requests are admitted to free lanes and prefilled,
+//! and every decoding request advances by one speculative round per step, all DFlash windows
+//! verified in one batched forward pass (weights are read once for every sequence).
+//!
+//! Agent loops resend almost the same prompt every step, so a lane keeps the keys of the tokens
+//! its state holds plus a checkpoint where the next request is likely to diverge (the last history
+//! turn before the screenshot). A new request restores the latest checkpoint inside the common
+//! prefix, or a context-store entry (system RAM, see `store`) when that covers more, and
+//! prefills only the rest; the vision tower runs only for images in that remainder.
 
 mod disk;
 mod prompt;
@@ -17,8 +22,10 @@ use store::ContextStore;
 
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use serde_json::{json, Value};
@@ -26,7 +33,8 @@ use velox_core::{Backend, Error as CoreError, KvFormat};
 use velox_frontend::image::{decode_data_url, preprocess, ImagePatches};
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
-    Checkpoint, DFlashModel, EmbedInsert, Qwen35Text, Qwen35Vision, Session, Workspace,
+    BatchWorkspace, Checkpoint, DFlashModel, DFlashState, DFlashWorkspace, EmbedInsert, Qwen35Text,
+    Qwen35Vision, Session, Workspace,
 };
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
 
@@ -58,9 +66,9 @@ pub struct EngineConfig {
     pub disk_context_bytes: u64,
     /// Directory of the NVMe tier's files (a private subdirectory is created and removed).
     pub disk_context_dir: std::path::PathBuf,
-    /// Capacity of a second, small lane for requests that share nothing with the main lane
-    /// (probes, side questions), so they do not evict the agent's context. 0 disables it.
-    pub scratch_capacity: usize,
+    /// Lanes: requests decoding at once (ninfer `--max-concurrency`), each with `capacity`
+    /// tokens of KV cache.
+    pub lanes: usize,
     /// MTP drafts per speculative round on the main lane (0: plain decoding).
     pub mtp_drafts: usize,
     /// DFlash2 drafts per block on the main lane when the engine has a DFlash2 model (0: use MTP
@@ -88,13 +96,20 @@ struct Lane<B: Backend> {
     drafter: Option<Drafter<B>>,
     /// Speculative rounds of the current request: (rounds, drafted, accepted).
     spec_stats: (usize, usize, usize),
+    /// Admission clock value of the lane's latest request (least recently used lanes go first).
+    last_used: u64,
 }
 
-/// All lanes plus the activation workspace they share (requests run one at a time).
+/// What the worker owns: the lanes and the activation workspaces they share.
 struct Lanes<B: Backend> {
     ws: Workspace<B>,
     lanes: Vec<Lane<B>>,
     store: ContextStore<B>,
+    /// DFlash drafting activations (shared by every lane's drafter).
+    dw: Option<DFlashWorkspace<B>>,
+    /// Batched-verify buffers, with more than one lane.
+    bw: Option<BatchWorkspace<B>>,
+    clock: u64,
 }
 
 /// Checkpoint storage kept for reuse per lane beyond the live checkpoints.
@@ -115,6 +130,13 @@ const STORE_GAIN: usize = 128;
 const DISK_GAIN: usize = 1024;
 
 pub struct QwenEngine<B: Backend> {
+    core: Arc<Core<B>>,
+    queue: Arc<JobQueue>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// The model and request handling shared by the HTTP threads and the worker.
+struct Core<B: Backend> {
     b: B,
     model: Qwen35Text<B>,
     vision: Option<Qwen35Vision<B>>,
@@ -122,9 +144,6 @@ pub struct QwenEngine<B: Backend> {
     dflash: Option<DFlashModel<B>>,
     fe: Frontend,
     cfg: EngineConfig,
-    state: Mutex<Lanes<B>>,
-    /// Requests waiting for `state` (idle work yields to them).
-    pending: AtomicUsize,
     special: SpecialTokens,
 }
 
@@ -300,7 +319,54 @@ fn single_token(fe: &Frontend, text: &str) -> Option<u32> {
     fe.encode(text).ok().filter(|v| v.len() == 1).map(|v| v[0])
 }
 
-impl<B: Backend> QwenEngine<B> {
+/// A prepared request waiting for (or holding) a lane.
+struct Job {
+    p: Prompt,
+    images: Vec<ImagePatches>,
+    sampler: Sampler,
+    max_tokens: usize,
+    reply: mpsc::Sender<Result<Done, ApiError>>,
+}
+
+/// What the worker hands back for a finished request.
+struct Done {
+    out: Vec<u32>,
+    finish: &'static str,
+    start: usize,
+    prompt_ms: f64,
+    predicted_ms: f64,
+}
+
+/// A request decoding on a lane.
+struct Active {
+    job: Job,
+    lane: usize,
+    out: Vec<u32>,
+    /// The sampled token to feed next.
+    c: u32,
+    finish: Option<&'static str>,
+    start: usize,
+    prompt_ms: f64,
+    t1: Instant,
+    /// MTP: cache row of the previous verify and its kept drafts (see `MtpDrafter::draft`).
+    mtp_row0: usize,
+    mtp_kept: Vec<u32>,
+    /// Plain decoding: the candidates after the last fed token.
+    cands: Vec<(u32, f32)>,
+}
+
+/// Requests handed from the HTTP threads to the worker.
+struct JobQueue {
+    jobs: Mutex<VecDeque<Job>>,
+    cv: Condvar,
+    stop: AtomicBool,
+}
+
+impl<B> QwenEngine<B>
+where
+    B: Backend + Send + Sync + 'static,
+    B::Buffer: Send + Sync + 'static,
+{
     pub fn new(
         b: B,
         model: Qwen35Text<B>,
@@ -314,27 +380,20 @@ impl<B: Backend> QwenEngine<B> {
         if let Some(dm) = &dflash {
             model.enable_capture(&b, &mut ws, &dm.cfg.target_layers)?;
         }
-        let mut lanes = Vec::new();
-        for (i, capacity) in [cfg.capacity, cfg.scratch_capacity.min(cfg.capacity)]
-            .into_iter()
-            .enumerate()
-        {
-            if capacity == 0 {
-                continue;
-            }
-            let session = model.session_with(&b, capacity, cfg.kv_format)?;
+        let n_lanes = cfg.lanes.max(1);
+        let mut lanes = Vec::with_capacity(n_lanes);
+        for i in 0..n_lanes {
+            let session = model.session_with(&b, cfg.capacity, cfg.kv_format)?;
             let zero = session.checkpoint_in(&b, cfg.host_checkpoints)?;
             let drafter = match &dflash {
-                // Every lane drafts: short unrelated requests (System One, probes) land on the scratch lane.
                 Some(dm) => Some(Drafter::DFlash(DFlashDrafter::new(
                     &b,
                     dm,
-                    &model,
-                    cfg.chunk,
                     cfg.dflash_drafts,
                 )?)),
+                // MTP and plain decoding run one request at a time (see `Core::batchable`).
                 None if i == 0 && cfg.mtp_drafts > 0 && model.has_mtp() => Some(Drafter::Mtp(
-                    MtpDrafter::new(&b, &model, capacity, cfg.chunk, cfg.mtp_drafts)?,
+                    MtpDrafter::new(&b, &model, cfg.capacity, cfg.chunk, cfg.mtp_drafts)?,
                 )),
                 _ => None,
             };
@@ -347,8 +406,23 @@ impl<B: Backend> QwenEngine<B> {
                 spec_stats: (0, 0, 0),
                 zero,
                 drafter,
+                last_used: 0,
             });
         }
+        let dw = match &dflash {
+            Some(dm) => Some(DFlashDrafter::workspace(
+                &b,
+                dm,
+                &model,
+                cfg.chunk,
+                cfg.dflash_drafts,
+            )?),
+            None => None,
+        };
+        let bw = match &dflash {
+            Some(_) if n_lanes > 1 => Some(model.batch_workspace(&b, n_lanes)?),
+            _ => None,
+        };
         let special = SpecialTokens {
             im_start: single_token(&fe, "<|im_start|>"),
             vision_start: single_token(&fe, "<|vision_start|>"),
@@ -363,35 +437,603 @@ impl<B: Backend> QwenEngine<B> {
             None
         };
         let store = ContextStore::new(cfg.host_context_bytes, cfg.lrfu_lambda, disk);
-        let state = Mutex::new(Lanes { ws, lanes, store });
-        Ok(QwenEngine {
+        let state = Lanes {
+            ws,
+            lanes,
+            store,
+            dw,
+            bw,
+            clock: 0,
+        };
+        let core = Arc::new(Core {
             b,
             model,
             vision,
             dflash,
             fe,
             cfg,
-            state,
-            pending: AtomicUsize::new(0),
             special,
+        });
+        let queue = Arc::new(JobQueue {
+            jobs: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let worker = {
+            let (core, queue) = (Arc::clone(&core), Arc::clone(&queue));
+            std::thread::Builder::new()
+                .name("velox-engine".into())
+                .spawn(move || core.run(state, &queue))
+                .map_err(|e| CoreError::Backend(format!("engine worker: {e}")))?
+        };
+        Ok(QwenEngine {
+            core,
+            queue,
+            worker: Some(worker),
         })
     }
+}
 
-    /// The lane for a prompt of `keys` needing `needed` tokens of capacity: the one that can reuse
-    /// the most, or, when no lane shares a meaningful prefix, the smallest lane that fits, so
-    /// unrelated short requests do not evict a long context.
-    fn pick_lane(lanes: &[Lane<B>], keys: &[u32], needed: usize) -> Option<usize> {
-        let fits: Vec<usize> = (0..lanes.len())
-            .filter(|&i| lanes[i].session.capacity >= needed)
-            .collect();
-        let (best, shared) = fits
+impl<B: Backend> Drop for QwenEngine<B> {
+    fn drop(&mut self) {
+        self.queue.stop.store(true, Ordering::SeqCst);
+        self.queue.cv.notify_all();
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+impl<B: Backend> Core<B> {
+    /// MTP and plain decoding keep per-step rows in the shared workspace between rounds, so only
+    /// DFlash requests decode side by side.
+    fn batchable(&self) -> bool {
+        self.dflash.is_some()
+    }
+
+    /// The worker: admits queued requests to free lanes (prefilling them) and runs speculative
+    /// rounds over every decoding request, batched into one verify pass.
+    fn run(&self, mut st: Lanes<B>, queue: &JobQueue) {
+        if let Err(e) = self.b.bind_thread() {
+            eprintln!("engine worker: {e}");
+            return;
+        }
+        let mut waiting: VecDeque<Job> = VecDeque::new();
+        let mut active: Vec<Active> = Vec::new();
+        loop {
+            // New requests; while idle, pin context-store storage between them.
+            loop {
+                let mut q = queue.jobs.lock().expect("queue lock");
+                let stop = queue.stop.load(Ordering::SeqCst);
+                if !q.is_empty() || !active.is_empty() || !waiting.is_empty() || stop {
+                    waiting.extend(q.drain(..));
+                    break;
+                }
+                drop(q);
+                let more = match st.store.top_up(&self.b, &st.lanes[0].session) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("context store: reserve allocation failed: {e}");
+                        false
+                    }
+                };
+                if !more {
+                    let q = queue.jobs.lock().expect("queue lock");
+                    let _q = queue
+                        .cv
+                        .wait_while(q, |q| q.is_empty() && !queue.stop.load(Ordering::SeqCst))
+                        .expect("queue lock");
+                }
+            }
+            if queue.stop.load(Ordering::SeqCst) {
+                let gone = || ApiError {
+                    status: 503,
+                    kind: "server_error",
+                    code: "shutting_down",
+                    message: "engine stopped".into(),
+                };
+                for j in waiting.drain(..).chain(active.drain(..).map(|a| a.job)) {
+                    let _ = j.reply.send(Err(gone()));
+                }
+                return;
+            }
+            // Admission: a free lane for each waiting request, in arrival order.
+            while !waiting.is_empty() {
+                if !self.batchable() && !active.is_empty() {
+                    break;
+                }
+                let busy: Vec<usize> = active.iter().map(|a| a.lane).collect();
+                let Some(li) = Self::pick_lane(&st.lanes, &busy, &waiting[0].p.keys) else {
+                    break;
+                };
+                let job = waiting.pop_front().expect("checked");
+                match self.admit(&mut st, li, job) {
+                    Ok(a) => active.push(a),
+                    Err((job, e)) => {
+                        let _ = job.reply.send(Err(e));
+                    }
+                }
+            }
+            if active.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.round(&mut st, &mut active) {
+                // A device error leaves every decoding lane in an unknown state.
+                for a in active.drain(..) {
+                    let lane = &mut st.lanes[a.lane];
+                    lane.keys.clear();
+                    lane.checkpoints.clear();
+                    let _ = a.job.reply.send(Err(e.clone()));
+                }
+                continue;
+            }
+            let (done, rest): (Vec<Active>, Vec<Active>) =
+                active.drain(..).partition(|a| a.finish.is_some());
+            active = rest;
+            for a in done {
+                self.complete(&st, a);
+            }
+        }
+    }
+
+    /// A free lane for a prompt of `keys`: the one that can reuse the most, else the least
+    /// recently used (its conversation is the least likely to come back soon; its chain head goes
+    /// to the context store when the new request takes it).
+    fn pick_lane(lanes: &[Lane<B>], busy: &[usize], keys: &[u32]) -> Option<usize> {
+        let free: Vec<usize> = (0..lanes.len()).filter(|i| !busy.contains(i)).collect();
+        let (best, shared) = free
             .iter()
             .map(|&i| (i, common_prefix(&lanes[i].keys, keys)))
-            .max_by_key(|&(_, s)| s)?;
+            .max_by_key(|&(i, s)| (s, std::cmp::Reverse(i)))?;
         if shared >= MIN_REUSE {
             return Some(best);
         }
-        fits.into_iter().min_by_key(|&i| lanes[i].session.capacity)
+        free.into_iter().min_by_key(|&i| lanes[i].last_used)
+    }
+
+    /// Takes `job` onto lane `li`: restores the best reusable state, prefills the rest and samples
+    /// the first token.
+    fn admit(&self, st: &mut Lanes<B>, li: usize, job: Job) -> Result<Active, (Job, ApiError)> {
+        let debug = std::env::var_os("VELOX_DEBUG_PREFIX").is_some();
+        let Lanes {
+            ws,
+            lanes,
+            store,
+            dw,
+            clock,
+            ..
+        } = st;
+        *clock += 1;
+        let lane = &mut lanes[li];
+        lane.last_used = *clock;
+        let p = &job.p;
+        let t0 = Instant::now();
+        if debug {
+            let shared = common_prefix(&lane.keys, &p.keys);
+            let cps: Vec<usize> = lane.checkpoints.iter().map(|c| c.pos).collect();
+            eprintln!(
+                "[prefix] lane {li} prompt {} held {} pos {} shared {} checkpoints {:?} next {:?} store [{}]",
+                p.keys.len(),
+                lane.keys.len(),
+                lane.session.pos,
+                shared,
+                cps,
+                self.checkpoint_positions(&p.ids, 0),
+                store.describe()
+            );
+        }
+        match lane.drafter.as_mut() {
+            Some(Drafter::Mtp(m)) => m.reset(),
+            Some(Drafter::DFlash(d)) => d.reset(),
+            None => {}
+        }
+        store.tick();
+        let shared = common_prefix(&lane.keys, &p.keys);
+        let r = (|| -> Result<(usize, Vec<(u32, f32)>, f64, f64), CoreError> {
+            if store.enabled() {
+                self.capture_head(lane, store, shared.min(p.keys.len() - 1))?;
+            }
+            let (start, adopted) = self.reuse(lane, store, &p.keys)?;
+            lane.chain = store.resumed(&p.keys, start, adopted);
+            let t_reuse = t0.elapsed().as_secs_f64() * 1e3;
+            if adopted.is_some() && debug {
+                eprintln!(
+                    "[store] lane {li} resumed at {start} ({} entries, {:.2} GB; {} on disk)",
+                    store.len(),
+                    store.bytes(&self.b) as f64 / 1e9,
+                    store.disk_len()
+                );
+            }
+            // Checkpoints still valid for this prompt are the lane's own inside the shared prefix.
+            let (keep, stale): (Vec<_>, Vec<_>) = lane
+                .checkpoints
+                .drain(..)
+                .partition(|c| c.pos <= start && c.pos <= shared);
+            lane.checkpoints = keep;
+            lane.spare.extend(stale);
+            lane.keys = p.keys[..start].to_vec();
+            let anchors: Vec<usize> = self
+                .checkpoint_positions(&p.ids, 0)
+                .into_iter()
+                .take(2)
+                .collect();
+            self.prefill(
+                lane,
+                ws,
+                dw.as_mut(),
+                store,
+                p,
+                &job.images,
+                start,
+                &anchors,
+            )?;
+            let t_fill = t0.elapsed().as_secs_f64() * 1e3;
+            let cands = self
+                .model
+                .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)?;
+            lane.keys.extend_from_slice(&p.keys[start..]);
+            if self.cfg.host_checkpoints {
+                self.place_checkpoints(lane, store, &anchors)?;
+            } else {
+                Self::prune_checkpoints(
+                    &mut lane.checkpoints,
+                    &mut lane.spare,
+                    self.cfg.max_checkpoints,
+                    start + 1,
+                );
+            }
+            Ok((start, cands, t_reuse, t_fill))
+        })();
+        let (start, cands, t_reuse, t_fill) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                // The state is partially advanced; forget it so the next request starts clean.
+                lane.keys.clear();
+                lane.checkpoints.clear();
+                return Err((job, core(e)));
+            }
+        };
+        let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if debug {
+            eprintln!(
+                "[prompt] lane {li} reuse {t_reuse:.1} ms, prefill {:.1} ms, candidates+place {:.1} ms, total {prompt_ms:.1} ms, top {:?}",
+                t_fill - t_reuse,
+                prompt_ms - t_fill,
+                &cands[..cands.len().min(3)]
+            );
+        }
+        lane.spec_stats = (0, 0, 0);
+        let mut job = job;
+        let c = job.sampler.sample(&cands);
+        Ok(Active {
+            job,
+            lane: li,
+            out: Vec::new(),
+            c,
+            finish: None,
+            start,
+            prompt_ms,
+            t1: Instant::now(),
+            mtp_row0: 0,
+            mtp_kept: Vec::new(),
+            cands,
+        })
+    }
+
+    /// Hands a finished request back to its HTTP thread.
+    fn complete(&self, st: &Lanes<B>, a: Active) {
+        let predicted_ms = a.t1.elapsed().as_secs_f64() * 1e3;
+        let lane = &st.lanes[a.lane];
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() && lane.drafter.is_some() {
+            let (rounds, drafted, accepted) = lane.spec_stats;
+            eprintln!(
+                "[decode] lane {} {} tokens in {predicted_ms:.0} ms, {rounds} rounds, accepted {accepted}/{drafted} drafts, {:.2} tokens/round",
+                a.lane,
+                a.out.len(),
+                a.out.len() as f64 / rounds.max(1) as f64
+            );
+        }
+        let _ = a.job.reply.send(Ok(Done {
+            out: a.out,
+            finish: a.finish.unwrap_or("length"),
+            start: a.start,
+            prompt_ms: a.prompt_ms,
+            predicted_ms,
+        }));
+    }
+
+    /// One decoding step for every active request: takes the pending token, then drafts, verifies
+    /// (in one batch when several DFlash requests decode) and commits.
+    fn round(&self, st: &mut Lanes<B>, active: &mut [Active]) -> Result<(), ApiError> {
+        for a in active.iter_mut() {
+            let c = a.c;
+            if self.fe.is_eos(c) {
+                a.finish = Some("stop");
+                continue;
+            }
+            a.out.push(c);
+            a.job.sampler.observe(c);
+            if a.out.len() >= a.job.max_tokens {
+                a.finish = Some("length");
+            }
+        }
+        let live: Vec<usize> = (0..active.len())
+            .filter(|&i| active[i].finish.is_none())
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let dflash: Vec<usize> = live
+            .iter()
+            .copied()
+            .filter(|&i| matches!(st.lanes[active[i].lane].drafter, Some(Drafter::DFlash(_))))
+            .collect();
+        if dflash.len() > 1 {
+            self.batch_round(st, active, &dflash)?;
+        } else if let Some(&i) = dflash.first() {
+            self.dflash_round(st, &mut active[i])?;
+        }
+        for &i in live.iter().filter(|i| !dflash.contains(i)) {
+            match st.lanes[active[i].lane].drafter {
+                Some(Drafter::Mtp(_)) => self.mtp_round(st, &mut active[i])?,
+                _ => self.plain_step(st, &mut active[i])?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Accepts the drafts of a verified `window` against the target's candidate `rows` (exact
+    /// match when greedy, speculative sampling against the proposal `qs` otherwise), appending
+    /// them to the output. Returns the kept prefix length and the next token.
+    fn accept(
+        &self,
+        a: &mut Active,
+        window: &[u32],
+        rows: &[Vec<(u32, f32)>],
+        qs: Option<&Vec<Vec<(u32, f32)>>>,
+    ) -> (usize, Option<u32>) {
+        let mut keep = 1;
+        let mut next = None;
+        for j in 0..window.len() {
+            if j + 1 == window.len() {
+                next = Some(a.job.sampler.sample(&rows[j]));
+                break;
+            }
+            let verdict = match qs {
+                Some(q) => a.job.sampler.verify_draft_q(&rows[j], window[j + 1], &q[j]),
+                None => a.job.sampler.verify_draft(&rows[j], window[j + 1]),
+            };
+            match verdict {
+                Ok(()) => {
+                    keep += 1;
+                    let d = window[j + 1];
+                    if self.fe.is_eos(d) {
+                        a.finish = Some("stop");
+                        break;
+                    }
+                    a.out.push(d);
+                    a.job.sampler.observe(d);
+                    if a.out.len() >= a.job.max_tokens {
+                        a.finish = Some("length");
+                        break;
+                    }
+                }
+                Err(t) => {
+                    next = Some(t);
+                    break;
+                }
+            }
+        }
+        (keep, next)
+    }
+
+    /// The draft window of a DFlash request: the pending token and up to the remaining budget of
+    /// drafts, with the proposal distribution of each draft.
+    #[allow(clippy::type_complexity)]
+    fn dflash_window(
+        &self,
+        lane: &mut Lane<B>,
+        dw: &mut DFlashWorkspace<B>,
+        ws: &Workspace<B>,
+        a: &Active,
+    ) -> Result<(Vec<u32>, Vec<Vec<(u32, f32)>>), ApiError> {
+        let dm = self
+            .dflash
+            .as_ref()
+            .expect("a DFlash drafter has its model");
+        let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() else {
+            unreachable!("caller checked");
+        };
+        let (drafts, qs) = d
+            .draft(
+                &self.b,
+                dm,
+                dw,
+                &self.model,
+                ws,
+                0,
+                0,
+                lane.session.pos,
+                a.c,
+                self.fe.public_vocab,
+                a.job.sampler.temperature(),
+            )
+            .map_err(core)?;
+        let mut window = vec![a.c];
+        window.extend(drafts.into_iter().take(a.job.max_tokens - a.out.len()));
+        Ok((window, qs))
+    }
+
+    /// Bookkeeping after a request's window was verified and `keep` tokens committed: drafter
+    /// context for the kept rows (features at `feat_row` of the verify), its adaptation, the
+    /// lane's keys and the next pending token.
+    #[allow(clippy::too_many_arguments)]
+    fn after_commit(
+        &self,
+        lane: &mut Lane<B>,
+        dw: &mut DFlashWorkspace<B>,
+        ws: &Workspace<B>,
+        a: &mut Active,
+        window: &[u32],
+        p: usize,
+        keep: usize,
+        feat_row: usize,
+        next: Option<u32>,
+    ) -> Result<(), ApiError> {
+        let dm = self
+            .dflash
+            .as_ref()
+            .expect("a DFlash drafter has its model");
+        let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() else {
+            unreachable!("caller checked");
+        };
+        lane.spec_stats.0 += 1;
+        lane.spec_stats.1 += window.len() - 1;
+        lane.spec_stats.2 += keep - 1;
+        d.commit_rows(&self.b, dm, dw, ws, feat_row, p, keep)
+            .map_err(core)?;
+        d.observe(keep - 1);
+        lane.keys.extend_from_slice(&window[..keep]);
+        if a.finish.is_none() {
+            a.c = next.expect("a window ends with a sampled token");
+        }
+        Ok(())
+    }
+
+    /// A single DFlash request's round: the recorded-graph verify path.
+    fn dflash_round(&self, st: &mut Lanes<B>, a: &mut Active) -> Result<(), ApiError> {
+        let Lanes { ws, lanes, dw, .. } = st;
+        let dw = dw.as_mut().expect("DFlash lanes have a workspace");
+        let lane = &mut lanes[a.lane];
+        let (window, qs) = self.dflash_window(lane, dw, ws, a)?;
+        let p = lane.session.pos;
+        let rows = self
+            .model
+            .verify(
+                &self.b,
+                &mut lane.session,
+                ws,
+                &window,
+                CANDIDATES,
+                self.fe.public_vocab,
+            )
+            .map_err(core)?;
+        let (keep, next) = self.accept(a, &window, &rows, Some(&qs));
+        self.model
+            .commit(&self.b, &mut lane.session, ws, keep)
+            .map_err(core)?;
+        self.after_commit(lane, dw, ws, a, &window, p, keep, 0, next)
+    }
+
+    /// Several DFlash requests' round: every window verified in one forward pass.
+    fn batch_round(
+        &self,
+        st: &mut Lanes<B>,
+        active: &mut [Active],
+        idx: &[usize],
+    ) -> Result<(), ApiError> {
+        let Lanes {
+            ws, lanes, dw, bw, ..
+        } = st;
+        let dw = dw.as_mut().expect("DFlash lanes have a workspace");
+        let bw = bw.as_mut().expect("several lanes have a batch workspace");
+        let mut windows = Vec::with_capacity(idx.len());
+        for &i in idx {
+            let a = &active[i];
+            windows.push(self.dflash_window(&mut lanes[a.lane], dw, ws, a)?);
+        }
+        // Disjoint lanes of this batch, in `idx` order.
+        let mut slots: Vec<Option<&mut Lane<B>>> = lanes.iter_mut().map(Some).collect();
+        let mut batch: Vec<&mut Lane<B>> = idx
+            .iter()
+            .map(|&i| slots[active[i].lane].take().expect("one request per lane"))
+            .collect();
+        let starts: Vec<usize> = batch.iter().map(|l| l.session.pos).collect();
+        let rows = {
+            let mut sessions: Vec<&mut Session<B>> =
+                batch.iter_mut().map(|l| &mut l.session).collect();
+            let ids: Vec<&[u32]> = windows.iter().map(|(w, _)| &w[..]).collect();
+            self.model
+                .verify_batch(
+                    &self.b,
+                    &mut sessions,
+                    ws,
+                    bw,
+                    &ids,
+                    CANDIDATES,
+                    self.fe.public_vocab,
+                )
+                .map_err(core)?
+        };
+        let mut feat_row = 0;
+        for (j, &i) in idx.iter().enumerate() {
+            let a = &mut active[i];
+            let (window, qs) = &windows[j];
+            let (keep, next) = self.accept(a, window, &rows[j], Some(qs));
+            let lane = &mut *batch[j];
+            self.model
+                .commit_batched(&self.b, &mut lane.session, bw, keep)
+                .map_err(core)?;
+            self.after_commit(lane, dw, ws, a, window, starts[j], keep, feat_row, next)?;
+            feat_row += window.len();
+        }
+        Ok(())
+    }
+
+    /// An MTP request's round (one request at a time; see `batchable`).
+    fn mtp_round(&self, st: &mut Lanes<B>, a: &mut Active) -> Result<(), ApiError> {
+        let Lanes { ws, lanes, .. } = st;
+        let lane = &mut lanes[a.lane];
+        let limit = self.fe.public_vocab;
+        let (b, model) = (&self.b, &self.model);
+        let Lane {
+            session,
+            keys,
+            drafter,
+            spec_stats,
+            ..
+        } = lane;
+        let Some(Drafter::Mtp(m)) = drafter.as_mut() else {
+            unreachable!("caller checked");
+        };
+        let drafts = m
+            .draft(b, model, session, ws, a.mtp_row0, &a.mtp_kept, a.c, limit)
+            .map_err(core)?;
+        let mut window = vec![a.c];
+        window.extend(drafts.into_iter().take(a.job.max_tokens - a.out.len()));
+        let p = session.pos;
+        let rows = model
+            .verify(b, session, ws, &window, CANDIDATES, limit)
+            .map_err(core)?;
+        let (keep, next) = self.accept(a, &window, &rows, None);
+        spec_stats.0 += 1;
+        spec_stats.1 += window.len() - 1;
+        spec_stats.2 += keep - 1;
+        model.commit(b, session, ws, keep).map_err(core)?;
+        m.record(keep - 1, window.len() - 1);
+        keys.extend_from_slice(&window[..keep]);
+        if a.finish.is_none() {
+            a.c = next.expect("a window ends with a sampled token");
+            a.mtp_row0 = p;
+            a.mtp_kept = window[1..keep].to_vec();
+        }
+        Ok(())
+    }
+
+    /// Plain decoding: feed the pending token, sample the next.
+    fn plain_step(&self, st: &mut Lanes<B>, a: &mut Active) -> Result<(), ApiError> {
+        let Lanes { ws, lanes, .. } = st;
+        let lane = &mut lanes[a.lane];
+        self.model
+            .advance(&self.b, &mut lane.session, ws, &[a.c], None, &[])
+            .map_err(core)?;
+        lane.keys.push(a.c);
+        a.cands = self
+            .model
+            .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)
+            .map_err(core)?;
+        a.c = a.job.sampler.sample(&a.cands);
+        Ok(())
     }
 
     /// Positions worth checkpointing in `ids` after `after`: every turn boundary (`<|im_start|>`,
@@ -444,50 +1086,43 @@ impl<B: Backend> QwenEngine<B> {
         spare.truncate(MAX_SPARE);
     }
 
-    /// Host checkpoint mode: the latest prefill's checkpoints (the next request's likeliest
-    /// restore points) stay on the device; older ones at `anchors` (system prompt and task: what
-    /// other conversations share) go to the context store as roots; the rest are dropped. Device
-    /// memory then holds a few checkpoints however long the context.
+    /// Host checkpoint mode, after a prefill: checkpoints at `anchors` (system prompt and task:
+    /// what other conversations share) go to the context store as roots, and the lane keeps only
+    /// its deepest checkpoint (its chain head, the next request's likeliest restore point; with
+    /// several lanes, device memory holds about one checkpoint per lane).
     fn place_checkpoints(
         &self,
         lane: &mut Lane<B>,
         store: &mut ContextStore<B>,
-        fresh: usize,
         anchors: &[usize],
     ) -> Result<(), CoreError> {
         lane.checkpoints.sort_by_key(|c| c.pos);
-        // A request that took no checkpoint of its own (a retry) keeps the one it resumed from.
-        let head = match lane.checkpoints.last() {
-            Some(c) if c.pos < fresh => Some(c.pos),
-            _ => None,
-        };
-        let mut kept = Vec::with_capacity(lane.checkpoints.len());
+        let head = lane.checkpoints.last().map(|c| c.pos);
         for cp in std::mem::take(&mut lane.checkpoints) {
-            if cp.pos < fresh && store.enabled() && cp.pos >= MIN_REUSE && anchors.contains(&cp.pos)
+            if store.enabled()
+                && cp.pos >= MIN_REUSE
+                && anchors.contains(&cp.pos)
+                && !store.holds(&lane.keys[..cp.pos])
             {
                 let drafter = self.drafter_context(lane);
                 store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
             }
-            if cp.pos >= fresh || Some(cp.pos) == head {
-                kept.push(cp);
+            if Some(cp.pos) == head {
+                lane.checkpoints.push(cp);
             } else {
                 lane.spare.push(cp);
             }
         }
-        lane.checkpoints = kept;
-        // A request snapshots about two points before its last image; keep storage for that.
-        lane.spare.truncate(2);
+        lane.spare.truncate(1);
         Ok(())
     }
 
     /// The lane's DFlash drafter context, to be saved with a context-store entry.
+    #[allow(clippy::type_complexity)]
     fn drafter_context<'a>(
         &'a self,
         lane: &'a Lane<B>,
-    ) -> Option<(
-        &'a DFlashModel<B>,
-        &'a velox_models::qwen3_5::DFlashState<B>,
-    )> {
+    ) -> Option<(&'a DFlashModel<B>, &'a DFlashState<B>)> {
         match (lane.drafter.as_ref(), self.dflash.as_ref()) {
             (Some(Drafter::DFlash(d)), Some(dm)) => Some((dm, d.context())),
             _ => None,
@@ -610,137 +1245,19 @@ impl<B: Backend> QwenEngine<B> {
             .collect()
     }
 
-    /// Prefills `p.ids[start..]` (checkpointing on the way) and returns the last logits.
-    /// Speculative decoding on a lane with an MTP drafter, from the candidates after the prompt.
-    /// Each round verifies `[pending, drafts..]`, accepts drafts by speculative sampling (exact
-    /// match when greedy), commits the fed prefix and drafts again. Returns the finish reason.
-    fn decode_speculative(
-        &self,
-        lane: &mut Lane<B>,
-        ws: &mut Workspace<B>,
-        sampler: &mut Sampler,
-        cands: Vec<(u32, f32)>,
-        max_tokens: usize,
-        out: &mut Vec<u32>,
-    ) -> Result<&'static str, ApiError> {
-        let limit = self.fe.public_vocab;
-        let Lane {
-            session,
-            keys,
-            drafter,
-            spec_stats,
-            ..
-        } = lane;
-        let dr = drafter.as_mut().expect("caller checked");
-        let (b, model) = (&self.b, &self.model);
-        let mut c = sampler.sample(&cands);
-        // Rows of the previous verify still to be paired in MTP (none: the prefill carry).
-        let (mut row0, mut kept_next) = (0usize, Vec::new());
-        let mut first = true;
-        loop {
-            if self.fe.is_eos(c) {
-                return Ok("stop");
-            }
-            out.push(c);
-            sampler.observe(c);
-            if out.len() >= max_tokens {
-                return Ok("length");
-            }
-            let (drafts, qs) = match dr {
-                Drafter::Mtp(m) => (
-                    m.draft(b, model, session, ws, row0, &kept_next, c, limit)
-                        .map_err(core)?,
-                    None,
-                ),
-                Drafter::DFlash(d) => {
-                    let dm = self
-                        .dflash
-                        .as_ref()
-                        .expect("a DFlash drafter has its model");
-                    let kept = if first { 0 } else { kept_next.len() + 1 };
-                    let temperature = sampler.temperature();
-                    let (drafts, qs) = d
-                        .draft(
-                            b,
-                            dm,
-                            model,
-                            ws,
-                            row0,
-                            kept,
-                            session.pos,
-                            c,
-                            limit,
-                            temperature,
-                        )
-                        .map_err(core)?;
-                    (drafts, Some(qs))
-                }
-            };
-            first = false;
-            let mut window = vec![c];
-            window.extend(drafts.into_iter().take(max_tokens - out.len()));
-            let p = session.pos;
-            let rows = model
-                .verify(b, session, ws, &window, CANDIDATES, limit)
-                .map_err(core)?;
-            let mut keep = 1;
-            let mut finish = None;
-            let mut next = None;
-            for j in 0..window.len() {
-                if j + 1 == window.len() {
-                    next = Some(sampler.sample(&rows[j]));
-                    break;
-                }
-                let verdict = match &qs {
-                    Some(q) => sampler.verify_draft_q(&rows[j], window[j + 1], &q[j]),
-                    None => sampler.verify_draft(&rows[j], window[j + 1]),
-                };
-                match verdict {
-                    Ok(()) => {
-                        keep += 1;
-                        let d = window[j + 1];
-                        if self.fe.is_eos(d) {
-                            finish = Some("stop");
-                            break;
-                        }
-                        out.push(d);
-                        sampler.observe(d);
-                        if out.len() >= max_tokens {
-                            finish = Some("length");
-                            break;
-                        }
-                    }
-                    Err(t) => {
-                        next = Some(t);
-                        break;
-                    }
-                }
-            }
-            spec_stats.0 += 1;
-            spec_stats.1 += window.len() - 1;
-            spec_stats.2 += keep - 1;
-            model.commit(b, session, ws, keep).map_err(core)?;
-            match dr {
-                Drafter::Mtp(m) => m.record(keep - 1, window.len() - 1),
-                Drafter::DFlash(d) => d.observe(keep - 1),
-            }
-            keys.extend_from_slice(&window[..keep]);
-            if let Some(f) = finish {
-                return Ok(f);
-            }
-            row0 = p;
-            kept_next = window[1..keep].to_vec();
-            c = next.expect("a round ends with a sampled token");
-        }
-    }
-
+    /// Prefills `p.ids[start..]`, snapshotting the deepest checkpoint position and any `anchors`
+    /// the context store does not hold yet.
+    #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
         lane: &mut Lane<B>,
         ws: &mut Workspace<B>,
+        dw: Option<&mut DFlashWorkspace<B>>,
+        store: &ContextStore<B>,
         p: &Prompt,
         images: &[ImagePatches],
         start: usize,
+        anchors: &[usize],
     ) -> Result<(), CoreError> {
         let debug = std::env::var_os("VELOX_DEBUG_PREFIX").is_some();
         let t0 = Instant::now();
@@ -767,11 +1284,22 @@ impl<B: Backend> QwenEngine<B> {
         lane.session.rope_delta = p.rope_delta;
         // Checkpoints are filled inside the forward pass, so the prompt is not cut into short
         // segments there (each segment would stream every weight once more).
+        let positions = self.checkpoint_positions(&p.ids, start);
+        let deepest = positions.last().copied();
         let mut snaps = Vec::new();
-        for pos in self.checkpoint_positions(&p.ids, start) {
+        for pos in positions {
+            let anchor = anchors.contains(&pos) && store.enabled() && !store.holds(&p.keys[..pos]);
+            if Some(pos) != deepest && !(anchor || !self.cfg.host_checkpoints) {
+                continue;
+            }
+            // Storage: spare, else the lane's oldest checkpoint (its restore, if any, is queued
+            // before the snapshot), else new.
             let mut cp = match lane.spare.pop() {
                 Some(cp) => cp,
-                // Snapshots are taken on the device (fast); see `Self::place_checkpoints`.
+                None if !lane.checkpoints.is_empty() && self.cfg.host_checkpoints => {
+                    lane.checkpoints.sort_by_key(|c| c.pos);
+                    lane.checkpoints.remove(0)
+                }
                 None => lane.session.blank_checkpoint(&self.b, pos)?,
             };
             cp.pos = pos;
@@ -802,6 +1330,7 @@ impl<B: Backend> QwenEngine<B> {
                 let model = &self.model;
                 let dflash = self.dflash.as_ref();
                 let b = &self.b;
+                let mut dw = dw;
                 model.advance_rows(
                     b,
                     session,
@@ -819,6 +1348,7 @@ impl<B: Backend> QwenEngine<B> {
                             Drafter::DFlash(d) => d.prefill_chunk(
                                 b,
                                 dflash.expect("a DFlash drafter has its model"),
+                                dw.as_deref_mut().expect("DFlash lanes have a workspace"),
                                 ws,
                                 row0 + base,
                                 t,
@@ -843,46 +1373,19 @@ impl<B: Backend> QwenEngine<B> {
         }
         Ok(())
     }
-}
 
-impl<B> ChatEngine for QwenEngine<B>
-where
-    B: Backend + Send + Sync,
-    B::Buffer: Send + Sync,
-{
-    fn architecture(&self) -> &str {
-        "Qwen3_5ForCausalLM"
-    }
-
-    fn idle(&self) {
-        if self.b.bind_thread().is_err() {
-            return;
-        }
-        while self.pending.load(Ordering::SeqCst) == 0 {
-            let Ok(mut st) = self.state.try_lock() else {
-                return;
-            };
-            let Lanes { lanes, store, .. } = &mut *st;
-            match store.top_up(&self.b, &lanes[0].session) {
-                Ok(true) => {}
-                Ok(false) => return,
-                Err(e) => {
-                    eprintln!("context store: reserve allocation failed: {e}");
-                    return;
-                }
-            }
-        }
-    }
-
-    fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
+    /// Request-side preparation: the rendered, tokenized prompt with its images, the sampler and
+    /// the completion budget.
+    fn prepare(
+        &self,
+        req: &Value,
+    ) -> Result<(Prompt, Vec<ImagePatches>, Sampler, usize, Option<Value>), ApiError> {
         let t_req = Instant::now();
-        self.b.bind_thread().map_err(core)?;
         let Normalized {
             messages,
             tools,
             images: urls,
         } = normalize_request(req)?;
-        let tools = tools.as_ref();
         let thinking = req
             .pointer("/chat_template_kwargs/enable_thinking")
             .and_then(Value::as_bool)
@@ -890,7 +1393,7 @@ where
         let text = self
             .fe
             .template
-            .render(&messages, tools, thinking, true)
+            .render(&messages, tools.as_ref(), thinking, true)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
         let t_tpl = t_req.elapsed();
         let ids = self.fe.encode(&text).map_err(core)?;
@@ -932,146 +1435,45 @@ where
                 ),
             });
         }
-        let mut sampler = Sampler::from_request(req, thinking);
+        let sampler = Sampler::from_request(req, thinking);
+        Ok((p, images, sampler, max_tokens, tools))
+    }
+}
 
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        let state = self.state.lock();
-        self.pending.fetch_sub(1, Ordering::SeqCst);
-        let mut state =
-            state.map_err(|_| core(CoreError::Backend("engine lanes poisoned".into())))?;
-        let Lanes { ws, lanes, store } = &mut *state;
-        let li = Self::pick_lane(lanes, &p.keys, p.ids.len() + max_tokens)
-            .ok_or_else(|| ApiError::invalid("no lane can hold this request"))?;
-        let lane = &mut lanes[li];
-        let t0 = Instant::now();
-        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
-            let shared = common_prefix(&lane.keys, &p.keys);
-            let cps: Vec<usize> = lane.checkpoints.iter().map(|c| c.pos).collect();
-            eprintln!(
-                "[prefix] lane {li} prompt {} held {} pos {} shared {} checkpoints {:?} next {:?} store [{}]",
-                p.keys.len(),
-                lane.keys.len(),
-                lane.session.pos,
-                shared,
-                cps,
-                self.checkpoint_positions(&p.ids, 0),
-                store.describe()
-            );
-        }
-        match lane.drafter.as_mut() {
-            Some(Drafter::Mtp(m)) => m.reset(),
-            Some(Drafter::DFlash(d)) => d.reset(),
-            None => {}
-        }
-        store.tick();
-        let shared = common_prefix(&lane.keys, &p.keys);
-        if store.enabled() {
-            self.capture_head(lane, store, shared.min(p.keys.len() - 1))
-                .map_err(core)?;
-        }
-        let (start, adopted) = self.reuse(lane, store, &p.keys).map_err(core)?;
-        lane.chain = store.resumed(&p.keys, start, adopted);
-        let t_reuse = t0.elapsed();
-        if adopted.is_some() && std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
-            eprintln!(
-                "[store] resumed at {start} ({} entries, {:.2} GB; {} on disk)",
-                store.len(),
-                store.bytes(&self.b) as f64 / 1e9,
-                store.disk_len()
-            );
-        }
-        // Checkpoints still valid for this prompt are the lane's own inside the shared prefix.
-        let (keep, stale): (Vec<_>, Vec<_>) = lane
-            .checkpoints
-            .drain(..)
-            .partition(|c| c.pos <= start && c.pos <= shared);
-        lane.checkpoints = keep;
-        lane.spare.extend(stale);
-        lane.keys = p.keys[..start].to_vec();
-        let mut t_fill = t_reuse;
-        let prefilled = self.prefill(lane, ws, &p, &images, start).and_then(|()| {
-            t_fill = t0.elapsed();
-            self.model
-                .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)
-        });
-        let mut cands = match prefilled {
-            Ok(c) => c,
-            Err(e) => {
-                // The state is partially advanced; forget it so the next request starts clean.
-                lane.keys.clear();
-                lane.checkpoints.clear();
-                return Err(core(e));
-            }
-        };
-        lane.keys.extend_from_slice(&p.keys[start..]);
-        Self::prune_checkpoints(
-            &mut lane.checkpoints,
-            &mut lane.spare,
-            self.cfg.max_checkpoints,
-            start + 1,
-        );
-        if self.cfg.host_checkpoints {
-            let anchors: Vec<usize> = self
-                .checkpoint_positions(&p.ids, 0)
-                .into_iter()
-                .take(2)
-                .collect();
-            self.place_checkpoints(lane, store, start + 1, &anchors)
-                .map_err(core)?;
-        }
-        let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
-        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
-            eprintln!(
-                "[prompt] reuse {:.1} ms, prefill {:.1} ms, candidates+prune {:.1} ms, total {prompt_ms:.1} ms, top {:?}",
-                t_reuse.as_secs_f64() * 1e3,
-                (t_fill - t_reuse).as_secs_f64() * 1e3,
-                (t0.elapsed() - t_fill).as_secs_f64() * 1e3,
-                &cands[..cands.len().min(3)]
-            );
-        }
+impl<B> ChatEngine for QwenEngine<B>
+where
+    B: Backend + Send + Sync,
+    B::Buffer: Send + Sync,
+{
+    fn architecture(&self) -> &str {
+        "Qwen3_5ForCausalLM"
+    }
 
-        let t1 = Instant::now();
-        let mut out = Vec::new();
-        let mut finish = "length";
-        if lane.drafter.is_some() {
-            lane.spec_stats = (0, 0, 0);
-            finish =
-                self.decode_speculative(lane, ws, &mut sampler, cands, max_tokens, &mut out)?;
-        } else {
-            loop {
-                let next = sampler.sample(&cands);
-                if self.fe.is_eos(next) {
-                    finish = "stop";
-                    break;
-                }
-                out.push(next);
-                sampler.observe(next);
-                if out.len() >= max_tokens {
-                    break;
-                }
-                self.model
-                    .advance(&self.b, &mut lane.session, ws, &[next], None, &[])
-                    .and_then(|()| {
-                        self.model
-                            .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)
-                    })
-                    .map(|c| cands = c)
-                    .map_err(core)?;
-                lane.keys.push(next);
-            }
+    fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
+        let core_ = &self.core;
+        let (p, images, sampler, max_tokens, tools) = core_.prepare(req)?;
+        let prompt_tokens = p.ids.len() as u64;
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut q = self
+                .queue
+                .jobs
+                .lock()
+                .map_err(|_| core(CoreError::Backend("engine queue poisoned".into())))?;
+            q.push_back(Job {
+                p,
+                images,
+                sampler,
+                max_tokens,
+                reply: tx,
+            });
         }
-        let predicted_ms = t1.elapsed().as_secs_f64() * 1e3;
-        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() && lane.drafter.is_some() {
-            let (rounds, drafted, accepted) = lane.spec_stats;
-            eprintln!(
-                "[decode] {} tokens in {predicted_ms:.0} ms, {rounds} rounds, accepted {accepted}/{drafted} drafts, {:.2} tokens/round",
-                out.len(),
-                out.len() as f64 / rounds.max(1) as f64
-            );
-        }
-
-        let text = self.fe.decode(&out).map_err(core)?;
-        let parsed = parse_output(&text, tools);
+        self.queue.cv.notify_one();
+        let done = rx
+            .recv()
+            .map_err(|_| core(CoreError::Backend("engine worker stopped".into())))??;
+        let text = core_.fe.decode(&done.out).map_err(core)?;
+        let parsed = parse_output(&text, tools.as_ref());
         if !parsed.content.is_empty() {
             emit(Delta::Content(parsed.content));
         }
@@ -1083,13 +1485,13 @@ where
             finish_reason: if has_calls {
                 "tool_calls".into()
             } else {
-                finish.into()
+                done.finish.into()
             },
-            prompt_tokens: p.ids.len() as u64,
-            cached_tokens: start as u64,
-            completion_tokens: out.len() as u64,
-            prompt_ms,
-            predicted_ms,
+            prompt_tokens,
+            cached_tokens: done.start as u64,
+            completion_tokens: done.out.len() as u64,
+            prompt_ms: done.prompt_ms,
+            predicted_ms: done.predicted_ms,
         })
     }
 }
