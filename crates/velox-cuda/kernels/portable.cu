@@ -53,7 +53,9 @@ __global__ void rms_norm_warp_kernel(const float* __restrict__ x, const float* _
 // One block per token: the token's rotary/2 angles are formed once (in double) into shared
 // memory, then every head applies them. Double is slow on consumer GPUs, so it runs once per
 // pair per token rather than once per pair per head.
-__global__ void rope_kernel(float* __restrict__ x, int heads, int head_dim, int rotary_dim, int pos0, float theta) {
+__global__ void rope_kernel(float* __restrict__ x, int heads, int head_dim, int rotary_dim, int pos0, float theta,
+                            const long long* __restrict__ params) {
+    if (params != nullptr) pos0 = static_cast<int>(params[0]);  // staged by a graph step
     extern __shared__ float cs[];  // [half] cos, then [half] sin
     const int half = rotary_dim / 2, t = blockIdx.x;
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
@@ -156,9 +158,11 @@ VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float
     return velox_launch_status();
 }
 
-VELOX_API int velox_portable_rope(float* x, int tokens, int heads, int head_dim, int rotary_dim, int pos0, float theta) {
+// params: null, or device [pos0] (graph steps stage per-call values; see velox_cuda_stage).
+VELOX_API int velox_portable_rope(float* x, int tokens, int heads, int head_dim, int rotary_dim, int pos0, float theta,
+                                  const long long* params) {
     if (tokens <= 0) return 0;
-    rope_kernel<<<tokens, 256, rotary_dim * sizeof(float)>>>(x, heads, head_dim, rotary_dim, pos0, theta);
+    rope_kernel<<<tokens, 256, rotary_dim * sizeof(float)>>>(x, heads, head_dim, rotary_dim, pos0, theta, params);
     return velox_launch_status();
 }
 
@@ -297,7 +301,9 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
     attention_gqa_partial_kernel(const float* __restrict__ q, const float* __restrict__ k,
                                  const float* __restrict__ v, float* __restrict__ part_acc,
                                  float* __restrict__ part_ml, int tokens, int heads, int kv_heads, int head_dim,
-                                 int pos0, float scale, int splits, int split_keys) {
+                                 int pos0, float scale, int splits, int split_keys,
+                                 const long long* __restrict__ params) {
+    if (params != nullptr) pos0 = static_cast<int>(params[0]);  // staged by a graph step
     extern __shared__ float gqa_smem[];
     float* ks = gqa_smem;
     float* vs = gqa_smem + TK * head_dim;
@@ -373,9 +379,11 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
 
 template <int PER>
 int attention_gqa(const float* q, const float* k, const float* v, float* out, int tokens, int heads, int kv_heads,
-                  int head_dim, int pos0, float scale) {
+                  int head_dim, int pos0, float scale, const long long* params, int kv_grid) {
     constexpr int TK = PER >= 8 ? 16 : 32;
-    const int kv = pos0 + tokens;
+    // Graph steps size the grid for a bucket of context lengths (kv_grid); the kernel reads the
+    // actual position and leaves splits past it empty.
+    const int kv = params != nullptr ? kv_grid : pos0 + tokens;
     const int group_rows = tokens * (heads / kv_heads);
     const int rgs = (group_rows + kGqaRows - 1) / kGqaRows;
     // About two blocks per SM, at least two tiles of keys per split.
@@ -390,7 +398,7 @@ int attention_gqa(const float* q, const float* k, const float* v, float* out, in
     float* part_ml = scratch + parts * head_dim;
     const size_t smem = static_cast<size_t>(2) * TK * head_dim * sizeof(float);
     attention_gqa_partial_kernel<PER, TK><<<dim3(kv_heads, splits, rgs), kGqaWarps * VELOX_WARP, smem>>>(
-        q, k, v, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, scale, splits, split_keys);
+        q, k, v, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, scale, splits, split_keys, params);
     attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
                                                                        splits);
     return velox_launch_status();
@@ -398,15 +406,22 @@ int attention_gqa(const float* q, const float* k, const float* v, float* out, in
 
 }  // namespace
 
+// params: null, or device [pos0] staged by a graph step, with kv_grid >= pos0 + tokens sizing the grid
+// (only the GQA decode / verify path reads it).
 VELOX_API int velox_portable_attention(const float* q, const float* k, const float* v, float* out, int tokens,
-                                       int heads, int kv_heads, int head_dim, int pos0, float scale) {
+                                       int heads, int kv_heads, int head_dim, int pos0, float scale,
+                                       const long long* params, int kv_grid) {
     if (tokens > 65535) return VELOX_ERR_UNSUPPORTED;
+    const bool gqa = tokens <= 16 && head_dim % 32 == 0 && head_dim <= 256 && heads % kv_heads == 0 &&
+                     heads / kv_heads > 1;
+    if (params != nullptr && !gqa) return VELOX_ERR_UNSUPPORTED;
     // Decode / verify: share each K/V tile across the query heads of its group and the tokens.
-    if (tokens <= 16 && head_dim % 32 == 0 && head_dim <= 256 && heads % kv_heads == 0 &&
-        heads / kv_heads > 1) {
-        if (head_dim <= 64) return attention_gqa<2>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
-        if (head_dim <= 128) return attention_gqa<4>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
-        return attention_gqa<8>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
+    if (gqa) {
+        if (head_dim <= 64)
+            return attention_gqa<2>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale, params, kv_grid);
+        if (head_dim <= 128)
+            return attention_gqa<4>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale, params, kv_grid);
+        return attention_gqa<8>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale, params, kv_grid);
     }
     // Few queries over a long cache: split the keys so the whole GPU works on them.
     if (tokens * heads <= 2048 && head_dim <= 256) {
@@ -688,6 +703,45 @@ VELOX_API int velox_portable_dyn_conv(const float* x, const float* base, const f
     const long long n = static_cast<long long>(rows) * channels;
     if (n == 0) return 0;
     dyn_conv_kernel<<<velox_grid_1d(n, 256), 256>>>(x, base, delta, out, rows, channels, group, side, accumulate);
+    return velox_launch_status();
+}
+
+namespace {
+// Copies whose offsets a graph step staged on the device (params: [src_offset, dst_offset]).
+__global__ void copy_param_kernel(const float* __restrict__ src, float* __restrict__ dst, long long len,
+                                  const long long* __restrict__ params) {
+    src += params[0];
+    dst += params[1];
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < len;
+         i += static_cast<long long>(gridDim.x) * blockDim.x)
+        dst[i] = src[i];
+}
+
+__global__ void copy2d_param_kernel(const float* __restrict__ src, long long src_stride, float* __restrict__ dst,
+                                    long long dst_stride, long long rows, long long cols,
+                                    const long long* __restrict__ params) {
+    src += params[0];
+    dst += params[1];
+    const long long n = rows * cols;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / cols, c = i % cols;
+        dst[r * dst_stride + c] = src[r * src_stride + c];
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_copy_param(const float* src, float* dst, long long len, const long long* params) {
+    if (len <= 0) return 0;
+    copy_param_kernel<<<velox_grid_1d(len, 256), 256>>>(src, dst, len, params);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_copy2d_param(const float* src, long long src_stride, float* dst, long long dst_stride,
+                                          long long rows, long long cols, const long long* params) {
+    if (rows == 0 || cols == 0) return 0;
+    copy2d_param_kernel<<<velox_grid_1d(rows * cols, 256), 256>>>(src, src_stride, dst, dst_stride, rows, cols,
+                                                                    params);
     return velox_launch_status();
 }
 
