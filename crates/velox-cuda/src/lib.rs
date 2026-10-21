@@ -373,15 +373,17 @@ pub trait CudaKernels: Send + Sync {
         portable::kv_load(k_cache, v_cache, k, v, s)
     }
 
+    /// `state_in`: advance from this state instead of `state` (which receives the result).
     fn conv1d_silu(
         &self,
         x: &CudaBuffer,
         weight: &CudaBuffer,
+        state_in: Option<&CudaBuffer>,
         state: &mut CudaBuffer,
         out: &mut CudaBuffer,
         s: ConvShape,
     ) -> Result<()> {
-        portable::conv1d_silu(x, weight, state, out, s)
+        portable::conv1d_silu(x, weight, state_in, state, out, s)
     }
 
     fn gated_delta_net(
@@ -390,11 +392,12 @@ pub trait CudaKernels: Send + Sync {
         ab: &CudaBuffer,
         a_log: &CudaBuffer,
         dt_bias: &CudaBuffer,
+        state_in: Option<&CudaBuffer>,
         state: &mut CudaBuffer,
         out: &mut CudaBuffer,
         s: GdnShape,
     ) -> Result<()> {
-        portable::gated_delta_net(qkv, ab, a_log, dt_bias, state, out, s)
+        portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s)
     }
 
     fn attention_full(
@@ -1102,7 +1105,23 @@ impl Backend for CudaBackend {
     ) -> Result<()> {
         check::conv1d(x.len, weight.len, state.len, out.len, &s)?;
         self.timed("conv1d_silu", || {
-            self.kernels.conv1d_silu(x, weight, state, out, s)
+            self.kernels.conv1d_silu(x, weight, None, state, out, s)
+        })
+    }
+
+    fn conv1d_silu_from(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        state_in: &CudaBuffer,
+        state_out: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: ConvShape,
+    ) -> Result<()> {
+        check::conv1d(x.len, weight.len, state_in.len, out.len, &s)?;
+        self.timed("conv1d_silu", || {
+            self.kernels
+                .conv1d_silu(x, weight, Some(state_in), state_out, out, s)
         })
     }
 
@@ -1132,7 +1151,24 @@ impl Backend for CudaBackend {
         };
         self.timed(op, || {
             self.kernels
-                .gated_delta_net(qkv, ab, a_log, dt_bias, state, out, s)
+                .gated_delta_net(qkv, ab, a_log, dt_bias, None, state, out, s)
+        })
+    }
+
+    fn gated_delta_net_from(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: &CudaBuffer,
+        state_out: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+    ) -> Result<()> {
+        self.timed("gated_delta_net verify", || {
+            self.kernels
+                .gated_delta_net(qkv, ab, a_log, dt_bias, Some(state_in), state_out, out, s)
         })
     }
 

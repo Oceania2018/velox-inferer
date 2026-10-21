@@ -204,14 +204,14 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __r
 
 // state[j] <- input at time tokens - (width - 1) + j. Ascending j only reads indices >= j + tokens
 // of the old state, which are not yet overwritten.
-__global__ void conv1d_state_kernel(const float* __restrict__ x, float* __restrict__ state, int tokens, int channels,
-                                    int width) {
+__global__ void conv1d_state_kernel(const float* __restrict__ x, const float* state_in, float* state, int tokens,
+                                    int channels, int width) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     for (int j = 0; j < width - 1; ++j) {
         const int s = tokens - (width - 1) + j;
         state[static_cast<size_t>(j) * channels + c] =
-            s >= 0 ? x[static_cast<size_t>(s) * channels + c] : state[static_cast<size_t>(j + tokens) * channels + c];
+            s >= 0 ? x[static_cast<size_t>(s) * channels + c] : state_in[static_cast<size_t>(j + tokens) * channels + c];
     }
 }
 
@@ -220,8 +220,8 @@ __global__ void conv1d_state_kernel(const float* __restrict__ x, float* __restri
 template <int PER>
 __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
                                             const float* __restrict__ a_log, const float* __restrict__ dt_bias,
-                                            float* __restrict__ state, float* __restrict__ out, int tokens,
-                                            int k_heads, int v_heads, int k_dim, int v_dim) {
+                                            const float* state_in, float* state, float* __restrict__ out,
+                                            int tokens, int k_heads, int v_heads, int k_dim, int v_dim) {
     const int warps = blockDim.x / VELOX_WARP;
     const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
     if (i >= v_dim) return;
@@ -229,12 +229,13 @@ __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const
     const int width = 2 * k_heads * k_dim + v_heads * v_dim;
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(k_dim));
     const float neg_a = -expf(a_log[h]), bias = dt_bias[h];
-    float* row_state = state + (static_cast<size_t>(h) * v_dim + i) * k_dim;
+    const size_t row_off = (static_cast<size_t>(h) * v_dim + i) * k_dim;
+    float* row_state = state + row_off;  // written at the end; read from state_in (may alias)
     float s[PER];
 #pragma unroll
     for (int p = 0; p < PER; ++p) {
         const int d = lane + p * VELOX_WARP;
-        s[p] = d < k_dim ? row_state[d] : 0.0f;
+        s[p] = d < k_dim ? state_in[row_off + d] : 0.0f;
     }
     for (int t = 0; t < tokens; ++t) {
         const float* row = qkv + static_cast<size_t>(t) * width;
@@ -932,19 +933,27 @@ VELOX_API int velox_portable_sigmoid_mul(float* x, const float* gate, long long 
     return velox_launch_status();
 }
 
-VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, float* state, float* out, int tokens,
-                                         int channels, int width) {
+// state_in: the rolling state before the call; the advanced state goes to `state` (may be the same buffer).
+VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, const float* state_in, float* state, float* out,
+                                         int tokens, int channels, int width) {
     if (width > kMaxConvWidth) return VELOX_ERR_UNSUPPORTED;
-    conv1d_silu_kernel<<<velox_grid_1d(static_cast<long long>(tokens) * channels, 256), 256>>>(x, w, state, out, tokens,
-                                                                                                channels, width);
-    conv1d_state_kernel<<<(channels + 255) / 256, 256>>>(x, state, tokens, channels, width);
+    conv1d_silu_kernel<<<velox_grid_1d(static_cast<long long>(tokens) * channels, 256), 256>>>(x, w, state_in, out,
+                                                                                                tokens, channels, width);
+    conv1d_state_kernel<<<(channels + 255) / 256, 256>>>(x, state_in, state, tokens, channels, width);
     return velox_launch_status();
 }
 
+// state_in: the state before the call; the updated state goes to `state` (may be the same buffer).
 VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, const float* a_log,
-                                             const float* dt_bias, float* state, float* out, int tokens, int k_heads,
-                                             int v_heads, int k_dim, int v_dim) {
+                                             const float* dt_bias, const float* state_in, float* state, float* out,
+                                             int tokens, int k_heads, int v_heads, int k_dim, int v_dim) {
     if (tokens >= kGdnChunkMinTokens && (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
+        if (state_in != state) {
+            // The chunked kernel updates in place.
+            const size_t n = static_cast<size_t>(v_heads) * v_dim * k_dim;
+            if (cudaError_t e = cudaMemcpyAsync(state, state_in, n * sizeof(float), cudaMemcpyDeviceToDevice, 0))
+                return static_cast<int>(e);
+        }
         const dim3 grid(v_heads, (v_dim + kGdnVt - 1) / kGdnVt), block(kGdnThreads);
 #define VELOX_GDN_CHUNK(DK)                                                                                 \
     gated_delta_net_chunk_kernel<DK><<<grid, block>>>(qkv, ab, a_log, dt_bias, state, out, tokens, k_heads, \
@@ -958,7 +967,7 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
     constexpr int kWarps = 4;
     const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps), block(kWarps * VELOX_WARP);
 #define VELOX_GDN(PER)                                                                                     \
-    gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state, out, tokens, k_heads, \
+    gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state_in, state, out, tokens, k_heads, \
                                                       v_heads, k_dim, v_dim)
     if (k_dim <= 32) VELOX_GDN(1);
     else if (k_dim <= 64) VELOX_GDN(2);
