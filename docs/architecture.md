@@ -54,6 +54,17 @@ Attention follows the same pattern: `Backend::attention_precision(shape)` return
 to f16 for the value product, as ninfer does). The oracle rounds Q, K and V identically
 (`quant::round_attention_inputs`); the unemulated f16 softmax weights set a 2e-3 tolerance.
 
+### KV cache formats
+
+`AttnShape::kv` names the storage format of the attention caches (`velox_core::kv::KvFormat`:
+`f32`, `bf16`, `fp8`, `nvfp4`, following ninfer's `--kv-dtype`). `kv_store` encodes K/V rows
+bit-exactly as `kv::encode_row` specifies (fp8: Hadamard-rotated K, one f16-valued scale per row;
+nvfp4: rotated K and V, E4M3 scale per 16 values). A cache *represents* `H · dequant(codes)` for
+rotated rows, and attention is exact softmax attention over the represented rows; kernels rotate
+the query and the output instead of the rows. The oracle decodes caches to f32 and runs the f32
+reference, so every format is checked against the same f64 attention. Models choose the format
+per session (`velox serve --kv-format`); the default stays `f32`.
+
 ## Current scope and next steps
 
 The engine is f32 end to end with synthetic weights. In dependency order, the work to run

@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use velox_core::{Backend, Error, Result};
+use velox_core::{Backend, Error, KvFormat, Result};
 use velox_engine::{EngineConfig, QwenEngine};
 use velox_frontend::Frontend;
 use velox_models::qwen3_5::{DFlashModel, Qwen35Text, Qwen35Vision, TextConfig, TextWeights};
@@ -49,6 +49,7 @@ where
         scratch_capacity: a.parse("scratch-context", 8192)?,
         mtp_drafts: a.parse("mtp-drafts", 7)?,
         dflash_drafts,
+        kv_format: KvFormat::parse(a.get("kv-format").unwrap_or("f32"))?,
     };
     let vision = if art.components().contains_key("vision")
         && a.get("vision").is_none_or(|v| v != "false")

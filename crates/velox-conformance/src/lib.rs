@@ -7,10 +7,11 @@
 
 use velox_core::backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape,
-    WeightView,
+    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind, RopeLayout,
+    RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
+use velox_core::kv::{decode_cache, encode_cache, KvFormat};
 use velox_core::model::{HostLayer, Stack};
 use velox_core::quant::{
     quantize_activations, round_attention_inputs, round_full_attention_inputs,
@@ -499,7 +500,100 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `kv_store` into caches holding valid prior rows; every cache row (written or not) is
+    /// decoded on the host and must match the oracle exactly (the encoding is bit-exact).
+    fn kv_store(
+        &mut self,
+        format: KvFormat,
+        kv_heads: usize,
+        head_dim: usize,
+        pos0: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let s = KvStoreShape {
+            tokens,
+            kv_heads,
+            head_dim,
+            pos0,
+            format,
+        };
+        let n = tokens * kv_heads * head_dim;
+        let (mut k, v) = (self.rng.vec(n, 3.0), self.rng.vec(n, 1.0));
+        // A zero row (zero scales) and a saturating outlier.
+        k[..head_dim].fill(0.0);
+        k[n - 1] = 3e5;
+        let rows = (pos0 + tokens + 2) * kv_heads;
+        let kc0 = encode_cache(format, &self.rng.vec(rows * head_dim, 1.0), head_dim, false);
+        let vc0 = encode_cache(format, &self.rng.vec(rows * head_dim, 1.0), head_dim, true);
+        let (mut kc, mut vc) = (
+            CpuBackend.upload_bytes(&kc0)?,
+            CpuBackend.upload_bytes(&vc0)?,
+        );
+        CpuBackend.kv_store(&k, &v, &mut kc, &mut vc, s)?;
+        let (kd, vd) = (self.b.upload(&k)?, self.b.upload(&v)?);
+        let (mut kcd, mut vcd) = (self.b.upload_bytes(&kc0)?, self.b.upload_bytes(&vc0)?);
+        self.b.kv_store(&kd, &vd, &mut kcd, &mut vcd, s)?;
+        let decode = |slots: &[f32], is_v| {
+            let bytes: Vec<u8> = slots.iter().flat_map(|x| x.to_le_bytes()).collect();
+            decode_cache(format, &bytes, rows, head_dim, is_v)
+        };
+        let mut want = decode(&kc, false);
+        want.extend(decode(&vc, true));
+        let mut got = decode(&fetch(self.b, &kcd, kc.len())?, false);
+        got.extend(decode(&fetch(self.b, &vcd, vc.len())?, true));
+        let name =
+            format!("kv_store {format} t={tokens} kv_heads={kv_heads} d={head_dim} pos0={pos0}");
+        self.record(name, Some(Op::KvStore), &got, &want, 0.0);
+        Ok(())
+    }
+
+    /// Attention over a cache in `s.kv`: the oracle decodes the cache to the rows it represents
+    /// and runs the f32 reference over them.
+    fn attention_kv(&mut self, s: AttnShape) -> Result<()> {
+        let d = s.head_dim;
+        let q_len = s.tokens * s.heads * d;
+        let rows = (s.kv_len() + 3) * s.kv_heads;
+        let q = self.rng.vec(q_len, 2.0);
+        let kb = encode_cache(s.kv, &self.rng.vec(rows * d, 2.0), d, false);
+        let vb = encode_cache(s.kv, &self.rng.vec(rows * d, 1.0), d, true);
+        let (mut kr, mut vr) = (
+            decode_cache(s.kv, &kb, rows, d, false),
+            decode_cache(s.kv, &vb, rows, d, true),
+        );
+        let f32_shape = AttnShape {
+            kv: KvFormat::F32,
+            ..s
+        };
+        let precision = self.b.attention_precision(s);
+        let mut qr = q.clone();
+        round_attention_inputs(&mut qr, &mut kr, &mut vr, f32_shape, precision);
+        let mut want = vec![0.0; q_len];
+        CpuBackend.attention(&qr, &kr, &vr, &mut want, f32_shape)?;
+        let (qd, kd, vd) = (
+            self.b.upload(&q)?,
+            self.b.upload_bytes(&kb)?,
+            self.b.upload_bytes(&vb)?,
+        );
+        let mut od = self.b.alloc(q_len)?;
+        self.b.attention(&qd, &kd, &vd, &mut od, s)?;
+        let got = fetch(self.b, &od, q_len)?;
+        let (tag, tol) = match precision {
+            AttnPrecision::Exact => ("", 2e-4),
+            AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+            AttnPrecision::F16 => (" f16", 2e-3),
+        };
+        let name = format!(
+            "attention kv {} t={} h={}/{} d={} pos0={}{tag}",
+            s.kv, s.tokens, s.heads, s.kv_heads, s.head_dim, s.pos0
+        );
+        self.record(name, Some(Op::Attention), &got, &want, tol);
+        Ok(())
+    }
+
     fn attention(&mut self, s: AttnShape) -> Result<()> {
+        if s.kv != KvFormat::F32 {
+            return self.attention_kv(s);
+        }
         let q_len = s.tokens * s.heads * s.head_dim;
         // Caches carry spare capacity past kv_len, like the model's.
         let kv_len = (s.kv_len() + 3) * s.kv_heads * s.head_dim;
@@ -1042,6 +1136,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 1,
             head_dim: 256,
             pos0: 0,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 130,
@@ -1049,6 +1144,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 2,
             head_dim: 256,
             pos0: 333,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 17,
@@ -1056,6 +1152,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 1,
             head_dim: 256,
             pos0: 2_000,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 1,
@@ -1063,6 +1160,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 2,
             head_dim: 64,
             pos0: 37,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 5,
@@ -1070,6 +1168,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 4,
             head_dim: 128,
             pos0: 0,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 3,
@@ -1077,6 +1176,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 3,
             head_dim: 96,
             pos0: 10,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 1,
@@ -1084,6 +1184,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 1,
             head_dim: 256,
             pos0: 1500,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 1,
@@ -1091,6 +1192,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 8,
             head_dim: 128,
             pos0: 4095,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 4,
@@ -1098,6 +1200,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 4,
             head_dim: 256,
             pos0: 20,
+            kv: KvFormat::F32,
         },
         // Split-KV path: few queries over long caches, ragged last split.
         AttnShape {
@@ -1106,6 +1209,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 4,
             head_dim: 256,
             pos0: 16_999,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 3,
@@ -1113,6 +1217,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 2,
             head_dim: 96,
             pos0: 1_000,
+            kv: KvFormat::F32,
         },
         // Speculative verify windows over long caches (GQA-packed split path).
         AttnShape {
@@ -1121,6 +1226,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 4,
             head_dim: 256,
             pos0: 17_000,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 16,
@@ -1128,6 +1234,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 4,
             head_dim: 256,
             pos0: 37,
+            kv: KvFormat::F32,
         },
         AttnShape {
             tokens: 5,
@@ -1135,10 +1242,51 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 8,
             head_dim: 128,
             pos0: 2_049,
+            kv: KvFormat::F32,
         },
     ] {
         s.attention(a)?;
     }
+    // Quantized KV caches: store, then decode / verify / prefill over packed rows.
+    for f in KvFormat::ALL {
+        s.kv_store(f, 4, 256, 16_999, 1)?;
+        s.kv_store(f, 4, 256, 100, 16)?;
+        s.kv_store(f, 4, 256, 0, 70)?;
+    }
+    s.kv_store(KvFormat::Bf16, 2, 72, 5, 3)?;
+    s.kv_store(KvFormat::Fp8, 2, 64, 5, 3)?;
+    s.kv_store(KvFormat::Fp8, 8, 128, 33, 9)?;
+    s.kv_store(KvFormat::Nvfp4, 3, 32, 7, 2)?;
+    s.kv_store(KvFormat::Nvfp4, 2, 128, 7, 5)?;
+    let attn = |tokens, heads, kv_heads, head_dim, pos0, kv| AttnShape {
+        tokens,
+        heads,
+        kv_heads,
+        head_dim,
+        pos0,
+        kv,
+    };
+    for f in [KvFormat::Bf16, KvFormat::Fp8, KvFormat::Nvfp4] {
+        // Qwen3.8 geometry: decode, verify windows (1..3 row groups), prefill chunks.
+        s.attention(attn(1, 24, 4, 256, 16_999, f))?;
+        s.attention(attn(2, 24, 4, 256, 300, f))?;
+        s.attention(attn(8, 24, 4, 256, 17_000, f))?;
+        s.attention(attn(16, 24, 4, 256, 37, f))?;
+        s.attention(attn(5, 24, 4, 256, 2_049, f))?;
+        s.attention(attn(20, 6, 1, 256, 16_500, f))?;
+        s.attention(attn(100, 24, 4, 256, 200, f))?;
+        s.attention(attn(70, 6, 1, 256, 0, f))?;
+    }
+    // Other head dims: non-power-of-two (bf16 only), narrower rotations, no GQA.
+    s.attention(attn(3, 6, 2, 96, 1_000, KvFormat::Bf16))?;
+    s.attention(attn(1, 8, 2, 72, 37, KvFormat::Bf16))?;
+    s.attention(attn(40, 8, 2, 72, 10, KvFormat::Bf16))?;
+    s.attention(attn(5, 32, 8, 128, 2_049, KvFormat::Fp8))?;
+    s.attention(attn(1, 8, 2, 64, 37, KvFormat::Fp8))?;
+    s.attention(attn(3, 4, 4, 128, 500, KvFormat::Fp8))?;
+    s.attention(attn(4, 8, 2, 128, 500, KvFormat::Nvfp4))?;
+    s.attention(attn(3, 4, 4, 32, 64, KvFormat::Nvfp4))?;
+    s.attention(attn(1, 16, 2, 64, 3_000, KvFormat::Nvfp4))?;
     s.conv1d(70, 4, [5, 1])?;
     s.conv1d(1024, 4, [1, 1])?;
     s.gdn(1, 3, 32, 32, [4, 1])?;

@@ -52,7 +52,8 @@ pub fn f32_to_e2m1(x: f32) -> u8 {
     } else if a < 4.0 {
         4 + (a - 2.0).round_ties_even() as u8
     } else {
-        (6 + ((a - 4.0) * 0.5).round_ties_even() as u8).min(7)
+        6u8.saturating_add(((a - 4.0) * 0.5).round_ties_even() as u8)
+            .min(7)
     };
     sign | code
 }

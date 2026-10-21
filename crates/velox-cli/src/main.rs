@@ -51,6 +51,9 @@ COMMANDS:
       --k-heads <n> --v-heads <n> --k-dim <n> --v-dim <n>  default 16/48 heads, 128/128 (Qwen3.8)
       --tokens <list>       token counts, comma separated (default 1,8,64,512)
       --iters <n>           timed iterations (default 50)
+  bench-attn              Time causal attention over a KV cache in each storage format
+      --heads <n> --kv-heads <n> --head-dim <n>  default 24/4, 256 (Qwen3.8)
+      --pos0 <n> (16384) --tokens <list> (1,8,16) --kv-format <list> (f32,bf16,fp8,nvfp4) --iters <n> (50)
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
@@ -58,12 +61,14 @@ COMMANDS:
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
       [--max-tokens 64] [--chunk 256] [--capacity 4096] [--mtp N | --dflash N] (speculative)
+      [--kv-format f32|bf16|fp8|nvfp4] (attention KV cache storage, default f32)
   serve                   OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
       --model-id <id>       default: artifact metadata name
       --chat-template <file> --max-context <n> (32768) --prefill-chunk <n> (512)
       --ctx-checkpoints <n> (8) --enable-thinking true|false (false)
+      --kv-format <fmt>     attention KV cache storage: f32 | bf16 | fp8 | nvfp4 (f32)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
       --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
   replay                  Replay a recorded agent session against an OpenAI-compatible server
@@ -108,6 +113,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench") => bench_cmd(a),
         Some("bench-linear") => bench_linear(a),
         Some("bench-gdn") => bench_gdn(a),
+        Some("bench-attn") => bench_attn(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
         Some("generate") => generate::run(a),
@@ -363,6 +369,41 @@ fn bench_gdn(a: &Args) -> Result<ExitCode> {
         Selected::Cpu(b) => bench::run_gdn(b, &cfg)?,
         #[cfg(feature = "cuda")]
         Selected::Cuda(b) => bench::run_gdn(b, &cfg)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn bench_attn(a: &Args) -> Result<ExitCode> {
+    let list = |key: &str, default: &str| -> Vec<String> {
+        a.get(key)
+            .unwrap_or(default)
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+    let tokens = list("tokens", "1,8,16")
+        .iter()
+        .map(|s| s.parse::<usize>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| velox_core::Error::Config("--tokens takes comma-separated integers".into()))?;
+    let formats = list("kv-format", "f32,bf16,fp8,nvfp4")
+        .iter()
+        .map(|s| velox_core::KvFormat::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+    let cfg = bench::AttnConfig {
+        heads: a.parse("heads", 24)?,
+        kv_heads: a.parse("kv-heads", 4)?,
+        head_dim: a.parse("head-dim", 256)?,
+        pos0: a.parse("pos0", 16384)?,
+        tokens,
+        formats,
+        iters: a.parse("iters", 50)?,
+    };
+    let sel = select::backend(a)?;
+    match &sel {
+        Selected::Cpu(b) => bench::run_attn(b, &cfg)?,
+        #[cfg(feature = "cuda")]
+        Selected::Cuda(b) => bench::run_attn(b, &cfg)?,
     }
     Ok(ExitCode::SUCCESS)
 }

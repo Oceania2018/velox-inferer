@@ -9,6 +9,7 @@ pub mod backend;
 pub mod check;
 pub mod error;
 pub mod format;
+pub mod kv;
 pub mod model;
 pub mod op;
 pub mod plan;
@@ -19,11 +20,12 @@ pub mod variant;
 
 pub use backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape,
-    GdnShape, GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView, GRAPH_KV_BUCKET,
-    GRAPH_STATIC,
+    GdnShape, GeluKind, KvStoreShape, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    GRAPH_KV_BUCKET, GRAPH_STATIC,
 };
 pub use error::{Error, Result};
 pub use format::WeightFormat;
+pub use kv::KvFormat;
 pub use op::Op;
 pub use plan::{MemoryPlan, ModelSpec, PlanPolicy, PlanRequest};
 pub use profile::{DeviceProfile, FormFactor, GpuArch, HwCaps, Vendor};

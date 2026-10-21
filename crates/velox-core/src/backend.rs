@@ -8,6 +8,7 @@ use std::fmt;
 
 use crate::error::Result;
 use crate::format::WeightFormat;
+use crate::kv::KvFormat;
 use crate::op::Op;
 use crate::profile::DeviceProfile;
 
@@ -32,8 +33,10 @@ impl fmt::Display for BackendKind {
 /// Causal grouped-query attention over a KV cache.
 ///
 /// `q` is `[tokens, heads, head_dim]` for positions `pos0 .. pos0 + tokens`. `k` and `v` are
-/// `[capacity, kv_heads, head_dim]` caches whose first `pos0 + tokens` rows are valid. Query head
-/// `h` reads KV head `h / (heads / kv_heads)`. Token `t` attends to keys `0 ..= pos0 + t`.
+/// `[capacity, kv_heads]` caches of rows stored in format `kv` whose first `pos0 + tokens`
+/// positions are valid. Query head `h` reads KV head `h / (heads / kv_heads)`. Token `t` attends to
+/// keys `0 ..= pos0 + t`. The result is exact softmax attention over the rows the cache represents
+/// (see [`crate::kv`]; for `F32` the stored values themselves).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttnShape {
     pub tokens: usize,
@@ -41,6 +44,7 @@ pub struct AttnShape {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub pos0: usize,
+    pub kv: KvFormat,
 }
 
 impl AttnShape {
@@ -51,6 +55,18 @@ impl AttnShape {
     pub fn scale(&self) -> f32 {
         1.0 / (self.head_dim as f32).sqrt()
     }
+}
+
+/// Stores `tokens` rows of K and V (`[tokens, kv_heads, head_dim]` f32, from row 0) into caches of
+/// format `format` at positions `pos0 .. pos0 + tokens`, encoded as [`crate::kv::encode_row`]
+/// specifies (bit-exact). Other cache rows are left untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvStoreShape {
+    pub tokens: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub pos0: usize,
+    pub format: KvFormat,
 }
 
 /// Rotary embedding (rotate-half / NeoX layout) applied in place to `[tokens, heads, head_dim]`,
@@ -455,7 +471,17 @@ pub trait Backend {
         out: &mut Self::Buffer,
         shape: AttnShape,
     ) -> Result<()>;
-    /// The operand precision `attention` uses for this shape.
+    /// Encodes K/V rows into caches; see [`KvStoreShape`].
+    fn kv_store(
+        &self,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        k_cache: &mut Self::Buffer,
+        v_cache: &mut Self::Buffer,
+        shape: KvStoreShape,
+    ) -> Result<()>;
+    /// The operand precision `attention` uses for this shape. For a quantized cache the rounding
+    /// applies to the rows the cache represents.
     fn attention_precision(&self, _shape: AttnShape) -> AttnPrecision {
         AttnPrecision::Exact
     }
