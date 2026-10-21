@@ -110,7 +110,13 @@ struct Lanes<B: Backend> {
     /// Batched-verify buffers, with more than one lane.
     bw: Option<BatchWorkspace<B>>,
     clock: u64,
+    /// Device checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
+    /// prefills snapshot into it instead of allocating, which would synchronize the device.
+    spare: Vec<Checkpoint<B>>,
 }
+
+/// Device checkpoint storage kept for reuse across lanes.
+const DEVICE_SPARE: usize = 2;
 
 /// Checkpoint storage kept for reuse per lane beyond the live checkpoints.
 const MAX_SPARE: usize = 4;
@@ -448,6 +454,7 @@ where
             dw,
             bw,
             clock: 0,
+            spare: Vec::new(),
         };
         let core = Arc::new(Core {
             b,
@@ -605,11 +612,14 @@ impl<B: Backend> Core<B> {
             store,
             dw,
             clock,
+            spare: pool,
             ..
         } = st;
         *clock += 1;
         let lane = &mut lanes[li];
         lane.last_used = *clock;
+        // The lane works with the shared spare storage while it is admitted.
+        lane.spare.append(pool);
         let p = &job.p;
         let t0 = Instant::now();
         if debug {
@@ -694,6 +704,8 @@ impl<B: Backend> Core<B> {
             }
             Ok((start, cands, t_reuse, t_fill))
         })();
+        lane.spare.truncate(DEVICE_SPARE);
+        pool.append(&mut lane.spare);
         let (start, cands, t_reuse, t_fill) = match r {
             Ok(v) => v,
             Err(e) => {
@@ -1188,9 +1200,7 @@ impl<B: Backend> Core<B> {
                 lane.spare.push(cp);
             }
         }
-        // Device memory: one checkpoint per lane when several share the card (a prefill snapshots
-        // into the lane's own old checkpoint), plus a spare with a single lane.
-        lane.spare.truncate(usize::from(self.cfg.lanes <= 1));
+        // Device memory: one checkpoint per lane plus the shared spares (see `DEVICE_SPARE`).
         Ok(())
     }
 
