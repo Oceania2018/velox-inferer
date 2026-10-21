@@ -547,6 +547,44 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `kv_load` of rows `pos0 .. pos0 + tokens` from caches of random rows, against the oracle.
+    fn kv_load(
+        &mut self,
+        format: KvFormat,
+        kv_heads: usize,
+        head_dim: usize,
+        pos0: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let s = KvStoreShape {
+            tokens,
+            kv_heads,
+            head_dim,
+            pos0,
+            format,
+        };
+        let rows = (pos0 + tokens + 1) * kv_heads;
+        let kc0 = encode_cache(format, &self.rng.vec(rows * head_dim, 3.0), head_dim, false);
+        let vc0 = encode_cache(format, &self.rng.vec(rows * head_dim, 1.0), head_dim, true);
+        let n = tokens * kv_heads * head_dim;
+        let (kc, vc) = (
+            CpuBackend.upload_bytes(&kc0)?,
+            CpuBackend.upload_bytes(&vc0)?,
+        );
+        let (mut k, mut v) = (vec![0.0; n], vec![0.0; n]);
+        CpuBackend.kv_load(&kc, &vc, &mut k, &mut v, s)?;
+        let (kcd, vcd) = (self.b.upload_bytes(&kc0)?, self.b.upload_bytes(&vc0)?);
+        let (mut kd, mut vd) = (self.b.alloc(n)?, self.b.alloc(n)?);
+        self.b.kv_load(&kcd, &vcd, &mut kd, &mut vd, s)?;
+        let mut got = fetch(self.b, &kd, n)?;
+        got.extend(fetch(self.b, &vd, n)?);
+        k.extend(v);
+        let name =
+            format!("kv_load {format} t={tokens} kv_heads={kv_heads} d={head_dim} pos0={pos0}");
+        self.record(name, Some(Op::KvLoad), &got, &k, 1e-6);
+        Ok(())
+    }
+
     /// Attention over a cache in `s.kv`: the oracle decodes the cache to the rows it represents
     /// and runs the f32 reference over them.
     fn attention_kv(&mut self, s: AttnShape) -> Result<()> {
@@ -1258,6 +1296,15 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.kv_store(KvFormat::Fp8, 8, 128, 33, 9)?;
     s.kv_store(KvFormat::Nvfp4, 3, 32, 7, 2)?;
     s.kv_store(KvFormat::Nvfp4, 2, 128, 7, 5)?;
+    for f in [
+        KvFormat::F32,
+        KvFormat::Bf16,
+        KvFormat::Fp8,
+        KvFormat::Nvfp4,
+    ] {
+        s.kv_load(f, 4, 256, 0, 300)?;
+        s.kv_load(f, 2, 64, 17, 5)?;
+    }
     let attn = |tokens, heads, kv_heads, head_dim, pos0, kv| AttnShape {
         tokens,
         heads,
