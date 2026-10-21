@@ -414,6 +414,23 @@ pub trait Backend {
         eps: f32,
         kind: NormKind,
     ) -> Result<()>;
+    /// Residual add then RMS norm: `acc[..rows * dim] += x`, then `y = rms_norm(acc)` (see
+    /// [`Self::rms_norm`]). One pass where a backend fuses it.
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm(
+        &self,
+        acc: &mut Self::Buffer,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        y: &mut Self::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        self.add(acc, x, rows * dim)?;
+        self.rms_norm(acc, weight, y, rows, dim, eps, kind)
+    }
     /// `x[i] *= sigmoid(gate[i])` for the first `len` elements.
     fn sigmoid_mul(&self, x: &mut Self::Buffer, gate: &Self::Buffer, len: usize) -> Result<()>;
     /// Causal depthwise convolution + SiLU with a rolling state; see [`ConvShape`].

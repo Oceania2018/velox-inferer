@@ -305,6 +305,22 @@ pub trait CudaKernels: Send + Sync {
         portable::rms_norm(x, weight, y, rows, dim, eps, kind)
     }
 
+    /// Residual add then RMS norm in one pass; see [`Backend::add_rms_norm`].
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        portable::add_rms_norm(acc, x, weight, y, rows, dim, eps, kind)
+    }
+
     fn rope(&self, x: &mut CudaBuffer, s: RopeShape) -> Result<()> {
         portable::rope(x, s)
     }
@@ -1000,6 +1016,25 @@ impl Backend for CudaBackend {
         check::rms_norm(x.len, weight.len, y.len, rows, dim)?;
         self.timed("rms_norm", || {
             self.kernels.rms_norm(x, weight, y, rows, dim, eps, kind)
+        })
+    }
+
+    fn add_rms_norm(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        check::rms_norm(acc.len, weight.len, y.len, rows, dim)?;
+        check::elementwise("add_rms_norm", &[x.len], rows * dim)?;
+        self.timed("add_rms_norm", || {
+            self.kernels
+                .add_rms_norm(acc, x, weight, y, rows, dim, eps, kind)
         })
     }
 
