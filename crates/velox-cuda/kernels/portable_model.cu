@@ -189,7 +189,8 @@ constexpr int kMaxConvWidth = 8;
 // conv1d_state_kernel afterwards, so every read here sees the state from before the call.
 __global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                    const float* __restrict__ state, float* __restrict__ out, int tokens, int channels,
-                                   int width) {
+                                   int width, const long long* __restrict__ pp) {
+    if (pp != nullptr) state = reinterpret_cast<const float*>(pp[0]);  // staged [state_in, state_out]
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= static_cast<long long>(tokens) * channels) return;
     const int t = static_cast<int>(i / channels), c = static_cast<int>(i % channels);
@@ -208,7 +209,11 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __r
 constexpr int kConvSmallTokens = 32;
 __global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                          const float* state_in, float* state, float* __restrict__ out, int tokens,
-                                         int channels, int width) {
+                                         int channels, int width, const long long* __restrict__ pp) {
+    if (pp != nullptr) {  // staged by a graph step: [state_in, state_out]
+        state_in = reinterpret_cast<const float*>(pp[0]);
+        state = reinterpret_cast<float*>(pp[1]);
+    }
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     float win[kMaxConvWidth], wt[kMaxConvWidth];
@@ -242,7 +247,11 @@ __global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const floa
 // state[j] <- input at time tokens - (width - 1) + j. Ascending j only reads indices >= j + tokens
 // of the old state, which are not yet overwritten.
 __global__ void conv1d_state_kernel(const float* __restrict__ x, const float* state_in, float* state, int tokens,
-                                    int channels, int width) {
+                                    int channels, int width, const long long* __restrict__ pp) {
+    if (pp != nullptr) {  // staged by a graph step: [state_in, state_out]
+        state_in = reinterpret_cast<const float*>(pp[0]);
+        state = reinterpret_cast<float*>(pp[1]);
+    }
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     for (int j = 0; j < width - 1; ++j) {
@@ -317,7 +326,12 @@ template <int PER>
 __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
                                             const float* __restrict__ a_log, const float* __restrict__ dt_bias,
                                             const float* state_in, float* state, float* __restrict__ out,
-                                            int tokens, int k_heads, int v_heads, int k_dim, int v_dim) {
+                                            int tokens, int k_heads, int v_heads, int k_dim, int v_dim,
+                                            const long long* __restrict__ pp) {
+    if (pp != nullptr) {  // staged by a graph step: [state_in, state_out]
+        state_in = reinterpret_cast<const float*>(pp[0]);
+        state = reinterpret_cast<float*>(pp[1]);
+    }
     const int warps = blockDim.x / VELOX_WARP;
     const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
     if (i >= v_dim) return;
@@ -1143,24 +1157,30 @@ VELOX_API int velox_portable_sigmoid_mul(float* x, const float* gate, long long 
 }
 
 // state_in: the rolling state before the call; the advanced state goes to `state` (may be the same buffer).
+// pp: null, or device [state_in, state_out] staged by a graph step (the states are per-call values).
 VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, const float* state_in, float* state, float* out,
-                                         int tokens, int channels, int width) {
+                                         int tokens, int channels, int width, const long long* pp) {
     if (width > kMaxConvWidth) return VELOX_ERR_UNSUPPORTED;
     if (tokens <= kConvSmallTokens) {
-        conv1d_silu_small_kernel<<<(channels + 127) / 128, 128>>>(x, w, state_in, state, out, tokens, channels, width);
+        conv1d_silu_small_kernel<<<(channels + 127) / 128, 128>>>(x, w, state_in, state, out, tokens, channels, width,
+                                                                  pp);
         return velox_launch_status();
     }
     conv1d_silu_kernel<<<velox_grid_1d(static_cast<long long>(tokens) * channels, 256), 256>>>(x, w, state_in, out,
-                                                                                                tokens, channels, width);
-    conv1d_state_kernel<<<(channels + 255) / 256, 256>>>(x, state_in, state, tokens, channels, width);
+                                                                                                tokens, channels, width,
+                                                                                                pp);
+    conv1d_state_kernel<<<(channels + 255) / 256, 256>>>(x, state_in, state, tokens, channels, width, pp);
     return velox_launch_status();
 }
 
 // state_in: the state before the call; the updated state goes to `state` (may be the same buffer).
+// pp: null, or device [state_in, state_out] staged by a graph step; staged calls take the per-row
+// kernel, which reads the states through it.
 VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, const float* a_log,
                                              const float* dt_bias, const float* state_in, float* state, float* out,
-                                             int tokens, int k_heads, int v_heads, int k_dim, int v_dim) {
-    if (tokens >= kGdnChunkMinTokens && (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
+                                             int tokens, int k_heads, int v_heads, int k_dim, int v_dim,
+                                             const long long* pp) {
+    if (pp == nullptr && tokens >= kGdnChunkMinTokens && (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
         if (state_in != state) {
             // The chunked kernel updates in place.
             const size_t n = static_cast<size_t>(v_heads) * v_dim * k_dim;
@@ -1190,7 +1210,7 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
     const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps), block(kWarps * VELOX_WARP);
 #define VELOX_GDN(PER)                                                                                     \
     gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state_in, state, out, tokens, k_heads, \
-                                                      v_heads, k_dim, v_dim)
+                                                      v_heads, k_dim, v_dim, pp)
     if (k_dim <= 32) VELOX_GDN(1);
     else if (k_dim <= 64) VELOX_GDN(2);
     else if (k_dim <= 128) VELOX_GDN(4);

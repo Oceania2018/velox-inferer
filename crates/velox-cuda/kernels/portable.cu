@@ -436,7 +436,11 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
                                  float* __restrict__ part_ml, int tokens, int heads, int kv_heads, int head_dim,
                                  int pos0, float scale, int splits, int split_keys,
                                  const long long* __restrict__ params) {
-    if (params != nullptr) pos0 = static_cast<int>(params[0]);  // staged by a graph step
+    if (params != nullptr) {  // staged by a graph step: [pos0, k_cache, v_cache]
+        pos0 = static_cast<int>(params[0]);
+        k = reinterpret_cast<const float*>(params[1]);
+        v = reinterpret_cast<const float*>(params[2]);
+    }
     extern __shared__ float gqa_smem[];
     float* ks = gqa_smem;
     float* vs = gqa_smem + TK * head_dim;
@@ -540,8 +544,8 @@ int attention_gqa(const float* q, const float* k, const float* v, float* out, in
 
 }  // namespace
 
-// params: null, or device [pos0] staged by a graph step, with kv_grid >= pos0 + tokens sizing the grid
-// (only the GQA decode / verify path reads it).
+// params: null, or device [pos0, k_cache, v_cache] staged by a graph step, with kv_grid >= pos0 + tokens
+// sizing the grid (only the GQA decode / verify path reads it).
 VELOX_API int velox_portable_attention(const float* q, const float* k, const float* v, float* out, int tokens,
                                        int heads, int kv_heads, int head_dim, int pos0, float scale,
                                        const long long* params, int kv_grid) {
