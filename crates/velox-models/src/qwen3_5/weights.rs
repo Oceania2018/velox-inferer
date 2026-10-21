@@ -12,7 +12,7 @@ use velox_core::format::{decode_rows, WeightFormat};
 use velox_core::{Error, Result};
 use velox_weights::{Artifact, ObjectKind};
 
-use super::config::{LayerKind, TextConfig};
+use super::config::{FfnConfig, LayerKind, MoeConfig, TextConfig};
 
 /// A row view into an uploaded parent object.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,15 +55,104 @@ pub enum Mixer {
     },
 }
 
+/// A SwiGLU FFN `down(silu(gate(h)) * up(h))`: the Dense block FFN, or a MoE block's shared expert.
+pub struct DenseFfn {
+    pub gate: WDesc,
+    pub up: WDesc,
+    pub down: WDesc,
+    /// gate and up as one view when adjacent in one parent.
+    pub gate_up: Option<WDesc>,
+}
+
+/// `experts` equally shaped matrices in one parent: expert `e` is `first` moved down by `e * stride`
+/// rows. Banks keep the stored encoding, like every other view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpertBank {
+    pub first: WDesc,
+    pub experts: usize,
+    pub stride: usize,
+}
+
+impl ExpertBank {
+    /// The bank formed by per-expert views (expert order); they must share a parent, format and
+    /// shape and sit at a constant row stride.
+    pub fn from_experts(what: &str, views: &[WDesc]) -> Result<Self> {
+        let (first, rest) = views
+            .split_first()
+            .ok_or_else(|| Error::Config(format!("{what}: no experts")))?;
+        let stride = match rest.first() {
+            None => first.rows,
+            Some(d) => d.row_begin.saturating_sub(first.row_begin),
+        };
+        for (e, d) in views.iter().enumerate() {
+            let at = e
+                .checked_mul(stride)
+                .and_then(|o| o.checked_add(first.row_begin));
+            let regular = d.parent == first.parent
+                && d.format == first.format
+                && (d.n, d.k, d.rows) == (first.n, first.k, first.rows)
+                && at == Some(d.row_begin);
+            if !regular {
+                return Err(Error::Unsupported(format!(
+                    "{what}: expert {e} is not at a constant row stride of one parent"
+                )));
+            }
+        }
+        if stride < first.rows {
+            return Err(Error::Config(format!("{what}: experts overlap")));
+        }
+        Ok(ExpertBank {
+            first: WDesc {
+                act: views.iter().fold(first.act, |a, d| a.meet(d.act)),
+                ..*first
+            },
+            experts: views.len(),
+            stride,
+        })
+    }
+
+    pub fn expert(&self, e: usize) -> WDesc {
+        WDesc {
+            row_begin: self.first.row_begin + e * self.stride,
+            ..self.first
+        }
+    }
+}
+
+/// A sparse MoE FFN (`Qwen3_5MoeForCausalLM`):
+///
+/// ```text
+/// p = softmax(router(h)); (w, ids) = top_k(p); w /= sum(w)
+/// y = sum_j w_j * down[ids_j](silu(gate[ids_j](h)) * up[ids_j](h)) + sigmoid(shared_score(h)) * shared(h)
+/// ```
+pub struct MoeFfn {
+    /// `[experts, hidden]` router logits.
+    pub router: WDesc,
+    /// `[1, hidden]` shared-expert gate logit.
+    pub shared_score: WDesc,
+    /// router and shared score as one view when adjacent in one parent (one GEMM).
+    pub router_score: Option<WDesc>,
+    /// Routed experts: gate and up `[intermediate, hidden]`, down `[hidden, intermediate]`. Gate
+    /// and up may interleave in one parent (ninfer stores expert e's gate then up at rows
+    /// `2e * I` and `(2e + 1) * I`).
+    pub gate: ExpertBank,
+    pub up: ExpertBank,
+    pub down: ExpertBank,
+    pub shared: DenseFfn,
+}
+
+// One per layer, built once at load: the variant size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum Ffn {
+    Dense(DenseFfn),
+    Moe(MoeFfn),
+}
+
 pub struct Layer {
     pub input_norm: usize,
     pub post_norm: usize,
     pub mixer: Mixer,
-    pub mlp_gate: WDesc,
-    pub mlp_up: WDesc,
-    pub mlp_down: WDesc,
-    /// gate and up as one view when adjacent in one parent.
-    pub mlp_gate_up: Option<WDesc>,
+    pub ffn: Ffn,
 }
 
 pub struct TextWeights<B: Backend> {
@@ -458,8 +547,9 @@ impl<'a, B: Backend> Loader<'a, B> {
     }
 }
 
-/// MTP predictor weights (`Qwen3_5MTP`): stem norms and input projection, one attention block
-/// with the target's geometry, and a final norm. Embedding and output head are the target's.
+/// MTP predictor weights (`Qwen3_5MTP`, or `Qwen3_5MoeMTP` whose block FFN is MoE like the
+/// target's): stem norms and input projection, one attention block with the target's geometry,
+/// and a final norm. Embedding and output head are the target's.
 pub struct MtpWeights {
     pub input_projection: WDesc,
     pub embedding_norm: usize,
@@ -511,21 +601,82 @@ fn finish_layer<B: Backend>(
     input_norm: usize,
     mixer: Mixer,
 ) -> Result<Layer> {
-    let layer = Layer {
+    let post_norm = l.param(&p("post_attention_norm"), cfg.hidden)?;
+    let ffn = match &cfg.ffn {
+        FfnConfig::Dense { intermediate } => Ffn::Dense(load_swiglu(
+            l,
+            cfg,
+            &|s| p(&format!("mlp/{s}")),
+            *intermediate,
+        )?),
+        FfnConfig::Moe(m) => Ffn::Moe(load_moe(l, cfg, p, m)?),
+    };
+    Ok(Layer {
         input_norm,
-        post_norm: l.param(&p("post_attention_norm"), cfg.hidden)?,
+        post_norm,
         mixer,
-        mlp_gate: l.matrix(&p("mlp/gate"))?,
-        mlp_up: l.matrix(&p("mlp/up"))?,
-        mlp_down: l.matrix(&p("mlp/down"))?,
-        mlp_gate_up: None,
+        ffn,
+    })
+}
+
+/// `{gate, up, down}` of a SwiGLU with the given intermediate width.
+fn load_swiglu<B: Backend>(
+    l: &mut Loader<'_, B>,
+    cfg: &TextConfig,
+    p: &dyn Fn(&str) -> String,
+    intermediate: usize,
+) -> Result<DenseFfn> {
+    let (gate, up, down) = (
+        l.matrix(&p("gate"))?,
+        l.matrix(&p("up"))?,
+        l.matrix(&p("down"))?,
+    );
+    expect(&p("gate"), gate.rows, intermediate)?;
+    expect(&p("up"), up.rows, intermediate)?;
+    expect(&p("down"), down.rows, cfg.hidden)?;
+    Ok(DenseFfn {
+        gate_up: fuse(&[&gate, &up]),
+        gate,
+        up,
+        down,
+    })
+}
+
+fn load_moe<B: Backend>(
+    l: &mut Loader<'_, B>,
+    cfg: &TextConfig,
+    p: &dyn Fn(&str) -> String,
+    m: &MoeConfig,
+) -> Result<MoeFfn> {
+    let router = l.matrix(&p("moe/router"))?;
+    let shared_score = l.matrix(&p("moe/shared_score"))?;
+    expect(&p("moe/router"), router.rows, m.experts)?;
+    expect(&p("moe/shared_score"), shared_score.rows, 1)?;
+    let mut bank = |role: &str, rows: usize| -> Result<ExpertBank> {
+        let views = (0..m.experts)
+            .map(|e| l.matrix(&p(&format!("moe/experts/{e}/{role}"))))
+            .collect::<Result<Vec<_>>>()?;
+        let bank = ExpertBank::from_experts(&p(&format!("moe/experts/*/{role}")), &views)?;
+        expect(&p(&format!("moe/experts/0/{role}")), bank.first.rows, rows)?;
+        Ok(bank)
     };
-    let layer = Layer {
-        mlp_gate_up: fuse(&[&layer.mlp_gate, &layer.mlp_up]),
-        ..layer
-    };
-    expect(&p("mlp gate"), layer.mlp_gate.rows, cfg.intermediate)?;
-    Ok(layer)
+    let gate = bank("gate", m.intermediate)?;
+    let up = bank("up", m.intermediate)?;
+    let down = bank("down", cfg.hidden)?;
+    Ok(MoeFfn {
+        router_score: fuse(&[&router, &shared_score]),
+        router,
+        shared_score,
+        gate,
+        up,
+        down,
+        shared: load_swiglu(
+            l,
+            cfg,
+            &|s| p(&format!("moe/shared/{s}")),
+            m.shared_intermediate,
+        )?,
+    })
 }
 
 fn has_binding(art: &Artifact, name: &str) -> bool {
@@ -603,4 +754,56 @@ pub fn fuse(parts: &[&WDesc]) -> Option<WDesc> {
         act,
         ..**first
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(parent: usize, row_begin: usize, rows: usize) -> WDesc {
+        WDesc {
+            parent,
+            format: WeightFormat::Q4G64,
+            n: 64,
+            k: 128,
+            row_begin,
+            rows,
+            act: ActPolicy::A16Only,
+        }
+    }
+
+    #[test]
+    fn interleaved_gate_up_form_two_banks() {
+        // ninfer's layout: expert e's gate at rows 2e*I, its up at (2e + 1)*I.
+        let i = 8;
+        let gates: Vec<_> = (0..4).map(|e| view(0, 2 * e * i, i)).collect();
+        let ups: Vec<_> = (0..4).map(|e| view(0, (2 * e + 1) * i, i)).collect();
+        let (g, u) = (
+            ExpertBank::from_experts("gate", &gates).unwrap(),
+            ExpertBank::from_experts("up", &ups).unwrap(),
+        );
+        assert_eq!((g.experts, g.stride, u.stride), (4, 2 * i, 2 * i));
+        assert_eq!(u.expert(3), ups[3]);
+    }
+
+    #[test]
+    fn irregular_experts_are_refused() {
+        let i = 8;
+        let mut v: Vec<_> = (0..3).map(|e| view(0, e * i, i)).collect();
+        assert_eq!(ExpertBank::from_experts("down", &v).unwrap().stride, i);
+        v[2].row_begin += 1;
+        assert!(ExpertBank::from_experts("down", &v).is_err());
+        v[2] = view(1, 2 * i, i);
+        assert!(ExpertBank::from_experts("down", &v).is_err());
+        let reversed: Vec<_> = (0..3).rev().map(|e| view(0, e * i, i)).collect();
+        assert!(ExpertBank::from_experts("down", &reversed).is_err());
+        let overlapping: Vec<_> = (0..3).map(|e| view(0, e * 4, i)).collect();
+        assert!(ExpertBank::from_experts("down", &overlapping).is_err());
+    }
+
+    #[test]
+    fn one_expert_is_a_bank() {
+        let b = ExpertBank::from_experts("gate", &[view(0, 16, 8)]).unwrap();
+        assert_eq!((b.experts, b.stride, b.expert(0).row_begin), (1, 8, 16));
+    }
 }

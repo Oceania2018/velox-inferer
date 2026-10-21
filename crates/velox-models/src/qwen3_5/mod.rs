@@ -1,4 +1,5 @@
-//! Qwen3.5 / Qwen3.8 text model (`Qwen3_5ForCausalLM`): Gated DeltaNet + gated attention hybrid.
+//! Qwen3.5 / Qwen3.6 / Qwen3.8 text model (`Qwen3_5ForCausalLM` Dense, `Qwen3_5MoeForCausalLM` sparse
+//! MoE): Gated DeltaNet + gated attention hybrid.
 //! The mathematics is specified in docs/qwen3_5-text.md.
 
 mod config;
@@ -14,7 +15,9 @@ use velox_core::backend::{
 };
 use velox_core::{CopySpec, Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
-pub use config::{LayerKind, TextConfig};
+pub use config::{
+    FfnConfig, LayerKind, MoeConfig, TextConfig, DENSE_ARCHITECTURE, MOE_ARCHITECTURE,
+};
 pub use dflash::{
     BlockCandidates, DFlashConfig, DFlashModel, DFlashState, DFlashWorkspace, DraftContext,
     DRAFT_PAGE_ROWS,
@@ -22,7 +25,7 @@ pub use dflash::{
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use paging::{KvChunkSet, KvShare};
 pub use vision::{Qwen35Vision, VisionConfig};
-pub use weights::{Layer, Mixer, TextWeights, WDesc};
+pub use weights::{DenseFfn, ExpertBank, Ffn, Layer, Mixer, MoeFfn, TextWeights, WDesc};
 
 /// Per-sequence state: attention KV caches, GDN convolution and recurrent states, position.
 pub struct Session<B: Backend> {
@@ -608,10 +611,12 @@ impl<B: Backend> Qwen35Text<B> {
             qn: b.alloc(t * c.q_dim())?,
             kn: b.alloc(t * c.kv_dim())?,
             attn: b.alloc(t * c.q_dim())?,
-            mg: b.alloc(t * c.intermediate)?,
-            mu: b.alloc(t * c.intermediate)?,
+            // The dense SwiGLU (a MoE block's shared expert); routed experts will need their own
+            // scratch once the MoE ops land.
+            mg: b.alloc(t * c.mlp_width())?,
+            mu: b.alloc(t * c.mlp_width())?,
             fused: b.alloc(tf * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
-            gu: b.alloc(tf * 2 * c.intermediate)?,
+            gu: b.alloc(tf * 2 * c.mlp_width())?,
             last: b.alloc(c.hidden)?,
             last_n: b.alloc(c.hidden)?,
             logits: b.alloc(c.vocab)?,
@@ -1185,25 +1190,36 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
-    /// Dense FFN of one layer: `ws.h` to `ws.y`.
+    /// FFN of one layer: `ws.h` to `ws.y`. Every forward path (chunks, verify, batched verify, MTP)
+    /// goes through here, so a new FFN kind only needs an arm in this match.
     fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize) -> Result<()> {
-        let (c, w) = (&self.cfg, &self.w);
-        match l.mlp_gate_up.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
+        match &l.ffn {
+            Ffn::Dense(d) => self.swiglu_ffn(b, ws, d, t),
+            Ffn::Moe(_) => Err(Error::Unsupported(
+                "sparse MoE FFN execution (planned ops moe_route / moe_experts, see \
+                 docs/qwen3_5-text.md) is not implemented yet"
+                    .into(),
+            )),
+        }
+    }
+
+    /// `ws.y = down(silu(gate(ws.h)) * up(ws.h))`.
+    fn swiglu_ffn(&self, b: &B, ws: &mut Workspace<B>, d: &DenseFfn, t: usize) -> Result<()> {
+        let w = &self.w;
+        let width = d.gate.rows;
+        match d.gate_up.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
             Some(f) => {
                 b.linear(&ws.h, &w.view(f), &mut ws.gu, t)?;
-                let (g, u) = (
-                    l.mlp_gate.row_begin - f.row_begin,
-                    l.mlp_up.row_begin - f.row_begin,
-                );
-                b.swiglu(&ws.gu, t, f.rows, g, u, c.intermediate, &mut ws.mg)?;
+                let (g, u) = (d.gate.row_begin - f.row_begin, d.up.row_begin - f.row_begin);
+                b.swiglu(&ws.gu, t, f.rows, g, u, width, &mut ws.mg)?;
             }
             None => {
-                b.linear(&ws.h, &w.view(&l.mlp_gate), &mut ws.mg, t)?;
-                b.linear(&ws.h, &w.view(&l.mlp_up), &mut ws.mu, t)?;
-                b.silu_mul(&mut ws.mg, &ws.mu, t * c.intermediate)?;
+                b.linear(&ws.h, &w.view(&d.gate), &mut ws.mg, t)?;
+                b.linear(&ws.h, &w.view(&d.up), &mut ws.mu, t)?;
+                b.silu_mul(&mut ws.mg, &ws.mu, t * width)?;
             }
         }
-        b.linear(&ws.mg, &w.view(&l.mlp_down), &mut ws.y, t)
+        b.linear(&ws.mg, &w.view(&d.down), &mut ws.y, t)
     }
 
     /// [`Self::advance`] that also hands every chunk's rows to `on_chunk` (with `ws.keep_rows`
