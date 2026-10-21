@@ -238,8 +238,16 @@ impl<B: Backend> MtpDrafter<B> {
 /// Speculative decoding with the DFlash2 block drafter: one masked-block forward proposes
 /// `drafts` tokens, each with the proposal distribution it was drawn from, so verification can
 /// use min(1, p / q) and the residual max(p - q, 0).
+/// The short DFlash block (drafts per round) every request starts with; see [`DFlashDrafter::observe`].
+const ADAPT_LOW: usize = 7;
+
 pub struct DFlashDrafter<B: Backend> {
+    /// Drafts in the next block (adapted by [`Self::observe`] between `low` and `max`).
     pub drafts: usize,
+    max: usize,
+    low: usize,
+    /// Running mean of accepted drafts per round.
+    accepted: f32,
     state: DFlashState<B>,
     dw: DFlashWorkspace<B>,
     rng: Rng,
@@ -253,13 +261,35 @@ impl<B: Backend> DFlashDrafter<B> {
         ctx_rows: usize,
         drafts: usize,
     ) -> Result<Self> {
-        let drafts = drafts.clamp(1, velox_models::qwen3_5::VERIFY_MAX - 1);
+        let max = drafts.clamp(1, velox_models::qwen3_5::VERIFY_MAX - 1);
+        let low = max.min(ADAPT_LOW);
         Ok(DFlashDrafter {
-            drafts,
+            drafts: low,
+            max,
+            low,
+            accepted: low as f32,
             state: dm.state(b)?,
-            dw: dm.workspace(b, target, ctx_rows, drafts + 1)?,
+            dw: dm.workspace(b, target, ctx_rows, max + 1)?,
             rng: Rng::new(0x5eed_df1a),
         })
+    }
+
+    /// Starts a request at the short block.
+    pub fn reset(&mut self) {
+        self.drafts = self.low;
+        self.accepted = self.low as f32;
+    }
+
+    /// Adapts the block to how many drafts the last round accepted: the long block while nearly
+    /// every draft of the short one would be accepted (predictable text: more tokens per round for
+    /// about the same verify cost), else the short one (a longer window then only costs more).
+    pub fn observe(&mut self, accepted: usize) {
+        self.accepted = 0.5 * self.accepted + 0.5 * accepted as f32;
+        self.drafts = if self.accepted >= self.low as f32 - 0.5 {
+            self.max
+        } else {
+            self.low
+        };
     }
 
     /// Context for one target prefill chunk: `t` rows at cache rows `row0 ..` whose features the
