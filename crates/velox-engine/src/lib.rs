@@ -127,7 +127,9 @@ const DEVICE_HEADS: usize = 2;
 /// Checkpoint storage kept for reuse per lane beyond the live checkpoints.
 const MAX_SPARE: usize = 4;
 
-/// Prompt tokens per mixed step (see `batch_round`): `VELOX_MIXED_CHUNK`, default 512.
+/// Prompt tokens per mixed step (see `batch_round`): `VELOX_MIXED_CHUNK`, default a whole
+/// workspace chunk (mixed steps run eagerly: short ones pay launch overhead, measured worse at
+/// 256 and 512).
 fn mixed_chunk() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -135,7 +137,7 @@ fn mixed_chunk() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n: &usize| n > 0)
-            .unwrap_or(512)
+            .unwrap_or(usize::MAX)
     })
 }
 
