@@ -73,6 +73,11 @@ pub(crate) struct ContextStore<B: Backend> {
 /// Evicted state storage kept for reuse.
 const MAX_SPARE: usize = 4;
 
+/// Storage [`ContextStore::top_up`] keeps ready: two states (a chain head and an anchor) and
+/// 8K positions of KV pages.
+const RESERVE_STATES: usize = 2;
+const RESERVE_PAGES: usize = 32;
+
 impl<B: Backend> ContextStore<B> {
     /// A store of at most `budget` bytes ranking entries by LRFU with decay `lambda` per request.
     pub fn new(budget: usize, lambda: f64, disk: Option<DiskTier>) -> Self {
@@ -176,6 +181,33 @@ impl<B: Backend> ContextStore<B> {
         });
         self.evict(b, id)?;
         Ok(true)
+    }
+
+    /// One step of preparing pinned storage while the server is idle: keeps a reserve of
+    /// [`RESERVE_STATES`] states and [`RESERVE_PAGES`] KV pages within the budget, so captures
+    /// do not pin memory on the request path. Returns whether there may be more to do.
+    pub fn top_up(&mut self, b: &B, session: &Session<B>) -> Result<bool, CoreError> {
+        if !self.enabled() {
+            return Ok(false);
+        }
+        let page_len = session.kv_page_len();
+        let pinned = self.bytes(b)
+            + self.spare.iter().map(|s| s.bytes(b)).sum::<usize>()
+            + self.pages.len() * page_len * 4;
+        if pinned >= self.budget {
+            return Ok(false);
+        }
+        if self.spare.len() < RESERVE_STATES {
+            self.spare.push(session.blank_checkpoint_in(b, 0, true)?);
+            return Ok(true);
+        }
+        if self.pages.len() < RESERVE_PAGES {
+            for _ in 0..4 {
+                self.pages.push(b.alloc_host(page_len)?);
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// The deepest entry position on the prefix of `keys` at or below `limit` (0 when none).

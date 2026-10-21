@@ -17,6 +17,7 @@ use store::ContextStore;
 
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -122,6 +123,8 @@ pub struct QwenEngine<B: Backend> {
     fe: Frontend,
     cfg: EngineConfig,
     state: Mutex<Lanes<B>>,
+    /// Requests waiting for `state` (idle work yields to them).
+    pending: AtomicUsize,
     special: SpecialTokens,
 }
 
@@ -369,6 +372,7 @@ impl<B: Backend> QwenEngine<B> {
             fe,
             cfg,
             state,
+            pending: AtomicUsize::new(0),
             special,
         })
     }
@@ -815,6 +819,26 @@ where
         "Qwen3_5ForCausalLM"
     }
 
+    fn idle(&self) {
+        if self.b.bind_thread().is_err() {
+            return;
+        }
+        while self.pending.load(Ordering::SeqCst) == 0 {
+            let Ok(mut st) = self.state.try_lock() else {
+                return;
+            };
+            let Lanes { lanes, store, .. } = &mut *st;
+            match store.top_up(&self.b, &lanes[0].session) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => {
+                    eprintln!("context store: reserve allocation failed: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
         let t_req = Instant::now();
         self.b.bind_thread().map_err(core)?;
@@ -875,10 +899,11 @@ where
         }
         let mut sampler = Sampler::from_request(req, thinking);
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| core(CoreError::Backend("engine lanes poisoned".into())))?;
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        let state = self.state.lock();
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+        let mut state =
+            state.map_err(|_| core(CoreError::Backend("engine lanes poisoned".into())))?;
         let Lanes { ws, lanes, store } = &mut *state;
         let li = Self::pick_lane(lanes, &p.keys, p.ids.len() + max_tokens)
             .ok_or_else(|| ApiError::invalid("no lane can hold this request"))?;
