@@ -85,17 +85,21 @@ static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 struct Spec<B: Backend> {
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
-    /// Per GDN layer: `[VERIFY_MAX, gdn_qkv]` raw qkv and conv outputs, `[VERIFY_MAX, 2 *
-    /// v_heads]` a/b rows (what commit replays a partially accepted window from).
-    qkv: Vec<B::Buffer>,
-    conv_out: Vec<B::Buffer>,
-    ab: Vec<B::Buffer>,
     pos0: usize,
     tokens: usize,
     recording: bool,
     /// Set by [`Qwen35Text::verify_batch`]: the window's replay inputs are rows `row0 ..` of the
-    /// batch workspace rather than `qkv` / `conv_out` / `ab` above.
+    /// batch workspace rather than the workspace's [`SpecRows`].
     batch_row0: Option<usize>,
+}
+
+/// Per GDN layer: `[VERIFY_MAX, gdn_qkv]` raw qkv and conv outputs and `[VERIFY_MAX, 2 * v_heads]`
+/// a/b rows of the latest verify window (what commit replays a partially accepted window from).
+/// One set in the workspace serves every session: a commit follows its verify.
+struct SpecRows<B: Backend> {
+    qkv: Vec<B::Buffer>,
+    conv_out: Vec<B::Buffer>,
+    ab: Vec<B::Buffer>,
 }
 
 /// Buffers for [`Qwen35Text::verify_batch`]: several sequences' windows (at most
@@ -430,6 +434,11 @@ pub struct Workspace<B: Backend> {
     /// f32 copies of a quantized cache's visible rows for long chunks (grown on demand), so they
     /// attend with the f32 prefill kernels instead of decoding packed rows per query.
     kv_f32: Option<(B::Buffer, B::Buffer)>,
+    /// Verify replay rows (allocated with the first verify).
+    spec_rows: Option<SpecRows<B>>,
+    /// `emb` / `rows_hidden` hold `max_tokens` rows (MTP drafting reads them); without, they are
+    /// placeholders and `keep_rows` does not fill them.
+    rows: bool,
 }
 
 pub struct Qwen35Text<B: Backend> {
@@ -487,8 +496,17 @@ impl<B: Backend> Qwen35Text<B> {
     }
 
     pub fn workspace(&self, b: &B, max_tokens: usize) -> Result<Workspace<B>> {
+        self.workspace_with(b, max_tokens, true)
+    }
+
+    /// [`Self::workspace`]; `rows`: whether chunks can keep their embeddings and final hidden rows
+    /// (`Workspace::keep_rows`, which MTP drafting needs and DFlash does not).
+    pub fn workspace_with(&self, b: &B, max_tokens: usize, rows: bool) -> Result<Workspace<B>> {
         let c = &self.cfg;
         let t = max_tokens;
+        // Fused projections and the fused MLP gate|up only run up to FUSE_MAX_TOKENS rows.
+        let tf = t.min(FUSE_MAX_TOKENS);
+        let tr = if rows { t } else { 1 };
         Ok(Workspace {
             max_tokens,
             x: b.alloc(t * c.hidden)?,
@@ -508,8 +526,8 @@ impl<B: Backend> Qwen35Text<B> {
             attn: b.alloc(t * c.q_dim())?,
             mg: b.alloc(t * c.intermediate)?,
             mu: b.alloc(t * c.intermediate)?,
-            fused: b.alloc(t * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
-            gu: b.alloc(t * 2 * c.intermediate)?,
+            fused: b.alloc(tf * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
+            gu: b.alloc(tf * 2 * c.intermediate)?,
             last: b.alloc(c.hidden)?,
             last_n: b.alloc(c.hidden)?,
             logits: b.alloc(c.vocab)?,
@@ -517,11 +535,13 @@ impl<B: Backend> Qwen35Text<B> {
             logits_rows: b.alloc(VERIFY_MAX * c.vocab)?,
             last_row: 0,
             keep_rows: false,
-            emb: b.alloc(t * c.hidden)?,
-            rows_hidden: b.alloc(t * c.hidden)?,
+            emb: b.alloc(tr * c.hidden)?,
+            rows_hidden: b.alloc(tr * c.hidden)?,
             capture: Vec::new(),
             kv_f32: None,
             features: None,
+            spec_rows: None,
+            rows,
         })
     }
 
@@ -674,7 +694,7 @@ impl<B: Backend> Qwen35Text<B> {
                 b.copy(ins.buf, src, &mut ws.x, (lo - base) * hd, (hi - lo) * hd)?;
             }
         }
-        if ws.keep_rows {
+        if ws.keep_rows && ws.rows {
             b.copy(&ws.x, 0, &mut ws.emb, 0, t * hd)?;
         }
         // Axis-major [3, t] positions for explicit MRoPE, else cache position + rope_delta.
@@ -739,22 +759,26 @@ impl<B: Backend> Qwen35Text<B> {
                         ssm: s_ssm,
                         ..
                     } = &mut *s;
-                    let (qkv_buf, ab_buf, mut state_out) =
-                        match spec.as_mut().filter(|sp| sp.recording) {
+                    let (qkv_buf, ab_buf, mut state_out) = match (
+                        spec.as_mut().filter(|sp| sp.recording),
+                        ws.spec_rows.as_mut(),
+                    ) {
+                        (
                             Some(Spec {
+                                conv: sc, ssm: ss, ..
+                            }),
+                            Some(SpecRows {
                                 qkv: sq,
                                 conv_out: so,
                                 ab: sa,
-                                conv: sc,
-                                ssm: ss,
-                                ..
-                            }) => (
-                                &mut sq[gi],
-                                &mut sa[gi],
-                                Some((&mut sc[gi], &mut ss[gi], &mut so[gi])),
-                            ),
-                            None => (&mut ws.qkv, &mut ws.ab, None),
-                        };
+                            }),
+                        ) => (
+                            &mut sq[gi],
+                            &mut sa[gi],
+                            Some((&mut sc[gi], &mut ss[gi], &mut so[gi])),
+                        ),
+                        _ => (&mut ws.qkv, &mut ws.ab, None),
+                    };
                     match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
                         Some(f) => {
                             b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
@@ -855,7 +879,7 @@ impl<B: Backend> Qwen35Text<B> {
         }
         b.add(&mut ws.x, &ws.y, t * hd)?;
         self.capture_features(b, ws, w.layers.len() - 1, t)?;
-        if ws.keep_rows {
+        if ws.keep_rows && ws.rows {
             b.rms_norm(
                 &ws.x,
                 w.param(w.final_norm),
@@ -1133,6 +1157,7 @@ impl<B: Backend> Qwen35Text<B> {
             )));
         }
         self.ensure_spec(b, s)?;
+        self.ensure_spec_rows(b, ws)?;
         if s.pos + t > s.capacity {
             return Err(Error::Config(format!(
                 "{} + {t} tokens exceed session capacity {}",
@@ -1182,7 +1207,7 @@ impl<B: Backend> Qwen35Text<B> {
         &self,
         b: &B,
         s: &mut Session<B>,
-        _ws: &mut Workspace<B>,
+        ws: &mut Workspace<B>,
         keep: usize,
     ) -> Result<()> {
         let c = &self.cfg;
@@ -1219,7 +1244,10 @@ impl<B: Backend> Qwen35Text<B> {
         } else {
             // The session still holds the state before the window: advance it over the kept
             // prefix from the recorded inputs, every GDN layer in one step per kept length.
-            let sp = &*sp;
+            let rows = ws
+                .spec_rows
+                .as_ref()
+                .ok_or_else(|| Error::Config("commit without verify rows".into()))?;
             b.graph(key, &mut || {
                 if keep == 0 {
                     return Ok(());
@@ -1234,9 +1262,9 @@ impl<B: Backend> Qwen35Text<B> {
                     .zip(gdn_params)
                     .enumerate()
                     .map(|(gi, ((cs, ss), (a_log, dt_bias)))| GdnReplayLayer {
-                        qkv: &sp.qkv[gi],
-                        conv_out: &sp.conv_out[gi],
-                        ab: &sp.ab[gi],
+                        qkv: &rows.qkv[gi],
+                        conv_out: &rows.conv_out[gi],
+                        ab: &rows.ab[gi],
                         a_log: self.w.param(a_log),
                         dt_bias: self.w.param(dt_bias),
                         conv_state: cs,
@@ -1270,29 +1298,42 @@ impl<B: Backend> Qwen35Text<B> {
         if s.spec.is_some() {
             return Ok(());
         }
-        let c = &self.cfg;
         let like = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
             bufs.iter().map(|x| b.alloc(b.len(x))).collect()
         };
-        let gdn = s.ssm.len();
         s.spec = Some(Spec {
             conv: like(&s.conv)?,
             ssm: like(&s.ssm)?,
-            qkv: (0..gdn)
-                .map(|_| b.alloc(VERIFY_MAX * c.gdn_qkv()))
-                .collect::<Result<_>>()?,
-            conv_out: (0..gdn)
-                .map(|_| b.alloc(VERIFY_MAX * c.gdn_qkv()))
-                .collect::<Result<_>>()?,
-            ab: (0..gdn)
-                .map(|_| b.alloc(VERIFY_MAX * 2 * c.gdn_v_heads))
-                .collect::<Result<_>>()?,
             pos0: 0,
             tokens: 0,
             recording: false,
             batch_row0: None,
         });
         Ok(())
+    }
+
+    fn ensure_spec_rows(&self, b: &B, ws: &mut Workspace<B>) -> Result<()> {
+        if ws.spec_rows.is_some() {
+            return Ok(());
+        }
+        let c = &self.cfg;
+        let gdn = c.layers.iter().filter(|l| **l == LayerKind::Gdn).count();
+        let per_layer = |w: usize| -> Result<Vec<B::Buffer>> {
+            (0..gdn).map(|_| b.alloc(VERIFY_MAX * w)).collect()
+        };
+        ws.spec_rows = Some(SpecRows {
+            qkv: per_layer(c.gdn_qkv())?,
+            conv_out: per_layer(c.gdn_qkv())?,
+            ab: per_layer(2 * c.gdn_v_heads)?,
+        });
+        Ok(())
+    }
+
+    /// Allocates what speculative verify needs for `s` and `ws` now rather than at the first
+    /// verify, so a server's memory is committed at startup.
+    pub fn reserve_verify(&self, b: &B, s: &mut Session<B>, ws: &mut Workspace<B>) -> Result<()> {
+        self.ensure_spec(b, s)?;
+        self.ensure_spec_rows(b, ws)
     }
 
     /// Buffers for batches of up to `max_seqs` sequences (see [`Self::verify_batch`]).
