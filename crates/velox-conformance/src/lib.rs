@@ -613,22 +613,28 @@ impl<B: Backend> Suite<'_, B> {
         let (wd, mut sd) = (self.b.upload(&w)?, self.b.upload(&state0)?);
         let mut sc = state0;
         for (i, tokens) in chunks.into_iter().enumerate() {
+            // The second call starts at a row offset (a segment of a chunk).
+            let row0 = 3 * i;
             let s = ConvShape {
                 tokens,
                 channels,
                 width,
+                row0,
             };
-            let x = self.rng.vec(tokens * channels, 1.0);
-            let mut want = vec![0.0; tokens * channels];
+            let rows = (row0 + tokens) * channels;
+            let x = self.rng.vec(rows, 1.0);
+            let mut want = vec![0.0; rows];
             CpuBackend.conv1d_silu(&x, &w, &mut sc, &mut want, s)?;
             let xd = self.b.upload(&x)?;
-            let mut od = self.b.alloc(tokens * channels)?;
+            let mut od = self.b.alloc(rows)?;
             self.b.conv1d_silu(&xd, &wd, &mut sd, &mut od, s)?;
-            let mut got = fetch(self.b, &od, tokens * channels)?;
+            want.drain(..row0 * channels);
+            let mut got = fetch(self.b, &od, rows)?;
+            got.drain(..row0 * channels);
             got.extend(fetch(self.b, &sd, (width - 1) * channels)?);
             want.extend_from_slice(&sc);
             let name =
-                format!("conv1d_silu c={channels} w={width} call {i} ({tokens} tokens) + state");
+                format!("conv1d_silu c={channels} w={width} call {i} ({tokens} tokens at row {row0}) + state");
             self.record(name, Some(Op::Conv1dSilu), &got, &want, 1e-5);
         }
         Ok(())
@@ -650,26 +656,32 @@ impl<B: Backend> Suite<'_, B> {
         let mut sd = self.b.alloc(state_len)?;
         let mut sc = vec![0.0; state_len];
         for (i, tokens) in chunks.into_iter().enumerate() {
+            let row0 = 3 * i;
             let s = GdnShape {
                 tokens,
                 k_heads,
                 v_heads,
                 k_dim,
                 v_dim,
+                row0,
             };
-            let qkv = self.rng.vec(tokens * s.qkv_width(), 1.0);
-            let ab = self.rng.vec(tokens * 2 * v_heads, 2.0);
-            let out_len = tokens * v_heads * v_dim;
+            let rows = row0 + tokens;
+            let qkv = self.rng.vec(rows * s.qkv_width(), 1.0);
+            let ab = self.rng.vec(rows * 2 * v_heads, 2.0);
+            let out_len = rows * v_heads * v_dim;
             let mut want = vec![0.0; out_len];
             CpuBackend.gated_delta_net(&qkv, &ab, &a_log, &dt_bias, &mut sc, &mut want, s)?;
             let (qd, abd) = (self.b.upload(&qkv)?, self.b.upload(&ab)?);
             let mut od = self.b.alloc(out_len)?;
             self.b
                 .gated_delta_net(&qd, &abd, &ad, &dd, &mut sd, &mut od, s)?;
+            let skip = row0 * v_heads * v_dim;
+            want.drain(..skip);
             let mut got = fetch(self.b, &od, out_len)?;
+            got.drain(..skip);
             got.extend(fetch(self.b, &sd, state_len)?);
             want.extend_from_slice(&sc);
-            let name = format!("gated_delta_net heads {k_heads}/{v_heads} d {k_dim}/{v_dim} call {i} ({tokens} tokens) + state");
+            let name = format!("gated_delta_net heads {k_heads}/{v_heads} d {k_dim}/{v_dim} call {i} ({tokens} tokens at row {row0}) + state");
             self.record(name, Some(Op::GatedDeltaNet), &got, &want, 1e-4);
         }
         Ok(())

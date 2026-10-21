@@ -177,7 +177,7 @@ pub fn conv1d(x: usize, weight: usize, state: usize, out: usize, s: &ConvShape) 
             "conv1d needs tokens, channels > 0 and width >= 2: {s:?}"
         )));
     }
-    let rows = product(&[s.tokens, s.channels])?;
+    let rows = product(&[s.row0 + s.tokens, s.channels])?;
     need("conv1d x", x, rows)?;
     need("conv1d weight", weight, product(&[s.width, s.channels])?)?;
     need("conv1d state", state, product(&[s.width - 1, s.channels])?)?;
@@ -204,12 +204,20 @@ pub fn gdn(
             s.v_heads, s.k_heads
         )));
     }
-    need("gdn qkv", qkv, product(&[s.tokens, s.qkv_width()])?)?;
-    need("gdn ab", ab, product(&[s.tokens, 2 * s.v_heads])?)?;
+    need(
+        "gdn qkv",
+        qkv,
+        product(&[s.row0 + s.tokens, s.qkv_width()])?,
+    )?;
+    need("gdn ab", ab, product(&[s.row0 + s.tokens, 2 * s.v_heads])?)?;
     need("gdn a_log", a_log, s.v_heads)?;
     need("gdn dt_bias", dt_bias, s.v_heads)?;
     need("gdn state", state, product(&[s.v_heads, s.v_dim, s.k_dim])?)?;
-    need("gdn out", out, product(&[s.tokens, s.v_heads, s.v_dim])?)
+    need(
+        "gdn out",
+        out,
+        product(&[s.row0 + s.tokens, s.v_heads, s.v_dim])?,
+    )
 }
 
 pub fn elementwise(what: &str, lens: &[usize], len: usize) -> Result<()> {
