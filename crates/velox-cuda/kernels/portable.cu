@@ -804,7 +804,7 @@ int attention_block_split(const float* q, const float* k_ctx, const float* v_ctx
 
 __global__ void dyn_conv_kernel(const float* __restrict__ x, const float* __restrict__ base,
                                 const float* __restrict__ delta, float* __restrict__ out, int rows, int channels,
-                                int group, int side, int accumulate) {
+                                int group, int side, int accumulate, int block) {
     const long long n = static_cast<long long>(rows) * channels;
     const int g_n = channels / group;
     for (long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
@@ -813,7 +813,7 @@ __global__ void dyn_conv_kernel(const float* __restrict__ x, const float* __rest
         const float* d = delta + static_cast<size_t>(i) * 4 * g_n;
         const int t0 = 2 * side, t1 = 2 * side + 1;
         float y = (base[t0 * channels + h] + d[t0 * g_n + g]) * x[idx];
-        if (i > 0) y += (base[t1 * channels + h] + d[t1 * g_n + g]) * x[idx - channels];
+        if (i % block > 0) y += (base[t1 * channels + h] + d[t1 * g_n + g]) * x[idx - channels];
         out[idx] = accumulate ? out[idx] + y : y;
     }
 }
@@ -848,11 +848,14 @@ VELOX_API int velox_portable_attention_block(const float* q, const float* k_ctx,
                                     ctx_lo, window, ring);
 }
 
+// block: rows per independent block (several sequences' draft blocks).
 VELOX_API int velox_portable_dyn_conv(const float* x, const float* base, const float* delta, float* out, int rows,
-                                      int channels, int group, int side, int accumulate) {
+                                      int channels, int group, int side, int accumulate, int block) {
     const long long n = static_cast<long long>(rows) * channels;
     if (n == 0) return 0;
-    dyn_conv_kernel<<<velox_grid_1d(n, 256), 256>>>(x, base, delta, out, rows, channels, group, side, accumulate);
+    if (block <= 0) return VELOX_ERR_UNSUPPORTED;
+    dyn_conv_kernel<<<velox_grid_1d(n, 256), 256>>>(x, base, delta, out, rows, channels, group, side, accumulate,
+                                                    block);
     return velox_launch_status();
 }
 
