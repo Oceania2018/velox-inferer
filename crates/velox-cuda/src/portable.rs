@@ -628,9 +628,21 @@ pub fn gdn_replay(
     conv: ConvShape,
     gdn: GdnShape,
 ) -> Result<()> {
-    let qkv: Vec<*const f32> = layers.iter().map(|l| l.qkv.as_ptr()).collect();
-    let conv_out: Vec<*const f32> = layers.iter().map(|l| l.conv_out.as_ptr()).collect();
-    let ab: Vec<*const f32> = layers.iter().map(|l| l.ab.as_ptr()).collect();
+    // The window starts at row0 of the per-row inputs; the kernels read from row 0 of these.
+    let (r, ch, abw) = (conv.row0, conv.channels, 2 * gdn.v_heads);
+    // SAFETY: offsets inside the buffers (check::gdn_replay_layer covered row0 + tokens rows).
+    let qkv: Vec<*const f32> = layers
+        .iter()
+        .map(|l| unsafe { l.qkv.as_ptr().add(r * ch) })
+        .collect();
+    let conv_out: Vec<*const f32> = layers
+        .iter()
+        .map(|l| unsafe { l.conv_out.as_ptr().add(r * ch) })
+        .collect();
+    let ab: Vec<*const f32> = layers
+        .iter()
+        .map(|l| unsafe { l.ab.as_ptr().add(r * abw) })
+        .collect();
     let a_log: Vec<*const f32> = layers.iter().map(|l| l.a_log.as_ptr()).collect();
     let dt_bias: Vec<*const f32> = layers.iter().map(|l| l.dt_bias.as_ptr()).collect();
     let conv_state: Vec<*mut f32> = layers

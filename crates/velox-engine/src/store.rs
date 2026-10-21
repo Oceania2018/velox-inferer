@@ -260,6 +260,14 @@ impl<B: Backend> ContextStore<B> {
         Ok(false)
     }
 
+    /// Whether an entry (resident or being copied to disk) holds exactly `keys`.
+    pub fn holds(&self, keys: &[u32]) -> bool {
+        self.entries
+            .iter()
+            .chain(self.inflight.iter().map(|(_, e)| e))
+            .any(|e| e.keys == keys)
+    }
+
     /// The deepest entry position on the prefix of `keys` at or below `limit` (0 when none).
     pub fn best_pos(&self, keys: &[u32], limit: usize) -> usize {
         self.best(keys, limit).map_or(0, |e| e.pos())
