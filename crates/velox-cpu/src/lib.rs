@@ -5,8 +5,8 @@
 //! change its numerics.
 
 use velox_core::backend::{
-    top_k_row, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind,
-    NormKind, RopePosShape, RopeShape, WeightView,
+    top_k_row, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
+    DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::decode_rows;
 use velox_core::{check, DeviceProfile, Op, Result};
@@ -272,6 +272,111 @@ impl Backend for CpuBackend {
                 for (c, oc) in o.iter_mut().enumerate() {
                     let acc: f64 = (0..visible)
                         .map(|j| scores[j] * f64::from(v[(j * s.kv_heads + kvh) * d + c]))
+                        .sum();
+                    *oc = (acc / denom) as f32;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn copy2d(&self, src: &Vec<f32>, dst: &mut Vec<f32>, s: Copy2dShape) -> Result<()> {
+        check::copy2d(src.len(), dst.len(), &s)?;
+        for r in 0..s.rows {
+            let (a, b) = (
+                s.src_offset + r * s.src_stride,
+                s.dst_offset + r * s.dst_stride,
+            );
+            dst[b..b + s.cols].copy_from_slice(&src[a..a + s.cols]);
+        }
+        Ok(())
+    }
+
+    fn dyn_conv(
+        &self,
+        x: &Vec<f32>,
+        base: &Vec<f32>,
+        delta: &Vec<f32>,
+        out: &mut Vec<f32>,
+        s: DynConvShape,
+    ) -> Result<()> {
+        check::dyn_conv(x.len(), base.len(), delta.len(), out.len(), &s)?;
+        let (c, g_n) = (s.channels, s.channels / s.group);
+        let (t0, t1) = (2 * s.side, 2 * s.side + 1);
+        for i in 0..s.rows {
+            let d = &delta[i * 4 * g_n..][..4 * g_n];
+            for h in 0..c {
+                let g = h / s.group;
+                let mut y = (f64::from(base[t0 * c + h]) + f64::from(d[t0 * g_n + g]))
+                    * f64::from(x[i * c + h]);
+                if i > 0 {
+                    y += (f64::from(base[t1 * c + h]) + f64::from(d[t1 * g_n + g]))
+                        * f64::from(x[(i - 1) * c + h]);
+                }
+                let o = &mut out[i * c + h];
+                *o = if s.accumulate {
+                    (f64::from(*o) + y) as f32
+                } else {
+                    y as f32
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn attention_block(
+        &self,
+        q: &Vec<f32>,
+        k_ctx: &Vec<f32>,
+        v_ctx: &Vec<f32>,
+        k_blk: &Vec<f32>,
+        v_blk: &Vec<f32>,
+        out: &mut Vec<f32>,
+        s: BlockAttnShape,
+    ) -> Result<()> {
+        check::attention_block(
+            q.len(),
+            k_ctx.len(),
+            v_ctx.len(),
+            k_blk.len(),
+            v_blk.len(),
+            out.len(),
+            &s,
+        )?;
+        let d = s.head_dim;
+        let group = s.heads / s.kv_heads;
+        let scale = 1.0 / (d as f64).sqrt();
+        for t in 0..s.tokens {
+            // Key rows: (buffer is context, row) for the visible context, then the block.
+            let keys: Vec<(bool, usize)> = (s.ctx_start(t)..s.pos0)
+                .map(|p| (true, p % s.ring))
+                .chain((0..s.tokens).map(|j| (false, j)))
+                .collect();
+            for h in 0..s.heads {
+                let kvh = h / group;
+                let qv = &q[(t * s.heads + h) * d..][..d];
+                let row = |ctx: bool, r: usize, which: usize| -> &[f32] {
+                    let buf = match (ctx, which) {
+                        (true, 0) => k_ctx,
+                        (true, _) => v_ctx,
+                        (false, 0) => k_blk,
+                        (false, _) => v_blk,
+                    };
+                    &buf[(r * s.kv_heads + kvh) * d..][..d]
+                };
+                let scores: Vec<f64> = keys
+                    .iter()
+                    .map(|&(c, r)| dot(qv, row(c, r, 0)) * scale)
+                    .collect();
+                let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = scores.iter().map(|sc| (sc - max).exp()).collect();
+                let denom: f64 = e.iter().sum();
+                let o = &mut out[(t * s.heads + h) * d..][..d];
+                for (c, oc) in o.iter_mut().enumerate() {
+                    let acc: f64 = keys
+                        .iter()
+                        .zip(&e)
+                        .map(|(&(ctx, r), w)| w * f64::from(row(ctx, r, 1)[c]))
                         .sum();
                     *oc = (acc / denom) as f32;
                 }

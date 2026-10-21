@@ -2,7 +2,8 @@
 //! fails identically on CPU, CUDA and future backends instead of reading out of bounds.
 
 use crate::backend::{
-    AttnShape, ConvShape, FullAttnShape, GdnShape, RopePosShape, RopeShape, WeightView,
+    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnShape,
+    RopePosShape, RopeShape, WeightView,
 };
 use crate::error::{Error, Result};
 
@@ -253,6 +254,70 @@ pub fn attention(q: usize, k: usize, v: usize, out: usize, s: &AttnShape) -> Res
     need("attention k", k, kv)?;
     need("attention v", v, kv)?;
     need("attention out", out, q_len)
+}
+
+pub fn copy2d(src: usize, dst: usize, s: &Copy2dShape) -> Result<()> {
+    if s.rows == 0 || s.cols == 0 {
+        return Ok(());
+    }
+    if s.cols > s.src_stride || s.cols > s.dst_stride {
+        return Err(Error::Shape(format!("copy2d: rows overlap: {s:?}")));
+    }
+    let end = |off: usize, stride: usize| -> Result<usize> {
+        product(&[s.rows - 1, stride])?
+            .checked_add(off + s.cols)
+            .ok_or_else(|| Error::Shape("copy2d range overflows".into()))
+    };
+    need("copy2d src", src, end(s.src_offset, s.src_stride)?)?;
+    need("copy2d dst", dst, end(s.dst_offset, s.dst_stride)?)
+}
+
+pub fn dyn_conv(x: usize, base: usize, delta: usize, out: usize, s: &DynConvShape) -> Result<()> {
+    if s.rows == 0 || s.group == 0 || !s.channels.is_multiple_of(s.group) || s.side > 1 {
+        return Err(Error::Shape(format!("dyn_conv: bad shape {s:?}")));
+    }
+    let n = product(&[s.rows, s.channels])?;
+    need("dyn_conv x", x, n)?;
+    need("dyn_conv out", out, n)?;
+    need("dyn_conv base", base, 4 * s.channels)?;
+    need(
+        "dyn_conv delta",
+        delta,
+        product(&[s.rows, 4, s.channels / s.group])?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_block(
+    q: usize,
+    k_ctx: usize,
+    v_ctx: usize,
+    k_blk: usize,
+    v_blk: usize,
+    out: usize,
+    s: &BlockAttnShape,
+) -> Result<()> {
+    if s.tokens == 0 || s.heads == 0 || s.kv_heads == 0 || s.head_dim == 0 || s.ring == 0 {
+        return Err(Error::Shape(format!(
+            "attention_block dims must be non-zero: {s:?}"
+        )));
+    }
+    if !s.heads.is_multiple_of(s.kv_heads)
+        || s.tokens > s.window
+        || s.ctx_lo > s.pos0
+        || s.pos0 - s.ctx_lo > s.ring
+    {
+        return Err(Error::Shape(format!("attention_block: bad shape {s:?}")));
+    }
+    let q_len = product(&[s.tokens, s.heads, s.head_dim])?;
+    let ctx = product(&[s.ring, s.kv_heads, s.head_dim])?;
+    let blk = product(&[s.tokens, s.kv_heads, s.head_dim])?;
+    need("attention_block q", q, q_len)?;
+    need("attention_block k_ctx", k_ctx, ctx)?;
+    need("attention_block v_ctx", v_ctx, ctx)?;
+    need("attention_block k_blk", k_blk, blk)?;
+    need("attention_block v_blk", v_blk, blk)?;
+    need("attention_block out", out, q_len)
 }
 
 /// Converts a dimension for a C ABI that takes `int`.

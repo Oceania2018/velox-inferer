@@ -101,6 +101,65 @@ pub struct GdnShape {
     pub v_dim: usize,
 }
 
+/// Non-causal attention of a query block over a sliding-window context (DFlash drafting).
+///
+/// `q` is `[tokens, heads, head_dim]` for positions `pos0 .. pos0 + tokens`. Context keys live in
+/// ring caches `[ring, kv_heads, head_dim]`, position `p` at row `p % ring`, valid for
+/// `ctx_lo <= p < pos0` (`pos0 - ctx_lo <= ring`). The block's own keys are `[tokens, kv_heads,
+/// head_dim]`. Token `i` attends to context positions `p` with `pos0 + i - p < window` and to every
+/// block row (`tokens <= window`). Query head `h` reads KV head `h / (heads / kv_heads)`; scores are
+/// scaled by `1 / sqrt(head_dim)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockAttnShape {
+    pub tokens: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub pos0: usize,
+    pub ctx_lo: usize,
+    pub window: usize,
+    pub ring: usize,
+}
+
+impl BlockAttnShape {
+    /// First context position token `i` sees.
+    pub fn ctx_start(&self, i: usize) -> usize {
+        (self.pos0 + i + 1)
+            .saturating_sub(self.window)
+            .max(self.ctx_lo)
+    }
+}
+
+/// Dynamic grouped convolution of DFlash2, side `side` (0: branch input, 1: branch output), over
+/// `rows` consecutive positions of one block. With `G = channels / group`, `base` is `[2 sides,
+/// 2 taps, channels]` and `delta` is `[rows, 4 G]` (column `(2 side + tap) G + g`). For channel
+/// `h` of group `g = h / group`:
+///
+/// `y[i][h] = (base[side][0][h] + delta[i][2 side G + g]) x[i][h]
+///          + [i > 0] (base[side][1][h] + delta[i][(2 side + 1) G + g]) x[i - 1][h]`
+///
+/// and `out = y`, or `out += y` with `accumulate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DynConvShape {
+    pub rows: usize,
+    pub channels: usize,
+    pub group: usize,
+    pub side: usize,
+    pub accumulate: bool,
+}
+
+/// A strided 2-D copy: `dst[dst_offset + r dst_stride + c] = src[src_offset + r src_stride + c]`
+/// for `r < rows`, `c < cols`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Copy2dShape {
+    pub rows: usize,
+    pub cols: usize,
+    pub src_offset: usize,
+    pub src_stride: usize,
+    pub dst_offset: usize,
+    pub dst_stride: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FullAttnShape {
     pub tokens: usize,
@@ -475,6 +534,29 @@ pub trait Backend {
         x: &mut Self::Buffer,
         positions: &[u32],
         shape: RopePosShape,
+    ) -> Result<()>;
+    /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
+    fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
+    /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.
+    fn dyn_conv(
+        &self,
+        x: &Self::Buffer,
+        base: &Self::Buffer,
+        delta: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: DynConvShape,
+    ) -> Result<()>;
+    /// Writes `[tokens, heads, head_dim]` into `out`; see [`BlockAttnShape`].
+    #[allow(clippy::too_many_arguments)]
+    fn attention_block(
+        &self,
+        q: &Self::Buffer,
+        k_ctx: &Self::Buffer,
+        v_ctx: &Self::Buffer,
+        k_blk: &Self::Buffer,
+        v_blk: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: BlockAttnShape,
     ) -> Result<()>;
 }
 
