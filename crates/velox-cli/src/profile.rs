@@ -87,6 +87,18 @@ impl<B: Backend> Backend for Profiled<B> {
     fn upload_bytes(&self, data: &[u8]) -> Result<B::Buffer> {
         self.inner.upload_bytes(data)
     }
+    fn alloc_host(&self, len: usize) -> Result<B::Buffer> {
+        self.inner.alloc_host(len)
+    }
+    fn upload_bytes_host(&self, data: &[u8]) -> Result<B::Buffer> {
+        self.inner.upload_bytes_host(data)
+    }
+    fn host_bytes<'a>(&self, buf: &'a B::Buffer) -> Option<&'a [u8]> {
+        self.inner.host_bytes(buf)
+    }
+    fn host_bytes_mut<'a>(&self, buf: &'a mut B::Buffer) -> Option<&'a mut [u8]> {
+        self.inner.host_bytes_mut(buf)
+    }
     fn synchronize(&self) -> Result<()> {
         self.inner.synchronize()
     }
@@ -141,6 +153,20 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> Result<()> {
         self.time("rms_norm", || {
             self.inner.rms_norm(x, w, y, rows, dim, eps, kind)
+        })
+    }
+    fn rms_norm_gated(
+        &self,
+        x: &B::Buffer,
+        w: &B::Buffer,
+        gate: &mut B::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        self.time("rms_norm_gated", || {
+            self.inner.rms_norm_gated(x, w, gate, rows, dim, eps, kind)
         })
     }
     fn rope(&self, x: &mut B::Buffer, s: RopeShape) -> Result<()> {

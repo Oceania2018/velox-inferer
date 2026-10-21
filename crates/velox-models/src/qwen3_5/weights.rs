@@ -79,6 +79,8 @@ pub struct TextWeights<B: Backend> {
     pub proposal: Option<Proposal>,
     /// Bytes uploaded for weights (parents + decoded params).
     pub bytes: u64,
+    /// Bytes placed in system RAM (see [`TextWeights::load_opts`]).
+    pub host_bytes: u64,
 }
 
 impl<B: Backend> TextWeights<B> {
@@ -115,9 +117,24 @@ impl<B: Backend> TextWeights<B> {
         art: &Artifact,
         cfg: &TextConfig,
         mtp: bool,
+        progress: impl FnMut(&str),
+    ) -> Result<Self> {
+        Self::load_opts(b, art, cfg, mtp, &[], progress)
+    }
+
+    /// [`Self::load_with`], keeping the matrices named in `host` (e.g. `text/token_embedding`,
+    /// which is only gathered a few rows at a time) in system RAM the device reads directly
+    /// ([`Backend::alloc_host`]) instead of device memory.
+    pub fn load_opts(
+        b: &B,
+        art: &Artifact,
+        cfg: &TextConfig,
+        mtp: bool,
+        host: &[String],
         mut progress: impl FnMut(&str),
     ) -> Result<Self> {
         let mut l = Loader::new(b, art);
+        l.host = host.to_vec();
         let embed = l.matrix("text/token_embedding")?;
         let head = l.matrix("text/output_head")?;
         let final_norm = l.param("text/final_norm", cfg.hidden)?;
@@ -175,6 +192,7 @@ impl<B: Backend> TextWeights<B> {
             mtp,
             proposal,
             bytes: l.bytes,
+            host_bytes: l.host_bytes,
         })
     }
 }
@@ -197,6 +215,9 @@ pub(crate) struct Loader<'a, B: Backend> {
     policies: HashMap<String, ActPolicy>,
     params: Vec<B::Buffer>,
     bytes: u64,
+    /// Matrices placed in system RAM (by binding name); `bytes` counts device bytes only.
+    host: Vec<String>,
+    pub(crate) host_bytes: u64,
 }
 
 fn werr(e: velox_weights::Error) -> Error {
@@ -270,8 +291,8 @@ impl<'a, B: Backend> Loader<'a, B> {
         Ok((id, range))
     }
 
-    /// Uploads parent `id` once; returns (slot, format, n, k).
-    fn parent(&mut self, id: &str) -> Result<(usize, WeightFormat, usize, usize)> {
+    /// Uploads parent `id` once (to system RAM when `host`); returns (slot, format, n, k).
+    fn parent(&mut self, id: &str, host: bool) -> Result<(usize, WeightFormat, usize, usize)> {
         if let Some(&p) = self.index.get(id) {
             return Ok(p);
         }
@@ -303,8 +324,13 @@ impl<'a, B: Backend> Loader<'a, B> {
                 fmt.payload_bytes(n, k)
             )));
         }
-        self.bytes += bytes.len() as u64;
-        self.parents.push(self.b.upload_bytes(&bytes)?);
+        if host {
+            self.host_bytes += bytes.len() as u64;
+            self.parents.push(self.b.upload_bytes_host(&bytes)?);
+        } else {
+            self.bytes += bytes.len() as u64;
+            self.parents.push(self.b.upload_bytes(&bytes)?);
+        }
         let entry = (self.parents.len() - 1, fmt, n, k);
         self.index.insert(id.to_string(), entry);
         Ok(entry)
@@ -312,7 +338,8 @@ impl<'a, B: Backend> Loader<'a, B> {
 
     pub(crate) fn matrix(&mut self, name: &str) -> Result<WDesc> {
         let (id, range) = self.binding(name)?;
-        let (parent, format, n, k) = self.parent(&id)?;
+        let host = self.host.iter().any(|h| h == name);
+        let (parent, format, n, k) = self.parent(&id, host)?;
         let (row_begin, rows) = match range {
             None => (0, n),
             Some((a, e)) => {
@@ -415,6 +442,8 @@ impl<'a, B: Backend> Loader<'a, B> {
             policies: read_policies(art),
             params: Vec::new(),
             bytes: 0,
+            host: Vec::new(),
+            host_bytes: 0,
         }
     }
 

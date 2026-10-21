@@ -52,6 +52,24 @@ __global__ void rms_norm_warp_kernel(const float* __restrict__ x, const float* _
     for (int i = lane; i < dim; i += VELOX_WARP) yr[i] = xr[i] * inv * (offset + weight[i]);
 }
 
+// gate = silu(gate) * rms_norm(x): one warp per row.
+__global__ void rms_norm_gated_kernel(const float* __restrict__ x, const float* __restrict__ weight,
+                                      float* __restrict__ gate, int rows, int dim, float eps, float offset) {
+    const int row = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    const int lane = threadIdx.x % VELOX_WARP;
+    if (row >= rows) return;
+    const float* xr = x + static_cast<size_t>(row) * dim;
+    float* gr = gate + static_cast<size_t>(row) * dim;
+    float ss = 0.0f;
+    for (int i = lane; i < dim; i += VELOX_WARP) ss += xr[i] * xr[i];
+    ss = velox_warp_sum(ss);
+    const float inv = rsqrtf(ss / dim + eps);
+    for (int i = lane; i < dim; i += VELOX_WARP) {
+        const float g = gr[i];
+        gr[i] = g / (1.0f + expf(-g)) * (xr[i] * inv * (offset + weight[i]));
+    }
+}
+
 // The angle is formed in double: positions reach 1e5+, where a float angle loses ~1e-2 rad.
 // One block per token: the token's rotary/2 angles are formed once (in double) into shared
 // memory, then every head applies them. Double is slow on consumer GPUs, so it runs once per
@@ -216,6 +234,12 @@ VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float
     }
     // Wide rows: few of them per call (the residual stream), so give each the most threads.
     rms_norm_kernel<<<rows, 1024>>>(x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_rms_norm_gated(const float* x, const float* weight, float* gate, int rows, int dim,
+                                            float eps, int offset) {
+    rms_norm_gated_kernel<<<(rows + 7) / 8, 256>>>(x, weight, gate, rows, dim, eps, offset ? 1.0f : 0.0f);
     return velox_launch_status();
 }
 

@@ -31,12 +31,19 @@ where
     let use_dflash = dflash_drafts > 0 && art.components().contains_key("dflash2");
     let t0 = Instant::now();
     // With DFlash2 the MTP predictor is never used: skip its weights.
-    let w = TextWeights::load_with(&b, art, &cfg, !use_dflash, |line| {
+    // Matrices kept in system RAM (ninfer NINFER_HOST_MAPPED_WEIGHTS): the token embedding is
+    // only gathered a few rows per step. `--host-weights none` keeps everything on the device.
+    let host: Vec<String> = match a.get("host-weights").unwrap_or("text/token_embedding") {
+        "none" | "" => Vec::new(),
+        list => list.split(',').map(|s| s.trim().to_string()).collect(),
+    };
+    let w = TextWeights::load_opts(&b, art, &cfg, !use_dflash, &host, |line| {
         eprint!("\rloading {line}   ")
     })?;
     eprintln!(
-        "\nloaded {:.2} GB in {:.1}s on {}",
+        "\nloaded {:.2} GB to the device and {:.2} GB to system RAM in {:.1}s on {}",
         w.bytes as f64 / 1e9,
+        w.host_bytes as f64 / 1e9,
         t0.elapsed().as_secs_f64(),
         b.describe()
     );
@@ -46,6 +53,28 @@ where
         default_max_tokens: a.parse("default-max-tokens", 4096)?,
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
         max_checkpoints: a.parse("ctx-checkpoints", 8)?,
+        // --ctx-checkpoint-store host|device (default host: system RAM).
+        host_checkpoints: a.get("ctx-checkpoint-store").is_none_or(|v| v != "device"),
+        // --ctx-checkpoint-skip-media-tail on|off (default on).
+        skip_media_tail: a
+            .get("ctx-checkpoint-skip-media-tail")
+            .is_none_or(|v| v != "off"),
+        // --host-context-mib N (ninfer's name): system RAM for prefixes any request can resume.
+        host_context_bytes: a.parse::<usize>("host-context-mib", 16384)? << 20,
+        // --ctx-lrfu-lambda F: LRFU decay per request of that store (0: LRU).
+        lrfu_lambda: a.parse("ctx-lrfu-lambda", 0.1)?,
+        // --disk-context-mib N (default 0: off) and --disk-context-dir DIR: NVMe tier below RAM.
+        disk_context_bytes: a.parse::<u64>("disk-context-mib", 0)? << 20,
+        disk_context_dir: match a.get("disk-context-dir") {
+            Some(d) => d.into(),
+            None => std::env::var_os("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cache"))
+                })
+                .unwrap_or_else(std::env::temp_dir)
+                .join("velox/disk-context"),
+        },
         scratch_capacity: a.parse("scratch-context", 8192)?,
         mtp_drafts: a.parse("mtp-drafts", 7)?,
         dflash_drafts,
