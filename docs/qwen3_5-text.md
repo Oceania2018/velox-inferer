@@ -71,6 +71,47 @@ for value head h (q/k head h / 3), per token:
 y = out_proj(plain_rmsnorm_per_head(o, gdn_norm) * silu(z))
 ```
 
+## Sparse MoE (`Qwen3_5MoeForCausalLM`)
+
+Same stack, attention, GDN, norms and RoPE; only the block FFN changes. Every block is MoE.
+Geometry of Qwen3.6-35B-A3B (from ninfer's model reference): H = 2048, 40 layers (10 attention,
+30 GDN; GDN 16 key / 32 value heads), attention 16 query / 2 KV heads of 256; 256 routed experts,
+top-8, expert width 512; one shared expert of width 512. The config carries `num_experts`,
+`num_experts_per_tok`, `moe_intermediate_size`, `shared_expert_intermediate_size` and no
+`intermediate_size`.
+
+```text
+p      = softmax(router(h))                 # [E], router is [E, H]
+(w, e) = top_k(p, K)                         # ties to the lower expert id
+w      = w / sum(w)                          # always renormalised over the selection
+routed = sum_j w_j * down[e_j](silu(gate[e_j](h)) * up[e_j](h))
+y      = routed + sigmoid(shared_score . h) * shared_down(silu(shared_gate(h)) * shared_up(h))
+```
+
+The shared expert always runs and is outside the top-k. Bindings and the layout ninfer's
+converter packs them into:
+
+| Binding (`text/layers/i/` + ...) | Shape | Stored as |
+|---|---|---|
+| `moe/router`, `moe/shared_score` | `[E, H]`, `[1, H]` | one parent `[E + 1, H]` (BF16) |
+| `moe/experts/e/gate`, `.../up` | `[I, H]` each | one parent `[E * 2I, H]`: gate at row `2eI`, up at `(2e + 1)I` (Q4 G64) |
+| `moe/experts/e/down` | `[H, I]` | one parent `[E * H, I]`, expert at row `eH` (Q5/Q6 G64) |
+| `moe/shared/{gate,up,down}` | `[I_s, H]`, `[I_s, H]`, `[H, I_s]` | as a Dense MLP |
+
+The loader accepts any layout in which each role's experts sit at a constant row stride of one
+parent (`ExpertBank`), and refuses others. MTP (`Qwen3_5MoeMTP`) uses the same MoE block.
+
+Planned op contract (not implemented; lands with CPU reference, portable kernels and conformance):
+
+- `moe_route(logits [T, row_len], experts, k) -> ids [T, k], weights [T, k]` on the device: the
+  softmax / top-k / renormalisation above over the first `experts` columns (the router and
+  shared-score rows run as one linear, so `row_len = E + 1`). Routing stays on the device so
+  recorded graph steps can replay it.
+- `moe_experts(x, ids, weights, gate, up, down banks) : y += routed`, with an `ActQuant` report
+  like `linear_act` for tuned low-precision kernels. Separate from routing so conformance can
+  feed both sides identical routes (near-tie logits may otherwise select different experts).
+- `sigmoid_scale_rows`: the shared expert's per-token scalar gate.
+
 ## Embedding, head, precision
 
 The embedding row is the dequantised table row (FP8: code x row scale); the head is
