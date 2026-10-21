@@ -141,6 +141,12 @@ fn mixed_chunk() -> usize {
     })
 }
 
+/// `VELOX_SOLO_DRAFT=1`: batch rounds draft lane by lane (A/B against batched proposals).
+fn solo_draft() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("VELOX_SOLO_DRAFT").is_ok_and(|v| v == "1"))
+}
+
 /// Below this much shared prefix a request counts as unrelated to a lane.
 const MIN_REUSE: usize = 64;
 
@@ -1270,14 +1276,16 @@ impl<B: Backend> Core<B> {
                 lanes[active[i].lane].session.pos + drafts < lanes[active[i].lane].session.capacity
             });
             let mut windows = Vec::with_capacity(idx.len());
-            if idx.len() == 1 {
-                // One drafter: the recorded proposal step.
-                let a = &active[idx[0]];
-                let lane = &mut lanes[a.lane];
-                if let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() {
-                    d.drafts = drafts;
+            if idx.len() == 1 || solo_draft() {
+                // One drafter at a time: the recorded proposal step.
+                for &i in idx {
+                    let a = &active[i];
+                    let lane = &mut lanes[a.lane];
+                    if let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() {
+                        d.drafts = drafts;
+                    }
+                    windows.push(self.dflash_window(lane, dw, ws, a, room)?);
                 }
-                windows.push(self.dflash_window(lane, dw, ws, a, room)?);
             } else {
                 // Every drafter in one block forward (one host sync), then each picks its drafts.
                 let dm = self
