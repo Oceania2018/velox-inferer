@@ -97,6 +97,29 @@ pub struct Checkpoint<B: Backend> {
     pub rope_delta: i64,
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
+    host: bool,
+}
+
+impl<B: Backend> Checkpoint<B> {
+    /// Whether the storage is in system RAM ([`Backend::alloc_host`]).
+    pub fn on_host(&self) -> bool {
+        self.host
+    }
+
+    /// Copies this checkpoint into `dst` (storage of the same session shape).
+    pub fn copy_into(&self, b: &B, dst: &mut Checkpoint<B>) -> Result<()> {
+        for (src, d) in self
+            .conv
+            .iter()
+            .zip(dst.conv.iter_mut())
+            .chain(self.ssm.iter().zip(dst.ssm.iter_mut()))
+        {
+            b.copy(src, 0, d, 0, b.len(src))?;
+        }
+        dst.pos = self.pos;
+        dst.rope_delta = self.rope_delta;
+        Ok(())
+    }
 }
 
 impl<B: Backend> Session<B> {
@@ -137,6 +160,7 @@ impl<B: Backend> Session<B> {
             rope_delta: self.rope_delta,
             conv: like(&self.conv)?,
             ssm: like(&self.ssm)?,
+            host,
         })
     }
 
