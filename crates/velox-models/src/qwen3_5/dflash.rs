@@ -426,6 +426,11 @@ impl<B: Backend> DFlashModel<B> {
     }
 
     /// f32 slots of one [`DraftContext`] page.
+    /// Context rows the drafter attends to (its sliding window).
+    pub fn context_window(&self) -> usize {
+        self.cfg.window
+    }
+
     pub fn context_page_len(&self) -> usize {
         2 * self.cfg.layers * DRAFT_PAGE_ROWS * self.cfg.kv_dim()
     }
