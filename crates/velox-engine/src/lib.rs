@@ -669,6 +669,7 @@ where
     }
 
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
+        let t_req = Instant::now();
         self.b.bind_thread().map_err(core)?;
         let Normalized {
             messages,
@@ -685,8 +686,20 @@ where
             .template
             .render(&messages, tools, thinking, true)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
+        let t_tpl = t_req.elapsed();
         let ids = self.fe.encode(&text).map_err(core)?;
+        let t_tok = t_req.elapsed();
         let images = self.load_images(&urls)?;
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+            eprintln!(
+                "[request] template {:.1} ms, tokenize {:.1} ms ({} ids), images {:.1} ms ({})",
+                t_tpl.as_secs_f64() * 1e3,
+                (t_tok - t_tpl).as_secs_f64() * 1e3,
+                ids.len(),
+                (t_req.elapsed() - t_tok).as_secs_f64() * 1e3,
+                images.len()
+            );
+        }
         let p = match self.special.image_pad {
             Some(pad) => build_prompt(&ids, pad, &images).map_err(ApiError::invalid)?,
             None if images.is_empty() => {
