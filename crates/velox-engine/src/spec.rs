@@ -8,9 +8,11 @@
 //! drafting filled with draft states) and drafts the next round from the last of them.
 
 use velox_core::backend::Backend;
+use velox_core::rng::Rng;
 use velox_core::Result;
 use velox_models::qwen3_5::{
-    MtpNext, MtpRope, MtpSession, MtpWorkspace, Qwen35Text, Session, Workspace,
+    DFlashModel, DFlashState, DFlashWorkspace, MtpNext, MtpRope, MtpSession, MtpWorkspace,
+    Qwen35Text, Session, Workspace,
 };
 
 /// The last prompt row, waiting for the first sampled token.
@@ -231,4 +233,89 @@ impl<B: Backend> MtpDrafter<B> {
         }
         Ok(drafts)
     }
+}
+
+/// Speculative decoding with the DFlash2 block drafter: one masked-block forward proposes
+/// `drafts` tokens, each with the proposal distribution it was drawn from, so verification can
+/// use min(1, p / q) and the residual max(p - q, 0).
+pub struct DFlashDrafter<B: Backend> {
+    pub drafts: usize,
+    state: DFlashState<B>,
+    dw: DFlashWorkspace<B>,
+    rng: Rng,
+}
+
+impl<B: Backend> DFlashDrafter<B> {
+    pub fn new(
+        b: &B,
+        dm: &DFlashModel<B>,
+        target: &Qwen35Text<B>,
+        ctx_rows: usize,
+        drafts: usize,
+    ) -> Result<Self> {
+        let drafts = drafts.clamp(1, velox_models::qwen3_5::VERIFY_MAX - 1);
+        Ok(DFlashDrafter {
+            drafts,
+            state: dm.state(b)?,
+            dw: dm.workspace(b, target, ctx_rows, drafts + 1)?,
+            rng: Rng::new(0x5eed_df1a),
+        })
+    }
+
+    /// Context for one target prefill chunk: `t` rows at cache rows `row0 ..` whose features the
+    /// target captured in `ws`.
+    pub fn prefill_chunk(
+        &mut self,
+        b: &B,
+        dm: &DFlashModel<B>,
+        ws: &Workspace<B>,
+        row0: usize,
+        t: usize,
+    ) -> Result<()> {
+        if t > dm.cfg.window {
+            return Err(velox_core::Error::Shape(format!(
+                "prefill chunk of {t} rows exceeds the DFlash window"
+            )));
+        }
+        dm.materialize(b, &mut self.state, &mut self.dw, ws, row0, t)
+    }
+
+    /// Materializes the `kept` rows of the last verify (cache rows from `row0`, features in `ws`),
+    /// aligns the context with the target `frontier`, and drafts after `anchor`. Returns the drafts
+    /// and the proposal distribution of each.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn draft(
+        &mut self,
+        b: &B,
+        dm: &DFlashModel<B>,
+        target: &Qwen35Text<B>,
+        ws: &Workspace<B>,
+        row0: usize,
+        kept: usize,
+        frontier: usize,
+        anchor: u32,
+        limit: usize,
+        temperature: f32,
+    ) -> Result<(Vec<u32>, Vec<Vec<(u32, f32)>>)> {
+        if kept > 0 {
+            dm.materialize(b, &mut self.state, &mut self.dw, ws, row0, kept)?;
+        }
+        let st = &mut self.state;
+        if st.end > frontier {
+            dm.rewind(st, frontier);
+        } else if st.end < frontier {
+            // Rows without features (should not happen): continue with an empty context.
+            st.lo = frontier;
+            st.end = frontier;
+        }
+        let bc = dm.propose(b, target, st, &mut self.dw, anchor, self.drafts, limit)?;
+        let rng = &mut self.rng;
+        Ok(dm.select(&bc, anchor, temperature, &mut || rng.uniform() * 0.5 + 0.5))
+    }
+}
+
+/// The main lane's draft model.
+pub enum Drafter<B: Backend> {
+    Mtp(MtpDrafter<B>),
+    DFlash(DFlashDrafter<B>),
 }

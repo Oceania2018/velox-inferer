@@ -132,6 +132,24 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             )?;
             continue;
         }
+        if let Some(n) = a.get("dflash") {
+            let drafts: usize = n
+                .parse()
+                .map_err(|_| Error::Config("--dflash takes a draft count".into()))?;
+            dflash_generate(
+                b,
+                &art,
+                &model,
+                &mut session,
+                &mut ws,
+                &ids,
+                max_tokens,
+                drafts,
+                chunk,
+                &fe,
+            )?;
+            continue;
+        }
         if a.get("spec-check").is_some() {
             spec_check(
                 b,
@@ -318,6 +336,89 @@ fn mtp_generate<B: Backend>(
         out.len() as f64 / decode.max(1e-9),
         100.0 * accepted as f64 / proposed.max(1) as f64,
         out.len() as f64 / rounds.max(1) as f64
+    );
+    println!("ids       {out:?}");
+    println!("text      {:?}", fe.decode(&out)?);
+    Ok(())
+}
+
+/// `--dflash N`: greedy decoding with DFlash2 block drafts (N per block), verified on the
+/// target; the output must equal plain greedy decoding.
+#[allow(clippy::too_many_arguments)]
+fn dflash_generate<B: Backend>(
+    b: &B,
+    art: &Artifact,
+    model: &Qwen35Text<B>,
+    s: &mut velox_models::qwen3_5::Session<B>,
+    ws: &mut velox_models::qwen3_5::Workspace<B>,
+    ids: &[u32],
+    max_tokens: usize,
+    drafts_per_block: usize,
+    chunk: usize,
+    fe: &Frontend,
+) -> Result<()> {
+    use velox_engine::spec::DFlashDrafter;
+    use velox_models::qwen3_5::DFlashModel;
+    let limit = fe.public_vocab;
+    let dm = DFlashModel::load(b, art, model.cfg.hidden)?
+        .ok_or_else(|| Error::Config("artifact has no dflash2 component".into()))?;
+    model.enable_capture(b, ws, &dm.cfg.target_layers)?;
+    let mut dr = DFlashDrafter::new(b, &dm, model, chunk, drafts_per_block)?;
+    let row0 = s.pos;
+    let t0 = Instant::now();
+    model.advance_rows(b, s, ws, ids, None, &[], &mut |ws, base, t| {
+        dr.prefill_chunk(b, &dm, ws, row0 + base, t)
+    })?;
+    let mut c = model.candidates(b, ws, 1, limit)?[0].0;
+    let prefill = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    let mut out = vec![c];
+    let (mut rounds, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
+    let (mut row, mut kept) = (0usize, 0usize);
+    let mut draft_s = 0.0;
+    while out.len() < max_tokens && !fe.is_eos(c) {
+        let td = Instant::now();
+        let (drafts, _) = dr.draft(b, &dm, model, ws, row, kept, s.pos, c, limit, 0.0)?;
+        draft_s += td.elapsed().as_secs_f64();
+        let mut window = vec![c];
+        window.extend(drafts.iter().copied().take(max_tokens - out.len()));
+        let p = s.pos;
+        let rows = model.verify(b, s, ws, &window, 1, limit)?;
+        let mut keep = 1;
+        while keep < window.len() && rows[keep - 1][0].0 == window[keep] {
+            keep += 1;
+        }
+        let next = rows[keep - 1][0].0;
+        model.commit(b, s, ws, keep)?;
+        rounds += 1;
+        proposed += window.len() - 1;
+        accepted += keep - 1;
+        let mut stop = false;
+        for &tok in window[1..keep].iter().chain(std::iter::once(&next)) {
+            out.push(tok);
+            if fe.is_eos(tok) || out.len() >= max_tokens {
+                stop = true;
+                break;
+            }
+        }
+        if stop {
+            break;
+        }
+        c = next;
+        (row, kept) = (p, keep);
+    }
+    let decode = t1.elapsed().as_secs_f64();
+    if out.last().is_some_and(|&t| fe.is_eos(t)) {
+        out.pop();
+    }
+    println!("prompt    {} tokens, prefill {prefill:.2}s", ids.len());
+    println!(
+        "decode    {} tokens in {decode:.2}s ({:.2} tok/s), {rounds} rounds, accepted {accepted}/{proposed} drafts ({:.0}%), {:.2} tokens/round, drafting {:.2} ms/round",
+        out.len(),
+        out.len() as f64 / decode.max(1e-9),
+        100.0 * accepted as f64 / proposed.max(1) as f64,
+        out.len() as f64 / rounds.max(1) as f64,
+        draft_s * 1e3 / rounds.max(1) as f64
     );
     println!("ids       {out:?}");
     println!("text      {:?}", fe.decode(&out)?);

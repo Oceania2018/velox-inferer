@@ -98,11 +98,23 @@ impl<B: Backend> TextWeights<B> {
         &self.params[i]
     }
 
-    /// Uploads every `text/` parameter the model uses. `progress` receives a short line per layer.
+    /// Uploads every `text/` parameter the model uses, and the MTP predictor when the artifact has
+    /// one. `progress` receives a short line per layer.
     pub fn load(
         b: &B,
         art: &Artifact,
         cfg: &TextConfig,
+        progress: impl FnMut(&str),
+    ) -> Result<Self> {
+        Self::load_with(b, art, cfg, true, progress)
+    }
+
+    /// [`Self::load`], loading the MTP predictor only when `mtp` is set.
+    pub fn load_with(
+        b: &B,
+        art: &Artifact,
+        cfg: &TextConfig,
+        mtp: bool,
         mut progress: impl FnMut(&str),
     ) -> Result<Self> {
         let mut l = Loader::new(b, art);
@@ -151,7 +163,7 @@ impl<B: Backend> TextWeights<B> {
                 l.bytes as f64 / 1e9
             ));
         }
-        let mtp = load_mtp(&mut l, cfg)?;
+        let mtp = if mtp { load_mtp(&mut l, cfg)? } else { None };
         let proposal = load_proposal(&mut l, art, cfg)?;
         Ok(TextWeights {
             parents: l.parents,
