@@ -59,6 +59,7 @@ impl<B: Backend> Profiled<B> {
 
 impl<B: Backend> Backend for Profiled<B> {
     type Buffer = B::Buffer;
+    type Chunk = B::Chunk;
 
     fn kind(&self) -> BackendKind {
         self.inner.kind()
@@ -89,6 +90,21 @@ impl<B: Backend> Backend for Profiled<B> {
     }
     fn alloc_host(&self, len: usize) -> Result<B::Buffer> {
         self.inner.alloc_host(len)
+    }
+    fn vm_chunk_len(&self) -> usize {
+        self.inner.vm_chunk_len()
+    }
+    fn alloc_virtual(&self, len: usize) -> Result<B::Buffer> {
+        self.inner.alloc_virtual(len)
+    }
+    fn alloc_chunk(&self) -> Result<B::Chunk> {
+        self.inner.alloc_chunk()
+    }
+    fn map_chunk(&self, buf: &mut B::Buffer, index: usize, chunk: &B::Chunk) -> Result<()> {
+        self.inner.map_chunk(buf, index, chunk)
+    }
+    fn unmap_chunk(&self, buf: &mut B::Buffer, index: usize) -> Result<()> {
+        self.inner.unmap_chunk(buf, index)
     }
     fn upload_bytes_host(&self, data: &[u8]) -> Result<B::Buffer> {
         self.inner.upload_bytes_host(data)

@@ -783,6 +783,53 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// Virtual memory (backends that have it): one physical chunk mapped in two buffers shares
+    /// contents both ways, and a remapped chunk shows its new backing.
+    fn virtual_memory(&mut self) -> Result<()> {
+        let c = self.b.vm_chunk_len();
+        if c == 0 {
+            return Ok(());
+        }
+        let (mut x, mut y) = (self.b.alloc_virtual(3 * c)?, self.b.alloc_virtual(2 * c)?);
+        let chunks = [
+            self.b.alloc_chunk()?,
+            self.b.alloc_chunk()?,
+            self.b.alloc_chunk()?,
+        ];
+        for (i, ch) in chunks.iter().enumerate() {
+            self.b.map_chunk(&mut x, i, ch)?;
+        }
+        // y chunk 0 aliases x chunk 2, y chunk 1 aliases x chunk 0.
+        self.b.map_chunk(&mut y, 0, &chunks[2])?;
+        self.b.map_chunk(&mut y, 1, &chunks[0])?;
+        let d = self.rng.vec(3 * c, 1.0);
+        let up = self.b.upload(&d)?;
+        self.b.copy(&up, 0, &mut x, 0, 3 * c)?;
+        let mut got = fetch(self.b, &y, 2 * c)?;
+        let mut want = [&d[2 * c..], &d[..c]].concat();
+        // Writes through y show in x.
+        let e = self.rng.vec(c, 1.0);
+        let ue = self.b.upload(&e)?;
+        self.b.copy(&ue, 0, &mut y, 0, c)?;
+        got.extend(fetch(self.b, &x, 3 * c)?[2 * c..].to_vec());
+        want.extend_from_slice(&e);
+        // Remapping y chunk 1 to x chunk 1 backing.
+        self.b.synchronize()?;
+        self.b.unmap_chunk(&mut y, 1)?;
+        self.b.map_chunk(&mut y, 1, &chunks[1])?;
+        got.extend(fetch(self.b, &y, 2 * c)?[c..].to_vec());
+        want.extend_from_slice(&d[c..2 * c]);
+        self.b.synchronize()?;
+        self.record(
+            "virtual memory: aliased and remapped chunks".into(),
+            None,
+            &got,
+            &want,
+            0.0,
+        );
+        Ok(())
+    }
+
     fn copy2d(&mut self, s: Copy2dShape) -> Result<()> {
         let src_len = s.src_offset + s.rows * s.src_stride;
         let dst_len = s.dst_offset + s.rows * s.dst_stride;
@@ -1503,6 +1550,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.elementwise(4097)?;
     s.copy(300, 1000, 123)?;
     s.copy_batch()?;
+    s.virtual_memory()?;
     for a in [
         // Prefill at the Qwen3.5 geometry (head_dim 256, 6 query heads per KV head); tensor-core
         // kernels tile 64 queries x 32 keys, so these are ragged in both.
