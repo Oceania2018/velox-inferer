@@ -844,6 +844,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         (512, 1024, 0, 512, 130),
         (256, 256, 128, 128, 300),
         (128, 64, 0, 128, 1),
+        // Skinny verify windows: wide K stages, a K whose code bytes need the narrow fallback, and
+        // row views that start inside a 128-row scale tile.
+        (512, 2048, 128, 384, 8),
+        (384, 640, 128, 256, 8),
+        (256, 1024, 64, 192, 3),
     ] {
         s.linear_act(WeightFormat::Nvfp4, n, k, begin, rows, m, a4)?;
     }
@@ -853,6 +858,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         (512, 1024, 64, 384, 130),
         (96, 300, 0, 96, 40),
         (64, 128, 0, 64, 2),
+        (512, 2048, 64, 384, 8),
+        (300, 192, 0, 300, 5),
     ] {
         s.linear_act(
             WeightFormat::Fp8RowBf16,
