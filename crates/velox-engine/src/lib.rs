@@ -485,6 +485,7 @@ where
                 &model,
                 cfg.chunk,
                 cfg.dflash_drafts,
+                n_lanes,
             )?),
             None => None,
         };
@@ -1269,13 +1270,62 @@ impl<B: Backend> Core<B> {
                 lanes[active[i].lane].session.pos + drafts < lanes[active[i].lane].session.capacity
             });
             let mut windows = Vec::with_capacity(idx.len());
-            for &i in idx {
-                let a = &active[i];
+            if idx.len() == 1 {
+                // One drafter: the recorded proposal step.
+                let a = &active[idx[0]];
                 let lane = &mut lanes[a.lane];
                 if let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() {
                     d.drafts = drafts;
                 }
                 windows.push(self.dflash_window(lane, dw, ws, a, room)?);
+            } else {
+                // Every drafter in one block forward (one host sync), then each picks its drafts.
+                let dm = self
+                    .dflash
+                    .as_ref()
+                    .expect("a DFlash drafter has its model");
+                for &i in idx {
+                    let lane = &mut lanes[active[i].lane];
+                    if let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() {
+                        d.drafts = drafts;
+                        d.align(dm, lane.session.pos);
+                    }
+                }
+                let proposals = {
+                    let states: Vec<&DFlashState<B>> = idx
+                        .iter()
+                        .map(|&i| match &lanes[active[i].lane].drafter {
+                            Some(Drafter::DFlash(d)) => d.context(),
+                            _ => unreachable!("caller checked"),
+                        })
+                        .collect();
+                    let anchors: Vec<u32> = idx.iter().map(|&i| active[i].c).collect();
+                    dm.propose_batch(
+                        &self.b,
+                        &self.model,
+                        &states,
+                        dw,
+                        &anchors,
+                        drafts,
+                        self.fe.public_vocab,
+                    )
+                    .map_err(core)?
+                };
+                for (j, &i) in idx.iter().enumerate() {
+                    let a = &active[i];
+                    let Some(Drafter::DFlash(d)) = lanes[a.lane].drafter.as_mut() else {
+                        unreachable!("caller checked");
+                    };
+                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, a.job.sampler.temperature());
+                    let budget = if room {
+                        picked.len()
+                    } else {
+                        a.job.max_tokens - a.out.len()
+                    };
+                    let mut window = vec![a.c];
+                    window.extend(picked.into_iter().take(budget));
+                    windows.push((window, qs));
+                }
             }
             let v: usize = windows.iter().map(|(w, _)| w.len()).sum();
             // Disjoint lanes of this batch, in `idx` order, and the prefilling lane.

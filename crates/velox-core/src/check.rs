@@ -348,6 +348,12 @@ pub fn copy2d(src: usize, dst: usize, s: &Copy2dShape) -> Result<()> {
 }
 
 pub fn dyn_conv(x: usize, base: usize, delta: usize, out: usize, s: &DynConvShape) -> Result<()> {
+    if s.block != 0 && s.rows % s.block != 0 {
+        return Err(Error::Shape(format!(
+            "dyn_conv: {} rows in blocks of {}",
+            s.rows, s.block
+        )));
+    }
     if s.rows == 0 || s.group == 0 || !s.channels.is_multiple_of(s.group) || s.side > 1 {
         return Err(Error::Shape(format!("dyn_conv: bad shape {s:?}")));
     }

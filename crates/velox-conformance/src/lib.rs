@@ -691,6 +691,7 @@ impl<B: Backend> Suite<'_, B> {
         channels: usize,
         side: usize,
         accumulate: bool,
+        block: usize,
     ) -> Result<()> {
         let s = DynConvShape {
             rows,
@@ -698,6 +699,7 @@ impl<B: Backend> Suite<'_, B> {
             group: 16,
             side,
             accumulate,
+            block,
         };
         let x = self.rng.vec(rows * channels, 2.0);
         let base = self.rng.vec(4 * channels, 1.0);
@@ -714,7 +716,7 @@ impl<B: Backend> Suite<'_, B> {
         self.b.dyn_conv(&xd, &bd, &dd, &mut od, s)?;
         let got = fetch(self.b, &od, rows * channels)?;
         self.record(
-            format!("dyn_conv rows={rows} channels={channels} side={side} acc={accumulate}"),
+            format!("dyn_conv rows={rows} channels={channels} side={side} acc={accumulate} block={block}"),
             Some(Op::DynConv),
             &got,
             &want,
@@ -1403,9 +1405,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         dst_offset: 128,
         dst_stride: 320,
     })?;
-    s.dyn_conv(8, 5120, 0, false)?;
-    s.dyn_conv(8, 5120, 1, true)?;
-    s.dyn_conv(1, 64, 0, false)?;
+    s.dyn_conv(8, 5120, 0, false, 0)?;
+    s.dyn_conv(8, 5120, 1, true, 0)?;
+    s.dyn_conv(1, 64, 0, false, 0)?;
+    s.dyn_conv(24, 64, 0, false, 8)?;
+    s.dyn_conv(24, 64, 1, true, 8)?;
     for (pos0, ctx_lo, window, ring) in [
         (3000, 1000, 2048, 2048),
         (40, 0, 2048, 2048),

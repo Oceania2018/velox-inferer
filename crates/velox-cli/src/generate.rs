@@ -365,7 +365,7 @@ fn dflash_generate<B: Backend>(
         .ok_or_else(|| Error::Config("artifact has no dflash2 component".into()))?;
     model.enable_capture(b, ws, &dm.cfg.target_layers)?;
     let mut dr = DFlashDrafter::new(b, &dm, drafts_per_block)?;
-    let mut dw = DFlashDrafter::workspace(b, &dm, model, chunk, drafts_per_block)?;
+    let mut dw = DFlashDrafter::workspace(b, &dm, model, chunk, drafts_per_block, 1)?;
     let row0 = s.pos;
     let t0 = Instant::now();
     model.advance_rows(b, s, ws, ids, None, &[], &mut [], &mut |ws, base, t| {
