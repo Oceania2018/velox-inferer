@@ -26,8 +26,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 
+use velox_core::backend::HostAlloc;
 use velox_core::{Backend, Error as CoreError};
 use velox_models::qwen3_5::{
     Checkpoint, DFlashModel, DFlashState, DraftContext, KvSegment, Session, KV_PAGE_ROWS,
@@ -67,6 +69,8 @@ impl<B: Backend> Entry<B> {
 }
 
 pub(crate) struct ContextStore<B: Backend> {
+    /// Background pinning (see [`Self::feed`]); `None`: pinned on demand and in idle time.
+    pinner: Option<Pinner<B>>,
     /// Declared before `inflight`: dropping it joins the writer that reads those entries.
     disk: Option<DiskTier>,
     /// Evicted entries being copied to disk, by record id (their memory must stay put).
@@ -92,11 +96,56 @@ const MAX_SPARE: usize = 4;
 /// 8K positions of KV pages.
 const RESERVE_STATES: usize = 2;
 const RESERVE_PAGES: usize = 32;
+/// States a background [`Pinner`] keeps ready: about one request's captures per lane pair.
+const PINNED_STATES: usize = 4;
+
+/// What a pinning request is for.
+#[derive(Clone, Copy)]
+enum Pin {
+    State,
+    Pages,
+    Draft,
+}
+
+/// Pins system RAM on a background thread, so captures under load take ready storage instead of
+/// pinning on the engine thread (~120 ms per recurrent state).
+pub struct Pinner<B: Backend> {
+    tx: mpsc::Sender<(Pin, Vec<usize>)>,
+    rx: mpsc::Receiver<(Pin, Result<Vec<B::Buffer>, CoreError>)>,
+    /// Requests sent and not yet received: states, KV pages, drafter pages.
+    pending: [usize; 3],
+}
+
+impl<B: Backend> Pinner<B>
+where
+    B::Buffer: Send + 'static,
+{
+    pub fn spawn(alloc: HostAlloc<B::Buffer>) -> std::io::Result<Self> {
+        let (tx, jobs) = mpsc::channel::<(Pin, Vec<usize>)>();
+        let (done, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("velox-pinner".into())
+            .spawn(move || {
+                for (kind, lens) in jobs {
+                    let bufs = lens.iter().map(|&n| alloc(n)).collect();
+                    if done.send((kind, bufs)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Pinner {
+            tx,
+            rx,
+            pending: [0; 3],
+        })
+    }
+}
 
 impl<B: Backend> ContextStore<B> {
     /// A store of at most `budget` bytes ranking entries by LRFU with decay `lambda` per request.
     pub fn new(budget: usize, lambda: f64, disk: Option<DiskTier>) -> Self {
         ContextStore {
+            pinner: None,
             disk,
             inflight: Vec::new(),
             entries: Vec::new(),
@@ -251,7 +300,8 @@ impl<B: Backend> ContextStore<B> {
         session: &Session<B>,
         draft: Option<(usize, usize)>,
     ) -> Result<bool, CoreError> {
-        if !self.enabled() {
+        // A background pinner keeps the reserve instead.
+        if !self.enabled() || self.pinner.is_some() {
             return Ok(false);
         }
         let page_len = session.kv_page_len();
@@ -277,6 +327,80 @@ impl<B: Backend> ContextStore<B> {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub fn set_pinner(&mut self, p: Pinner<B>) {
+        self.pinner = Some(p);
+    }
+
+    /// Takes storage the background pinner finished and asks it for more, keeping
+    /// [`PINNED_STATES`] states, [`RESERVE_PAGES`] KV pages and `draft` drafter pages
+    /// (`(count, page length)`) ready within the budget. Cheap: call once per scheduler step.
+    pub fn feed(&mut self, b: &B, session: &Session<B>, draft: Option<(usize, usize)>) {
+        let Some(p) = self.pinner.as_mut() else {
+            return;
+        };
+        while let Ok((kind, bufs)) = p.rx.try_recv() {
+            let k = kind as usize;
+            p.pending[k] -= 1;
+            let bufs = match bufs {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("context store: background pinning failed: {e}");
+                    continue;
+                }
+            };
+            match kind {
+                Pin::State => match session.host_checkpoint_from(bufs) {
+                    Ok(cp) => self.spare.push(cp),
+                    Err(e) => eprintln!("context store: {e}"),
+                },
+                Pin::Pages => self.pages.extend(bufs),
+                Pin::Draft => self.draft_pages.extend(bufs),
+            }
+        }
+        if !self.enabled() {
+            return;
+        }
+        let Some(p) = self.pinner.as_ref() else {
+            return;
+        };
+        let state_lens = session.state_lens(b);
+        let state_bytes: usize = state_lens.iter().sum::<usize>() * 4;
+        let page_len = session.kv_page_len();
+        const PAGES_PER_PIN: usize = 4;
+        let mut pinned = self.bytes(b)
+            + self.spare.iter().map(|s| s.bytes(b)).sum::<usize>()
+            + self.pages.len() * page_len * 4
+            + draft.map_or(0, |(_, len)| self.draft_pages.len() * len * 4)
+            + p.pending[0] * state_bytes
+            + p.pending[1] * PAGES_PER_PIN * page_len * 4
+            + draft.map_or(0, |(_, len)| p.pending[2] * len * 4);
+        let mut asks: Vec<(Pin, Vec<usize>, usize)> = Vec::new();
+        if self.spare.len() + p.pending[0] < PINNED_STATES {
+            asks.push((Pin::State, state_lens, state_bytes));
+        }
+        if self.pages.len() + p.pending[1] * PAGES_PER_PIN < RESERVE_PAGES {
+            asks.push((
+                Pin::Pages,
+                vec![page_len; PAGES_PER_PIN],
+                PAGES_PER_PIN * page_len * 4,
+            ));
+        }
+        if let Some((_, len)) = draft.filter(|&(n, _)| self.draft_pages.len() + p.pending[2] < n) {
+            asks.push((Pin::Draft, vec![len], len * 4));
+        }
+        let p = self.pinner.as_mut().expect("checked above");
+        for (kind, lens, bytes) in asks {
+            if pinned + bytes > self.budget {
+                break;
+            }
+            if p.tx.send((kind, lens)).is_err() {
+                return;
+            }
+            p.pending[kind as usize] += 1;
+            pinned += bytes;
+        }
     }
 
     /// Whether a state is ready for a capture without pinning memory on the request path.

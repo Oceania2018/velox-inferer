@@ -18,7 +18,7 @@ pub mod spec;
 mod store;
 
 use disk::DiskTier;
-use store::ContextStore;
+use store::{ContextStore, Pinner};
 
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
@@ -515,7 +515,15 @@ where
         } else {
             None
         };
-        let store = ContextStore::new(cfg.host_context_bytes, cfg.lrfu_lambda, disk);
+        let mut store = ContextStore::new(cfg.host_context_bytes, cfg.lrfu_lambda, disk);
+        if store.enabled() && std::env::var_os("VELOX_NO_PINNER").is_none() {
+            if let Some(alloc) = b.host_alloc() {
+                store.set_pinner(
+                    Pinner::spawn(alloc)
+                        .map_err(|e| CoreError::Backend(format!("pinning thread: {e}")))?,
+                );
+            }
+        }
         let state = Lanes {
             ws,
             lanes,
@@ -670,7 +678,14 @@ impl<B: Backend> Core<B> {
         }
         let mut waiting: VecDeque<Job> = VecDeque::new();
         let mut active: Vec<Active<B>> = Vec::new();
+        let draft = self.dflash.as_ref().map(|dm| {
+            (
+                dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
+                dm.context_page_len(),
+            )
+        });
         loop {
+            st.store.feed(&self.b, &st.lanes[0].session, draft);
             // New requests; while idle, pin context-store storage between them.
             loop {
                 let mut q = queue.jobs.lock().expect("queue lock");
@@ -682,12 +697,6 @@ impl<B: Backend> Core<B> {
                 drop(q);
                 // One drafter window of context pages: a capture that saves the drafter context
                 // does not allocate pinned memory on the request path.
-                let draft = self.dflash.as_ref().map(|dm| {
-                    (
-                        dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
-                        dm.context_page_len(),
-                    )
-                });
                 let more = match st.store.top_up(&self.b, &st.lanes[0].session, draft) {
                     Ok(m) => m,
                     Err(e) => {
