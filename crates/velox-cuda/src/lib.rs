@@ -800,11 +800,12 @@ impl Backend for CudaBackend {
         m: usize,
     ) -> Result<()> {
         check::linear(x.len, w, w.buf.len, y.len, m)?;
-        let op = format!(
-            "linear {} {}",
-            w.format.name(),
-            if m == 1 { "m=1" } else { "m>1" }
-        );
+        // Verify-sized calls carry their shape: per-matrix efficiency is what decode tuning needs.
+        let op = match m {
+            1 => format!("linear {} m=1", w.format.name()),
+            2..=16 => format!("linear {} m<=16 [{}x{}]", w.format.name(), w.rows, w.k),
+            _ => format!("linear {} m>16", w.format.name()),
+        };
         self.timed(&op, || self.kernels.linear(x, w, y, m))
     }
 
@@ -881,10 +882,10 @@ impl Backend for CudaBackend {
         s: AttnShape,
     ) -> Result<()> {
         check::attention(q.len, k.len, v.len, out.len, &s)?;
-        let op = if s.tokens == 1 {
-            "attention decode"
-        } else {
-            "attention prefill"
+        let op = match s.tokens {
+            1 => "attention decode",
+            2..=16 => "attention verify",
+            _ => "attention prefill",
         };
         self.timed(op, || self.kernels.attention(q, k, v, out, s))
     }
@@ -926,10 +927,10 @@ impl Backend for CudaBackend {
             out.len,
             &s,
         )?;
-        let op = if s.tokens == 1 {
-            "gated_delta_net decode"
-        } else {
-            "gated_delta_net prefill"
+        let op = match s.tokens {
+            1 => "gated_delta_net decode",
+            2..=16 => "gated_delta_net verify",
+            _ => "gated_delta_net prefill",
         };
         self.timed(op, || {
             self.kernels
