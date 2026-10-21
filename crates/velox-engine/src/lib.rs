@@ -937,6 +937,8 @@ impl<B: Backend> Core<B> {
         } = st;
         let dw = dw.as_mut().expect("DFlash lanes have a workspace");
         let bw = bw.as_mut().expect("several lanes have a batch workspace");
+        let timing = std::env::var_os("VELOX_DEBUG_BATCH").is_some();
+        let t0 = Instant::now();
         let mut windows = Vec::with_capacity(idx.len());
         for &i in idx {
             let a = &active[i];
@@ -949,6 +951,7 @@ impl<B: Backend> Core<B> {
             .map(|&i| slots[active[i].lane].take().expect("one request per lane"))
             .collect();
         let starts: Vec<usize> = batch.iter().map(|l| l.session.pos).collect();
+        let t_draft = t0.elapsed();
         let rows = {
             let mut sessions: Vec<&mut Session<B>> =
                 batch.iter_mut().map(|l| &mut l.session).collect();
@@ -965,6 +968,7 @@ impl<B: Backend> Core<B> {
                 )
                 .map_err(core)?
         };
+        let t_verify = t0.elapsed();
         let mut feat_row = 0;
         for (j, &i) in idx.iter().enumerate() {
             let a = &mut active[i];
@@ -976,6 +980,18 @@ impl<B: Backend> Core<B> {
                 .map_err(core)?;
             self.after_commit(lane, dw, ws, a, window, starts[j], keep, feat_row, next)?;
             feat_row += window.len();
+        }
+        if timing {
+            self.b.synchronize().map_err(core)?;
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "[batch] {} seqs, {} rows: draft {:.1} ms, verify {:.1} ms, commit {:.1} ms",
+                idx.len(),
+                feat_row,
+                ms(t_draft),
+                ms(t_verify - t_draft),
+                ms(t0.elapsed() - t_verify)
+            );
         }
         Ok(())
     }
