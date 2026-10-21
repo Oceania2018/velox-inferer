@@ -874,9 +874,77 @@ int launch_gemv_vec_m(const float* x, const WDesc& d, long long row_begin, int r
 
 }  // namespace
 
+namespace {
+// Few output rows (e.g. a 96-row gate projection) over a few tokens, bf16 weights, exact f32
+// activations: a block computes kSnRows rows for every token, its threads splitting K, so the
+// activations are read once per row group rather than once per row. Fixed-order reductions.
+constexpr int kSnRows = 4, kSnThreads = 512, kSnMaxM = 8;
+
+template <int M>
+__global__ void __launch_bounds__(kSnThreads) linear_small_n_bf16_kernel(const float* __restrict__ x,
+                                                                      const uint16_t* __restrict__ w, long long k,
+                                                                      long long row_begin, int rows, int m,
+                                                                      float* __restrict__ y) {
+    __shared__ float red[kSnThreads / VELOX_WARP][kSnRows][M];
+    const int r0 = blockIdx.x * kSnRows;
+    float acc[kSnRows][M];
+#pragma unroll
+    for (int r = 0; r < kSnRows; ++r)
+#pragma unroll
+        for (int t = 0; t < M; ++t) acc[r][t] = 0.0f;
+    const uint16_t* wr[kSnRows];
+#pragma unroll
+    for (int r = 0; r < kSnRows; ++r) wr[r] = w + (row_begin + min(r0 + r, rows - 1)) * k;
+    // Four consecutive K values per step: one 8-byte weight load per row, one float4 per token.
+    for (long long c = threadIdx.x; c < k / 4; c += kSnThreads) {
+        float4 xv[M];
+#pragma unroll
+        for (int t = 0; t < M; ++t)
+            xv[t] = t < m ? reinterpret_cast<const float4*>(x + t * k)[c] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int r = 0; r < kSnRows; ++r) {
+            const uint2 b = reinterpret_cast<const uint2*>(wr[r])[c];
+            const float w0 = __uint_as_float(b.x << 16), w1 = __uint_as_float(b.x & 0xffff0000u);
+            const float w2 = __uint_as_float(b.y << 16), w3 = __uint_as_float(b.y & 0xffff0000u);
+#pragma unroll
+            for (int t = 0; t < M; ++t) acc[r][t] += w0 * xv[t].x + w1 * xv[t].y + w2 * xv[t].z + w3 * xv[t].w;
+        }
+    }
+    const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+#pragma unroll
+    for (int r = 0; r < kSnRows; ++r)
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+            const float v = velox_warp_sum(acc[r][t]);
+            if (lane == 0) red[warp][r][t] = v;
+        }
+    __syncthreads();
+    for (int i = threadIdx.x; i < kSnRows * M; i += kSnThreads) {
+        const int r = i / M, t = i % M;
+        if (r0 + r >= rows || t >= m) continue;
+        float s = 0.0f;
+        for (int wi = 0; wi < kSnThreads / VELOX_WARP; ++wi) s += red[wi][r][t];
+        y[static_cast<long long>(t) * rows + r0 + r] = s;
+    }
+}
+
+template <int M>
+int launch_small_n(const float* x, const uint8_t* w, long long k, long long row_begin, int rows, int m, float* y) {
+    linear_small_n_bf16_kernel<M><<<(rows + kSnRows - 1) / kSnRows, kSnThreads>>>(
+        x, reinterpret_cast<const uint16_t*>(w), k, row_begin, rows, m, y);
+    return velox_launch_status();
+}
+}  // namespace
+
 VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format, long long n, long long k,
                                     long long row_begin, int rows, int m, float* y) {
     const WDesc d{w, format, n, k};
+    if (format == VELOX_FMT_BF16 && m >= 2 && m <= kSnMaxM && rows <= 256 && k % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(x) % 16 == 0 && reinterpret_cast<uintptr_t>(w) % 8 == 0) {
+        if (m <= 2) return launch_small_n<2>(x, w, k, row_begin, rows, m, y);
+        if (m <= 4) return launch_small_n<4>(x, w, k, row_begin, rows, m, y);
+        return launch_small_n<8>(x, w, k, row_begin, rows, m, y);
+    }
     // x rows are read as float4, so k must keep them 16-byte aligned too.
     if (m <= kGemvMaxM && k % 16 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0) {
         if (format == VELOX_FMT_NVFP4) return launch_gemv_vec_m<VELOX_FMT_NVFP4>(x, d, row_begin, rows, m, y);

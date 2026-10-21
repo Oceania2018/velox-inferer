@@ -1087,6 +1087,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 16)?;
     // Verify and draft sizes with K a multiple of 128 (GDN gate projection, a row view).
     s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 8)?;
+    s.linear(WeightFormat::Bf16, 130, 1024, 3, 98, 3)?;
+    s.linear(WeightFormat::Bf16, 40, 256, 0, 40, 2)?;
     s.linear(WeightFormat::Bf16, 300, 1024, 40, 200, 3)?;
     s.linear(WeightFormat::Nvfp4, 256, 128, 0, 256, 1)?;
     s.linear(WeightFormat::Nvfp4, 384, 192, 128, 200, 5)?;
