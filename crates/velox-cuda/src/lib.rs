@@ -36,6 +36,7 @@ mod ffi {
         ) -> i32;
         pub fn velox_cuda_set_device(device: i32) -> i32;
         pub fn velox_cuda_mem_info(free: *mut usize, total: *mut usize) -> i32;
+        pub fn velox_cuda_profiler(on: i32) -> i32;
         pub fn velox_cuda_malloc_zeroed(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn velox_cuda_free(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_htod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
@@ -162,6 +163,13 @@ pub fn mem_info() -> Result<(u64, u64)> {
         "cudaMemGetInfo",
     )?;
     Ok((free as u64, total as u64))
+}
+
+/// Starts or stops collection by an external profiler started with collection off
+/// (`ncu --profile-from-start off`).
+pub fn profiler(on: bool) -> Result<()> {
+    // SAFETY: no arguments besides the flag.
+    status(unsafe { ffi::velox_cuda_profiler(i32::from(on)) }, "cudaProfiler")
 }
 
 /// Refuses to run a variant's arch-specific kernels on a device they were not compiled for.
