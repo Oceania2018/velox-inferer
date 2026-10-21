@@ -57,8 +57,10 @@ const GRAPH_COMMIT: u64 = 3 << 16;
 /// path that stages its position.
 const STATIC_MAX_TOKENS: usize = 15;
 
-/// Layers per graph segment (see [`Backend::graph_break`]).
-const GRAPH_SEGMENT_LAYERS: usize = 16;
+/// Layers where a recorded step starts a new graph segment (see [`Backend::graph_break`]).
+/// Submission time grows with a segment's size and the GPU waits for the first one, so it holds
+/// one layer; each later segment is submitted while the GPU runs the ones before it.
+const GRAPH_SEGMENT_STARTS: [usize; 5] = [1, 4, 16, 32, 48];
 
 fn graph_key(kind: u64, shape: u64, s: &Session<impl Backend>, kv_len: Option<usize>) -> u64 {
     let mut key = kind | shape | u64::from(s.parity) << 15 | (s.id & 0xffff) << 40;
@@ -468,7 +470,7 @@ impl<B: Backend> Qwen35Text<B> {
         };
         let (mut ai, mut gi) = (0, 0);
         for (li, l) in w.layers.iter().enumerate() {
-            if li > 0 && li % GRAPH_SEGMENT_LAYERS == 0 {
+            if GRAPH_SEGMENT_STARTS.contains(&li) {
                 // Recorded steps launch in segments, so the GPU starts while the rest is submitted.
                 b.graph_break()?;
             }
