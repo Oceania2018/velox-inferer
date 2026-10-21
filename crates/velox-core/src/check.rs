@@ -296,6 +296,11 @@ pub fn kv_store(
     need("kv_store v_cache", v_cache, cache)
 }
 
+/// `kv_load` reads what `kv_store` writes: the same extents.
+pub fn kv_load(k_cache: usize, v_cache: usize, k: usize, v: usize, s: &KvStoreShape) -> Result<()> {
+    kv_store(k, v, k_cache, v_cache, s)
+}
+
 pub fn copy2d(src: usize, dst: usize, s: &Copy2dShape) -> Result<()> {
     if s.rows == 0 || s.cols == 0 {
         return Ok(());
