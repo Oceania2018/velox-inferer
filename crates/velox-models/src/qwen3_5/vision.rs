@@ -1,6 +1,8 @@
 //! Qwen3.5 vision tower and merger: image patches -> text-width embeddings.
 //! The mathematics is specified in docs/qwen3_5-vision.md.
 
+use std::sync::Mutex;
+
 use serde_json::Value;
 use velox_core::backend::{Backend, FullAttnShape, GeluKind, RopeLayout, RopePosShape, WeightView};
 use velox_core::{Error, Result};
@@ -91,6 +93,24 @@ pub struct Qwen35Vision<B: Backend> {
     merger_fc1: (WDesc, usize),
     merger_fc2: (WDesc, usize),
     pub bytes: u64,
+    /// Activations of the latest image grid, reused while the grid repeats (agent screenshots):
+    /// fresh buffers per layer would allocate and free, and a free synchronizes the device.
+    ws: Mutex<Option<VisionWs<B>>>,
+}
+
+struct VisionWs<B: Backend> {
+    grid: (usize, usize),
+    /// Interpolated position embeddings of the grid.
+    pos: B::Buffer,
+    x: B::Buffer,
+    h: B::Buffer,
+    attn: B::Buffer,
+    q: B::Buffer,
+    k: B::Buffer,
+    v: B::Buffer,
+    o: B::Buffer,
+    f: B::Buffer,
+    m: B::Buffer,
 }
 
 impl<B: Backend> Qwen35Vision<B> {
@@ -175,6 +195,7 @@ impl<B: Backend> Qwen35Vision<B> {
             merger_fc1,
             merger_fc2,
             bytes,
+            ws: Mutex::new(None),
         })
     }
 
@@ -190,12 +211,17 @@ impl<B: Backend> Qwen35Vision<B> {
         }
     }
 
-    /// `y = x . W^T + bias` into a fresh buffer of `m` rows.
-    fn linear_bias(&self, b: &B, x: &B::Buffer, w: &(WDesc, usize), m: usize) -> Result<B::Buffer> {
-        let mut y = b.alloc(m * w.0.rows)?;
-        b.linear(x, &self.view(&w.0), &mut y, m)?;
-        b.add_bias(&mut y, &self.params[w.1], m, w.0.rows)?;
-        Ok(y)
+    /// `y = x . W^T + bias` for `m` rows.
+    fn linear_bias(
+        &self,
+        b: &B,
+        x: &B::Buffer,
+        w: &(WDesc, usize),
+        y: &mut B::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        b.linear(x, &self.view(&w.0), y, m)?;
+        b.add_bias(y, &self.params[w.1], m, w.0.rows)
     }
 
     /// Raw patch coordinates `(y, x)` of a `gh x gw` grid in merge-group order.
@@ -269,70 +295,102 @@ impl<B: Backend> Qwen35Vision<B> {
             layout: RopeLayout::Blocked,
         };
 
+        let mut guard = self
+            .ws
+            .lock()
+            .map_err(|_| Error::Backend("vision workspace poisoned".into()))?;
+        if guard.as_ref().is_none_or(|w| w.grid != (gh, gw)) {
+            *guard = None; // free the old grid's buffers first
+            let inter = c.intermediate.max(self.merger_fc1.0.rows);
+            *guard = Some(VisionWs {
+                grid: (gh, gw),
+                pos: b.upload(&self.position_embeddings(&coords, gh, gw))?,
+                x: b.alloc(n * h)?,
+                h: b.alloc(n * h)?,
+                attn: b.alloc(n * h)?,
+                q: b.alloc(n * h)?,
+                k: b.alloc(n * h)?,
+                v: b.alloc(n * h)?,
+                o: b.alloc(n * h)?,
+                f: b.alloc(n * inter)?,
+                m: b.alloc(n * inter)?,
+            });
+        }
+        let ws = guard.as_mut().expect("allocated above");
+        let VisionWs {
+            pos,
+            x,
+            h: hbuf,
+            attn,
+            q,
+            k,
+            v,
+            o,
+            f,
+            m,
+            ..
+        } = ws;
         let input = b.upload(patches)?;
-        let mut x = self.linear_bias(b, &input, &self.patch, n)?;
-        drop(input);
-        let pos = b.upload(&self.position_embeddings(&coords, gh, gw))?;
-        b.add(&mut x, &pos, n * h)?;
-        drop(pos);
+        self.linear_bias(b, &input, &self.patch, x, n)?;
+        b.add(x, pos, n * h)?;
 
-        let mut hbuf = b.alloc(n * h)?;
-        let mut attn = b.alloc(n * h)?;
         for l in &self.layers {
             b.layer_norm(
-                &x,
+                x,
                 &self.params[l.norm1.0],
                 &self.params[l.norm1.1],
-                &mut hbuf,
+                hbuf,
                 n,
                 h,
                 1e-6,
             )?;
-            let mut q = self.linear_bias(b, &hbuf, &l.q, n)?;
-            let mut k = self.linear_bias(b, &hbuf, &l.k, n)?;
-            let v = self.linear_bias(b, &hbuf, &l.v, n)?;
-            b.rope_positions(&mut q, &positions, rope)?;
-            b.rope_positions(&mut k, &positions, rope)?;
+            self.linear_bias(b, hbuf, &l.q, q, n)?;
+            self.linear_bias(b, hbuf, &l.k, k, n)?;
+            self.linear_bias(b, hbuf, &l.v, v, n)?;
+            b.rope_positions(q, &positions, rope)?;
+            b.rope_positions(k, &positions, rope)?;
             b.attention_full(
-                &q,
-                &k,
-                &v,
-                &mut attn,
+                q,
+                k,
+                v,
+                attn,
                 FullAttnShape {
                     tokens: n,
                     heads: c.heads,
                     head_dim: d,
                 },
             )?;
-            let o = self.linear_bias(b, &attn, &l.out, n)?;
-            b.add(&mut x, &o, n * h)?;
+            self.linear_bias(b, attn, &l.out, o, n)?;
+            b.add(x, o, n * h)?;
             b.layer_norm(
-                &x,
+                x,
                 &self.params[l.norm2.0],
                 &self.params[l.norm2.1],
-                &mut hbuf,
+                hbuf,
                 n,
                 h,
                 1e-6,
             )?;
-            let mut f = self.linear_bias(b, &hbuf, &l.fc1, n)?;
-            b.gelu(&mut f, n * c.intermediate, GeluKind::Tanh)?;
-            let g = self.linear_bias(b, &f, &l.fc2, n)?;
-            b.add(&mut x, &g, n * h)?;
+            self.linear_bias(b, hbuf, &l.fc1, f, n)?;
+            b.gelu(f, n * c.intermediate, GeluKind::Tanh)?;
+            self.linear_bias(b, f, &l.fc2, o, n)?;
+            b.add(x, o, n * h)?;
         }
         // Merger: patches are merge-group ordered, so [n, h] is already [n/4, 4h].
         b.layer_norm(
-            &x,
+            x,
             &self.params[self.merger_norm.0],
             &self.params[self.merger_norm.1],
-            &mut hbuf,
+            hbuf,
             n,
             h,
             1e-6,
         )?;
         let tokens = n / 4;
-        let mut m = self.linear_bias(b, &hbuf, &self.merger_fc1, tokens)?;
-        b.gelu(&mut m, tokens * self.merger_fc1.0.rows, GeluKind::Erf)?;
-        self.linear_bias(b, &m, &self.merger_fc2, tokens)
+        self.linear_bias(b, hbuf, &self.merger_fc1, m, tokens)?;
+        b.gelu(m, tokens * self.merger_fc1.0.rows, GeluKind::Erf)?;
+        let mut out = b.alloc(tokens * self.merger_fc2.0.rows)?;
+        self.linear_bias(b, m, &self.merger_fc2, &mut out, tokens)?;
+        Ok(out)
     }
 }

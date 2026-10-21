@@ -47,6 +47,10 @@ COMMANDS:
       --m <list>            token counts, comma separated (default 1,4,16,128,512)
       --act <a16|a8|a4>     activation policy (default a16); --divisor <f> for a4 (default 500)
       --iters <n>           timed iterations (default 20)
+  bench-gdn               Time one gated_delta_net at a model head geometry with random inputs
+      --k-heads <n> --v-heads <n> --k-dim <n> --v-dim <n>  default 16/48 heads, 128/128 (Qwen3.8)
+      --tokens <list>       token counts, comma separated (default 1,8,64,512)
+      --iters <n>           timed iterations (default 50)
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
@@ -103,6 +107,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("selftest") => selftest(a),
         Some("bench") => bench_cmd(a),
         Some("bench-linear") => bench_linear(a),
+        Some("bench-gdn") => bench_gdn(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
         Some("generate") => generate::run(a),
@@ -333,6 +338,31 @@ fn bench_linear(a: &Args) -> Result<ExitCode> {
         Selected::Cpu(b) => bench::run_linear(b, &cfg)?,
         #[cfg(feature = "cuda")]
         Selected::Cuda(b) => bench::run_linear(b, &cfg)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn bench_gdn(a: &Args) -> Result<ExitCode> {
+    let tokens = a
+        .get("tokens")
+        .unwrap_or("1,8,64,512")
+        .split(',')
+        .map(|s| s.trim().parse::<usize>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| velox_core::Error::Config("--tokens takes comma-separated integers".into()))?;
+    let cfg = bench::GdnConfig {
+        k_heads: a.parse("k-heads", 16)?,
+        v_heads: a.parse("v-heads", 48)?,
+        k_dim: a.parse("k-dim", 128)?,
+        v_dim: a.parse("v-dim", 128)?,
+        tokens,
+        iters: a.parse("iters", 50)?,
+    };
+    let sel = select::backend(a)?;
+    match &sel {
+        Selected::Cpu(b) => bench::run_gdn(b, &cfg)?,
+        #[cfg(feature = "cuda")]
+        Selected::Cuda(b) => bench::run_gdn(b, &cfg)?,
     }
     Ok(ExitCode::SUCCESS)
 }
