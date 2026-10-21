@@ -1057,6 +1057,28 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             head_dim: 96,
             pos0: 1_000,
         },
+        // Speculative verify windows over long caches (GQA-packed split path).
+        AttnShape {
+            tokens: 8,
+            heads: 24,
+            kv_heads: 4,
+            head_dim: 256,
+            pos0: 17_000,
+        },
+        AttnShape {
+            tokens: 16,
+            heads: 24,
+            kv_heads: 4,
+            head_dim: 256,
+            pos0: 37,
+        },
+        AttnShape {
+            tokens: 5,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            pos0: 2_049,
+        },
     ] {
         s.attention(a)?;
     }
