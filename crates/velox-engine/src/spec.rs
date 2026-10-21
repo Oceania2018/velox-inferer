@@ -249,19 +249,14 @@ pub struct DFlashDrafter<B: Backend> {
     /// Running mean of accepted drafts per round.
     accepted: f32,
     state: DFlashState<B>,
-    dw: DFlashWorkspace<B>,
     rng: Rng,
 }
 
 impl<B: Backend> DFlashDrafter<B> {
-    pub fn new(
-        b: &B,
-        dm: &DFlashModel<B>,
-        target: &Qwen35Text<B>,
-        ctx_rows: usize,
-        drafts: usize,
-    ) -> Result<Self> {
-        let max = drafts.clamp(1, velox_models::qwen3_5::VERIFY_MAX - 1);
+    /// A drafter of up to `drafts` drafts per block. Its activations live in a workspace from
+    /// [`Self::workspace`], which drafters of several sequences can share.
+    pub fn new(b: &B, dm: &DFlashModel<B>, drafts: usize) -> Result<Self> {
+        let max = Self::max_drafts(drafts);
         let low = max.min(ADAPT_LOW);
         Ok(DFlashDrafter {
             drafts: low,
@@ -269,9 +264,24 @@ impl<B: Backend> DFlashDrafter<B> {
             low,
             accepted: low as f32,
             state: dm.state(b)?,
-            dw: dm.workspace(b, target, ctx_rows, max + 1)?,
             rng: Rng::new(0x5eed_df1a),
         })
+    }
+
+    fn max_drafts(drafts: usize) -> usize {
+        drafts.clamp(1, velox_models::qwen3_5::VERIFY_MAX - 1)
+    }
+
+    /// Activations for drafters of up to `drafts` drafts that materialize up to `ctx_rows`
+    /// context rows at once (the target's prefill chunk).
+    pub fn workspace(
+        b: &B,
+        dm: &DFlashModel<B>,
+        target: &Qwen35Text<B>,
+        ctx_rows: usize,
+        drafts: usize,
+    ) -> Result<DFlashWorkspace<B>> {
+        dm.workspace(b, target, ctx_rows, Self::max_drafts(drafts) + 1)
     }
 
     /// The context rings (for saving them with a context-store entry).
@@ -318,6 +328,7 @@ impl<B: Backend> DFlashDrafter<B> {
         &mut self,
         b: &B,
         dm: &DFlashModel<B>,
+        dw: &mut DFlashWorkspace<B>,
         ws: &Workspace<B>,
         row0: usize,
         t: usize,
@@ -327,7 +338,23 @@ impl<B: Backend> DFlashDrafter<B> {
                 "prefill chunk of {t} rows exceeds the DFlash window"
             )));
         }
-        dm.materialize(b, &mut self.state, &mut self.dw, ws, row0, t)
+        dm.materialize(b, &mut self.state, dw, ws, 0, row0, t)
+    }
+
+    /// Context for the `kept` committed rows of a verify (cache rows from `row0`), whose
+    /// features are rows `feat_row ..` of `ws` (a batched verify's offset for this sequence).
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_rows(
+        &mut self,
+        b: &B,
+        dm: &DFlashModel<B>,
+        dw: &mut DFlashWorkspace<B>,
+        ws: &Workspace<B>,
+        feat_row: usize,
+        row0: usize,
+        kept: usize,
+    ) -> Result<()> {
+        dm.materialize(b, &mut self.state, dw, ws, feat_row, row0, kept)
     }
 
     /// Materializes the `kept` rows of the last verify (cache rows from `row0`, features in `ws`),
@@ -338,6 +365,7 @@ impl<B: Backend> DFlashDrafter<B> {
         &mut self,
         b: &B,
         dm: &DFlashModel<B>,
+        dw: &mut DFlashWorkspace<B>,
         target: &Qwen35Text<B>,
         ws: &Workspace<B>,
         row0: usize,
@@ -348,7 +376,7 @@ impl<B: Backend> DFlashDrafter<B> {
         temperature: f32,
     ) -> Result<(Vec<u32>, Vec<Vec<(u32, f32)>>)> {
         if kept > 0 {
-            dm.materialize(b, &mut self.state, &mut self.dw, ws, row0, kept)?;
+            dm.materialize(b, &mut self.state, dw, ws, 0, row0, kept)?;
         }
         let st = &mut self.state;
         if st.end > frontier {
@@ -358,7 +386,7 @@ impl<B: Backend> DFlashDrafter<B> {
             st.lo = frontier;
             st.end = frontier;
         }
-        let bc = dm.propose(b, target, st, &mut self.dw, anchor, self.drafts, limit)?;
+        let bc = dm.propose(b, target, st, dw, anchor, self.drafts, limit)?;
         let rng = &mut self.rng;
         Ok(dm.select(&bc, anchor, temperature, &mut || rng.uniform() * 0.5 + 0.5))
     }

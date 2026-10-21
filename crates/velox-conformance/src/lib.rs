@@ -898,8 +898,9 @@ impl<B: Backend> Suite<'_, B> {
 
     /// `gdn_replay`: `layers` GDN layers advanced over the first `keep` rows of a `window`-row
     /// window from its recorded inputs and conv outputs; the conv and recurrent states must equal
-    /// running `conv1d_silu` and `gated_delta_net` over those rows.
-    fn gdn_replay(&mut self, layers: usize, window: usize, keep: usize) -> Result<()> {
+    /// running `conv1d_silu` and `gated_delta_net` over those rows. The window starts at row
+    /// `row0` of buffers whose earlier rows belong to other windows.
+    fn gdn_replay(&mut self, layers: usize, window: usize, keep: usize, row0: usize) -> Result<()> {
         let (k_heads, v_heads, dk, width) = (2, 6, 64, 4);
         let gs = GdnShape {
             tokens: keep,
@@ -934,6 +935,10 @@ impl<B: Backend> Suite<'_, B> {
             let w = self.rng.vec(width * ch, 0.5);
             let c0 = self.rng.vec(conv_len, 1.0);
             let ab = self.rng.vec(window * 2 * v_heads, 2.0);
+            let (junk_qkv, junk_ab) = (
+                self.rng.vec(row0 * ch, 1.0),
+                self.rng.vec(row0 * 2 * v_heads, 2.0),
+            );
             let (a_log, dt) = (self.rng.vec(v_heads, 1.0), self.rng.vec(v_heads, 1.0));
             let s0 = self.rng.vec(state_len, 0.1);
             // The window's conv outputs, then the reference states after `keep` rows.
@@ -947,10 +952,13 @@ impl<B: Backend> Suite<'_, B> {
             CpuBackend.conv1d_silu(&qkv, &w, &mut want_c, &mut y, cs)?;
             let (mut want_s, mut o) = (s0.clone(), vec![0.0; keep * v_heads * dk]);
             CpuBackend.gated_delta_net(&conv_out, &ab, &a_log, &dt, &mut want_s, &mut o, gs)?;
+            // Other windows' rows ahead of this one.
+            let at = |junk: &[f32], rows: Vec<f32>| [junk, &rows[..]].concat();
+            let junk_out = self.rng.vec(row0 * ch, 1.0);
             ls.push(L {
-                qkv,
-                conv_out,
-                ab,
+                qkv: at(&junk_qkv, qkv),
+                conv_out: at(&junk_out, conv_out),
+                ab: at(&junk_ab, ab),
                 a_log,
                 dt,
                 c0,
@@ -984,7 +992,11 @@ impl<B: Backend> Suite<'_, B> {
                 ssm: s,
             })
             .collect();
-        self.b.gdn_replay(&mut items, cs, gs)?;
+        self.b.gdn_replay(
+            &mut items,
+            ConvShape { row0, ..cs },
+            GdnShape { row0, ..gs },
+        )?;
         drop(items);
         let (mut got, mut want) = (Vec::new(), Vec::new());
         for (l, d) in ls.iter().zip(&dev) {
@@ -993,7 +1005,7 @@ impl<B: Backend> Suite<'_, B> {
             want.extend_from_slice(&l.want_c);
             want.extend_from_slice(&l.want_s);
         }
-        let name = format!("gdn_replay {layers} layers, {keep} of {window} rows");
+        let name = format!("gdn_replay {layers} layers, {keep} of {window} rows at {row0}");
         self.record(name, Some(Op::GdnReplay), &got, &want, 1e-4);
         Ok(())
     }
@@ -1582,9 +1594,10 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.state_from(16, 48, 128, 8)?;
     s.state_from(2, 6, 64, 3)?;
     s.state_from(2, 4, 128, 20)?;
-    s.gdn_replay(3, 8, 5)?;
-    s.gdn_replay(2, 8, 1)?;
-    s.gdn_replay(2, 12, 12)?;
+    s.gdn_replay(3, 8, 5, 0)?;
+    s.gdn_replay(2, 8, 1, 0)?;
+    s.gdn_replay(2, 12, 12, 0)?;
+    s.gdn_replay(3, 8, 5, 11)?;
     s.gdn(1, 3, 32, 32, [4, 1])?;
     // Qwen3.5 GDN head geometry (16/48 heads scaled down to 2/6), Dk = Dv = 128.
     s.gdn(2, 6, 128, 128, [6, 1])?;
