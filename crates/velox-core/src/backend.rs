@@ -473,6 +473,18 @@ pub trait Backend {
     fn upload_bytes_host(&self, data: &[u8]) -> Result<Self::Buffer> {
         self.upload_bytes(data)
     }
+    /// The bytes of `buf` when the host can address them directly (storage from
+    /// [`Self::alloc_host`] on a backend with such memory), else `None`. Callers synchronize
+    /// with pending device work on `buf` first.
+    fn host_bytes<'a>(&self, buf: &'a Self::Buffer) -> Option<&'a [u8]> {
+        let _ = buf;
+        None
+    }
+    /// Mutable [`Self::host_bytes`].
+    fn host_bytes_mut<'a>(&self, buf: &'a mut Self::Buffer) -> Option<&'a mut [u8]> {
+        let _ = buf;
+        None
+    }
     /// `x[i] *= sigmoid(gate[i])` for the first `len` elements.
     fn sigmoid_mul(&self, x: &mut Self::Buffer, gate: &Self::Buffer, len: usize) -> Result<()>;
     /// Causal depthwise convolution + SiLU with a rolling state; see [`ConvShape`].

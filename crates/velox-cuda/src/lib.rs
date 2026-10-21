@@ -1007,6 +1007,18 @@ impl Backend for CudaBackend {
         Ok(buf)
     }
 
+    fn host_bytes<'a>(&self, buf: &'a CudaBuffer) -> Option<&'a [u8]> {
+        // SAFETY: mapped host memory of len f32 slots, owned by buf for its lifetime.
+        (buf.host && !buf.ptr.is_null())
+            .then(|| unsafe { std::slice::from_raw_parts(buf.ptr.cast::<u8>(), buf.len * 4) })
+    }
+
+    fn host_bytes_mut<'a>(&self, buf: &'a mut CudaBuffer) -> Option<&'a mut [u8]> {
+        // SAFETY: as above, borrowed mutably.
+        (buf.host && !buf.ptr.is_null())
+            .then(|| unsafe { std::slice::from_raw_parts_mut(buf.ptr.cast::<u8>(), buf.len * 4) })
+    }
+
     fn download(&self, buf: &CudaBuffer, out: &mut [f32]) -> Result<()> {
         check::elementwise("download", &[buf.len], out.len())?;
         if !out.is_empty() {
