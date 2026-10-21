@@ -465,7 +465,8 @@ impl<B: Backend> QwenEngine<B> {
         for cp in std::mem::take(&mut lane.checkpoints) {
             if cp.pos < fresh && store.enabled() && cp.pos >= MIN_REUSE && anchors.contains(&cp.pos)
             {
-                store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None)?;
+                let drafter = self.drafter_context(lane);
+                store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
             }
             if cp.pos >= fresh || Some(cp.pos) == head {
                 kept.push(cp);
@@ -477,6 +478,20 @@ impl<B: Backend> QwenEngine<B> {
         // A request snapshots about two points before its last image; keep storage for that.
         lane.spare.truncate(2);
         Ok(())
+    }
+
+    /// The lane's DFlash drafter context, to be saved with a context-store entry.
+    fn drafter_context<'a>(
+        &'a self,
+        lane: &'a Lane<B>,
+    ) -> Option<(
+        &'a DFlashModel<B>,
+        &'a velox_models::qwen3_5::DFlashState<B>,
+    )> {
+        match (lane.drafter.as_ref(), self.dflash.as_ref()) {
+            (Some(Drafter::DFlash(d)), Some(dm)) => Some((dm, d.context())),
+            _ => None,
+        }
     }
 
     /// Before a request overwrites a lane that holds another conversation, stores the lane's
@@ -494,7 +509,16 @@ impl<B: Backend> QwenEngine<B> {
             .filter(|c| c.pos > shared && c.pos <= lane.keys.len() && c.pos >= MIN_CAPTURE)
             .max_by_key(|c| c.pos);
         if let Some(cp) = head {
-            store.insert(&self.b, &lane.session, &lane.keys, cp, false, lane.chain)?;
+            let drafter = self.drafter_context(lane);
+            store.insert(
+                &self.b,
+                &lane.session,
+                &lane.keys,
+                cp,
+                false,
+                lane.chain,
+                drafter,
+            )?;
         }
         Ok(())
     }
@@ -525,8 +549,15 @@ impl<B: Backend> QwenEngine<B> {
         };
         let reach = limit.min(lane.session.capacity);
         let resident = own.max(store.best_pos(keys, reach));
-        if store.promote(&self.b, &lane.session, keys, reach, resident, DISK_GAIN)?
-            && std::env::var_os("VELOX_DEBUG_PREFIX").is_some()
+        if store.promote(
+            &self.b,
+            &lane.session,
+            keys,
+            reach,
+            resident,
+            DISK_GAIN,
+            self.dflash.as_ref(),
+        )? && std::env::var_os("VELOX_DEBUG_PREFIX").is_some()
         {
             eprintln!("[disk] read back a prefix beyond {resident}");
         }
@@ -537,12 +568,16 @@ impl<B: Backend> QwenEngine<B> {
                 for seg in &e.kv {
                     lane.session.load_kv(&self.b, seg, shared)?;
                 }
-                // The drafter's context past the shared prefix belongs to the other conversation
+                // The drafter continues from the context saved with the entry; without one, its
+                // context past the shared prefix belongs to the other conversation and is dropped
                 // (MTP KV rows there only cost acceptance until overwritten).
                 if let (Some(Drafter::DFlash(d)), Some(dm)) =
                     (lane.drafter.as_mut(), self.dflash.as_ref())
                 {
-                    d.forget(dm, shared);
+                    match &e.draft {
+                        Some(ctx) => d.restore_context(&self.b, dm, ctx)?,
+                        None => d.forget(dm, shared),
+                    }
                 }
                 return Ok((e.pos(), Some(e.id)));
             }
