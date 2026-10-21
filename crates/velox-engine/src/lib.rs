@@ -836,6 +836,7 @@ impl<B: Backend> Core<B> {
         dw: &mut DFlashWorkspace<B>,
         ws: &Workspace<B>,
         a: &Active,
+        whole: bool,
     ) -> Result<(Vec<u32>, Vec<Vec<(u32, f32)>>), ApiError> {
         let dm = self
             .dflash
@@ -859,8 +860,15 @@ impl<B: Backend> Core<B> {
                 a.job.sampler.temperature(),
             )
             .map_err(core)?;
+        // `whole`: keep drafts past the request's budget (acceptance stops at the budget anyway),
+        // so every window of a batch has the same length.
+        let budget = if whole {
+            drafts.len()
+        } else {
+            a.job.max_tokens - a.out.len()
+        };
         let mut window = vec![a.c];
-        window.extend(drafts.into_iter().take(a.job.max_tokens - a.out.len()));
+        window.extend(drafts.into_iter().take(budget));
         Ok((window, qs))
     }
 
@@ -905,7 +913,7 @@ impl<B: Backend> Core<B> {
         let Lanes { ws, lanes, dw, .. } = st;
         let dw = dw.as_mut().expect("DFlash lanes have a workspace");
         let lane = &mut lanes[a.lane];
-        let (window, qs) = self.dflash_window(lane, dw, ws, a)?;
+        let (window, qs) = self.dflash_window(lane, dw, ws, a, false)?;
         let p = lane.session.pos;
         let rows = self
             .model
@@ -939,10 +947,27 @@ impl<B: Backend> Core<B> {
         let bw = bw.as_mut().expect("several lanes have a batch workspace");
         let timing = std::env::var_os("VELOX_DEBUG_BATCH").is_some();
         let t0 = Instant::now();
+        // Every sequence drafts the same number of tokens (the most any of them wants), so the
+        // batch keeps one shape and replays one recorded step.
+        let drafts = idx
+            .iter()
+            .filter_map(|&i| match &lanes[active[i].lane].drafter {
+                Some(Drafter::DFlash(d)) => Some(d.drafts),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let room = idx.iter().all(|&i| {
+            lanes[active[i].lane].session.pos + drafts < lanes[active[i].lane].session.capacity
+        });
         let mut windows = Vec::with_capacity(idx.len());
         for &i in idx {
             let a = &active[i];
-            windows.push(self.dflash_window(&mut lanes[a.lane], dw, ws, a)?);
+            let lane = &mut lanes[a.lane];
+            if let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() {
+                d.drafts = drafts;
+            }
+            windows.push(self.dflash_window(lane, dw, ws, a, room)?);
         }
         // Disjoint lanes of this batch, in `idx` order.
         let mut slots: Vec<Option<&mut Lane<B>>> = lanes.iter_mut().map(Some).collect();

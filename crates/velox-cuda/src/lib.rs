@@ -645,6 +645,15 @@ pub enum GraphMode {
     Replay,
 }
 
+/// The KV bucket (in keys) a static graph step's key carries, while one is recorded or replayed.
+pub(crate) fn static_kv_bucket() -> Option<usize> {
+    if graph_mode() == GraphMode::None {
+        return None;
+    }
+    let key = GRAPH_SEG.with(std::cell::Cell::get).0;
+    (key & GRAPH_STATIC != 0).then(|| ((key >> 24) & 0xffff) as usize * velox_core::GRAPH_KV_BUCKET)
+}
+
 thread_local! {
     static GRAPH_MODE: std::cell::Cell<GraphMode> = const { std::cell::Cell::new(GraphMode::None) };
     /// The step being recorded or replayed: its key, current segment and that segment's slot.
@@ -1250,7 +1259,7 @@ impl Backend for CudaBackend {
         s: ConvShape,
     ) -> Result<()> {
         check::conv1d(x.len, weight.len, state.len, out.len, &s)?;
-        self.timed("conv1d_silu", || {
+        self.staged("conv1d_silu", || {
             self.kernels.conv1d_silu(x, weight, None, state, out, s)
         })
     }
@@ -1265,7 +1274,7 @@ impl Backend for CudaBackend {
         s: ConvShape,
     ) -> Result<()> {
         check::conv1d(x.len, weight.len, state_in.len, out.len, &s)?;
-        self.timed("conv1d_silu", || {
+        self.staged("conv1d_silu", || {
             self.kernels
                 .conv1d_silu(x, weight, Some(state_in), state_out, out, s)
         })
@@ -1295,7 +1304,8 @@ impl Backend for CudaBackend {
             2..=16 => "gated_delta_net verify",
             _ => "gated_delta_net prefill",
         };
-        self.timed(op, || {
+        // Staged: graph steps stage the state (see `portable::gated_delta_net`).
+        self.staged(op, || {
             self.kernels
                 .gated_delta_net(qkv, ab, a_log, dt_bias, None, state, out, s)
         })
@@ -1334,7 +1344,7 @@ impl Backend for CudaBackend {
         out: &mut CudaBuffer,
         s: GdnShape,
     ) -> Result<()> {
-        self.timed("gated_delta_net verify", || {
+        self.staged("gated_delta_net verify", || {
             self.kernels
                 .gated_delta_net(qkv, ab, a_log, dt_bias, Some(state_in), state_out, out, s)
         })
