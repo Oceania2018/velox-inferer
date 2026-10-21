@@ -376,14 +376,18 @@ where
         cfg: EngineConfig,
     ) -> Result<Self, CoreError> {
         let dflash = dflash.filter(|_| cfg.dflash_drafts > 0);
-        let mut ws = model.workspace(&b, cfg.chunk)?;
+        // Chunks keep their rows only for MTP drafting.
+        let mut ws = model.workspace_with(&b, cfg.chunk, dflash.is_none())?;
         if let Some(dm) = &dflash {
             model.enable_capture(&b, &mut ws, &dm.cfg.target_layers)?;
         }
         let n_lanes = cfg.lanes.max(1);
         let mut lanes = Vec::with_capacity(n_lanes);
         for i in 0..n_lanes {
-            let session = model.session_with(&b, cfg.capacity, cfg.kv_format)?;
+            let mut session = model.session_with(&b, cfg.capacity, cfg.kv_format)?;
+            if dflash.is_some() || cfg.mtp_drafts > 0 {
+                model.reserve_verify(&b, &mut session, &mut ws)?;
+            }
             let zero = session.checkpoint_in(&b, cfg.host_checkpoints)?;
             let drafter = match &dflash {
                 Some(dm) => Some(Drafter::DFlash(DFlashDrafter::new(
@@ -1154,7 +1158,9 @@ impl<B: Backend> Core<B> {
                 lane.spare.push(cp);
             }
         }
-        lane.spare.truncate(1);
+        // Device memory: one checkpoint per lane when several share the card (a prefill snapshots
+        // into the lane's own old checkpoint), plus a spare with a single lane.
+        lane.spare.truncate(usize::from(self.cfg.lanes <= 1));
         Ok(())
     }
 
