@@ -242,16 +242,23 @@ impl<B: Backend> ContextStore<B> {
     }
 
     /// One step of preparing pinned storage while the server is idle: keeps a reserve of
-    /// [`RESERVE_STATES`] states and [`RESERVE_PAGES`] KV pages within the budget, so captures
+    /// [`RESERVE_STATES`] states, [`RESERVE_PAGES`] KV pages and `draft` drafter context pages
+    /// (`(count, page length)`: one drafter window) within the budget, so captures
     /// do not pin memory on the request path. Returns whether there may be more to do.
-    pub fn top_up(&mut self, b: &B, session: &Session<B>) -> Result<bool, CoreError> {
+    pub fn top_up(
+        &mut self,
+        b: &B,
+        session: &Session<B>,
+        draft: Option<(usize, usize)>,
+    ) -> Result<bool, CoreError> {
         if !self.enabled() {
             return Ok(false);
         }
         let page_len = session.kv_page_len();
         let pinned = self.bytes(b)
             + self.spare.iter().map(|s| s.bytes(b)).sum::<usize>()
-            + self.pages.len() * page_len * 4;
+            + self.pages.len() * page_len * 4
+            + draft.map_or(0, |(_, len)| self.draft_pages.len() * len * 4);
         if pinned >= self.budget {
             return Ok(false);
         }
@@ -263,6 +270,10 @@ impl<B: Backend> ContextStore<B> {
             for _ in 0..4 {
                 self.pages.push(b.alloc_host(page_len)?);
             }
+            return Ok(true);
+        }
+        if let Some((_, len)) = draft.filter(|&(n, _)| self.draft_pages.len() < n) {
+            self.draft_pages.push(b.alloc_host(len)?);
             return Ok(true);
         }
         Ok(false)
