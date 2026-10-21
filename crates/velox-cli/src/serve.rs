@@ -35,7 +35,10 @@ where
         fe.vision_pixels = Some((lo.min(max_vision * 1024), hi.min(max_vision * 1024)));
     }
     let cfg = TextConfig::from_json(&art.components()["text"]["config"])?;
-    let dflash_drafts: usize = a.parse("dflash-drafts", 11)?;
+    // --dflash-drafts N (default 7, ninfer --draft-tokens 7 as deployed): drafts per block. Above 7
+    // the drafter switches to a longer block while recent rounds accept nearly everything; in
+    // production that proposed more drafts without accepting more (4.03 vs ninfer 4.06 per round).
+    let dflash_drafts: usize = a.parse("dflash-drafts", 7)?;
     let use_dflash = dflash_drafts > 0 && art.components().contains_key("dflash2");
     let t0 = Instant::now();
     // With DFlash2 the MTP predictor is never used: skip its weights.
