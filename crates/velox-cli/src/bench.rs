@@ -193,6 +193,7 @@ pub fn run_gdn<B: Backend>(b: &B, c: &GdnConfig) -> Result<()> {
             v_heads: c.v_heads,
             k_dim: c.k_dim,
             v_dim: c.v_dim,
+            row0: 0,
         };
         let qkv = b.upload(&rng.vec(tokens * s.qkv_width(), 1.0))?;
         let ab = b.upload(&rng.vec(tokens * 2 * c.v_heads, 2.0))?;

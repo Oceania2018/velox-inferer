@@ -78,11 +78,14 @@ pub enum NormKind {
 /// with `u = [state; x]` (`state` holds the previous `width - 1` input rows, oldest first),
 /// `out[t, c] = silu(Σ_j weight[j, c] · u[t + j, c])`; tap `width - 1` is the current token.
 /// `state` is updated to the last `width - 1` rows of `u`. `weight` is `[width, channels]` f32.
+/// Only rows `row0 .. row0 + tokens` of `x` and `out` are read and written, so a chunk can be
+/// processed in segments (recurrent state snapshots inside one prefill chunk).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConvShape {
     pub tokens: usize,
     pub channels: usize,
     pub width: usize,
+    pub row0: usize,
 }
 
 /// Gated DeltaNet over `tokens` steps.
@@ -92,6 +95,7 @@ pub struct ConvShape {
 /// `state` is `[v_heads, v_dim, k_dim]` f32, updated in place; `out` is `[tokens, v_heads, v_dim]`.
 /// Per step: `g = -exp(a_log)·softplus(a + dt_bias)`, `β = sigmoid(b)`, q and k L2-normalised
 /// (`x / sqrt(Σx² + 1e-6)`), `S = e^g·S`, `S += (β(v − S k)) ⊗ k`, `o = S q / sqrt(k_dim)`.
+/// Only rows `row0 .. row0 + tokens` of `qkv`, `ab` and `out` are read and written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GdnShape {
     pub tokens: usize,
@@ -99,6 +103,7 @@ pub struct GdnShape {
     pub v_heads: usize,
     pub k_dim: usize,
     pub v_dim: usize,
+    pub row0: usize,
 }
 
 /// Non-causal attention of a query block over a sliding-window context (DFlash drafting).
