@@ -2,9 +2,10 @@
 //! conversations have overwritten its state (several agents, task types and side requests sharing
 //! one server).
 //!
-//! An entry is a recurrent-state checkpoint plus the attention KV rows below it. KV is held as
-//! segments shared between entries: an entry that extends another reuses its segments and adds
-//! one for the rows after it, so a chain of agent steps costs one state and one step of KV each.
+//! An entry is a recurrent-state checkpoint plus the attention KV rows below it, held as pages of
+//! [`KV_PAGE_ROWS`] positions. A full page is addressed by the keys of the whole prefix up to its
+//! end and shared by every entry on that prefix whatever order they were stored in, so a chain of
+//! agent steps costs one state and about one step of KV each.
 //!
 //! Retention follows ninfer's context cache (docs/maintainer/cua-context-checkpoints.md §4):
 //! - LRFU ranking (Lee et al., 2001): `CRF(t) = Σ 2^(-λ (t - t_i))` over an entry's references,
@@ -21,11 +22,12 @@
 //! An optional NVMe tier ([`DiskTier`]) keeps copies of evicted entries that can still be
 //! resumed.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Weak};
 
 use velox_core::{Backend, Error as CoreError};
-use velox_models::qwen3_5::{Checkpoint, KvSegment, Session};
+use velox_models::qwen3_5::{Checkpoint, KvSegment, Session, KV_PAGE_ROWS};
 
 use crate::disk::DiskTier;
 
@@ -35,7 +37,7 @@ pub(crate) struct Entry<B: Backend> {
     pub keys: Vec<u32>,
     /// Recurrent state at `pos`, in system RAM.
     pub state: Checkpoint<B>,
-    /// Contiguous KV segments covering rows `0..pos`.
+    /// KV pages covering rows `0..pos` in order (page `i` holds rows `i * KV_PAGE_ROWS ..`).
     pub kv: Vec<Arc<KvSegment<B>>>,
     root: bool,
     adopted: u32,
@@ -64,6 +66,8 @@ pub(crate) struct ContextStore<B: Backend> {
     /// 0.4 ms per MB, ten times the copy.
     spare: Vec<Checkpoint<B>>,
     pages: Vec<B::Buffer>,
+    /// Full KV pages by the hash of their whole prefix (see [`page_hashes`]).
+    shared: HashMap<u64, Weak<KvSegment<B>>>,
     budget: usize,
     lambda: f64,
     now: u64,
@@ -87,6 +91,7 @@ impl<B: Backend> ContextStore<B> {
             entries: Vec::new(),
             spare: Vec::new(),
             pages: Vec::new(),
+            shared: HashMap::new(),
             budget,
             lambda: lambda.max(0.0),
             now: 0,
@@ -166,13 +171,33 @@ impl<B: Backend> ContextStore<B> {
         }
         state.pos = pos;
         state.rope_delta = rope_delta;
+        // Pages another entry already holds replace the copies just read.
+        let hashes = page_hashes(&rkeys);
+        let mut pages = Vec::with_capacity(kv.len());
+        for seg in kv {
+            let i = seg.lo / KV_PAGE_ROWS;
+            match hashes.get(i).filter(|_| seg.hi - seg.lo == KV_PAGE_ROWS) {
+                Some(&h) => match self.shared.get(&h).and_then(Weak::upgrade) {
+                    Some(old) => {
+                        self.pages.extend(seg.into_pages());
+                        pages.push(old);
+                    }
+                    None => {
+                        let seg = Arc::new(seg);
+                        self.shared.insert(h, Arc::downgrade(&seg));
+                        pages.push(seg);
+                    }
+                },
+                None => pages.push(Arc::new(seg)),
+            }
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.entries.push(Entry {
             id,
             keys: rkeys,
             state,
-            kv: kv.into_iter().map(Arc::new).collect(),
+            kv: pages,
             root,
             adopted: 0,
             superseded: false,
@@ -283,17 +308,26 @@ impl<B: Backend> ContextStore<B> {
             e.root |= root;
             return Ok(e.id);
         }
-        // KV below the deepest stored prefix is shared with it.
-        let parent = self
-            .entries
-            .iter()
-            .filter(|e| e.pos() < pos && e.prefix_of(keys))
-            .max_by_key(|e| e.pos());
-        let mut kv = parent.map(|p| p.kv.clone()).unwrap_or_default();
-        let lo = parent.map_or(0, |p| p.pos());
+        let hashes = page_hashes(keys);
+        let mut kv = Vec::with_capacity(pos.div_ceil(KV_PAGE_ROWS));
         let (pool, page_len) = (&mut self.pages, session.kv_page_len());
         let mut page = || pool.pop().map_or_else(|| b.alloc_host(page_len), Ok);
-        kv.push(Arc::new(session.save_kv(b, lo, pos, &mut page)?));
+        for i in 0..pos.div_ceil(KV_PAGE_ROWS) {
+            let (lo, hi) = (i * KV_PAGE_ROWS, ((i + 1) * KV_PAGE_ROWS).min(pos));
+            let full = hashes.get(i);
+            if let Some(seg) = full
+                .and_then(|h| self.shared.get(h))
+                .and_then(Weak::upgrade)
+            {
+                kv.push(seg);
+                continue;
+            }
+            let seg = Arc::new(session.save_kv(b, lo, hi, &mut page)?);
+            if let Some(&h) = full {
+                self.shared.insert(h, Arc::downgrade(&seg));
+            }
+            kv.push(seg);
+        }
         let mut state = match self.spare.pop() {
             Some(s) => s,
             None => session.blank_checkpoint_in(b, pos, true)?,
@@ -374,6 +408,7 @@ impl<B: Backend> ContextStore<B> {
                 Self::release(&mut self.spare, &mut self.pages, e);
             }
         }
+        self.shared.retain(|_, w| w.strong_count() > 0);
         Ok(())
     }
 
@@ -441,8 +476,35 @@ impl<B: Backend> ContextStore<B> {
     }
 }
 
+/// Hash of the keys of every full KV page's whole prefix: entry `i` covers keys
+/// `0 .. (i + 1) * KV_PAGE_ROWS` (chained, so equal hashes mean equal prefixes).
+fn page_hashes(keys: &[u32]) -> Vec<u64> {
+    let mut h = 0u64;
+    keys.chunks_exact(KV_PAGE_ROWS)
+        .map(|c| {
+            let mut s = std::collections::hash_map::DefaultHasher::new();
+            h.hash(&mut s);
+            c.hash(&mut s);
+            h = s.finish();
+            h
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn page_hashes_chain_the_prefix() {
+        let a: Vec<u32> = (0..3 * super::KV_PAGE_ROWS as u32 + 5).collect();
+        let mut b = a.clone();
+        b[1] = 7;
+        let (ha, hb) = (super::page_hashes(&a), super::page_hashes(&b));
+        assert_eq!(ha.len(), 3);
+        // A change in the first page changes every later page's address.
+        assert!(ha.iter().zip(&hb).all(|(x, y)| x != y));
+        assert_eq!(ha, super::page_hashes(&a[..3 * super::KV_PAGE_ROWS]));
+    }
+
     #[test]
     fn lrfu_demand_matches_crf_ranking() {
         // Two references 10 events apart at λ = 0.1 rank above one reference at the later time.
