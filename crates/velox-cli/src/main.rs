@@ -2,6 +2,7 @@
 
 mod args;
 mod bench;
+mod bench_verify;
 mod generate;
 mod profile;
 mod prompt_debug;
@@ -52,6 +53,7 @@ COMMANDS:
       --tokens <list>       token counts, comma separated (default 1,8,64,512)
       --iters <n>           timed iterations (default 50)
   bench-attn              Time causal attention over a KV cache in each storage format
+  bench-verify            Time batched speculative verify rounds against one sequence at a time
       --heads <n> --kv-heads <n> --head-dim <n>  default 24/4, 256 (Qwen3.8)
       --pos0 <n> (16384) --tokens <list> (1,8,16) --kv-format <list> (f32,bf16,fp8,nvfp4) --iters <n> (50)
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
@@ -114,6 +116,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench-linear") => bench_linear(a),
         Some("bench-gdn") => bench_gdn(a),
         Some("bench-attn") => bench_attn(a),
+        Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
         Some("generate") => generate::run(a),
