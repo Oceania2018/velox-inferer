@@ -286,11 +286,128 @@ int attention_split(const float* q, const float* k, const float* v, float* out, 
     return velox_launch_status();
 }
 
+// GQA-packed split attention for few tokens over a long cache (decode, speculative verify): one
+// block owns a KV head, a key split and up to kGqaRows query rows (token x head of that group),
+// stages each K/V tile in shared memory once and serves every row from it, instead of every
+// (token, head) warp re-reading the same keys.
+constexpr int kGqaWarps = 8, kGqaRowsPerWarp = 4, kGqaRows = kGqaWarps * kGqaRowsPerWarp;
+
+template <int PER, int TK>
+__global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
+    attention_gqa_partial_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                 const float* __restrict__ v, float* __restrict__ part_acc,
+                                 float* __restrict__ part_ml, int tokens, int heads, int kv_heads, int head_dim,
+                                 int pos0, float scale, int splits, int split_keys) {
+    extern __shared__ float gqa_smem[];
+    float* ks = gqa_smem;
+    float* vs = gqa_smem + TK * head_dim;
+    const int kvh = blockIdx.x, sp = blockIdx.y, rg = blockIdx.z;
+    const int group = heads / kv_heads, rows = tokens * group;
+    const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    float qr[kGqaRowsPerWarp][PER], acc[kGqaRowsPerWarp][PER], m[kGqaRowsPerWarp], l[kGqaRowsPerWarp];
+    int last[kGqaRowsPerWarp];  // last visible key, -1 for a padding row
+#pragma unroll
+    for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+        const int r = rg * kGqaRows + warp * kGqaRowsPerWarp + i;
+        const int t = r / group, h = kvh * group + r % group;
+        last[i] = r < rows ? pos0 + t : -1;
+        m[i] = -INFINITY;
+        l[i] = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            qr[i][p] = r < rows && d < head_dim ? q[(static_cast<size_t>(t) * heads + h) * head_dim + d] * scale : 0.0f;
+            acc[i][p] = 0.0f;
+        }
+    }
+    const int j0 = sp * split_keys, j1 = min(j0 + split_keys, pos0 + tokens);
+    const int vec = head_dim / 4;
+    for (int base = j0; base < j1; base += TK) {
+        const int n = min(TK, j1 - base);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < n * vec; idx += blockDim.x) {
+            const int key = idx / vec, d4 = idx % vec;
+            const size_t off = (static_cast<size_t>(base + key) * kv_heads + kvh) * head_dim;
+            reinterpret_cast<float4*>(ks)[key * vec + d4] = reinterpret_cast<const float4*>(k + off)[d4];
+            reinterpret_cast<float4*>(vs)[key * vec + d4] = reinterpret_cast<const float4*>(v + off)[d4];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+            const int stop = min(n, last[i] - base + 1);  // warp-uniform
+            for (int jj = 0; jj < stop; ++jj) {
+                const float* kr = ks + jj * head_dim;
+                float s = 0.0f;
+#pragma unroll
+                for (int p = 0; p < PER; ++p)
+                    if (lane + p * VELOX_WARP < head_dim) s += qr[i][p] * kr[lane + p * VELOX_WARP];
+                s = velox_warp_sum(s);
+                const float m_new = fmaxf(m[i], s);
+                const float corr = expf(m[i] - m_new), pj = expf(s - m_new);
+                l[i] = l[i] * corr + pj;
+                const float* vr = vs + jj * head_dim;
+#pragma unroll
+                for (int p = 0; p < PER; ++p)
+                    if (lane + p * VELOX_WARP < head_dim) acc[i][p] = acc[i][p] * corr + pj * vr[lane + p * VELOX_WARP];
+                m[i] = m_new;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+        const int r = rg * kGqaRows + warp * kGqaRowsPerWarp + i;
+        if (r >= rows) continue;
+        const int t = r / group, h = kvh * group + r % group;
+        const size_t idx = (static_cast<size_t>(t) * heads + h) * splits + sp;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            if (d < head_dim) part_acc[idx * head_dim + d] = acc[i][p];
+        }
+        if (lane == 0) {
+            part_ml[2 * idx] = m[i];
+            part_ml[2 * idx + 1] = l[i];
+        }
+    }
+}
+
+template <int PER>
+int attention_gqa(const float* q, const float* k, const float* v, float* out, int tokens, int heads, int kv_heads,
+                  int head_dim, int pos0, float scale) {
+    constexpr int TK = PER >= 8 ? 16 : 32;
+    const int kv = pos0 + tokens;
+    const int group_rows = tokens * (heads / kv_heads);
+    const int rgs = (group_rows + kGqaRows - 1) / kGqaRows;
+    // About two blocks per SM, at least two tiles of keys per split.
+    const int want = (340 + kv_heads * rgs - 1) / (kv_heads * rgs);
+    int split_keys = (kv + want - 1) / want;
+    split_keys = (split_keys < 2 * TK ? 2 * TK : split_keys + TK - 1) / TK * TK;
+    const int splits = (kv + split_keys - 1) / split_keys;
+    const size_t parts = static_cast<size_t>(tokens) * heads * splits;
+    float* scratch = split_scratch(parts * (head_dim + 2));
+    if (scratch == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+    float* part_acc = scratch;
+    float* part_ml = scratch + parts * head_dim;
+    const size_t smem = static_cast<size_t>(2) * TK * head_dim * sizeof(float);
+    attention_gqa_partial_kernel<PER, TK><<<dim3(kv_heads, splits, rgs), kGqaWarps * VELOX_WARP, smem>>>(
+        q, k, v, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, scale, splits, split_keys);
+    attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
+                                                                       splits);
+    return velox_launch_status();
+}
+
 }  // namespace
 
 VELOX_API int velox_portable_attention(const float* q, const float* k, const float* v, float* out, int tokens,
                                        int heads, int kv_heads, int head_dim, int pos0, float scale) {
     if (tokens > 65535) return VELOX_ERR_UNSUPPORTED;
+    // Decode / verify: share each K/V tile across the query heads of its group and the tokens.
+    if (tokens <= 16 && head_dim % 32 == 0 && head_dim <= 256 && heads % kv_heads == 0 &&
+        heads / kv_heads > 1) {
+        if (head_dim <= 64) return attention_gqa<2>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
+        if (head_dim <= 128) return attention_gqa<4>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
+        return attention_gqa<8>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
+    }
     // Few queries over a long cache: split the keys so the whole GPU works on them.
     if (tokens * heads <= 2048 && head_dim <= 256) {
         if (head_dim <= 64) return attention_split<2>(q, k, v, out, tokens, heads, kv_heads, head_dim, pos0, scale);
