@@ -41,6 +41,17 @@ extern "C" {
         pos0: i32,
         scale: f32,
     ) -> i32;
+    fn velox_5090_linear_skinny16(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        format: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5090_linear_rowsplit(
         x: *const f32,
         m: i32,
@@ -79,6 +90,23 @@ const FLASH_MIN_TOKENS: usize = 16;
 /// From this many tokens groupwise-integer weights (vision tower, draft models) use the bf16
 /// tensor-core kernel; below it the exact portable path.
 const ROWSPLIT_MIN_M: usize = 64;
+
+/// Up to this many tokens, A16Only NVFP4 and q4/q8 weights (draft model, proposal head) use the
+/// weight-streaming bf16 tensor-core kernel.
+const SKINNY16_MAX_M: usize = 16;
+
+/// `velox_5090_linear_skinny16`'s format code for a weight it serves at `m` tokens.
+fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
+    if !(2..=SKINNY16_MAX_M).contains(&m) {
+        return None;
+    }
+    match w.format {
+        WeightFormat::Nvfp4 if w.k % 128 == 0 && w.row_begin % 64 == 0 => Some(0),
+        WeightFormat::Q4G64 => Some(4),
+        WeightFormat::Q8G32 => Some(8),
+        _ => None,
+    }
+}
 
 pub struct Rtx5090Kernels;
 
@@ -171,6 +199,13 @@ impl CudaKernels for Rtx5090Kernels {
         if m <= GEMV_MAX_M {
             return ActQuant::Exact;
         }
+        if let Some(f) = skinny16_format(w, m) {
+            // NVFP4 views the FP4 tensor-core path serves (A4 allowed, 128-row aligned) keep it.
+            let a4 = matches!(w.act, ActPolicy::AllowA4 { .. }) && w.row_begin % 128 == 0;
+            if f != 0 || !a4 {
+                return ActQuant::Bf16;
+            }
+        }
         match (w.format, w.act) {
             (WeightFormat::Nvfp4, ActPolicy::AllowA4 { divisor }) if w.k % 128 == 0 && w.row_begin % 128 == 0 => {
                 ActQuant::Nvfp4 { divisor }
@@ -200,6 +235,12 @@ impl CudaKernels for Rtx5090Kernels {
                 "rtx5090 linear a8",
             ),
             ActQuant::Bf16 => {
+                if let Some(f) = skinny16_format(w, m) {
+                    return status(
+                        unsafe { velox_5090_linear_skinny16(x.as_ptr(), mi, wp, pr, k, rb, rows, f, y.as_mut_ptr()) },
+                        "rtx5090 linear skinny16",
+                    );
+                }
                 let bits = w.format.row_split().map_or(0, |r| r.bits as i32);
                 status(
                     unsafe { velox_5090_linear_rowsplit(x.as_ptr(), mi, wp, pr, k, rb, rows, bits, y.as_mut_ptr()) },
