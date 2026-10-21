@@ -1164,7 +1164,7 @@ impl<B: Backend> Core<B> {
                     None,
                     drafter,
                 )?;
-                store.mark_tail(id);
+                store.mark_tail(id, head.unwrap_or(0));
                 lane.spare.push(cp);
                 continue;
             }
