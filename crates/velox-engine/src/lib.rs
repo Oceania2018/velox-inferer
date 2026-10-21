@@ -530,6 +530,8 @@ impl<B: Backend> QwenEngine<B> {
         images: &[ImagePatches],
         start: usize,
     ) -> Result<(), CoreError> {
+        let debug = std::env::var_os("VELOX_DEBUG_PREFIX").is_some();
+        let t0 = Instant::now();
         // Vision embeddings for images not already in the reused prefix.
         let mut embeds: Vec<(usize, B::Buffer)> = Vec::new();
         for (r, run) in p.runs.iter().enumerate() {
@@ -545,6 +547,11 @@ impl<B: Backend> QwenEngine<B> {
                 ));
             }
         }
+        if debug {
+            self.b.synchronize()?;
+        }
+        let vision_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let t1 = Instant::now();
         lane.session.rope_delta = p.rope_delta;
         let mut pos = start;
         for cp in self
@@ -614,6 +621,15 @@ impl<B: Backend> QwenEngine<B> {
             if cp < p.ids.len() {
                 lane.checkpoints.push(lane.session.checkpoint(&self.b)?);
             }
+        }
+        if debug {
+            self.b.synchronize()?;
+            eprintln!(
+                "[prefill] {} images {vision_ms:.0} ms, {} tokens from {start} in {:.0} ms",
+                embeds.len(),
+                p.ids.len() - start,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
         }
         Ok(())
     }
