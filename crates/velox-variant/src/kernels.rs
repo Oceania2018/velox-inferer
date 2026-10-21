@@ -138,9 +138,13 @@ fn a16_fp8(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VELOX_NO_A16FP8").is_none())
         && w.format == WeightFormat::Fp8RowBf16
-        && (2..=SKINNY16_MAX_M).contains(&m)
+        && (2..=A16_FP8_MAX_M).contains(&m)
         && w.k % 256 == 0
 }
+
+/// Batched speculative verify (up to 6 sequences x 16 rows) keeps the bf16-activation path, run
+/// in 16-row blocks, so a sequence's rounding does not depend on what it is batched with.
+const A16_FP8_MAX_M: usize = 96;
 
 /// `velox_5090_linear_skinny16`'s format code for a weight it serves at `m` tokens.
 fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
@@ -198,8 +202,9 @@ impl CudaKernels for Rtx5090Kernels {
     fn attention(&self, q: &CudaBuffer, k: &CudaBuffer, v: &CudaBuffer, out: &mut CudaBuffer, s: AttnShape) -> Result<()> {
         if verify_nvfp4(&s) {
             velox_core::check::attention(q.len(), k.len(), v.len(), out.len(), &s)?;
-            let Some(params) = portable::graph_params(&[s.pos0 as i64])? else {
-                return Ok(()); // graph replay: the recorded launch reads the staged position
+            // Graph steps stage the caches too: a recording serves any sequence.
+            let Some(params) = portable::graph_params(&[s.pos0 as i64, k.as_ptr() as i64, v.as_ptr() as i64])? else {
+                return Ok(()); // graph replay: the recorded launch reads the staged values
             };
             // SAFETY: extents validated above (caches sized for the format).
             return status(
@@ -217,7 +222,7 @@ impl CudaKernels for Rtx5090Kernels {
                         s.scale(),
                         velox_core::kv::hadamard_norm(s.head_dim),
                         params,
-                        to_i32("kv bucket", portable::kv_bucket(s.kv_len()))?,
+                        to_i32("kv grid", portable::kv_grid(s.kv_len()))?,
                     )
                 },
                 "rtx5090 attention verify (nvfp4)",
@@ -322,10 +327,18 @@ impl CudaKernels for Rtx5090Kernels {
             ),
             ActQuant::Bf16 => {
                 if a16_fp8(w, m) {
-                    return status(
-                        unsafe { velox_5090_linear_a16_fp8(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr()) },
-                        "rtx5090 linear a16 fp8",
-                    );
+                    // The kernel takes up to 16 rows; larger m runs in blocks (activations [m, k],
+                    // outputs [m, rows]).
+                    for r0 in (0..m).step_by(SKINNY16_MAX_M) {
+                        let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
+                        // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
+                        let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
+                        status(
+                            unsafe { velox_5090_linear_a16_fp8(xp, mb, wp, pr, k, rb, rows, yp) },
+                            "rtx5090 linear a16 fp8",
+                        )?;
+                    }
+                    return Ok(());
                 }
                 if let Some(f) = skinny16_format(w, m) {
                     return status(

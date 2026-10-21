@@ -128,7 +128,7 @@ struct VerifyArgs {
     const uint8_t* v;
     float* part_acc;      // [tokens * heads, splits, 256]
     float* part_ml;       // [tokens * heads, splits, 2] (log2-domain max, sum)
-    const long long* pp;  // null, or device [pos0] staged by a graph step
+    const long long* pp;  // null, or device [pos0, k_cache, v_cache] staged by a graph step
     int tokens, heads, kv_heads, pos0, splits, split_keys;
 };
 
@@ -153,6 +153,8 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
     __half* qs = vs + kTK * kD;  // [mt * 16][256]
 
     const int pos0 = p.pp != nullptr ? static_cast<int>(p.pp[0]) : p.pos0;
+    const uint8_t* kc = p.pp != nullptr ? reinterpret_cast<const uint8_t*>(p.pp[1]) : p.k;
+    const uint8_t* vc = p.pp != nullptr ? reinterpret_cast<const uint8_t*>(p.pp[2]) : p.v;
     const int sp = blockIdx.x, kvh = blockIdx.y;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, q4 = lane & 3;
@@ -167,7 +169,7 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
             r.s[f] = 0;
             if (base + key < j1) {
                 const uint8_t* row =
-                    (which ? p.v : p.k) + (static_cast<size_t>(base + key) * p.kv_heads + kvh) * kRowBytes;
+                    (which ? vc : kc) + (static_cast<size_t>(base + key) * p.kv_heads + kvh) * kRowBytes;
                 r.w[f] = __ldcs(reinterpret_cast<const uint4*>(row + 16 * c));
                 r.s[f] = *reinterpret_cast<const uint16_t*>(row + kD / 2 + 2 * c);
             }
@@ -422,7 +424,7 @@ size_t align_up(size_t x) { return (x + 255) / 256 * 256; }
 
 }  // namespace
 
-// Rows (tokens x heads / kv_heads) up to 96. params: null, or device [pos0] staged by a graph step,
+// Rows (tokens x heads / kv_heads) up to 96. params: null, or device [pos0, k_cache, v_cache] staged by a graph step,
 // with kv_grid >= pos0 + tokens sizing the grid (the grid never depends on the staged value).
 VELOX_API int velox_5090_attention_verify_nvfp4(const float* q, const unsigned char* k, const unsigned char* v,
                                                 float* out, int tokens, int heads, int kv_heads, int head_dim,
