@@ -794,3 +794,66 @@ VELOX_API int velox_portable_attention_kv(const float* q, const unsigned char* k
         default: return VELOX_ERR_UNSUPPORTED;
     }
 }
+
+// ---- kv_load ----
+
+namespace {
+// One warp per (row, kv head): the represented row (rotated formats rotate back; the normalized
+// Hadamard transform is its own inverse).
+template <int FMT, int PER>
+__global__ void __launch_bounds__(kStoreWarps* VELOX_WARP)
+    kv_load_kernel(const unsigned char* __restrict__ kc, const unsigned char* __restrict__ vc, float* __restrict__ k,
+                   float* __restrict__ v, int units, int kv_heads, int head_dim, long long pos0, float norm) {
+    const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    const int unit = blockIdx.x * kStoreWarps + warp;  // token * kv_heads + kv_head
+    if (unit >= units) return;                         // warp-uniform
+    const size_t rb = static_cast<size_t>(kv_row_bytes(FMT, head_dim));
+    const size_t row = static_cast<size_t>(pos0) * kv_heads + unit;
+#pragma unroll
+    for (int side = 0; side < 2; ++side) {
+        float x[PER];
+        kv_load_lane<FMT, PER>((side ? vc : kc) + row * rb, head_dim, lane, x);
+        if (side ? KvRot<FMT>::v : KvRot<FMT>::k) kv_hadamard<PER>(x, lane, norm);
+        float* dst = (side ? v : k) + static_cast<size_t>(unit) * head_dim;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int i = lane + p * VELOX_WARP;
+            if (i < head_dim) dst[i] = x[p];
+        }
+    }
+}
+
+template <int FMT>
+int kv_load_launch(const unsigned char* kc, const unsigned char* vc, float* k, float* v, int tokens, int kv_heads,
+                   int head_dim, long long pos0, float norm) {
+    const int units = tokens * kv_heads;
+    const unsigned grid = static_cast<unsigned>((units + kStoreWarps - 1) / kStoreWarps);
+    const dim3 block(kStoreWarps * VELOX_WARP);
+    if (head_dim <= 32)
+        kv_load_kernel<FMT, 1><<<grid, block>>>(kc, vc, k, v, units, kv_heads, head_dim, pos0, norm);
+    else if (head_dim <= 64)
+        kv_load_kernel<FMT, 2><<<grid, block>>>(kc, vc, k, v, units, kv_heads, head_dim, pos0, norm);
+    else if (head_dim <= 128)
+        kv_load_kernel<FMT, 4><<<grid, block>>>(kc, vc, k, v, units, kv_heads, head_dim, pos0, norm);
+    else
+        kv_load_kernel<FMT, 8><<<grid, block>>>(kc, vc, k, v, units, kv_heads, head_dim, pos0, norm);
+    return velox_launch_status();
+}
+}  // namespace
+
+VELOX_API int velox_portable_kv_load(const unsigned char* k_cache, const unsigned char* v_cache, float* k, float* v,
+                                     int tokens, int kv_heads, int head_dim, long long pos0, int format, float norm) {
+    if (tokens <= 0) return 0;
+    if (head_dim > 256) return VELOX_ERR_UNSUPPORTED;
+    switch (format) {
+        case VELOX_KV_F32:
+            return kv_load_launch<VELOX_KV_F32>(k_cache, v_cache, k, v, tokens, kv_heads, head_dim, pos0, norm);
+        case VELOX_KV_BF16:
+            return kv_load_launch<VELOX_KV_BF16>(k_cache, v_cache, k, v, tokens, kv_heads, head_dim, pos0, norm);
+        case VELOX_KV_FP8:
+            return kv_load_launch<VELOX_KV_FP8>(k_cache, v_cache, k, v, tokens, kv_heads, head_dim, pos0, norm);
+        case VELOX_KV_NVFP4:
+            return kv_load_launch<VELOX_KV_NVFP4>(k_cache, v_cache, k, v, tokens, kv_heads, head_dim, pos0, norm);
+        default: return VELOX_ERR_UNSUPPORTED;
+    }
+}

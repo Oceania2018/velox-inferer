@@ -190,6 +190,16 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> Result<()> {
         self.time("kv_store", || self.inner.kv_store(k, v, kc, vc, s))
     }
+    fn kv_load(
+        &self,
+        kc: &B::Buffer,
+        vc: &B::Buffer,
+        k: &mut B::Buffer,
+        v: &mut B::Buffer,
+        s: KvStoreShape,
+    ) -> Result<()> {
+        self.time("kv_load", || self.inner.kv_load(kc, vc, k, v, s))
+    }
     fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_precision(s)
     }

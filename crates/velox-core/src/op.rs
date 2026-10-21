@@ -32,6 +32,7 @@ pub enum Op {
     DynConv,
     AttentionBlock,
     KvStore,
+    KvLoad,
 }
 
 impl Op {
@@ -61,6 +62,7 @@ impl Op {
         Op::DynConv,
         Op::AttentionBlock,
         Op::KvStore,
+        Op::KvLoad,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -90,6 +92,7 @@ impl Op {
             Op::DynConv => "dyn_conv",
             Op::AttentionBlock => "attention_block",
             Op::KvStore => "kv_store",
+            Op::KvLoad => "kv_load",
         }
     }
 }

@@ -10,7 +10,7 @@ use velox_core::backend::{
     RopeShape, WeightView,
 };
 use velox_core::format::decode_rows;
-use velox_core::kv::{decode_cache, encode_row, KvFormat};
+use velox_core::kv::{decode_cache, decode_row, encode_row, KvFormat};
 use velox_core::{check, DeviceProfile, Op, Result};
 
 #[derive(Default, Clone, Copy)]
@@ -317,6 +317,31 @@ impl Backend for CpuBackend {
                     &src[r * d..(r + 1) * d],
                     is_v,
                     &mut bytes[at..at + rb],
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn kv_load(
+        &self,
+        k_cache: &Vec<f32>,
+        v_cache: &Vec<f32>,
+        k: &mut Vec<f32>,
+        v: &mut Vec<f32>,
+        s: KvStoreShape,
+    ) -> Result<()> {
+        check::kv_load(k_cache.len(), v_cache.len(), k.len(), v.len(), &s)?;
+        let (d, rb) = (s.head_dim, s.format.row_bytes(s.head_dim));
+        for (cache, dst, is_v) in [(k_cache, k, false), (v_cache, v, true)] {
+            let bytes = as_bytes(cache);
+            for r in 0..s.tokens * s.kv_heads {
+                let at = (s.pos0 * s.kv_heads + r) * rb;
+                decode_row(
+                    s.format,
+                    &bytes[at..at + rb],
+                    is_v,
+                    &mut dst[r * d..(r + 1) * d],
                 );
             }
         }

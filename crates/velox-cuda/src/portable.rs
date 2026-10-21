@@ -374,6 +374,18 @@ extern "C" {
         params: *const i64,
         kv_grid: i32,
     ) -> i32;
+    fn velox_portable_kv_load(
+        k_cache: *const u8,
+        v_cache: *const u8,
+        k: *mut f32,
+        v: *mut f32,
+        tokens: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i64,
+        format: i32,
+        norm: f32,
+    ) -> i32;
     fn velox_portable_kv_store(
         k: *const f32,
         v: *const f32,
@@ -1016,4 +1028,33 @@ fn graph_params(values: &[i64]) -> Result<Option<*const i64>> {
 /// within a bucket share a recording (the model's graph keys carry the same bucket).
 pub fn kv_bucket(kv_len: usize) -> usize {
     kv_len.div_ceil(GRAPH_KV_BUCKET) * GRAPH_KV_BUCKET
+}
+
+/// Decodes cache rows to the f32 rows they represent; see `Backend::kv_load`.
+pub fn kv_load(
+    k_cache: &CudaBuffer,
+    v_cache: &CudaBuffer,
+    k: &mut CudaBuffer,
+    v: &mut CudaBuffer,
+    s: KvStoreShape,
+) -> Result<()> {
+    check::kv_load(k_cache.len(), v_cache.len(), k.len(), v.len(), &s)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_kv_load(
+                k_cache.as_ptr().cast(),
+                v_cache.as_ptr().cast(),
+                k.as_mut_ptr(),
+                v.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                s.pos0 as i64,
+                kv_format_code(s.format),
+                hadamard_norm(s.head_dim),
+            )
+        },
+        "portable kv_load",
+    )
 }
