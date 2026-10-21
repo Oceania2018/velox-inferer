@@ -28,7 +28,7 @@ velox-cli ──► velox-conformance ──► velox-cpu (oracle)
    later. Validates every call with `velox_core::check` so all backends reject the same input.
 3. **Variant** (code, branch): how to be fast on specific cards. A `CudaKernels` implementation
    whose methods default to the portable kernels, plus `plan_policy`. A branch covering several
-   SKUs (the RTX 5060 Ti 16 GB and 8 GB) picks policy per detected profile at runtime.
+   SKUs picks policy per detected profile at runtime.
 
 ## Correctness model
 
