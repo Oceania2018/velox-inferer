@@ -737,6 +737,12 @@ pub trait Backend {
     /// issues the same ops on the same buffers with the same shapes, differing only in the
     /// per-call values ops take from the host (token ids, positions, copy offsets). A backend
     /// may then skip recording and launch the recorded work with those values refreshed.
+    ///
+    /// Per-call values under a static key also include the KV caches of `kv_store` and
+    /// `attention` and the recurrent states of `conv1d_silu*` and `gated_delta_net*`: one
+    /// recording serves any sequence (a batch of sequences is one step whatever sequences it holds).
+    /// A static key carries a KV bucket in bits 24..40 (keys = bucket x [`GRAPH_KV_BUCKET`]); every
+    /// attention call of the step covers at most that many keys, and grids are sized for it.
     fn graph(&self, _key: u64, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         f()
     }

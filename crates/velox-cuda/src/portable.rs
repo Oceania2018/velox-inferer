@@ -105,6 +105,7 @@ extern "C" {
         tokens: i32,
         channels: i32,
         width: i32,
+        pp: *const i64,
     ) -> i32;
     fn velox_portable_gated_delta_net(
         qkv: *const f32,
@@ -119,6 +120,7 @@ extern "C" {
         v_heads: i32,
         k_dim: i32,
         v_dim: i32,
+        pp: *const i64,
     ) -> i32;
 }
 
@@ -386,10 +388,11 @@ pub fn attention(
 ) -> Result<()> {
     check::attention(q.len(), k.len(), v.len(), out.len(), &s)?;
     to_i32("kv_len", s.kv_len())?;
-    let Some(params) = graph_params(&[s.pos0 as i64])? else {
+    // Graph steps stage the caches too: a recording serves any session.
+    let Some(params) = graph_params(&[s.pos0 as i64, k.as_ptr() as i64, v.as_ptr() as i64])? else {
         return Ok(());
     };
-    let kv_grid = to_i32("kv bucket", kv_bucket(s.kv_len()))?;
+    let kv_grid = to_i32("kv grid", kv_grid(s.kv_len()))?;
     // Decode and verify windows over f32 caches also take the GQA verify kernel of the KV path,
     // which reads each K/V tile once per block for every query row of the group.
     let verify =
@@ -502,16 +505,12 @@ pub fn kv_store(
     s: KvStoreShape,
 ) -> Result<()> {
     check::kv_store(k.len(), v.len(), k_cache.len(), v_cache.len(), &s)?;
-    if s.format == KvFormat::F32 {
-        // Rows are stored as they are: two device copies, as the model did before formats.
-        let (n, at) = (
-            s.tokens * s.kv_heads * s.head_dim,
-            s.pos0 * s.kv_heads * s.head_dim,
-        );
-        copy(k, 0, k_cache, at, n)?;
-        return copy(v, 0, v_cache, at, n);
-    }
-    let Some(params) = graph_params(&[s.pos0 as i64])? else {
+    let Some(params) = graph_params(&[
+        s.pos0 as i64,
+        k_cache.as_ptr() as i64,
+        v_cache.as_ptr() as i64,
+    ])?
+    else {
         return Ok(());
     };
     // SAFETY: buffer extents validated above.
@@ -549,6 +548,10 @@ pub fn conv1d_silu(
         check::conv1d(x.len(), weight.len(), si.len(), out.len(), &s)?;
     }
     let state_in = state_in.map_or(state.as_ptr(), CudaBuffer::as_ptr);
+    // Graph steps stage the states: a recording serves any session.
+    let Some(pp) = graph_params(&[state_in as i64, state.as_mut_ptr() as i64])? else {
+        return Ok(());
+    };
     // SAFETY: buffer extents validated above.
     status(
         unsafe {
@@ -561,6 +564,7 @@ pub fn conv1d_silu(
                 to_i32("tokens", s.tokens)?,
                 to_i32("channels", s.channels)?,
                 to_i32("width", s.width)?,
+                pp,
             )
         },
         "portable conv1d_silu",
@@ -600,6 +604,9 @@ pub fn gated_delta_net(
         )?;
     }
     let state_in = state_in.map_or(state.as_ptr(), CudaBuffer::as_ptr);
+    let Some(pp) = graph_params(&[state_in as i64, state.as_mut_ptr() as i64])? else {
+        return Ok(());
+    };
     // SAFETY: buffer extents validated above.
     status(
         unsafe {
@@ -616,6 +623,7 @@ pub fn gated_delta_net(
                 to_i32("v_heads", s.v_heads)?,
                 to_i32("k_dim", s.k_dim)?,
                 to_i32("v_dim", s.v_dim)?,
+                pp,
             )
         },
         "portable gated_delta_net",
@@ -1204,6 +1212,13 @@ pub fn graph_params(values: &[i64]) -> Result<Option<*const i64>> {
 /// within a bucket share a recording (the model's graph keys carry the same bucket).
 pub fn kv_bucket(kv_len: usize) -> usize {
     kv_len.div_ceil(GRAPH_KV_BUCKET) * GRAPH_KV_BUCKET
+}
+
+/// The keys an attention grid covers: inside a static graph step, the KV bucket its key carries
+/// (bits 24..40, see `Backend::graph`; several sequences of one step share the largest),
+/// otherwise the bucket of `kv_len`.
+pub fn kv_grid(kv_len: usize) -> usize {
+    kv_bucket(kv_len).max(crate::static_kv_bucket().unwrap_or(0))
 }
 
 /// Decodes cache rows to the f32 rows they represent; see `Backend::kv_load`.
