@@ -1079,7 +1079,7 @@ pub fn copy2d(src: &CudaBuffer, dst: &mut CudaBuffer, s: Copy2dShape) -> Result<
 /// refreshes them without re-recording. `Ok(None)` means the step is a replay and the caller
 /// must return without launching; outside graphs the result is a null pointer (values are
 /// passed by value).
-fn graph_params(values: &[i64]) -> Result<Option<*const i64>> {
+pub fn graph_params(values: &[i64]) -> Result<Option<*const i64>> {
     match graph_mode() {
         GraphMode::None => Ok(Some(std::ptr::null())),
         mode => {
