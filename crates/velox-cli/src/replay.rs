@@ -30,13 +30,31 @@ struct Step {
     recorded: Value,
 }
 
-/// Finds every step record (an object with a `requestPrompt` string) in document order.
-fn collect_steps(v: &Value, dir: &Path, out: &mut Vec<Step>) -> Result<()> {
+/// The full request of a step record: an inline `requestPrompt` string, or the session's
+/// `requestEnvelope` (constant fields plus the system message) with the step's `requestMessages`.
+fn step_request(m: &serde_json::Map<String, Value>, env: Option<&Value>) -> Result<Option<Value>> {
+    if let Some(Value::String(prompt)) = m.get("requestPrompt") {
+        return serde_json::from_str(prompt)
+            .map(Some)
+            .map_err(|e| cfg(format!("step requestPrompt is not JSON: {e}")));
+    }
+    let (Some(Value::Array(dynamic)), Some(Value::Object(env))) = (m.get("requestMessages"), env)
+    else {
+        return Ok(None);
+    };
+    let mut req = env.clone();
+    let mut messages: Vec<Value> = req.remove("system").into_iter().collect();
+    messages.extend(dynamic.iter().cloned());
+    req.insert("messages".into(), Value::Array(messages));
+    Ok(Some(Value::Object(req)))
+}
+
+/// Finds every step record (an object with a request, see `step_request`) in document order.
+fn collect_steps(v: &Value, dir: &Path, env: Option<&Value>, out: &mut Vec<Step>) -> Result<()> {
     match v {
         Value::Object(m) => {
-            if let Some(Value::String(prompt)) = m.get("requestPrompt") {
-                let request: Value = serde_json::from_str(prompt)
-                    .map_err(|e| cfg(format!("step requestPrompt is not JSON: {e}")))?;
+            let env = m.get("requestEnvelope").or(env);
+            if let Some(request) = step_request(m, env)? {
                 let file = match m.get("screenshot") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Object(o)) => {
@@ -78,12 +96,12 @@ fn collect_steps(v: &Value, dir: &Path, out: &mut Vec<Step>) -> Result<()> {
                 return Ok(());
             }
             for x in m.values() {
-                collect_steps(x, dir, out)?;
+                collect_steps(x, dir, env, out)?;
             }
         }
         Value::Array(a) => {
             for x in a {
-                collect_steps(x, dir, out)?;
+                collect_steps(x, dir, env, out)?;
             }
         }
         _ => {}
@@ -320,7 +338,7 @@ pub fn load_requests(a: &Args) -> Result<Vec<(Value, Value)>> {
     let session: Value =
         serde_json::from_str(&text).map_err(|e| cfg(format!("session.json: {e}")))?;
     let mut steps = Vec::new();
-    collect_steps(&session, &dir, &mut steps)?;
+    collect_steps(&session, &dir, None, &mut steps)?;
     steps.truncate(a.parse("steps", usize::MAX)?);
     steps
         .into_iter()
@@ -361,10 +379,10 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     let session: Value =
         serde_json::from_str(&text).map_err(|e| cfg(format!("session.json: {e}")))?;
     let mut steps = Vec::new();
-    collect_steps(&session, &dir, &mut steps)?;
+    collect_steps(&session, &dir, None, &mut steps)?;
     steps.truncate(max_steps);
     if steps.is_empty() {
-        return Err(cfg("no steps with requestPrompt found"));
+        return Err(cfg("no steps with a recorded request found"));
     }
     eprintln!(
         "replaying {} steps against {endpoint_url} as '{label}'",
@@ -544,6 +562,26 @@ mod tests {
         ] {
             assert_eq!(base64(i.as_bytes()), o);
         }
+    }
+
+    #[test]
+    fn rebuilds_requests_from_the_envelope() {
+        let session = json!({
+            "requestEnvelope": {"model": "m", "temperature": 0, "system": {"role": "system", "content": "s"}},
+            "steps": [
+                {"requestMessages": [{"role": "user", "content": "a"}]},
+                {"requestPrompt": "{\"model\":\"inline\",\"messages\":[]}"}
+            ]
+        });
+        let mut steps = Vec::new();
+        collect_steps(&session, Path::new("."), None, &mut steps).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps[0].request,
+            json!({"model": "m", "temperature": 0, "messages": [
+                {"role": "system", "content": "s"}, {"role": "user", "content": "a"}]})
+        );
+        assert_eq!(steps[1].request["model"], "inline");
     }
 
     #[test]
