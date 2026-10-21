@@ -157,7 +157,14 @@ __device__ __forceinline__ void kv_store_row(const float* __restrict__ src, unsi
         x[p] = i < d ? src[i] : 0.0f;
     }
     if (rotate) kv_hadamard<PER>(x, lane, norm);  // warp-uniform
-    if (FMT == VELOX_KV_BF16) {
+    if (FMT == VELOX_KV_F32) {
+        float* w = reinterpret_cast<float*>(dst);
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int i = lane + p * VELOX_WARP;
+            if (i < d) w[i] = x[p];
+        }
+    } else if (FMT == VELOX_KV_BF16) {
         unsigned short* w = reinterpret_cast<unsigned short*>(dst);
 #pragma unroll
         for (int p = 0; p < PER; ++p) {
@@ -207,7 +214,11 @@ __global__ void __launch_bounds__(kStoreWarps* VELOX_WARP)
     kv_store_kernel(const float* __restrict__ k, const float* __restrict__ v, unsigned char* __restrict__ kc,
                     unsigned char* __restrict__ vc, int units, int kv_heads, int head_dim, long long pos0, float norm,
                     const long long* __restrict__ pp) {
-    if (pp != nullptr) pos0 = pp[0];  // staged by a graph step
+    if (pp != nullptr) {  // staged by a graph step: [pos0, k_cache, v_cache]
+        pos0 = pp[0];
+        kc = reinterpret_cast<unsigned char*>(pp[1]);
+        vc = reinterpret_cast<unsigned char*>(pp[2]);
+    }
     const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
     const int unit = blockIdx.x * kStoreWarps + warp;  // token * kv_heads + kv_head
     if (unit >= units) return;                         // warp-uniform
@@ -483,7 +494,11 @@ __global__ void __launch_bounds__(kVerifyWarps* VELOX_WARP, kVerifyMinBlocks<RW>
                       const unsigned char* __restrict__ v, float* __restrict__ part_acc, float* __restrict__ part_ml,
                       int tokens, int heads, int kv_heads, int pos0, float scale, int splits, int split_keys,
                       float norm, const long long* __restrict__ pp) {
-    if (pp != nullptr) pos0 = static_cast<int>(pp[0]);  // staged by a graph step
+    if (pp != nullptr) {  // staged by a graph step: [pos0, k_cache, v_cache]
+        pos0 = static_cast<int>(pp[0]);
+        k = reinterpret_cast<const unsigned char*>(pp[1]);
+        v = reinterpret_cast<const unsigned char*>(pp[2]);
+    }
     constexpr int D = PER * VELOX_WARP;  // head_dim
     constexpr int TK = KvTile<FMT>::keys, EPC = KvChunk<FMT>::elems, CPR = D / EPC;
     constexpr int THREADS = kVerifyWarps * VELOX_WARP;
@@ -761,13 +776,15 @@ int kvq_dispatch(const float* q, const unsigned char* k, const unsigned char* v,
 }  // namespace
 
 // Rotated formats need head_dim a power of two in 32..256 (validated by velox_core::check).
-// params: null, or device [pos0] staged by a graph step.
+// params: null, or device [pos0, k_cache, v_cache] staged by a graph step.
 VELOX_API int velox_portable_kv_store(const float* k, const float* v, unsigned char* k_cache, unsigned char* v_cache,
                                       int tokens, int kv_heads, int head_dim, long long pos0, int format, float norm,
                                       const long long* params) {
     if (tokens <= 0) return 0;
     if (head_dim > 256) return VELOX_ERR_UNSUPPORTED;
     switch (format) {
+        case VELOX_KV_F32:
+            return kv_store_launch<VELOX_KV_F32>(k, v, k_cache, v_cache, tokens, kv_heads, head_dim, pos0, norm, params);
         case VELOX_KV_BF16:
             return kv_store_launch<VELOX_KV_BF16>(k, v, k_cache, v_cache, tokens, kv_heads, head_dim, pos0, norm, params);
         case VELOX_KV_FP8:
@@ -778,7 +795,8 @@ VELOX_API int velox_portable_kv_store(const float* k, const float* v, unsigned c
     }
 }
 
-// params: null, or device [pos0] staged by a graph step, with kv_grid >= pos0 + tokens sizing the grid.
+// params: null, or device [pos0, k_cache, v_cache] staged by a graph step, with kv_grid >= pos0 + tokens
+// sizing the grid.
 VELOX_API int velox_portable_attention_kv(const float* q, const unsigned char* k, const unsigned char* v, float* out,
                                           int tokens, int heads, int kv_heads, int head_dim, int pos0, float scale,
                                           int format, float norm, const long long* params, int kv_grid) {
