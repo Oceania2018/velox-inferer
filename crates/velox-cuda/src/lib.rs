@@ -561,6 +561,8 @@ pub enum GraphMode {
 
 thread_local! {
     static GRAPH_MODE: std::cell::Cell<GraphMode> = const { std::cell::Cell::new(GraphMode::None) };
+    /// The step being recorded or replayed: its key, current segment and that segment's slot.
+    static GRAPH_SEG: std::cell::Cell<(u64, u64, i32)> = const { std::cell::Cell::new((0, 0, -1)) };
 }
 
 pub fn graph_mode() -> GraphMode {
@@ -761,6 +763,7 @@ impl Backend for CudaBackend {
         };
         status(begun, "graph begin")?;
         set_graph_mode(mode);
+        GRAPH_SEG.with(|c| c.set((key, 0, slot)));
         let r = f();
         set_graph_mode(GraphMode::None);
         if let Err(e) = r {
@@ -774,6 +777,8 @@ impl Backend for CudaBackend {
             }
             return Err(e);
         }
+        // The last segment (see `graph_break`) is the one still open.
+        let slot = GRAPH_SEG.with(std::cell::Cell::get).2;
         // SAFETY: slot is in the shim's range and its graph was begun above.
         let launched = unsafe {
             if replay {
@@ -791,6 +796,39 @@ impl Backend for CudaBackend {
                 .insert(key);
         }
         Ok(())
+    }
+
+    fn graph_break(&self) -> Result<()> {
+        let (Some(graphs), mode) = (&self.graphs, graph_mode()) else {
+            return Ok(());
+        };
+        if mode == GraphMode::None {
+            return Ok(());
+        }
+        let (key, seg, slot) = GRAPH_SEG.with(std::cell::Cell::get);
+        let next_key = key | (seg + 1) << 56;
+        let next = {
+            let mut g = graphs
+                .lock()
+                .map_err(|_| Error::Backend("graph keys poisoned".into()))?;
+            let n = g.slots.len() as i32;
+            *g.slots.entry(next_key).or_insert(n)
+        };
+        if next >= GRAPH_SLOTS || seg + 1 >= 128 {
+            return Ok(()); // out of slots: the step stays one graph
+        }
+        // SAFETY: both slots are in the shim's range; the current one was begun by `graph`.
+        let r = unsafe {
+            if mode == GraphMode::Replay {
+                status(ffi::velox_cuda_graph_replay_launch(slot), "graph launch")
+                    .and_then(|()| status(ffi::velox_cuda_graph_replay_begin(next), "graph begin"))
+            } else {
+                status(ffi::velox_cuda_graph_end_launch(slot), "graph launch")
+                    .and_then(|()| status(ffi::velox_cuda_graph_begin(next), "graph begin"))
+            }
+        };
+        GRAPH_SEG.with(|c| c.set((key, seg + 1, next)));
+        r
     }
 
     fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {
