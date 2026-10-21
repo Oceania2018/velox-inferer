@@ -87,6 +87,26 @@ fn bench<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
         b.synchronize()?;
         Ok(t.elapsed().as_secs_f64() * 1e3 / rounds as f64)
     };
+    // --profile batched|solo: brackets two warm rounds of that mode for `ncu --profile-from-start off`.
+    if let Some(mode) = a.get("profile") {
+        let mut f: Box<dyn FnMut() -> Result<()>> = match mode {
+            "solo" => Box::new(|| solo_round(&mut sessions, &mut ws)),
+            _ => Box::new(|| batch_round(&mut sessions, &mut ws, &mut bw)),
+        };
+        for _ in 0..3 {
+            f()?;
+        }
+        b.synchronize()?;
+        #[cfg(feature = "cuda")]
+        velox_cuda::profiler(true)?;
+        for _ in 0..2 {
+            f()?;
+        }
+        b.synchronize()?;
+        #[cfg(feature = "cuda")]
+        velox_cuda::profiler(false)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let solo = time(&mut || solo_round(&mut sessions, &mut ws))?;
     let batched = if n > 1 {
         time(&mut || batch_round(&mut sessions, &mut ws, &mut bw))?
