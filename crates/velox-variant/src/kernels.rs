@@ -41,6 +41,21 @@ extern "C" {
         pos0: i32,
         scale: f32,
     ) -> i32;
+    fn velox_5090_attention_verify_nvfp4(
+        q: *const f32,
+        k: *const u8,
+        v: *const u8,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
+        norm: f32,
+        params: *const i64,
+        kv_grid: i32,
+    ) -> i32;
     fn velox_5090_linear_skinny16(
         x: *const f32,
         m: i32,
@@ -87,6 +102,18 @@ const GEMV_MAX_M: usize = 1;
 /// split-KV kernel, which is bound by reading the cache anyway.
 const FLASH_MIN_TOKENS: usize = 16;
 
+/// Most query rows (tokens x heads per KV head) the tensor-core NVFP4 verify kernel takes.
+const VERIFY_MAX_ROWS: usize = 96;
+
+/// Decode and verify windows over an NVFP4 cache: f16 tensor-core flash-decoding.
+fn verify_nvfp4(s: &AttnShape) -> bool {
+    s.kv == KvFormat::Nvfp4
+        && s.head_dim == 256
+        && s.heads % s.kv_heads == 0
+        && s.tokens * (s.heads / s.kv_heads) <= VERIFY_MAX_ROWS
+        && s.kv_len() <= i32::MAX as usize
+}
+
 /// From this many tokens groupwise-integer weights (vision tower, draft models) use the bf16
 /// tensor-core kernel; below it the exact portable path.
 const ROWSPLIT_MIN_M: usize = 64;
@@ -132,7 +159,10 @@ impl CudaKernels for Rtx5090Kernels {
     }
 
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
-        // The flash kernel reads f32 caches; packed (quantized) caches take the portable KV path.
+        if verify_nvfp4(&s) {
+            return AttnPrecision::F16;
+        }
+        // The flash kernel reads f32 caches; other packed caches take the portable KV path.
         if s.kv == KvFormat::F32
             && s.tokens >= FLASH_MIN_TOKENS
             && s.head_dim == 256
@@ -146,6 +176,33 @@ impl CudaKernels for Rtx5090Kernels {
     }
 
     fn attention(&self, q: &CudaBuffer, k: &CudaBuffer, v: &CudaBuffer, out: &mut CudaBuffer, s: AttnShape) -> Result<()> {
+        if verify_nvfp4(&s) {
+            velox_core::check::attention(q.len(), k.len(), v.len(), out.len(), &s)?;
+            let Some(params) = portable::graph_params(&[s.pos0 as i64])? else {
+                return Ok(()); // graph replay: the recorded launch reads the staged position
+            };
+            // SAFETY: extents validated above (caches sized for the format).
+            return status(
+                unsafe {
+                    velox_5090_attention_verify_nvfp4(
+                        q.as_ptr(),
+                        k.as_ptr().cast(),
+                        v.as_ptr().cast(),
+                        out.as_mut_ptr(),
+                        to_i32("tokens", s.tokens)?,
+                        to_i32("heads", s.heads)?,
+                        to_i32("kv_heads", s.kv_heads)?,
+                        to_i32("head_dim", s.head_dim)?,
+                        s.pos0 as i32,
+                        s.scale(),
+                        velox_core::kv::hadamard_norm(s.head_dim),
+                        params,
+                        to_i32("kv bucket", portable::kv_bucket(s.kv_len()))?,
+                    )
+                },
+                "rtx5090 attention verify (nvfp4)",
+            );
+        }
         if self.attention_precision(s) == AttnPrecision::Exact {
             return portable::attention(q, k, v, out, s);
         }
