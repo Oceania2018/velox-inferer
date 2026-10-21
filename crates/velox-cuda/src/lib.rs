@@ -316,6 +316,20 @@ pub trait CudaKernels: Send + Sync {
         portable::rms_norm(x, weight, y, rows, dim, eps, kind)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_gated(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        gate: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        portable::rms_norm_gated(x, weight, gate, rows, dim, eps, kind)
+    }
+
     /// Residual add then RMS norm in one pass; see [`Backend::add_rms_norm`].
     #[allow(clippy::too_many_arguments)]
     fn add_rms_norm(
@@ -1036,6 +1050,23 @@ impl Backend for CudaBackend {
         check::rms_norm(x.len, weight.len, y.len, rows, dim)?;
         self.timed("rms_norm", || {
             self.kernels.rms_norm(x, weight, y, rows, dim, eps, kind)
+        })
+    }
+
+    fn rms_norm_gated(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        gate: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        check::rms_norm(x.len, weight.len, gate.len, rows, dim)?;
+        self.timed("rms_norm_gated", || {
+            self.kernels
+                .rms_norm_gated(x, weight, gate, rows, dim, eps, kind)
         })
     }
 

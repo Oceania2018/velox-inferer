@@ -34,6 +34,7 @@ pub enum Op {
     KvStore,
     KvLoad,
     GdnReplay,
+    RmsNormGated,
 }
 
 impl Op {
@@ -65,6 +66,7 @@ impl Op {
         Op::KvStore,
         Op::KvLoad,
         Op::GdnReplay,
+        Op::RmsNormGated,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -96,6 +98,7 @@ impl Op {
             Op::KvStore => "kv_store",
             Op::KvLoad => "kv_load",
             Op::GdnReplay => "gdn_replay",
+            Op::RmsNormGated => "rms_norm_gated",
         }
     }
 }

@@ -39,6 +39,15 @@ extern "C" {
         eps: f32,
         offset: i32,
     ) -> i32;
+    fn velox_portable_rms_norm_gated(
+        x: *const f32,
+        weight: *const f32,
+        gate: *mut f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
     fn velox_portable_rope(
         x: *mut f32,
         tokens: i32,
@@ -256,6 +265,36 @@ pub fn rms_norm(
             )
         },
         "portable rms_norm",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gated(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    gate: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    kind: NormKind,
+) -> Result<()> {
+    check::rms_norm(x.len(), weight.len(), gate.len(), rows, dim)?;
+    let (rows, dim) = (to_i32("rows", rows)?, to_i32("dim", dim)?);
+    let offset = i32::from(kind == NormKind::Offset);
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_rms_norm_gated(
+                x.as_ptr(),
+                weight.as_ptr(),
+                gate.as_mut_ptr(),
+                rows,
+                dim,
+                eps,
+                offset,
+            )
+        },
+        "portable rms_norm_gated",
     )
 }
 
