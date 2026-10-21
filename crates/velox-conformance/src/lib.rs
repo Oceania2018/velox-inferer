@@ -1369,6 +1369,10 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         64,
         ActPolicy::A16Only,
     )?;
+    // Batched drafting with A16-only NVFP4 weights (draft model, proposal head): 17..96 rows.
+    for m in [21, 42, 48, 96] {
+        s.linear_act(WeightFormat::Nvfp4, 384, 1024, 64, 256, m, ActPolicy::A16Only)?;
+    }
     // Groupwise integer formats; K not a multiple of 128 exercises physical padding.
     for f in [
         WeightFormat::Q4G64,
@@ -1381,6 +1385,9 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.linear(f, 512, 4096, 0, 512, 8)?;
         s.linear(f, 384, 2560, 64, 256, 16)?;
         s.linear(f, 72, 1152, 0, 72, 20)?;
+        // Batched drafting: several sequences' blocks / proposal rows (17..63 rows).
+        s.linear(f, 384, 2560, 64, 256, 42)?;
+        s.linear(f, 512, 1024, 0, 512, 48)?;
         // Vision-tower sizes, where tuned kernels switch to tensor cores (bf16 activations):
         // ragged token counts, a row view, and K = 4304 padded to 4352 in storage.
         // Small m (decode, drafting): the vectorized GEMV for Q4 / Q8, row views and K-split rows.
