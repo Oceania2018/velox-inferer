@@ -220,3 +220,72 @@ pub fn run_gdn<B: Backend>(b: &B, c: &GdnConfig) -> Result<()> {
     }
     Ok(())
 }
+
+pub struct AttnConfig {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub pos0: usize,
+    pub tokens: Vec<usize>,
+    pub formats: Vec<velox_core::KvFormat>,
+    pub iters: usize,
+}
+
+/// Times `attention` over a random cache of `pos0 + tokens` positions in each KV format, and
+/// reports the K/V bytes read per call as achieved bandwidth.
+pub fn run_attn<B: Backend>(b: &B, c: &AttnConfig) -> Result<()> {
+    use velox_core::kv::encode_cache;
+    let mut rng = Rng::new(17);
+    let d = c.head_dim;
+    println!(
+        "attention heads {}/{} d {} pos0 {}  on {}",
+        c.heads,
+        c.kv_heads,
+        d,
+        c.pos0,
+        b.describe()
+    );
+    let max_t = c.tokens.iter().copied().max().unwrap_or(1);
+    let rows = (c.pos0 + max_t) * c.kv_heads;
+    let k = rng.vec(rows * d, 2.0);
+    let v = rng.vec(rows * d, 1.0);
+    for &fmt in &c.formats {
+        let kc = b.upload_bytes(&encode_cache(fmt, &k, d, false))?;
+        let vc = b.upload_bytes(&encode_cache(fmt, &v, d, true))?;
+        for &tokens in &c.tokens {
+            let s = velox_core::AttnShape {
+                tokens,
+                heads: c.heads,
+                kv_heads: c.kv_heads,
+                head_dim: d,
+                pos0: c.pos0,
+                kv: fmt,
+            };
+            let q = b.upload(&rng.vec(tokens * c.heads * d, 2.0))?;
+            let mut out = b.alloc(tokens * c.heads * d)?;
+            for _ in 0..3 {
+                b.attention(&q, &kc, &vc, &mut out, s)?;
+            }
+            b.synchronize()?;
+            let mut samples = Vec::with_capacity(c.iters);
+            for _ in 0..c.iters {
+                let t0 = Instant::now();
+                b.attention(&q, &kc, &vc, &mut out, s)?;
+                b.synchronize()?;
+                samples.push(t0.elapsed().as_secs_f64());
+            }
+            let best = samples.iter().copied().fold(f64::INFINITY, f64::min);
+            let t = median(samples);
+            let bytes = 2.0 * (s.kv_len() * c.kv_heads * fmt.row_bytes(d)) as f64;
+            println!(
+                "  {:<5} tokens={tokens:<4} {:>8.1} us (min {:>8.1})  K+V {:>7.1} MB  {:>7.1} GB/s",
+                fmt.name(),
+                t * 1e6,
+                best * 1e6,
+                bytes / 1e6,
+                bytes / t / 1e9
+            );
+        }
+    }
+    Ok(())
+}

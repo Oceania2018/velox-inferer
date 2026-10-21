@@ -11,7 +11,7 @@ use velox_core::backend::{
     AttnShape, Backend, ConvShape, Copy2dShape, GdnShape, NormKind, RopeLayout, RopePosShape,
     RopeShape,
 };
-use velox_core::{Error, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
+use velox_core::{Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
 pub use config::{LayerKind, TextConfig};
 pub use dflash::{BlockCandidates, DFlashConfig, DFlashModel, DFlashState, DFlashWorkspace};
@@ -26,6 +26,8 @@ pub struct Session<B: Backend> {
     /// Rotary position minus cache position for tokens after the prompt. MRoPE compresses each
     /// image run, so this is negative once a prompt contains an image.
     pub rope_delta: i64,
+    /// Storage format of the attention KV caches.
+    pub kv_format: KvFormat,
     kv: Vec<(B::Buffer, B::Buffer)>,
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
@@ -211,7 +213,16 @@ impl<B: Backend> Qwen35Text<B> {
     }
 
     pub fn session(&self, b: &B, capacity: usize) -> Result<Session<B>> {
+        self.session_with(b, capacity, KvFormat::F32)
+    }
+
+    /// A session whose attention KV caches store rows in `kv_format`.
+    pub fn session_with(&self, b: &B, capacity: usize, kv_format: KvFormat) -> Result<Session<B>> {
         let c = &self.cfg;
+        kv_format.check_head_dim(c.head_dim)?;
+        let kv_len = kv_format
+            .cache_slots(capacity, c.kv_heads, c.head_dim)
+            .ok_or_else(|| Error::Config("KV cache size overflows".into()))?;
         if capacity == 0 || capacity > c.max_positions {
             return Err(Error::Config(format!(
                 "session capacity {capacity} outside 1..={}",
@@ -223,10 +234,7 @@ impl<B: Backend> Qwen35Text<B> {
         let mut ssm = Vec::new();
         for kind in &c.layers {
             match kind {
-                LayerKind::FullAttention => kv.push((
-                    b.alloc(capacity * c.kv_dim())?,
-                    b.alloc(capacity * c.kv_dim())?,
-                )),
+                LayerKind::FullAttention => kv.push((b.alloc(kv_len)?, b.alloc(kv_len)?)),
                 LayerKind::Gdn => {
                     conv.push(b.alloc((c.conv_width - 1) * c.gdn_qkv())?);
                     ssm.push(b.alloc(c.gdn_v_heads * c.gdn_v_dim * c.gdn_k_dim)?);
@@ -237,6 +245,7 @@ impl<B: Backend> Qwen35Text<B> {
             pos: 0,
             capacity,
             rope_delta: 0,
+            kv_format,
             kv,
             conv,
             ssm,
@@ -550,7 +559,8 @@ impl<B: Backend> Qwen35Text<B> {
                         Some(p) => Rope::Axes(p),
                         None => Rope::At(rope_pos0),
                     };
-                    self.attention_mixer(b, ws, &l.mixer, &mut s.kv[ai], t, pos0, rope)?;
+                    let kv_format = s.kv_format;
+                    self.attention_mixer(b, ws, &l.mixer, &mut s.kv[ai], kv_format, t, pos0, rope)?;
                     ai += 1;
                 }
             }
@@ -632,6 +642,7 @@ impl<B: Backend> Qwen35Text<B> {
         ws: &mut Workspace<B>,
         mixer: &Mixer,
         kv: &mut (B::Buffer, B::Buffer),
+        kv_format: KvFormat,
         t: usize,
         pos0: usize,
         rope: Rope<'_>,
@@ -719,15 +730,21 @@ impl<B: Backend> Qwen35Text<B> {
             }
         }
         let (kc, vc) = kv;
-        let kvd = c.kv_dim();
-        b.copy(&ws.kn, 0, kc, pos0 * kvd, t * kvd)?;
-        b.copy(&ws.v, 0, vc, pos0 * kvd, t * kvd)?;
+        let store = KvStoreShape {
+            tokens: t,
+            kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            pos0,
+            format: kv_format,
+        };
+        b.kv_store(&ws.kn, &ws.v, kc, vc, store)?;
         let shape = AttnShape {
             tokens: t,
             heads: c.heads,
             kv_heads: c.kv_heads,
             head_dim: c.head_dim,
             pos0,
+            kv: kv_format,
         };
         b.attention(&ws.qn, kc, vc, &mut ws.attn, shape)?;
         b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;

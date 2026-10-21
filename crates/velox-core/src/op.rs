@@ -31,6 +31,7 @@ pub enum Op {
     Copy2d,
     DynConv,
     AttentionBlock,
+    KvStore,
 }
 
 impl Op {
@@ -59,6 +60,7 @@ impl Op {
         Op::Copy2d,
         Op::DynConv,
         Op::AttentionBlock,
+        Op::KvStore,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -87,6 +89,7 @@ impl Op {
             Op::Copy2d => "copy2d",
             Op::DynConv => "dyn_conv",
             Op::AttentionBlock => "attention_block",
+            Op::KvStore => "kv_store",
         }
     }
 }

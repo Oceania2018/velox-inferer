@@ -6,9 +6,11 @@
 
 use velox_core::backend::{
     top_k_row, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopePosShape, RopeShape, WeightView,
+    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind, RopePosShape,
+    RopeShape, WeightView,
 };
 use velox_core::format::decode_rows;
+use velox_core::kv::{decode_cache, encode_row, KvFormat};
 use velox_core::{check, DeviceProfile, Op, Result};
 
 #[derive(Default, Clone, Copy)]
@@ -18,6 +20,11 @@ pub struct CpuBackend;
 fn as_bytes(v: &[f32]) -> &[u8] {
     // SAFETY: f32 has no padding or invalid bit patterns; u8 has alignment 1.
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 4) }
+}
+
+fn as_bytes_mut(v: &mut [f32]) -> &mut [u8] {
+    // SAFETY: as for `as_bytes`; every byte pattern is a valid f32.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), v.len() * 4) }
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
@@ -247,6 +254,17 @@ impl Backend for CpuBackend {
         s: AttnShape,
     ) -> Result<()> {
         check::attention(q.len(), k.len(), v.len(), out.len(), &s)?;
+        if s.kv != KvFormat::F32 {
+            // The rows the cache represents, then the f32 reference over them.
+            let rows = s.kv_len() * s.kv_heads;
+            let kd = decode_cache(s.kv, as_bytes(k), rows, s.head_dim, false);
+            let vd = decode_cache(s.kv, as_bytes(v), rows, s.head_dim, true);
+            let f32_shape = AttnShape {
+                kv: KvFormat::F32,
+                ..s
+            };
+            return self.attention(q, &kd, &vd, out, f32_shape);
+        }
         let d = s.head_dim;
         let group = s.heads / s.kv_heads;
         let scale = f64::from(s.scale());
@@ -275,6 +293,31 @@ impl Backend for CpuBackend {
                         .sum();
                     *oc = (acc / denom) as f32;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn kv_store(
+        &self,
+        k: &Vec<f32>,
+        v: &Vec<f32>,
+        k_cache: &mut Vec<f32>,
+        v_cache: &mut Vec<f32>,
+        s: KvStoreShape,
+    ) -> Result<()> {
+        check::kv_store(k.len(), v.len(), k_cache.len(), v_cache.len(), &s)?;
+        let (d, rb) = (s.head_dim, s.format.row_bytes(s.head_dim));
+        for (src, cache, is_v) in [(k, k_cache, false), (v, v_cache, true)] {
+            let bytes = as_bytes_mut(cache);
+            for r in 0..s.tokens * s.kv_heads {
+                let at = (s.pos0 * s.kv_heads + r) * rb;
+                encode_row(
+                    s.format,
+                    &src[r * d..(r + 1) * d],
+                    is_v,
+                    &mut bytes[at..at + rb],
+                );
             }
         }
         Ok(())
@@ -735,6 +778,7 @@ mod tests {
             kv_heads: 1,
             head_dim: 2,
             pos0: 0,
+            kv: KvFormat::F32,
         };
         let mut out = vec![0.0; 4];
         b.attention(
@@ -746,6 +790,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![4.0, -1.0, 4.0, -1.0]);
+    }
+
+    #[test]
+    fn quantized_cache_attention_matches_decoded_rows() {
+        let b = CpuBackend;
+        let mut rng = velox_core::rng::Rng::new(4);
+        let (kv_heads, d, pos0, tokens) = (2, 64, 5, 3);
+        let n = (pos0 + tokens) * kv_heads * d;
+        let (k, v) = (rng.vec(n, 2.0), rng.vec(n, 1.0));
+        let q = rng.vec(tokens * 4 * d, 2.0);
+        for fmt in KvFormat::ALL {
+            let slots = fmt.cache_slots(pos0 + tokens, kv_heads, d).unwrap();
+            let (mut kc, mut vc) = (vec![0.0; slots], vec![0.0; slots]);
+            // Two stores: a prefill chunk, then the verify window.
+            for (p, t) in [(0, pos0), (pos0, tokens)] {
+                let rows = p * kv_heads * d..(p + t) * kv_heads * d;
+                let st = KvStoreShape {
+                    tokens: t,
+                    kv_heads,
+                    head_dim: d,
+                    pos0: p,
+                    format: fmt,
+                };
+                b.kv_store(
+                    &k[rows.clone()].to_vec(),
+                    &v[rows].to_vec(),
+                    &mut kc,
+                    &mut vc,
+                    st,
+                )
+                .unwrap();
+            }
+            let s = AttnShape {
+                tokens,
+                heads: 4,
+                kv_heads,
+                head_dim: d,
+                pos0,
+                kv: fmt,
+            };
+            let mut got = vec![0.0; q.len()];
+            b.attention(&q, &kc, &vc, &mut got, s).unwrap();
+            let rows = (pos0 + tokens) * kv_heads;
+            let kd = decode_cache(fmt, as_bytes(&kc), rows, d, false);
+            let vd = decode_cache(fmt, as_bytes(&vc), rows, d, true);
+            let mut want = vec![0.0; q.len()];
+            let f = AttnShape {
+                kv: KvFormat::F32,
+                ..s
+            };
+            b.attention(&q, &kd, &vd, &mut want, f).unwrap();
+            assert_eq!(got, want, "{fmt}");
+            // Quantization error stays small next to the f32 reference.
+            let mut exact = vec![0.0; q.len()];
+            b.attention(&q, &k, &v, &mut exact, f).unwrap();
+            let err = got
+                .iter()
+                .zip(&exact)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(err < 0.5, "{fmt}: {err}");
+        }
     }
 
     #[test]
