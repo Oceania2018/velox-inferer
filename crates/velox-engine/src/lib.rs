@@ -760,13 +760,16 @@ where
             None => {}
         }
         let start = self.reuse(lane, &p.keys).map_err(core)?;
+        let t_reuse = t0.elapsed();
         // Checkpoints still valid for this prompt are those inside the shared prefix.
         let (keep, stale): (Vec<_>, Vec<_>) =
             lane.checkpoints.drain(..).partition(|c| c.pos <= start);
         lane.checkpoints = keep;
         lane.spare.extend(stale);
         lane.keys.truncate(start);
+        let mut t_fill = t_reuse;
         let prefilled = self.prefill(lane, ws, &p, &images, start).and_then(|()| {
+            t_fill = t0.elapsed();
             self.model
                 .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)
         });
@@ -787,6 +790,14 @@ where
             start + 1,
         );
         let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+            eprintln!(
+                "[prompt] reuse {:.1} ms, prefill {:.1} ms, candidates+prune {:.1} ms, total {prompt_ms:.1} ms",
+                t_reuse.as_secs_f64() * 1e3,
+                (t_fill - t_reuse).as_secs_f64() * 1e3,
+                (t0.elapsed() - t_fill).as_secs_f64() * 1e3
+            );
+        }
 
         let t1 = Instant::now();
         let mut out = Vec::new();
