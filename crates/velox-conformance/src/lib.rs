@@ -819,6 +819,83 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `gated_delta_net_from` / `conv1d_silu_from`: the result state lands in a second buffer and
+    /// the input state stays as it was (both compared, with the outputs).
+    fn state_from(
+        &mut self,
+        k_heads: usize,
+        v_heads: usize,
+        dk: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let gs = GdnShape {
+            tokens,
+            k_heads,
+            v_heads,
+            k_dim: dk,
+            v_dim: dk,
+            row0: 0,
+        };
+        let (state_len, out_len) = (v_heads * dk * dk, tokens * v_heads * dk);
+        let qkv = self.rng.vec(tokens * gs.qkv_width(), 1.0);
+        let ab = self.rng.vec(tokens * 2 * v_heads, 2.0);
+        let (a_log, dt_bias) = (self.rng.vec(v_heads, 1.0), self.rng.vec(v_heads, 1.0));
+        let s0 = self.rng.vec(state_len, 0.1);
+        let (mut want_s, mut want_o) = (vec![0.0; state_len], vec![0.0; out_len]);
+        CpuBackend.gated_delta_net_from(
+            &qkv,
+            &ab,
+            &a_log,
+            &dt_bias,
+            &s0,
+            &mut want_s,
+            &mut want_o,
+            gs,
+        )?;
+        let (qd, abd) = (self.b.upload(&qkv)?, self.b.upload(&ab)?);
+        let (ad, dd, sd) = (
+            self.b.upload(&a_log)?,
+            self.b.upload(&dt_bias)?,
+            self.b.upload(&s0)?,
+        );
+        let (mut so, mut od) = (self.b.alloc(state_len)?, self.b.alloc(out_len)?);
+        self.b
+            .gated_delta_net_from(&qd, &abd, &ad, &dd, &sd, &mut so, &mut od, gs)?;
+        let mut got = fetch(self.b, &od, out_len)?;
+        got.extend(fetch(self.b, &so, state_len)?);
+        got.extend(fetch(self.b, &sd, state_len)?);
+        want_o.extend(want_s);
+        want_o.extend_from_slice(&s0);
+        let name = format!(
+            "gated_delta_net_from heads {k_heads}/{v_heads} d {dk} ({tokens} tokens) + states"
+        );
+        self.record(name, Some(Op::GatedDeltaNet), &got, &want_o, 1e-4);
+
+        let (channels, width) = (gs.qkv_width(), 4);
+        let cs = ConvShape {
+            tokens,
+            channels,
+            width,
+            row0: 0,
+        };
+        let w = self.rng.vec(width * channels, 0.5);
+        let c0 = self.rng.vec((width - 1) * channels, 1.0);
+        let (mut want_c, mut want_y) = (vec![0.0; c0.len()], vec![0.0; tokens * channels]);
+        CpuBackend.conv1d_silu_from(&qkv, &w, &c0, &mut want_c, &mut want_y, cs)?;
+        let (wd, cd) = (self.b.upload(&w)?, self.b.upload(&c0)?);
+        let (mut co, mut yd) = (self.b.alloc(c0.len())?, self.b.alloc(tokens * channels)?);
+        self.b
+            .conv1d_silu_from(&qd, &wd, &cd, &mut co, &mut yd, cs)?;
+        let mut got = fetch(self.b, &yd, tokens * channels)?;
+        got.extend(fetch(self.b, &co, c0.len())?);
+        got.extend(fetch(self.b, &cd, c0.len())?);
+        want_y.extend(want_c);
+        want_y.extend_from_slice(&c0);
+        let name = format!("conv1d_silu_from c={channels} w={width} ({tokens} tokens) + states");
+        self.record(name, Some(Op::Conv1dSilu), &got, &want_y, 1e-5);
+        Ok(())
+    }
+
     fn attention_full(&mut self, s: FullAttnShape) -> Result<()> {
         let len = s.tokens * s.heads * s.head_dim;
         let (q, k, v) = (
@@ -1336,6 +1413,9 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.attention(attn(1, 16, 2, 64, 3_000, KvFormat::Nvfp4))?;
     s.conv1d(70, 4, [5, 1])?;
     s.conv1d(1024, 4, [1, 1])?;
+    s.state_from(16, 48, 128, 8)?;
+    s.state_from(2, 6, 64, 3)?;
+    s.state_from(2, 4, 128, 20)?;
     s.gdn(1, 3, 32, 32, [4, 1])?;
     // Qwen3.5 GDN head geometry (16/48 heads scaled down to 2/6), Dk = Dv = 128.
     s.gdn(2, 6, 128, 128, [6, 1])?;

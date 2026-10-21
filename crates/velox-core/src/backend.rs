@@ -425,6 +425,37 @@ pub trait Backend {
         out: &mut Self::Buffer,
         shape: ConvShape,
     ) -> Result<()>;
+    /// [`Self::conv1d_silu`] advancing from `state_in` into `state_out` (distinct buffers), leaving
+    /// `state_in` as it was: speculative windows keep the state they may roll back to.
+    fn conv1d_silu_from(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        state_in: &Self::Buffer,
+        state_out: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: ConvShape,
+    ) -> Result<()> {
+        self.copy(state_in, 0, state_out, 0, self.len(state_in))?;
+        self.conv1d_silu(x, weight, state_out, out, shape)
+    }
+    /// [`Self::gated_delta_net`] updating from `state_in` into `state_out` (distinct buffers),
+    /// leaving `state_in` as it was.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_from(
+        &self,
+        qkv: &Self::Buffer,
+        ab: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        state_in: &Self::Buffer,
+        state_out: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: GdnShape,
+    ) -> Result<()> {
+        self.copy(state_in, 0, state_out, 0, self.len(state_in))?;
+        self.gated_delta_net(qkv, ab, a_log, dt_bias, state_out, out, shape)
+    }
     /// Gated DeltaNet gating, L2 norm and recurrence over `tokens` steps; see [`GdnShape`].
     #[allow(clippy::too_many_arguments)]
     fn gated_delta_net(

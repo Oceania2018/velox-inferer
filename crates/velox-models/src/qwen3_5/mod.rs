@@ -35,6 +35,8 @@ pub struct Session<B: Backend> {
     spec: Option<Spec<B>>,
     /// Distinguishes this session's graph recordings from other sessions' (they bind its buffers).
     id: u64,
+    /// Flips whenever a committed verify swaps the recurrent state with the speculative buffers.
+    parity: bool,
 }
 
 /// Up to this many tokens (decode, verify) adjacent projections run as one fused linear; larger
@@ -59,7 +61,7 @@ const STATIC_MAX_TOKENS: usize = 15;
 const GRAPH_SEGMENT_LAYERS: usize = 16;
 
 fn graph_key(kind: u64, shape: u64, s: &Session<impl Backend>, kv_len: Option<usize>) -> u64 {
-    let mut key = kind | shape | (s.id & 0xffff) << 40;
+    let mut key = kind | shape | u64::from(s.parity) << 15 | (s.id & 0xffff) << 40;
     if let Some(kv) = kv_len {
         key |= GRAPH_STATIC | (kv.div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
     }
@@ -257,6 +259,7 @@ impl<B: Backend> Qwen35Text<B> {
             ssm,
             spec: None,
             id: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            parity: false,
         })
     }
 
@@ -490,6 +493,26 @@ impl<B: Backend> Qwen35Text<B> {
                     dt_bias,
                     norm,
                 } => {
+                    // While a verify window is recorded, its qkv and a/b rows land directly in the
+                    // spec buffers commit replays from, and the recurrent state advances into the
+                    // spec state, so the session keeps the state to roll back to (no copies).
+                    let Session {
+                        spec,
+                        conv: s_conv,
+                        ssm: s_ssm,
+                        ..
+                    } = &mut *s;
+                    let (qkv_buf, ab_buf, mut state_out) =
+                        match spec.as_mut().filter(|sp| sp.recording) {
+                            Some(Spec {
+                                qkv: sq,
+                                ab: sa,
+                                conv: sc,
+                                ssm: ss,
+                                ..
+                            }) => (&mut sq[gi], &mut sa[gi], Some((&mut sc[gi], &mut ss[gi]))),
+                            None => (&mut ws.qkv, &mut ws.ab, None),
+                        };
                     match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
                         Some(f) => {
                             b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
@@ -498,21 +521,17 @@ impl<B: Backend> Qwen35Text<B> {
                                 t,
                                 f.rows,
                                 &mut [
-                                    (&mut ws.qkv, qkv.row_begin - f.row_begin, qkv.rows),
+                                    (&mut *qkv_buf, qkv.row_begin - f.row_begin, qkv.rows),
                                     (&mut ws.z, z.row_begin - f.row_begin, z.rows),
                                 ],
                             )?;
                         }
                         None => {
-                            b.linear(&ws.h, &w.view(qkv), &mut ws.qkv, t)?;
+                            b.linear(&ws.h, &w.view(qkv), qkv_buf, t)?;
                             b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
                         }
                     }
-                    b.linear(&ws.h, &w.view(ab), &mut ws.ab, t)?;
-                    if let Some(sp) = s.spec.as_mut().filter(|sp| sp.recording) {
-                        b.copy(&ws.qkv, 0, &mut sp.qkv[gi], 0, t * c.gdn_qkv())?;
-                        b.copy(&ws.ab, 0, &mut sp.ab[gi], 0, t * 2 * c.gdn_v_heads)?;
-                    }
+                    b.linear(&ws.h, &w.view(ab), ab_buf, t)?;
                     let mut row0 = 0;
                     for &end in &cuts {
                         let cs = ConvShape {
@@ -521,13 +540,6 @@ impl<B: Backend> Qwen35Text<B> {
                             width: c.conv_width,
                             row0,
                         };
-                        b.conv1d_silu(
-                            &ws.qkv,
-                            w.param(*conv),
-                            &mut s.conv[gi],
-                            &mut ws.conv_out,
-                            cs,
-                        )?;
                         let gs = GdnShape {
                             tokens: end - row0,
                             k_heads: c.gdn_k_heads,
@@ -536,18 +548,44 @@ impl<B: Backend> Qwen35Text<B> {
                             v_dim: c.gdn_v_dim,
                             row0,
                         };
-                        b.gated_delta_net(
-                            &ws.conv_out,
-                            &ws.ab,
-                            w.param(*a_log),
-                            w.param(*dt_bias),
-                            &mut s.ssm[gi],
-                            &mut ws.o,
-                            gs,
-                        )?;
+                        let (cw, al, dt) = (w.param(*conv), w.param(*a_log), w.param(*dt_bias));
+                        match &mut state_out {
+                            Some((sc, ss)) => {
+                                b.conv1d_silu_from(
+                                    qkv_buf,
+                                    cw,
+                                    &s_conv[gi],
+                                    sc,
+                                    &mut ws.conv_out,
+                                    cs,
+                                )?;
+                                b.gated_delta_net_from(
+                                    &ws.conv_out,
+                                    ab_buf,
+                                    al,
+                                    dt,
+                                    &s_ssm[gi],
+                                    ss,
+                                    &mut ws.o,
+                                    gs,
+                                )?;
+                            }
+                            None => {
+                                b.conv1d_silu(qkv_buf, cw, &mut s_conv[gi], &mut ws.conv_out, cs)?;
+                                b.gated_delta_net(
+                                    &ws.conv_out,
+                                    ab_buf,
+                                    al,
+                                    dt,
+                                    &mut s_ssm[gi],
+                                    &mut ws.o,
+                                    gs,
+                                )?;
+                            }
+                        }
                         for cp in snaps.iter_mut().filter(|cp| cp.pos == pos0 + end) {
-                            b.copy(&s.conv[gi], 0, &mut cp.conv[gi], 0, b.len(&s.conv[gi]))?;
-                            b.copy(&s.ssm[gi], 0, &mut cp.ssm[gi], 0, b.len(&s.ssm[gi]))?;
+                            b.copy(&s_conv[gi], 0, &mut cp.conv[gi], 0, b.len(&s_conv[gi]))?;
+                            b.copy(&s_ssm[gi], 0, &mut cp.ssm[gi], 0, b.len(&s_ssm[gi]))?;
                         }
                         row0 = end;
                     }
@@ -873,22 +911,10 @@ impl<B: Backend> Qwen35Text<B> {
         let key = graph_key(GRAPH_VERIFY, shape, s, kv);
         b.graph(key, &mut || {
             {
-                let Session {
-                    spec,
-                    conv,
-                    ssm,
-                    pos,
-                    ..
-                } = &mut *s;
+                // The window's GDN layers advance from the session's state into the spec buffers
+                // (see `chunk`), so the state to roll back to stays in place.
+                let Session { spec, pos, .. } = &mut *s;
                 let sp = spec.as_mut().expect("allocated above");
-                for (dst, src) in sp
-                    .conv
-                    .iter_mut()
-                    .zip(conv.iter())
-                    .chain(sp.ssm.iter_mut().zip(ssm.iter()))
-                {
-                    b.copy(src, 0, dst, 0, b.len(src))?;
-                }
                 sp.pos0 = *pos;
                 sp.tokens = t;
                 sp.recording = true;
@@ -932,10 +958,11 @@ impl<B: Backend> Qwen35Text<B> {
             conv,
             ssm,
             pos,
+            parity,
             ..
         } = &mut *s;
         let sp = spec
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| Error::Config("commit without verify".into()))?;
         if keep > sp.tokens {
             return Err(Error::Shape(format!(
@@ -943,16 +970,17 @@ impl<B: Backend> Qwen35Text<B> {
                 sp.tokens
             )));
         }
-        if keep < sp.tokens {
-            // Restore and replay are one recorded step per kept length.
+        if keep == sp.tokens {
+            // The whole window stays: verify left its state in the spec buffers, which become
+            // the session's (graph keys carry the parity, as recordings bind buffers).
+            std::mem::swap(conv, &mut sp.conv);
+            std::mem::swap(ssm, &mut sp.ssm);
+            *parity = !*parity;
+        } else {
+            // The session still holds the state before the window: replay the kept prefix onto
+            // it, one recorded step per kept length.
+            let sp = &*sp;
             b.graph(key, &mut || {
-                for (dst, src) in conv
-                    .iter_mut()
-                    .zip(&sp.conv)
-                    .chain(ssm.iter_mut().zip(&sp.ssm))
-                {
-                    b.copy(src, 0, dst, 0, b.len(src))?;
-                }
                 if keep > 0 {
                     let mut gi = 0;
                     for l in &self.w.layers {
