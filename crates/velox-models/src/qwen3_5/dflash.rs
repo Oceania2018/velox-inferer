@@ -226,6 +226,13 @@ pub struct DFlashWorkspace<B: Backend> {
     qn: B::Buffer,
     bkn: B::Buffer,
     attn: B::Buffer,
+    /// One sequence's block rows (queries, keys, values, output) staged for its own context
+    /// (batched proposals); `stage_rows` rows each.
+    stage_rows: usize,
+    sq: B::Buffer,
+    sk: B::Buffer,
+    sv: B::Buffer,
+    sattn: B::Buffer,
     gu: B::Buffer,
     mg: B::Buffer,
     mu: B::Buffer,
@@ -366,21 +373,25 @@ impl<B: Backend> DFlashModel<B> {
         })
     }
 
+    /// Activations for context chunks of up to `ctx_rows` rows, blocks of up to `block` rows, and
+    /// batched proposals of up to `batch_rows` rows (every sequence's block).
     pub fn workspace(
         &self,
         b: &B,
         target: &Qwen35Text<B>,
         ctx_rows: usize,
         block: usize,
+        batch_rows: usize,
     ) -> Result<DFlashWorkspace<B>> {
         let c = &self.cfg;
-        let (h, r, w) = (self.hidden, ctx_rows, block);
+        let stage = block;
+        let (h, r, w) = (self.hidden, ctx_rows, block.max(batch_rows));
         let tw = &target.w;
         let head_rows = tw.proposal.as_ref().map_or(tw.head.rows, |p| p.head.rows);
         Ok(DFlashWorkspace {
             id: NEXT_DRAFTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ctx_rows,
-            block,
+            block: w,
             ctx_raw: b.alloc(r * h)?,
             feat: b.alloc(super::VERIFY_MAX * self.feature_projection.k)?,
             ctx: b.alloc(r * h)?,
@@ -399,6 +410,11 @@ impl<B: Backend> DFlashModel<B> {
             qn: b.alloc(w * c.q_dim())?,
             bkn: b.alloc(w * c.kv_dim())?,
             attn: b.alloc(w * c.q_dim())?,
+            stage_rows: stage,
+            sq: b.alloc(stage * c.q_dim())?,
+            sk: b.alloc(stage * c.kv_dim())?,
+            sv: b.alloc(stage * c.kv_dim())?,
+            sattn: b.alloc(stage * c.q_dim())?,
             gu: b.alloc(w * 2 * c.intermediate)?,
             mg: b.alloc(w * c.intermediate)?,
             mu: b.alloc(w * c.intermediate)?,
@@ -695,7 +711,7 @@ impl<B: Backend> DFlashModel<B> {
             b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
             for (li, l) in self.layers.iter().enumerate() {
                 // Attention branch.
-                self.prepare(b, dw, l.input_norm, &l.attn_conv, w)?;
+                self.prepare(b, dw, l.input_norm, &l.attn_conv, w, w)?;
                 b.linear(&dw.prep, &self.view(&l.qkv), &mut dw.qkv, w)?;
                 b.split_cols(
                     &dw.qkv,
@@ -754,9 +770,9 @@ impl<B: Backend> DFlashModel<B> {
                     },
                 )?;
                 b.linear(&dw.attn, &self.view(&l.output), &mut dw.z, w)?;
-                self.finish(b, dw, &l.attn_conv, w)?;
+                self.finish(b, dw, &l.attn_conv, w, w)?;
                 // MLP branch.
-                self.prepare(b, dw, l.post_norm, &l.mlp_conv, w)?;
+                self.prepare(b, dw, l.post_norm, &l.mlp_conv, w, w)?;
                 match &l.gate_up {
                     Some(f) => {
                         b.linear(&dw.prep, &self.view(f), &mut dw.gu, w)?;
@@ -770,7 +786,7 @@ impl<B: Backend> DFlashModel<B> {
                     }
                 }
                 b.linear(&dw.mg, &self.view(&l.down), &mut dw.z, w)?;
-                self.finish(b, dw, &l.mlp_conv, w)?;
+                self.finish(b, dw, &l.mlp_conv, w, w)?;
             }
             // Mask columns 1 .. w: final norm, proposal head, unary top-k, selector projection.
             b.copy(&dw.x, h, &mut dw.tail, 0, k * h)?;
@@ -810,7 +826,188 @@ impl<B: Backend> DFlashModel<B> {
         Ok(BlockCandidates { cands, g })
     }
 
-    /// `prep = conv side 0 of plain_rmsnorm(x, norm)`, keeping the side-1 delta in `dw.delta`.
+    /// [`Self::propose`] for several sequences at once: sequence `i` drafts `drafts` tokens after
+    /// `anchors[i]` over its context `states[i]`. The block forward runs once over every block
+    /// (projections, MLPs and the proposal head read their weights once); block attention runs per
+    /// sequence over its own context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_batch(
+        &self,
+        b: &B,
+        target: &Qwen35Text<B>,
+        states: &[&DFlashState<B>],
+        dw: &mut DFlashWorkspace<B>,
+        anchors: &[u32],
+        drafts: usize,
+        limit: usize,
+    ) -> Result<Vec<BlockCandidates>> {
+        let c = &self.cfg;
+        let n = states.len();
+        let (h, w) = (self.hidden, drafts + 1);
+        let rows = n * w;
+        if n == 0
+            || anchors.len() != n
+            || drafts == 0
+            || w > c.window
+            || rows > dw.block
+            || w > dw.stage_rows
+        {
+            return Err(Error::Shape(format!(
+                "dflash2 batch of {n} blocks of {w} (workspace {} rows)",
+                dw.block
+            )));
+        }
+        let tw = &target.w;
+        let mut ids = vec![c.mask_token; rows];
+        for (i, &a) in anchors.iter().enumerate() {
+            ids[i * w] = a;
+        }
+        let (head, map) = match &tw.proposal {
+            Some(p) => (tw.view(&p.head), Some(&p.token_ids)),
+            None => (tw.view(&tw.head), None),
+        };
+        let (qd, kvd) = (c.q_dim(), c.kv_dim());
+        let k = drafts;
+        b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
+        for (li, l) in self.layers.iter().enumerate() {
+            // Attention branch.
+            self.prepare(b, dw, l.input_norm, &l.attn_conv, rows, w)?;
+            b.linear(&dw.prep, &self.view(&l.qkv), &mut dw.qkv, rows)?;
+            b.split_cols(
+                &dw.qkv,
+                rows,
+                qd + 2 * kvd,
+                &mut [
+                    (&mut dw.q, 0, qd),
+                    (&mut dw.k, qd, kvd),
+                    (&mut dw.v, qd + kvd, kvd),
+                ],
+            )?;
+            b.rms_norm(
+                &dw.q,
+                &self.params[l.q_norm],
+                &mut dw.qn,
+                rows * c.heads,
+                c.head_dim,
+                c.eps,
+                NormKind::Plain,
+            )?;
+            b.rms_norm(
+                &dw.k,
+                &self.params[l.k_norm],
+                &mut dw.bkn,
+                rows * c.kv_heads,
+                c.head_dim,
+                c.eps,
+                NormKind::Plain,
+            )?;
+            for (i, st) in states.iter().enumerate() {
+                // Sequence i's block rows, staged for its rotation and context.
+                let r = i * w;
+                b.copy(&dw.qn, r * qd, &mut dw.sq, 0, w * qd)?;
+                b.copy(&dw.bkn, r * kvd, &mut dw.sk, 0, w * kvd)?;
+                b.copy(&dw.v, r * kvd, &mut dw.sv, 0, w * kvd)?;
+                let rope = |heads| RopeShape {
+                    tokens: w,
+                    heads,
+                    head_dim: c.head_dim,
+                    rotary_dim: c.head_dim,
+                    pos0: st.end,
+                    theta: c.theta,
+                };
+                b.rope(&mut dw.sq, rope(c.heads))?;
+                b.rope(&mut dw.sk, rope(c.kv_heads))?;
+                b.attention_block(
+                    &dw.sq,
+                    &st.k[li],
+                    &st.v[li],
+                    &dw.sk,
+                    &dw.sv,
+                    &mut dw.sattn,
+                    BlockAttnShape {
+                        tokens: w,
+                        heads: c.heads,
+                        kv_heads: c.kv_heads,
+                        head_dim: c.head_dim,
+                        pos0: st.end,
+                        ctx_lo: st.lo,
+                        window: c.window,
+                        ring: c.window,
+                    },
+                )?;
+                b.copy(&dw.sattn, 0, &mut dw.attn, r * qd, w * qd)?;
+            }
+            b.linear(&dw.attn, &self.view(&l.output), &mut dw.z, rows)?;
+            self.finish(b, dw, &l.attn_conv, rows, w)?;
+            // MLP branch.
+            self.prepare(b, dw, l.post_norm, &l.mlp_conv, rows, w)?;
+            match &l.gate_up {
+                Some(f) => {
+                    b.linear(&dw.prep, &self.view(f), &mut dw.gu, rows)?;
+                    let (g, u) = (l.gate.row_begin - f.row_begin, l.up.row_begin - f.row_begin);
+                    b.swiglu(&dw.gu, rows, f.rows, g, u, c.intermediate, &mut dw.mg)?;
+                }
+                None => {
+                    b.linear(&dw.prep, &self.view(&l.gate), &mut dw.mg, rows)?;
+                    b.linear(&dw.prep, &self.view(&l.up), &mut dw.mu, rows)?;
+                    b.silu_mul(&mut dw.mg, &dw.mu, rows * c.intermediate)?;
+                }
+            }
+            b.linear(&dw.mg, &self.view(&l.down), &mut dw.z, rows)?;
+            self.finish(b, dw, &l.mlp_conv, rows, w)?;
+        }
+        // Mask columns 1 .. w of every block: final norm, proposal head, unary top-k, selector.
+        for i in 0..n {
+            b.copy(&dw.x, (i * w + 1) * h, &mut dw.tail, i * k * h, k * h)?;
+        }
+        let m = n * k;
+        b.rms_norm(
+            &dw.tail,
+            &self.params[self.final_norm],
+            &mut dw.hid,
+            m,
+            h,
+            c.eps,
+            NormKind::Plain,
+        )?;
+        b.linear(&dw.hid, &head, &mut dw.logits, m)?;
+        b.linear(&dw.hid, &self.view(&self.hidden_projection), &mut dw.g, m)?;
+        let nh = head.rows;
+        let fetch = c.top_k + if map.is_some() { 8 } else { 0 };
+        let all = b.top_k(
+            &dw.logits,
+            m,
+            nh,
+            if map.is_some() { nh } else { limit.min(nh) },
+            fetch,
+        )?;
+        let mut g = vec![0.0; m * c.rank];
+        b.download(&dw.g, &mut g)?;
+        let mut rows_iter = all.into_iter();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let cands = rows_iter
+                .by_ref()
+                .take(k)
+                .map(|row| {
+                    row.into_iter()
+                        .map(|(t, v)| (map.map_or(t, |mp| mp[t as usize]), v))
+                        .filter(|&(id, _)| (id as usize) < limit)
+                        .take(c.top_k)
+                        .collect()
+                })
+                .collect();
+            out.push(BlockCandidates {
+                cands,
+                g: g[i * k * c.rank..(i + 1) * k * c.rank].to_vec(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// `prep = conv side 0 of plain_rmsnorm(x, norm)` over `w` rows in blocks of `block`, keeping
+    /// the side-1 delta in `dw.delta`.
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &self,
         b: &B,
@@ -818,6 +1015,7 @@ impl<B: Backend> DFlashModel<B> {
         norm: usize,
         conv: &Conv,
         w: usize,
+        block: usize,
     ) -> Result<()> {
         let c = &self.cfg;
         let h = self.hidden;
@@ -842,12 +1040,20 @@ impl<B: Backend> DFlashModel<B> {
                 group: c.conv_group,
                 side: 0,
                 accumulate: false,
+                block,
             },
         )
     }
 
     /// `x += conv side 1 of dw.z` with the delta of the matching `prepare`.
-    fn finish(&self, b: &B, dw: &mut DFlashWorkspace<B>, conv: &Conv, w: usize) -> Result<()> {
+    fn finish(
+        &self,
+        b: &B,
+        dw: &mut DFlashWorkspace<B>,
+        conv: &Conv,
+        w: usize,
+        block: usize,
+    ) -> Result<()> {
         b.dyn_conv(
             &dw.z,
             &self.params[conv.base],
@@ -859,6 +1065,7 @@ impl<B: Backend> DFlashModel<B> {
                 group: self.cfg.conv_group,
                 side: 1,
                 accumulate: true,
+                block,
             },
         )
     }
