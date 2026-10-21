@@ -539,8 +539,9 @@ impl<B: Backend> QwenEngine<B> {
             spec_stats.1 += window.len() - 1;
             spec_stats.2 += keep - 1;
             model.commit(b, session, ws, keep).map_err(core)?;
-            if let Drafter::Mtp(m) = dr {
-                m.record(keep - 1, window.len() - 1);
+            match dr {
+                Drafter::Mtp(m) => m.record(keep - 1, window.len() - 1),
+                Drafter::DFlash(d) => d.observe(keep - 1),
             }
             keys.extend_from_slice(&window[..keep]);
             if let Some(f) = finish {
@@ -753,8 +754,10 @@ where
                 self.checkpoint_positions(&p.ids, 0)
             );
         }
-        if let Some(Drafter::Mtp(m)) = lane.drafter.as_mut() {
-            m.reset();
+        match lane.drafter.as_mut() {
+            Some(Drafter::Mtp(m)) => m.reset(),
+            Some(Drafter::DFlash(d)) => d.reset(),
+            None => {}
         }
         let start = self.reuse(lane, &p.keys).map_err(core)?;
         // Checkpoints still valid for this prompt are those inside the shared prefix.
