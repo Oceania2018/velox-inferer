@@ -12,7 +12,7 @@
 //! when the artifact has one, otherwise from the target's output head.
 
 use velox_core::backend::{Backend, NormKind, WeightView};
-use velox_core::{Error, Result};
+use velox_core::{Error, KvFormat, Result};
 
 use super::weights::MtpWeights;
 use super::{Qwen35Text, Rope, Workspace};
@@ -163,7 +163,8 @@ impl<B: Backend> Qwen35Text<B> {
                 Rope::Axes(&axes)
             }
         };
-        self.attention_mixer(b, ws, &l.mixer, &mut ms.kv, t, pos0, rope)?;
+        // The MTP cache stays f32 whatever the target session stores.
+        self.attention_mixer(b, ws, &l.mixer, &mut ms.kv, KvFormat::F32, t, pos0, rope)?;
         b.add(&mut ws.x, &ws.y, t * hd)?;
         b.rms_norm(
             &ws.x,

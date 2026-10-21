@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use velox_core::{Backend, Error as CoreError};
+use velox_core::{Backend, Error as CoreError, KvFormat};
 use velox_frontend::image::{decode_data_url, preprocess, ImagePatches};
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
@@ -46,6 +46,8 @@ pub struct EngineConfig {
     /// DFlash2 drafts per block on the main lane when the engine has a DFlash2 model (0: use MTP
     /// instead).
     pub dflash_drafts: usize,
+    /// Storage format of the target model's attention KV caches.
+    pub kv_format: KvFormat,
 }
 
 /// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
@@ -283,7 +285,7 @@ impl<B: Backend> QwenEngine<B> {
             if capacity == 0 {
                 continue;
             }
-            let session = model.session(&b, capacity)?;
+            let session = model.session_with(&b, capacity, cfg.kv_format)?;
             let zero = session.checkpoint(&b)?;
             let drafter = match &dflash {
                 // Every lane drafts: short unrelated requests (System One, probes) land on the scratch lane.
