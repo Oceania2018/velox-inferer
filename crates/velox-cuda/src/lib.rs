@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopePosShape,
-    RopeShape, WeightView,
+    RopeShape, WeightView, GRAPH_STATIC,
 };
 use velox_core::{check, profile, DeviceProfile, Error, GpuArch, Op, Result, VariantInfo};
 
@@ -48,8 +48,10 @@ mod ffi {
         pub fn velox_cuda_error_string(code: i32) -> *const c_char;
         pub fn velox_cuda_runtime_version(v: *mut i32) -> i32;
         pub fn velox_cuda_driver_version(v: *mut i32) -> i32;
-        pub fn velox_cuda_graph_begin() -> i32;
+        pub fn velox_cuda_graph_begin(slot: i32) -> i32;
         pub fn velox_cuda_graph_end_launch(slot: i32) -> i32;
+        pub fn velox_cuda_graph_replay_begin(slot: i32) -> i32;
+        pub fn velox_cuda_graph_replay_launch(slot: i32) -> i32;
         pub fn velox_cuda_graph_abort() -> i32;
     }
 }
@@ -510,12 +512,56 @@ pub struct CudaBackend {
 
 #[derive(Default)]
 struct GraphKeys {
-    slots: HashMap<u32, i32>,
-    seen: HashSet<u32>,
+    slots: HashMap<u64, i32>,
+    seen: HashSet<u64>,
+    /// Static keys recorded at least once: later runs replay.
+    recorded: HashSet<u64>,
 }
 
 /// Graph slots the shim keeps (`kGraphSlots`).
-const GRAPH_SLOTS: i32 = 256;
+const GRAPH_SLOTS: i32 = 4096;
+
+/// What this thread is doing inside [`Backend::graph`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphMode {
+    None,
+    /// Recording: ops launch into the capture and stage per-call values in the step's region.
+    Capture,
+    /// Re-running a static step's host code: ops only stage their per-call values; the recorded
+    /// graph is launched afterwards.
+    Replay,
+}
+
+thread_local! {
+    static GRAPH_MODE: std::cell::Cell<GraphMode> = const { std::cell::Cell::new(GraphMode::None) };
+}
+
+pub fn graph_mode() -> GraphMode {
+    GRAPH_MODE.with(std::cell::Cell::get)
+}
+
+fn set_graph_mode(m: GraphMode) {
+    GRAPH_MODE.with(|c| c.set(m));
+}
+
+/// Ops whose launches a replay skips return this.
+trait Skipped {
+    fn skipped() -> Self;
+}
+
+impl Skipped for Result<()> {
+    fn skipped() -> Self {
+        Ok(())
+    }
+}
+
+impl<T> Skipped for Result<Vec<T>> {
+    fn skipped() -> Self {
+        Err(Error::Backend(
+            "host readback inside a replayed graph step".into(),
+        ))
+    }
+}
 
 impl CudaBackend {
     /// Makes `device` current and binds the variant's kernels to it.
@@ -546,7 +592,16 @@ impl CudaBackend {
         &self.device
     }
 
-    fn timed<T>(&self, op: &str, f: impl FnOnce() -> T) -> T {
+    /// Runs an op; a replay skips it (its launches are in the recorded graph).
+    fn timed<T: Skipped>(&self, op: &str, f: impl FnOnce() -> T) -> T {
+        if graph_mode() == GraphMode::Replay {
+            return T::skipped();
+        }
+        self.staged(op, f)
+    }
+
+    /// Runs an op that stages per-call values: a replay runs it too (it returns after staging).
+    fn staged<T>(&self, op: &str, f: impl FnOnce() -> T) -> T {
         match &self.timing {
             Some(t) => t.time(op, f),
             None => f(),
@@ -637,42 +692,83 @@ impl Backend for CudaBackend {
         })
     }
 
-    fn graph(&self, key: u32, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+    fn graph(&self, key: u64, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         let Some(graphs) = &self.graphs else {
             return f();
         };
+        if graph_mode() != GraphMode::None {
+            // Nested steps run inside the enclosing recording.
+            return f();
+        }
         // The first run of a key is eager: lazy allocations and caches settle outside capture.
-        let slot = {
+        let (slot, replay) = {
             let mut g = graphs
                 .lock()
                 .map_err(|_| Error::Backend("graph keys poisoned".into()))?;
             if g.seen.insert(key) {
-                None
+                (None, false)
             } else {
                 let next = g.slots.len() as i32;
-                Some(*g.slots.entry(key).or_insert(next))
+                let slot = *g.slots.entry(key).or_insert(next);
+                (
+                    Some(slot),
+                    key & GRAPH_STATIC != 0 && g.recorded.contains(&key),
+                )
             }
         };
         let Some(slot) = slot.filter(|&s| s < GRAPH_SLOTS) else {
             return f();
         };
-        // SAFETY: no arguments; the shim checks its own state.
-        status(unsafe { ffi::velox_cuda_graph_begin() }, "graph capture")?;
-        if let Err(e) = f() {
-            // SAFETY: ends the capture begun above.
+        let mode = if replay {
+            GraphMode::Replay
+        } else {
+            GraphMode::Capture
+        };
+        // SAFETY: slot is in the shim's range (checked above).
+        let begun = unsafe {
+            if replay {
+                ffi::velox_cuda_graph_replay_begin(slot)
+            } else {
+                ffi::velox_cuda_graph_begin(slot)
+            }
+        };
+        status(begun, "graph begin")?;
+        set_graph_mode(mode);
+        let r = f();
+        set_graph_mode(GraphMode::None);
+        if let Err(e) = r {
+            // SAFETY: ends the capture or replay begun above.
             unsafe { ffi::velox_cuda_graph_abort() };
+            if replay {
+                // Forget the recording: the next run records again.
+                if let Ok(mut g) = graphs.lock() {
+                    g.recorded.remove(&key);
+                }
+            }
             return Err(e);
         }
-        // SAFETY: slot is in the shim's range (checked above).
-        status(
-            unsafe { ffi::velox_cuda_graph_end_launch(slot) },
-            "graph launch",
-        )
+        // SAFETY: slot is in the shim's range and its graph was begun above.
+        let launched = unsafe {
+            if replay {
+                ffi::velox_cuda_graph_replay_launch(slot)
+            } else {
+                ffi::velox_cuda_graph_end_launch(slot)
+            }
+        };
+        status(launched, "graph launch")?;
+        if !replay && key & GRAPH_STATIC != 0 {
+            graphs
+                .lock()
+                .map_err(|_| Error::Backend("graph keys poisoned".into()))?
+                .recorded
+                .insert(key);
+        }
+        Ok(())
     }
 
     fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {
         check::copy2d(src.len, dst.len, &shape)?;
-        self.timed("copy2d", || self.kernels.copy2d(src, dst, shape))
+        self.staged("copy2d", || self.kernels.copy2d(src, dst, shape))
     }
 
     fn dyn_conv(
@@ -820,7 +916,7 @@ impl Backend for CudaBackend {
         out: &mut CudaBuffer,
     ) -> Result<()> {
         check::embed(ids, table, table.buf.len, out.len)?;
-        self.timed("embed", || self.kernels.embed(ids, table, out))
+        self.staged("embed", || self.kernels.embed(ids, table, out))
     }
 
     fn rms_norm(
@@ -841,7 +937,7 @@ impl Backend for CudaBackend {
 
     fn rope(&self, x: &mut CudaBuffer, s: RopeShape) -> Result<()> {
         check::rope(x.len, &s)?;
-        self.timed("rope", || self.kernels.rope(x, s))
+        self.staged("rope", || self.kernels.rope(x, s))
     }
 
     fn silu_mul(&self, gate: &mut CudaBuffer, up: &CudaBuffer, len: usize) -> Result<()> {
@@ -868,7 +964,7 @@ impl Backend for CudaBackend {
         len: usize,
     ) -> Result<()> {
         check::copy(src.len, src_offset, dst.len, dst_offset, len)?;
-        self.timed("copy", || {
+        self.staged("copy", || {
             self.kernels.copy(src, src_offset, dst, dst_offset, len)
         })
     }
@@ -887,7 +983,13 @@ impl Backend for CudaBackend {
             2..=16 => "attention verify",
             _ => "attention prefill",
         };
-        self.timed(op, || self.kernels.attention(q, k, v, out, s))
+        if graph_mode() == GraphMode::Replay && s.tokens >= 16 {
+            // Only the portable GQA path stages its position; tuned prefill kernels do not.
+            return Err(Error::Backend(
+                "attention over 16+ tokens in a replayed graph step".into(),
+            ));
+        }
+        self.staged(op, || self.kernels.attention(q, k, v, out, s))
     }
 
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
@@ -990,7 +1092,7 @@ impl Backend for CudaBackend {
 
     fn rope_positions(&self, x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) -> Result<()> {
         check::rope_positions(x.len, positions, &s)?;
-        self.timed("rope_positions", || {
+        self.staged("rope_positions", || {
             self.kernels.rope_positions(x, positions, s)
         })
     }

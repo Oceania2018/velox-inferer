@@ -6,9 +6,9 @@ use velox_core::backend::{
     GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
-use velox_core::{Result, WeightFormat};
+use velox_core::{Result, WeightFormat, GRAPH_KV_BUCKET};
 
-use crate::{dtod, stage, status, CudaBuffer};
+use crate::{dtod, graph_mode, stage, status, CudaBuffer, GraphMode};
 
 extern "C" {
     fn velox_portable_matmul(
@@ -36,6 +36,7 @@ extern "C" {
         rotary_dim: i32,
         pos0: i32,
         theta: f32,
+        params: *const i64,
     ) -> i32;
     fn velox_portable_silu_mul(gate: *mut f32, up: *const f32, len: i64) -> i32;
     fn velox_portable_add(acc: *mut f32, x: *const f32, len: i64) -> i32;
@@ -50,6 +51,8 @@ extern "C" {
         head_dim: i32,
         pos0: i32,
         scale: f32,
+        params: *const i64,
+        kv_grid: i32,
     ) -> i32;
     fn velox_portable_linear(
         x: *const f32,
@@ -161,6 +164,9 @@ pub fn embed(ids: &[u32], table: &WeightView<'_, CudaBuffer>, out: &mut CudaBuff
     }
     let id_bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
     let dev_ids = stage(&id_bytes)?;
+    if graph_mode() == GraphMode::Replay {
+        return Ok(());
+    }
     // SAFETY: ids are in range (checked) and out holds ids.len() rows.
     status(
         unsafe {
@@ -218,9 +224,12 @@ pub fn rope(x: &mut CudaBuffer, s: RopeShape) -> Result<()> {
     );
     // The kernel forms positions as pos0 + t in i32.
     to_i32("pos0 + tokens", s.pos0 + s.tokens)?;
+    let Some(params) = graph_params(&[s.pos0 as i64])? else {
+        return Ok(());
+    };
     // SAFETY: buffer extent validated above.
     status(
-        unsafe { velox_portable_rope(x.as_mut_ptr(), t, h, d, r, s.pos0 as i32, s.theta) },
+        unsafe { velox_portable_rope(x.as_mut_ptr(), t, h, d, r, s.pos0 as i32, s.theta, params) },
         "portable rope",
     )
 }
@@ -263,6 +272,19 @@ pub fn copy(
     if len == 0 {
         return Ok(());
     }
+    if graph_mode() != GraphMode::None {
+        // A graph step copies at offsets it stages, so its recording does not depend on them.
+        let Some(params) = graph_params(&[src_offset as i64, dst_offset as i64])? else {
+            return Ok(());
+        };
+        // SAFETY: both ranges validated above; the kernel adds the staged offsets to the bases.
+        return status(
+            unsafe {
+                velox_portable_copy_param(src.as_ptr(), dst.as_mut_ptr(), len as i64, params)
+            },
+            "portable copy",
+        );
+    }
     // SAFETY: both ranges validated above, so the offset pointers are in bounds.
     dtod(
         unsafe { dst.as_mut_ptr().add(dst_offset) },
@@ -280,6 +302,10 @@ pub fn attention(
 ) -> Result<()> {
     check::attention(q.len(), k.len(), v.len(), out.len(), &s)?;
     to_i32("kv_len", s.kv_len())?;
+    let Some(params) = graph_params(&[s.pos0 as i64])? else {
+        return Ok(());
+    };
+    let kv_grid = to_i32("kv bucket", kv_bucket(s.kv_len()))?;
     // SAFETY: buffer extents validated above.
     status(
         unsafe {
@@ -294,6 +320,8 @@ pub fn attention(
                 to_i32("head_dim", s.head_dim)?,
                 s.pos0 as i32,
                 s.scale(),
+                params,
+                kv_grid,
             )
         },
         "portable attention",
@@ -483,6 +511,9 @@ pub fn rope_positions(x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) ->
     check::rope_positions(x.len(), positions, &s)?;
     let bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
     let pos = stage(&bytes)?;
+    if graph_mode() == GraphMode::Replay {
+        return Ok(());
+    }
     // SAFETY: buffer extents validated above; pos holds axes * tokens u32 values.
     status(
         unsafe {
@@ -721,6 +752,21 @@ extern "C" {
         rows: i64,
         cols: i64,
     ) -> i32;
+    fn velox_portable_copy2d_param(
+        src: *const f32,
+        src_stride: i64,
+        dst: *mut f32,
+        dst_stride: i64,
+        rows: i64,
+        cols: i64,
+        params: *const i64,
+    ) -> i32;
+    fn velox_portable_copy_param(
+        src: *const f32,
+        dst: *mut f32,
+        len: i64,
+        params: *const i64,
+    ) -> i32;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -798,6 +844,26 @@ pub fn copy2d(src: &CudaBuffer, dst: &mut CudaBuffer, s: Copy2dShape) -> Result<
     if s.rows == 0 || s.cols == 0 {
         return Ok(());
     }
+    if graph_mode() != GraphMode::None {
+        let Some(params) = graph_params(&[s.src_offset as i64, s.dst_offset as i64])? else {
+            return Ok(());
+        };
+        // SAFETY: both strided ranges validated above; the kernel adds the staged offsets.
+        return status(
+            unsafe {
+                velox_portable_copy2d_param(
+                    src.as_ptr(),
+                    s.src_stride as i64,
+                    dst.as_mut_ptr(),
+                    s.dst_stride as i64,
+                    s.rows as i64,
+                    s.cols as i64,
+                    params,
+                )
+            },
+            "portable copy2d",
+        );
+    }
     // SAFETY: both strided ranges validated above, so the offset pointers are in bounds.
     status(
         unsafe {
@@ -812,4 +878,25 @@ pub fn copy2d(src: &CudaBuffer, dst: &mut CudaBuffer, s: Copy2dShape) -> Result<
         },
         "portable copy2d",
     )
+}
+
+/// Per-call values of an op inside a graph step: staged into the step's region, so a replay
+/// refreshes them without re-recording. `Ok(None)` means the step is a replay and the caller
+/// must return without launching; outside graphs the result is a null pointer (values are
+/// passed by value).
+fn graph_params(values: &[i64]) -> Result<Option<*const i64>> {
+    match graph_mode() {
+        GraphMode::None => Ok(Some(std::ptr::null())),
+        mode => {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let p = stage(&bytes)?.cast::<i64>();
+            Ok((mode == GraphMode::Capture).then_some(p))
+        }
+    }
+}
+
+/// Context length a graph step sizes attention grids for: one bucket of 1024 keys, so steps
+/// within a bucket share a recording (the model's graph keys carry the same bucket).
+pub fn kv_bucket(kv_len: usize) -> usize {
+    kv_len.div_ceil(GRAPH_KV_BUCKET) * GRAPH_KV_BUCKET
 }
