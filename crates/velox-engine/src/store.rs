@@ -246,9 +246,12 @@ impl<B: Backend> ContextStore<B> {
     }
 
     /// The deepest entry on the prefix of `keys` at or below `limit` tokens.
+    /// Entries being copied to disk still qualify: their memory stays intact until the copy
+    /// completes, and restoring only reads it.
     pub fn best(&self, keys: &[u32], limit: usize) -> Option<&Entry<B>> {
         self.entries
             .iter()
+            .chain(self.inflight.iter().map(|(_, e)| e))
             .filter(|e| e.pos() <= limit && e.prefix_of(keys))
             .max_by_key(|e| e.pos())
     }
