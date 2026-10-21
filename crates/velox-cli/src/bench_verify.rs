@@ -87,8 +87,8 @@ fn bench<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
         b.synchronize()?;
         Ok(t.elapsed().as_secs_f64() * 1e3 / rounds as f64)
     };
-    // --profile batched|solo: brackets two warm rounds of that mode for `ncu --profile-from-start off`.
-    if let Some(mode) = a.get("profile") {
+    // --bracket batched|solo: brackets two warm rounds of that mode for `ncu --profile-from-start off`.
+    if let Some(mode) = a.get("bracket") {
         let mut f: Box<dyn FnMut() -> Result<()>> = match mode {
             "solo" => Box::new(|| solo_round(&mut sessions, &mut ws)),
             _ => Box::new(|| batch_round(&mut sessions, &mut ws, &mut bw)),
