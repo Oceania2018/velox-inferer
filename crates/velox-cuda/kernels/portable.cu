@@ -267,11 +267,12 @@ float* split_scratch(size_t floats) {
 template <int PER>
 int attention_split(const float* q, const float* k, const float* v, float* out, int tokens, int heads, int kv_heads,
                     int head_dim, int pos0, float scale) {
-    // Aim for >= 512 partial warps so short caches still occupy the GPU, with 8..256 keys each.
+    // Aim for ~4096 partial warps: each warp walks its keys serially (a dependent load chain per
+    // key), so short splits are what hides memory latency. 16..256 keys each.
     const int kv = pos0 + tokens;
-    const int want = (512 + tokens * heads - 1) / (tokens * heads);
+    const int want = (4096 + tokens * heads - 1) / (tokens * heads);
     int split_keys = (kv + want - 1) / want;
-    split_keys = split_keys < 8 ? 8 : split_keys > kSplitKeys ? kSplitKeys : split_keys;
+    split_keys = split_keys < 16 ? 16 : split_keys > kSplitKeys ? kSplitKeys : split_keys;
     const int splits = (kv + split_keys - 1) / split_keys;
     const size_t parts = static_cast<size_t>(tokens) * heads * splits;
     float* scratch = split_scratch(parts * (head_dim + 2));
@@ -385,7 +386,7 @@ int attention_block_split(const float* q, const float* k_ctx, const float* v_ctx
     long long most = pos0 - ctx_lo;  // token 0 sees the most context
     if (most > window - 1) most = window - 1;
     const int kv = static_cast<int>(most) + tokens;
-    const int want = (1024 + tokens * heads - 1) / (tokens * heads);
+    const int want = (4096 + tokens * heads - 1) / (tokens * heads);
     int split_keys = (kv + want - 1) / want;
     split_keys = split_keys < 16 ? 16 : split_keys > kSplitKeys ? kSplitKeys : split_keys;
     const int splits = (kv + split_keys - 1) / split_keys;
