@@ -287,7 +287,7 @@ fn mtp_generate<B: Backend>(
     let mut dr = MtpDrafter::new(b, model, s.capacity, chunk, draft_len)?;
     let row0 = s.pos;
     let t0 = Instant::now();
-    model.advance_rows(b, s, ws, ids, None, &[], &mut |ws, base, t| {
+    model.advance_rows(b, s, ws, ids, None, &[], &mut [], &mut |ws, base, t| {
         dr.prefill_chunk(b, model, ws, row0 + base, t, 0, None)
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;
@@ -366,7 +366,7 @@ fn dflash_generate<B: Backend>(
     let mut dr = DFlashDrafter::new(b, &dm, model, chunk, drafts_per_block)?;
     let row0 = s.pos;
     let t0 = Instant::now();
-    model.advance_rows(b, s, ws, ids, None, &[], &mut |ws, base, t| {
+    model.advance_rows(b, s, ws, ids, None, &[], &mut [], &mut |ws, base, t| {
         dr.prefill_chunk(b, &dm, ws, row0 + base, t)
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;

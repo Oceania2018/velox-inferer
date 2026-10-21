@@ -55,6 +55,9 @@ struct Lane<B: Backend> {
     /// Keys of the tokens the session state has consumed, in order (see `Prompt::keys`).
     keys: Vec<u32>,
     checkpoints: Vec<Checkpoint<B>>,
+    /// Storage of dropped checkpoints, reused for new ones (allocating and freeing them would
+    /// synchronize the device).
+    spare: Vec<Checkpoint<B>>,
     zero: Checkpoint<B>,
     /// Draft model for speculative decoding (main lane only).
     drafter: Option<Drafter<B>>,
@@ -65,6 +68,9 @@ struct Lanes<B: Backend> {
     ws: Workspace<B>,
     lanes: Vec<Lane<B>>,
 }
+
+/// Checkpoint storage kept for reuse per lane beyond the live checkpoints.
+const MAX_SPARE: usize = 4;
 
 /// Below this much shared prefix a request counts as unrelated to a lane.
 const MIN_REUSE: usize = 64;
@@ -294,6 +300,7 @@ impl<B: Backend> QwenEngine<B> {
                 session,
                 keys: Vec::new(),
                 checkpoints: Vec::new(),
+                spare: Vec::new(),
                 zero,
                 drafter,
             });
@@ -355,15 +362,28 @@ impl<B: Backend> QwenEngine<B> {
     }
 
     /// Keeps at most `max` checkpoints, dropping the one closest to its predecessor so the rest
-    /// stay spread over the prefix (the newest is always kept).
-    fn prune_checkpoints(checkpoints: &mut Vec<Checkpoint<B>>, max: usize) {
+    /// stay spread over the prefix (the oldest and newest are always kept). Checkpoints at or
+    /// after `fresh` (taken by the latest prefill, the likeliest to be reused next) go last.
+    /// Dropped storage goes to `spare`.
+    fn prune_checkpoints(
+        checkpoints: &mut Vec<Checkpoint<B>>,
+        spare: &mut Vec<Checkpoint<B>>,
+        max: usize,
+        fresh: usize,
+    ) {
         checkpoints.sort_by_key(|c| c.pos);
         while checkpoints.len() > max.max(1) {
-            let drop = (1..checkpoints.len() - 1)
-                .min_by_key(|&i| checkpoints[i].pos - checkpoints[i - 1].pos)
+            let gap = |i: &usize| checkpoints[*i].pos - checkpoints[i - 1].pos;
+            let inner = 1..checkpoints.len() - 1;
+            let drop = inner
+                .clone()
+                .filter(|&i| checkpoints[i].pos < fresh)
+                .min_by_key(gap)
+                .or_else(|| inner.min_by_key(gap))
                 .unwrap_or(0);
-            checkpoints.remove(drop);
+            spare.push(checkpoints.remove(drop));
         }
+        spare.truncate(MAX_SPARE);
     }
 
     /// Restores the best reusable state for `keys` and returns how many tokens are already in it.
@@ -553,75 +573,72 @@ impl<B: Backend> QwenEngine<B> {
         let vision_ms = t0.elapsed().as_secs_f64() * 1e3;
         let t1 = Instant::now();
         lane.session.rope_delta = p.rope_delta;
-        let mut pos = start;
-        for cp in self
-            .checkpoint_positions(&p.ids, start)
-            .into_iter()
-            .chain(std::iter::once(p.ids.len()))
-        {
-            if cp > pos {
-                let inserts: Vec<EmbedInsert<'_, B::Buffer>> = embeds
-                    .iter()
-                    .filter_map(|(r, buf)| {
-                        let run = &p.runs[*r];
-                        let (lo, hi) = (run.start.max(pos), (run.start + run.len).min(cp));
-                        (lo < hi).then(|| EmbedInsert {
-                            token: lo - pos,
-                            rows: hi - lo,
-                            buf,
-                            row_offset: lo - run.start,
-                        })
-                    })
-                    .collect();
-                let positions = p.positions.as_ref().map(|v| &v[pos..cp]);
-                let Lane {
-                    session, drafter, ..
-                } = &mut *lane;
-                match drafter.as_mut() {
-                    Some(dr) => {
-                        let (row0, delta) = (session.pos, session.rope_delta);
-                        let model = &self.model;
-                        let dflash = self.dflash.as_ref();
-                        let b = &self.b;
-                        model.advance_rows(
-                            b,
-                            session,
-                            ws,
-                            &p.ids[pos..cp],
-                            positions,
-                            &inserts,
-                            &mut |ws, base, t| {
-                                let rows = positions.map(|v| &v[base..base + t]);
-                                match &mut *dr {
-                                    Drafter::Mtp(m) => {
-                                        m.prefill_chunk(b, model, ws, row0 + base, t, delta, rows)
-                                    }
-                                    Drafter::DFlash(d) => d.prefill_chunk(
-                                        b,
-                                        dflash.expect("a DFlash drafter has its model"),
-                                        ws,
-                                        row0 + base,
-                                        t,
-                                    ),
-                                }
-                            },
-                        )?;
-                    }
-                    None => self.model.advance(
-                        &self.b,
-                        session,
-                        ws,
-                        &p.ids[pos..cp],
-                        positions,
-                        &inserts,
-                    )?,
-                }
-                pos = cp;
-            }
-            if cp < p.ids.len() {
-                lane.checkpoints.push(lane.session.checkpoint(&self.b)?);
-            }
+        // Checkpoints are filled inside the forward pass, so the prompt is not cut into short
+        // segments there (each segment would stream every weight once more).
+        let mut snaps = Vec::new();
+        for pos in self.checkpoint_positions(&p.ids, start) {
+            let mut cp = match lane.spare.pop() {
+                Some(cp) => cp,
+                None => lane.session.blank_checkpoint(&self.b, pos)?,
+            };
+            cp.pos = pos;
+            cp.rope_delta = p.rope_delta;
+            snaps.push(cp);
         }
+        let inserts: Vec<EmbedInsert<'_, B::Buffer>> = embeds
+            .iter()
+            .filter_map(|(r, buf)| {
+                let run = &p.runs[*r];
+                let lo = run.start.max(start);
+                (lo < run.start + run.len).then(|| EmbedInsert {
+                    token: lo - start,
+                    rows: run.start + run.len - lo,
+                    buf,
+                    row_offset: lo - run.start,
+                })
+            })
+            .collect();
+        let ids = &p.ids[start..];
+        let positions = p.positions.as_ref().map(|v| &v[start..]);
+        let Lane {
+            session, drafter, ..
+        } = &mut *lane;
+        match drafter.as_mut() {
+            Some(dr) => {
+                let (row0, delta) = (session.pos, session.rope_delta);
+                let model = &self.model;
+                let dflash = self.dflash.as_ref();
+                let b = &self.b;
+                model.advance_rows(
+                    b,
+                    session,
+                    ws,
+                    ids,
+                    positions,
+                    &inserts,
+                    &mut snaps,
+                    &mut |ws, base, t| {
+                        let rows = positions.map(|v| &v[base..base + t]);
+                        match &mut *dr {
+                            Drafter::Mtp(m) => {
+                                m.prefill_chunk(b, model, ws, row0 + base, t, delta, rows)
+                            }
+                            Drafter::DFlash(d) => d.prefill_chunk(
+                                b,
+                                dflash.expect("a DFlash drafter has its model"),
+                                ws,
+                                row0 + base,
+                                t,
+                            ),
+                        }
+                    },
+                )?;
+            }
+            None => self
+                .model
+                .advance_snap(&self.b, session, ws, ids, positions, &inserts, &mut snaps)?,
+        }
+        lane.checkpoints.extend(snaps);
         if debug {
             self.b.synchronize()?;
             eprintln!(
@@ -718,7 +735,10 @@ where
         }
         let start = self.reuse(lane, &p.keys).map_err(core)?;
         // Checkpoints still valid for this prompt are those inside the shared prefix.
-        lane.checkpoints.retain(|c| c.pos <= start);
+        let (keep, stale): (Vec<_>, Vec<_>) =
+            lane.checkpoints.drain(..).partition(|c| c.pos <= start);
+        lane.checkpoints = keep;
+        lane.spare.extend(stale);
         lane.keys.truncate(start);
         let prefilled = self.prefill(lane, ws, &p, &images, start).and_then(|()| {
             self.model
@@ -734,7 +754,12 @@ where
             }
         };
         lane.keys.extend_from_slice(&p.keys[start..]);
-        Self::prune_checkpoints(&mut lane.checkpoints, self.cfg.max_checkpoints);
+        Self::prune_checkpoints(
+            &mut lane.checkpoints,
+            &mut lane.spare,
+            self.cfg.max_checkpoints,
+            start + 1,
+        );
         let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         let t1 = Instant::now();
