@@ -235,6 +235,14 @@ impl<B: Backend> Backend for Profiled<B> {
             self.inner.gated_delta_net(qkv, ab, a_log, dt, st, out, s)
         })
     }
+    fn gdn_replay(
+        &self,
+        layers: &mut [velox_core::GdnReplayLayer<'_, B::Buffer>],
+        conv: ConvShape,
+        gdn: GdnShape,
+    ) -> Result<()> {
+        self.time("gdn_replay", || self.inner.gdn_replay(layers, conv, gdn))
+    }
     fn attention_full(
         &self,
         q: &B::Buffer,

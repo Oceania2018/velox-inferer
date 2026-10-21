@@ -216,15 +216,12 @@ __global__ void conv1d_state_kernel(const float* __restrict__ x, const float* st
 }
 
 // Gated DeltaNet: state rows are independent, so one warp owns one row S[h][i][:] (lanes split
-// k_dim, PER elements each, kept in registers for the whole call). Grid: heads x row groups.
+// k_dim, PER elements each, kept in registers for the whole call). `out` may be null (state only).
 template <int PER>
-__global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
-                                            const float* __restrict__ a_log, const float* __restrict__ dt_bias,
-                                            const float* state_in, float* state, float* __restrict__ out,
-                                            int tokens, int k_heads, int v_heads, int k_dim, int v_dim) {
-    const int warps = blockDim.x / VELOX_WARP;
-    const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
-    if (i >= v_dim) return;
+__device__ __forceinline__ void gdn_rows(const float* __restrict__ qkv, const float* __restrict__ ab,
+                                         const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                         const float* state_in, float* state, float* __restrict__ out, int tokens,
+                                         int k_heads, int v_heads, int k_dim, int v_dim, int h, int i, int lane) {
     const int kh = h / (v_heads / k_heads);
     const int width = 2 * k_heads * k_dim + v_heads * v_dim;
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(k_dim));
@@ -266,8 +263,10 @@ __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const
             s[p] += delta * k[p] * kn;
             o += s[p] * q[p] * qn;
         }
-        o = velox_warp_sum(o);
-        if (lane == 0) out[(static_cast<size_t>(t) * v_heads + h) * v_dim + i] = o * inv_sqrt_dk;
+        if (out != nullptr) {
+            o = velox_warp_sum(o);
+            if (lane == 0) out[(static_cast<size_t>(t) * v_heads + h) * v_dim + i] = o * inv_sqrt_dk;
+        }
     }
 #pragma unroll
     for (int p = 0; p < PER; ++p) {
@@ -275,6 +274,57 @@ __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const
         if (d < k_dim) row_state[d] = s[p];
     }
 }
+
+// Grid: heads x row groups.
+template <int PER>
+__global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
+                                            const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                            const float* state_in, float* state, float* __restrict__ out,
+                                            int tokens, int k_heads, int v_heads, int k_dim, int v_dim) {
+    const int warps = blockDim.x / VELOX_WARP;
+    const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    if (i >= v_dim) return;
+    gdn_rows<PER>(qkv, ab, a_log, dt_bias, state_in, state, out, tokens, k_heads, v_heads, k_dim, v_dim, h, i, lane);
+}
+
+// gdn_replay: per-layer buffers, passed by value as a kernel parameter (3.6 KB; graph launches
+// capture it with the node).
+constexpr int kGdnReplayMaxLayers = 64;
+struct GdnReplayTable {
+    const float* qkv[kGdnReplayMaxLayers];
+    const float* conv_out[kGdnReplayMaxLayers];
+    const float* ab[kGdnReplayMaxLayers];
+    const float* a_log[kGdnReplayMaxLayers];
+    const float* dt_bias[kGdnReplayMaxLayers];
+    float* conv_state[kGdnReplayMaxLayers];
+    float* ssm[kGdnReplayMaxLayers];
+};
+
+// Grid: heads x row groups x layers; the recurrent state advances in place, no output.
+template <int PER>
+__global__ void gdn_replay_rows_kernel(const __grid_constant__ GdnReplayTable t, int tokens, int k_heads, int v_heads,
+                                       int k_dim, int v_dim) {
+    const int warps = blockDim.x / VELOX_WARP, l = blockIdx.z;
+    const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    if (i >= v_dim) return;
+    gdn_rows<PER>(t.conv_out[l], t.ab[l], t.a_log[l], t.dt_bias[l], t.ssm[l], t.ssm[l], nullptr, tokens,
+                  k_heads, v_heads, k_dim, v_dim, h, i, lane);
+}
+
+// Grid: channel blocks x layers. New conv state row j is row tokens + j of [old state; inputs];
+// ascending j reads old rows at or above the ones it overwrites.
+__global__ void gdn_replay_conv_kernel(const __grid_constant__ GdnReplayTable t, int tokens, int channels, int width) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, l = blockIdx.y;
+    if (c >= channels) return;
+    float* st = t.conv_state[l];
+    const float* x = t.qkv[l];
+    for (int j = 0; j < width - 1; ++j) {
+        const int r = tokens + j;
+        st[static_cast<size_t>(j) * channels + c] = r < width - 1 ? st[static_cast<size_t>(r) * channels + c]
+                                                                  : x[static_cast<size_t>(r - (width - 1)) * channels + c];
+    }
+}
+
 
 // Chunkwise-parallel Gated DeltaNet for prefill (the chunked delta rule in WY form). Within a chunk
 // of C tokens let G be the in-chunk cumulative log decay and gamma = exp(G). The per-token deltas
@@ -1044,6 +1094,37 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
     else if (k_dim <= 256) VELOX_GDN(8);
     else return VELOX_ERR_UNSUPPORTED;
 #undef VELOX_GDN
+    return velox_launch_status();
+}
+
+// Pointer arrays hold `layers` entries each: qkv, conv_out, ab, a_log, dt_bias, conv_state, ssm.
+VELOX_API int velox_portable_gdn_replay(const float* const* qkv, const float* const* conv_out, const float* const* ab,
+                                        const float* const* a_log, const float* const* dt_bias,
+                                        float* const* conv_state, float* const* ssm, int layers, int tokens,
+                                        int channels, int width, int k_heads, int v_heads, int k_dim, int v_dim) {
+    if (layers <= 0) return 0;
+    if (layers > kGdnReplayMaxLayers || width > kMaxConvWidth || k_dim > 256) return VELOX_ERR_UNSUPPORTED;
+    GdnReplayTable host{};
+    for (int l = 0; l < layers; ++l) {
+        host.qkv[l] = qkv[l];
+        host.conv_out[l] = conv_out[l];
+        host.ab[l] = ab[l];
+        host.a_log[l] = a_log[l];
+        host.dt_bias[l] = dt_bias[l];
+        host.conv_state[l] = conv_state[l];
+        host.ssm[l] = ssm[l];
+    }
+    const GdnReplayTable& t = host;
+    gdn_replay_conv_kernel<<<dim3((channels + 255) / 256, layers), 256>>>(t, tokens, channels, width);
+    constexpr int kWarps = 4;
+    const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps, layers), block(kWarps * VELOX_WARP);
+#define VELOX_GDN_REPLAY(PER) \
+    gdn_replay_rows_kernel<PER><<<grid, block>>>(t, tokens, k_heads, v_heads, k_dim, v_dim)
+    if (k_dim <= 32) VELOX_GDN_REPLAY(1);
+    else if (k_dim <= 64) VELOX_GDN_REPLAY(2);
+    else if (k_dim <= 128) VELOX_GDN_REPLAY(4);
+    else VELOX_GDN_REPLAY(8);
+#undef VELOX_GDN_REPLAY
     return velox_launch_status();
 }
 
