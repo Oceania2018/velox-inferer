@@ -3,9 +3,10 @@
 
 use crate::backend::{
     AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnShape,
-    RopePosShape, RopeShape, WeightView,
+    KvStoreShape, RopePosShape, RopeShape, WeightView,
 };
 use crate::error::{Error, Result};
+use crate::kv::KvFormat;
 
 pub fn attention_full(q: usize, k: usize, v: usize, out: usize, s: &FullAttnShape) -> Result<()> {
     if s.tokens == 0 || s.heads == 0 || s.head_dim == 0 {
@@ -256,12 +257,43 @@ pub fn attention(q: usize, k: usize, v: usize, out: usize, s: &AttnShape) -> Res
             s.heads, s.kv_heads
         )));
     }
+    s.kv.check_head_dim(s.head_dim)?;
     let q_len = product(&[s.tokens, s.heads, s.head_dim])?;
-    let kv = product(&[s.kv_len(), s.kv_heads, s.head_dim])?;
+    let kv = cache_slots(s.kv, s.kv_len(), s.kv_heads, s.head_dim)?;
     need("attention q", q, q_len)?;
     need("attention k", k, kv)?;
     need("attention v", v, kv)?;
     need("attention out", out, q_len)
+}
+
+fn cache_slots(f: KvFormat, positions: usize, kv_heads: usize, head_dim: usize) -> Result<usize> {
+    f.cache_slots(positions, kv_heads, head_dim)
+        .ok_or_else(|| Error::Shape(format!("KV cache size overflows: {positions} positions")))
+}
+
+pub fn kv_store(
+    k: usize,
+    v: usize,
+    k_cache: usize,
+    v_cache: usize,
+    s: &KvStoreShape,
+) -> Result<()> {
+    if s.tokens == 0 || s.kv_heads == 0 || s.head_dim == 0 {
+        return Err(Error::Shape(format!(
+            "kv_store dims must be non-zero: {s:?}"
+        )));
+    }
+    s.format.check_head_dim(s.head_dim)?;
+    let rows = product(&[s.tokens, s.kv_heads, s.head_dim])?;
+    need("kv_store k", k, rows)?;
+    need("kv_store v", v, rows)?;
+    let end = s
+        .pos0
+        .checked_add(s.tokens)
+        .ok_or_else(|| Error::Shape("kv_store range overflows".into()))?;
+    let cache = cache_slots(s.format, end, s.kv_heads, s.head_dim)?;
+    need("kv_store k_cache", k_cache, cache)?;
+    need("kv_store v_cache", v_cache, cache)
 }
 
 pub fn copy2d(src: usize, dst: usize, s: &Copy2dShape) -> Result<()> {
@@ -413,8 +445,36 @@ mod tests {
             kv_heads: 4,
             head_dim: 8,
             pos0: 0,
+            kv: KvFormat::F32,
         };
         assert!(attention(48, 32, 32, 48, &s).is_err());
+    }
+
+    #[test]
+    fn quantized_caches_are_sized_by_format() {
+        let s = AttnShape {
+            tokens: 2,
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 256,
+            pos0: 3,
+            kv: KvFormat::Nvfp4,
+        };
+        // 5 positions x 2 heads x 36 slots.
+        assert!(attention(2048, 360, 360, 2048, &s).is_ok());
+        assert!(attention(2048, 359, 360, 2048, &s).is_err());
+        let odd = AttnShape { head_dim: 96, ..s };
+        assert!(attention(1 << 20, 1 << 20, 1 << 20, 1 << 20, &odd).is_err());
+        let st = KvStoreShape {
+            tokens: 2,
+            kv_heads: 2,
+            head_dim: 64,
+            pos0: 3,
+            format: KvFormat::Fp8,
+        };
+        // 5 positions x 2 heads x 20 slots (68 bytes padded to 80).
+        assert!(kv_store(256, 256, 200, 200, &st).is_ok());
+        assert!(kv_store(256, 256, 199, 200, &st).is_err());
     }
 
     #[test]

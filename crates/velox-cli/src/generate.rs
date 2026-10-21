@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use serde_json::json;
-use velox_core::{Backend, Error, Result};
+use velox_core::{Backend, Error, KvFormat, Result};
 use velox_frontend::Frontend;
 use velox_models::qwen3_5::{argmax, Qwen35Text, TextConfig, TextWeights};
 use velox_weights::Artifact;
@@ -44,6 +44,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
     let max_tokens: usize = a.parse("max-tokens", 64)?;
     let chunk: usize = a.parse("chunk", 256)?;
     let capacity: usize = a.parse("capacity", 4096)?;
+    let kv_format = KvFormat::parse(a.get("kv-format").unwrap_or("f32"))?;
     let art = Artifact::open(path).map_err(|e| Error::Config(e.to_string()))?;
     let template = match a.get("chat-template") {
         Some(p) => {
@@ -114,7 +115,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             }
             Input::Ids(ids) => (None, ids),
         };
-        let mut session = model.session(b, capacity)?;
+        let mut session = model.session_with(b, capacity, kv_format)?;
         if let Some(n) = a.get("mtp") {
             let draft_len: usize = n
                 .parse()
