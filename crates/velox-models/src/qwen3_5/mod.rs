@@ -11,7 +11,7 @@ use velox_core::backend::{
     AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, NormKind, RopeLayout,
     RopePosShape, RopeShape,
 };
-use velox_core::{Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
+use velox_core::{CopySpec, Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
 pub use config::{LayerKind, TextConfig};
 pub use dflash::{
@@ -147,14 +147,11 @@ impl<B: Backend> Checkpoint<B> {
 
     /// Copies this checkpoint into `dst` (storage of the same session shape).
     pub fn copy_into(&self, b: &B, dst: &mut Checkpoint<B>) -> Result<()> {
-        for (src, d) in self
-            .conv
-            .iter()
-            .zip(dst.conv.iter_mut())
-            .chain(self.ssm.iter().zip(dst.ssm.iter_mut()))
-        {
-            b.copy(src, 0, d, 0, b.len(src))?;
-        }
+        copy_all(
+            b,
+            self.conv.iter().chain(&self.ssm),
+            dst.conv.iter_mut().chain(dst.ssm.iter_mut()),
+        )?;
         dst.pos = self.pos;
         dst.rope_delta = self.rope_delta;
         Ok(())
@@ -261,14 +258,25 @@ impl<B: Backend> Session<B> {
     ) -> Result<KvSegment<B>> {
         let mut seg = self.blank_kv(b, lo, hi, page)?;
         let row = self.kv_row;
-        for (p, buf) in seg.pages.iter_mut().enumerate() {
+        // One submission: every layer's K and V rows of every page.
+        let mut ops = Vec::with_capacity(seg.pages.len() * 2 * self.kv.len());
+        for p in 0..seg.pages.len() {
             let r0 = lo + p * KV_PAGE_ROWS;
             let n = (hi - r0).min(KV_PAGE_ROWS) * row;
             for (l, (kc, vc)) in self.kv.iter().enumerate() {
-                b.copy(kc, r0 * row, buf, 2 * l * KV_PAGE_ROWS * row, n)?;
-                b.copy(vc, r0 * row, buf, (2 * l + 1) * KV_PAGE_ROWS * row, n)?;
+                for (side, src) in [kc, vc].into_iter().enumerate() {
+                    ops.push(CopySpec {
+                        src,
+                        src_offset: r0 * row,
+                        dst: p,
+                        dst_offset: (2 * l + side) * KV_PAGE_ROWS * row,
+                        len: n,
+                    });
+                }
             }
         }
+        let mut dsts: Vec<&mut B::Buffer> = seg.pages.iter_mut().collect();
+        b.copy_batch(&mut dsts, &ops)?;
         Ok(seg)
     }
 
@@ -278,6 +286,8 @@ impl<B: Backend> Session<B> {
             return Err(Error::Config("KV segment beyond session capacity".into()));
         }
         let row = self.kv_row;
+        // One submission; destinations are the caches in layer order, K then V.
+        let mut ops = Vec::new();
         for (p, buf) in seg.pages.iter().enumerate() {
             let r0 = seg.lo + p * KV_PAGE_ROWS;
             let r1 = (r0 + KV_PAGE_ROWS).min(seg.hi);
@@ -289,18 +299,20 @@ impl<B: Backend> Session<B> {
                 return Err(Error::Config("KV segment does not fit this session".into()));
             }
             let n = (r1 - a) * row;
-            for (l, (kc, vc)) in self.kv.iter_mut().enumerate() {
-                b.copy(buf, (2 * l * KV_PAGE_ROWS + a - r0) * row, kc, a * row, n)?;
-                b.copy(
-                    buf,
-                    ((2 * l + 1) * KV_PAGE_ROWS + a - r0) * row,
-                    vc,
-                    a * row,
-                    n,
-                )?;
+            for l in 0..self.kv.len() {
+                for side in 0..2 {
+                    ops.push(CopySpec {
+                        src: buf,
+                        src_offset: ((2 * l + side) * KV_PAGE_ROWS + a - r0) * row,
+                        dst: 2 * l + side,
+                        dst_offset: a * row,
+                        len: n,
+                    });
+                }
             }
         }
-        Ok(())
+        let mut dsts: Vec<&mut B::Buffer> = self.kv.iter_mut().flat_map(|(k, v)| [k, v]).collect();
+        b.copy_batch(&mut dsts, &ops)
     }
 
     /// Device copy of the recurrent state at the current position.
@@ -346,14 +358,11 @@ impl<B: Backend> Session<B> {
 
     /// Copies the current recurrent state into `cp` (reused storage) and stamps its position.
     pub fn snapshot_into(&self, b: &B, cp: &mut Checkpoint<B>) -> Result<()> {
-        for (src, dst) in self
-            .conv
-            .iter()
-            .zip(cp.conv.iter_mut())
-            .chain(self.ssm.iter().zip(cp.ssm.iter_mut()))
-        {
-            b.copy(src, 0, dst, 0, b.len(src))?;
-        }
+        copy_all(
+            b,
+            self.conv.iter().chain(&self.ssm),
+            cp.conv.iter_mut().chain(cp.ssm.iter_mut()),
+        )?;
         cp.pos = self.pos;
         cp.rope_delta = self.rope_delta;
         Ok(())
@@ -365,19 +374,38 @@ impl<B: Backend> Session<B> {
         if cp.pos > self.capacity {
             return Err(Error::Config("checkpoint beyond session capacity".into()));
         }
-        for (dst, src) in self
-            .conv
-            .iter_mut()
-            .zip(&cp.conv)
-            .chain(self.ssm.iter_mut().zip(&cp.ssm))
-        {
-            let n = b.len(src);
-            b.copy(src, 0, dst, 0, n)?;
-        }
+        copy_all(
+            b,
+            cp.conv.iter().chain(&cp.ssm),
+            self.conv.iter_mut().chain(self.ssm.iter_mut()),
+        )?;
         self.pos = cp.pos;
         self.rope_delta = cp.rope_delta;
         Ok(())
     }
+}
+
+/// Copies each of `srcs` whole into the matching buffer of `dsts`, in one submission.
+fn copy_all<'a, B: Backend + 'a>(
+    b: &B,
+    srcs: impl Iterator<Item = &'a B::Buffer>,
+    dsts: impl Iterator<Item = &'a mut B::Buffer>,
+) -> Result<()> {
+    let ops: Vec<CopySpec<'_, B::Buffer>> = srcs
+        .enumerate()
+        .map(|(i, src)| CopySpec {
+            src,
+            src_offset: 0,
+            dst: i,
+            dst_offset: 0,
+            len: b.len(src),
+        })
+        .collect();
+    let mut dsts: Vec<&mut B::Buffer> = dsts.collect();
+    if dsts.len() != ops.len() {
+        return Err(Error::Shape("copy_all: buffer counts differ".into()));
+    }
+    b.copy_batch(&mut dsts, &ops)
 }
 
 /// Embedding rows `buf[row_offset .. row_offset + rows]` (`[*, hidden]`) that replace the token

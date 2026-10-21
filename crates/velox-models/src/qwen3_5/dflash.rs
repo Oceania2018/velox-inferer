@@ -19,7 +19,7 @@
 use serde_json::Value;
 use velox_core::backend::{Backend, BlockAttnShape, DynConvShape, NormKind, RopeShape, WeightView};
 use velox_core::format::WeightFormat;
-use velox_core::{Error, Result, GRAPH_STATIC};
+use velox_core::{CopySpec, Error, Result, GRAPH_STATIC};
 use velox_weights::{Artifact, ObjectKind};
 
 use super::weights::{fuse, Loader, WDesc};
@@ -480,17 +480,26 @@ impl<B: Backend> DFlashModel<B> {
         }
         let mut ctx = self.blank_context(b, lo, hi, page)?;
         let kvd = self.cfg.kv_dim();
-        for (p, buf) in ctx.pages.iter_mut().enumerate() {
+        let mut ops = Vec::new();
+        for p in 0..ctx.pages.len() {
             let r0 = lo + p * DRAFT_PAGE_ROWS;
             let r1 = (r0 + DRAFT_PAGE_ROWS).min(hi);
             for (row, slot, n) in self.ring_runs(r0, r1) {
                 for li in 0..self.cfg.layers {
-                    let at = |kind: usize| ((2 * li + kind) * DRAFT_PAGE_ROWS + row - r0) * kvd;
-                    b.copy(&st.k[li], slot * kvd, buf, at(0), n * kvd)?;
-                    b.copy(&st.v[li], slot * kvd, buf, at(1), n * kvd)?;
+                    for (kind, src) in [&st.k[li], &st.v[li]].into_iter().enumerate() {
+                        ops.push(CopySpec {
+                            src,
+                            src_offset: slot * kvd,
+                            dst: p,
+                            dst_offset: ((2 * li + kind) * DRAFT_PAGE_ROWS + row - r0) * kvd,
+                            len: n * kvd,
+                        });
+                    }
                 }
             }
         }
+        let mut dsts: Vec<&mut B::Buffer> = ctx.pages.iter_mut().collect();
+        b.copy_batch(&mut dsts, &ops)?;
         Ok(ctx)
     }
 
@@ -505,17 +514,28 @@ impl<B: Backend> DFlashModel<B> {
             return Err(Error::Shape("dflash2 context exceeds the window".into()));
         }
         let kvd = self.cfg.kv_dim();
+        // Destinations: K rings in layer order, then V rings.
+        let layers = self.cfg.layers;
+        let mut ops = Vec::new();
         for (p, buf) in ctx.pages.iter().enumerate() {
             let r0 = ctx.lo + p * DRAFT_PAGE_ROWS;
             let r1 = (r0 + DRAFT_PAGE_ROWS).min(ctx.hi);
             for (row, slot, n) in self.ring_runs(r0, r1) {
-                for li in 0..self.cfg.layers {
-                    let at = |kind: usize| ((2 * li + kind) * DRAFT_PAGE_ROWS + row - r0) * kvd;
-                    b.copy(buf, at(0), &mut st.k[li], slot * kvd, n * kvd)?;
-                    b.copy(buf, at(1), &mut st.v[li], slot * kvd, n * kvd)?;
+                for li in 0..layers {
+                    for kind in 0..2 {
+                        ops.push(CopySpec {
+                            src: buf,
+                            src_offset: ((2 * li + kind) * DRAFT_PAGE_ROWS + row - r0) * kvd,
+                            dst: kind * layers + li,
+                            dst_offset: slot * kvd,
+                            len: n * kvd,
+                        });
+                    }
                 }
             }
         }
+        let mut dsts: Vec<&mut B::Buffer> = st.k.iter_mut().chain(st.v.iter_mut()).collect();
+        b.copy_batch(&mut dsts, &ops)?;
         st.lo = ctx.lo;
         st.end = ctx.hi;
         Ok(())
