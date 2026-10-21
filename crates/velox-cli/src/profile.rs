@@ -143,6 +143,20 @@ impl<B: Backend> Backend for Profiled<B> {
             self.inner.rms_norm(x, w, y, rows, dim, eps, kind)
         })
     }
+    fn rms_norm_gated(
+        &self,
+        x: &B::Buffer,
+        w: &B::Buffer,
+        gate: &mut B::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        self.time("rms_norm_gated", || {
+            self.inner.rms_norm_gated(x, w, gate, rows, dim, eps, kind)
+        })
+    }
     fn rope(&self, x: &mut B::Buffer, s: RopeShape) -> Result<()> {
         self.time("rope", || self.inner.rope(x, s))
     }

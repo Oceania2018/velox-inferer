@@ -202,6 +202,43 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __r
     out[i] = acc / (1.0f + expf(-acc));
 }
 
+// Few tokens (decode, verify): one thread per channel runs the window over its inputs and advances
+// the state itself (each thread reads its channel's state before writing it, so state may alias
+// state_in).
+constexpr int kConvSmallTokens = 32;
+__global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                         const float* state_in, float* state, float* __restrict__ out, int tokens,
+                                         int channels, int width) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    float win[kMaxConvWidth], wt[kMaxConvWidth];
+#pragma unroll
+    for (int j = 0; j < kMaxConvWidth; ++j) {
+        wt[j] = j < width ? w[static_cast<size_t>(j) * channels + c] : 0.0f;
+        win[j] = j < width - 1 ? state_in[static_cast<size_t>(j) * channels + c] : 0.0f;
+    }
+    for (int t = 0; t < tokens; ++t) {
+        const float in = x[static_cast<size_t>(t) * channels + c];
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kMaxConvWidth - 1; ++j)
+            if (j < width - 1) acc += wt[j] * win[j];
+#pragma unroll
+        for (int j = 0; j < kMaxConvWidth; ++j)
+            if (j == width - 1) acc += wt[j] * in;
+        out[static_cast<size_t>(t) * channels + c] = acc / (1.0f + expf(-acc));
+#pragma unroll
+        for (int j = 0; j < kMaxConvWidth - 2; ++j)
+            if (j < width - 2) win[j] = win[j + 1];
+#pragma unroll
+        for (int j = 0; j < kMaxConvWidth - 1; ++j)
+            if (j == width - 2) win[j] = in;
+    }
+#pragma unroll
+    for (int j = 0; j < kMaxConvWidth - 1; ++j)
+        if (j < width - 1) state[static_cast<size_t>(j) * channels + c] = win[j];
+}
+
 // state[j] <- input at time tokens - (width - 1) + j. Ascending j only reads indices >= j + tokens
 // of the old state, which are not yet overwritten.
 __global__ void conv1d_state_kernel(const float* __restrict__ x, const float* state_in, float* state, int tokens,
@@ -1109,6 +1146,10 @@ VELOX_API int velox_portable_sigmoid_mul(float* x, const float* gate, long long 
 VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, const float* state_in, float* state, float* out,
                                          int tokens, int channels, int width) {
     if (width > kMaxConvWidth) return VELOX_ERR_UNSUPPORTED;
+    if (tokens <= kConvSmallTokens) {
+        conv1d_silu_small_kernel<<<(channels + 127) / 128, 128>>>(x, w, state_in, state, out, tokens, channels, width);
+        return velox_launch_status();
+    }
     conv1d_silu_kernel<<<velox_grid_1d(static_cast<long long>(tokens) * channels, 256), 256>>>(x, w, state_in, out,
                                                                                                 tokens, channels, width);
     conv1d_state_kernel<<<(channels + 255) / 256, 256>>>(x, state_in, state, tokens, channels, width);

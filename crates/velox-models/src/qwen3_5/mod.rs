@@ -177,7 +177,6 @@ pub struct Workspace<B: Backend> {
     z: B::Buffer,
     ab: B::Buffer,
     o: B::Buffer,
-    on: B::Buffer,
     q: B::Buffer,
     g: B::Buffer,
     k: B::Buffer,
@@ -280,7 +279,6 @@ impl<B: Backend> Qwen35Text<B> {
             z: b.alloc(t * c.gdn_v())?,
             ab: b.alloc(t * 2 * c.gdn_v_heads)?,
             o: b.alloc(t * c.gdn_v())?,
-            on: b.alloc(t * c.gdn_v())?,
             q: b.alloc(t * c.q_dim())?,
             g: b.alloc(t * c.q_dim())?,
             k: b.alloc(t * c.kv_dim())?,
@@ -599,17 +597,16 @@ impl<B: Backend> Qwen35Text<B> {
                         }
                         row0 = end;
                     }
-                    b.rms_norm(
+                    // z = silu(z) * plain_rmsnorm(o)
+                    b.rms_norm_gated(
                         &ws.o,
                         w.param(*norm),
-                        &mut ws.on,
+                        &mut ws.z,
                         t * c.gdn_v_heads,
                         c.gdn_v_dim,
                         c.eps,
                         NormKind::Plain,
                     )?;
-                    // z = silu(z) * plain_rmsnorm(o)
-                    b.silu_mul(&mut ws.z, &ws.on, t * c.gdn_v())?;
                     b.linear(&ws.z, &w.view(out), &mut ws.y, t)?;
                     gi += 1;
                 }
