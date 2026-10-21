@@ -185,12 +185,13 @@ impl BlockAttnShape {
 }
 
 /// Dynamic grouped convolution of DFlash2, side `side` (0: branch input, 1: branch output), over
-/// `rows` consecutive positions of one block. With `G = channels / group`, `base` is `[2 sides,
+/// `rows` consecutive positions: blocks of `block` rows (several sequences' draft blocks; 0: one
+/// block of all rows), each convolved on its own. With `G = channels / group`, `base` is `[2 sides,
 /// 2 taps, channels]` and `delta` is `[rows, 4 G]` (column `(2 side + tap) G + g`). For channel
 /// `h` of group `g = h / group`:
 ///
 /// `y[i][h] = (base[side][0][h] + delta[i][2 side G + g]) x[i][h]
-///          + [i > 0] (base[side][1][h] + delta[i][(2 side + 1) G + g]) x[i - 1][h]`
+///          + [i mod block > 0] (base[side][1][h] + delta[i][(2 side + 1) G + g]) x[i - 1][h]`
 ///
 /// and `out = y`, or `out += y` with `accumulate`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +201,18 @@ pub struct DynConvShape {
     pub group: usize,
     pub side: usize,
     pub accumulate: bool,
+    pub block: usize,
+}
+
+impl DynConvShape {
+    /// Rows per independent block.
+    pub fn block_rows(&self) -> usize {
+        if self.block == 0 {
+            self.rows.max(1)
+        } else {
+            self.block
+        }
+    }
 }
 
 /// A strided 2-D copy: `dst[dst_offset + r dst_stride + c] = src[src_offset + r src_stride + c]`
