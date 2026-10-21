@@ -40,6 +40,11 @@ const FUSE_MAX_TOKENS: usize = 16;
 /// Most tokens one `verify` call may feed (the anchor plus drafts).
 pub const VERIFY_MAX: usize = 16;
 
+/// Graph keys (`Backend::graph`) of the model's repeated steps; low bits carry the shape.
+const GRAPH_ADVANCE: u32 = 1 << 16;
+const GRAPH_VERIFY: u32 = 2 << 16;
+const GRAPH_COMMIT: u32 = 3 << 16;
+
 /// What `commit` needs to keep only a prefix of a verified window: the recurrent state before
 /// the window, and per GDN layer the raw projections each token fed to the convolution and the
 /// recurrence. Replaying a prefix runs the same kernels on the same inputs, so the committed
@@ -308,6 +313,19 @@ impl<B: Backend> Qwen35Text<B> {
                 ids.len(),
                 s.capacity
             )));
+        }
+        let t = ids.len();
+        if t <= FUSE_MAX_TOKENS && t <= ws.max_tokens && positions.is_none() && inserts.is_empty() {
+            // Decode and verify steps repeat with the same structure: one recorded graph per shape.
+            let recording = s.spec.as_ref().is_some_and(|sp| sp.recording);
+            let key = GRAPH_ADVANCE
+                | t as u32
+                | u32::from(recording) << 8
+                | u32::from(!ws.capture.is_empty()) << 9
+                | u32::from(ws.keep_rows) << 10;
+            b.graph(key, &mut || self.chunk(b, s, ws, ids, 0, None, &[]))?;
+            ws.last_row = t - 1;
+            return Ok(());
         }
         for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
             let base = i * ws.max_tokens;
@@ -708,43 +726,54 @@ impl<B: Backend> Qwen35Text<B> {
             )));
         }
         self.ensure_spec(b, s)?;
-        {
-            let Session {
-                spec,
-                conv,
-                ssm,
-                pos,
-                ..
-            } = &mut *s;
-            let sp = spec.as_mut().expect("allocated above");
-            for (dst, src) in sp
-                .conv
-                .iter_mut()
-                .zip(conv.iter())
-                .chain(sp.ssm.iter_mut().zip(ssm.iter()))
-            {
-                b.copy(src, 0, dst, 0, b.len(src))?;
-            }
-            sp.pos0 = *pos;
-            sp.tokens = t;
-            sp.recording = true;
+        if s.pos + t > s.capacity {
+            return Err(Error::Config(format!(
+                "{} + {t} tokens exceed session capacity {}",
+                s.pos, s.capacity
+            )));
         }
-        let r = self.advance(b, s, ws, ids, None, &[]);
-        if let Some(sp) = s.spec.as_mut() {
-            sp.recording = false;
-        }
-        r?;
         let (c, w) = (&self.cfg, &self.w);
-        b.rms_norm(
-            &ws.x,
-            w.param(w.final_norm),
-            &mut ws.hidden,
-            t,
-            c.hidden,
-            c.eps,
-            NormKind::Offset,
-        )?;
-        b.linear(&ws.hidden, &w.view(&w.head), &mut ws.logits_rows, t)?;
+        // Snapshot, forward and output head are one recorded step per window length.
+        let key = GRAPH_VERIFY | t as u32 | u32::from(!ws.capture.is_empty()) << 9;
+        b.graph(key, &mut || {
+            {
+                let Session {
+                    spec,
+                    conv,
+                    ssm,
+                    pos,
+                    ..
+                } = &mut *s;
+                let sp = spec.as_mut().expect("allocated above");
+                for (dst, src) in sp
+                    .conv
+                    .iter_mut()
+                    .zip(conv.iter())
+                    .chain(sp.ssm.iter_mut().zip(ssm.iter()))
+                {
+                    b.copy(src, 0, dst, 0, b.len(src))?;
+                }
+                sp.pos0 = *pos;
+                sp.tokens = t;
+                sp.recording = true;
+            }
+            let r = self.chunk(b, s, ws, ids, 0, None, &[]);
+            if let Some(sp) = s.spec.as_mut() {
+                sp.recording = false;
+            }
+            r?;
+            ws.last_row = t - 1;
+            b.rms_norm(
+                &ws.x,
+                w.param(w.final_norm),
+                &mut ws.hidden,
+                t,
+                c.hidden,
+                c.eps,
+                NormKind::Offset,
+            )?;
+            b.linear(&ws.hidden, &w.view(&w.head), &mut ws.logits_rows, t)
+        })?;
         b.top_k(&ws.logits_rows, t, c.vocab, limit.min(c.vocab), k)
     }
 
@@ -777,55 +806,59 @@ impl<B: Backend> Qwen35Text<B> {
             )));
         }
         if keep < sp.tokens {
-            for (dst, src) in conv
-                .iter_mut()
-                .zip(&sp.conv)
-                .chain(ssm.iter_mut().zip(&sp.ssm))
-            {
-                b.copy(src, 0, dst, 0, b.len(src))?;
-            }
-            if keep > 0 {
-                let mut gi = 0;
-                for l in &self.w.layers {
-                    if let Mixer::Gdn {
-                        conv: cw,
-                        a_log,
-                        dt_bias,
-                        ..
-                    } = &l.mixer
-                    {
-                        let cs = ConvShape {
-                            tokens: keep,
-                            channels: c.gdn_qkv(),
-                            width: c.conv_width,
-                        };
-                        b.conv1d_silu(
-                            &sp.qkv[gi],
-                            self.w.param(*cw),
-                            &mut conv[gi],
-                            &mut ws.conv_out,
-                            cs,
-                        )?;
-                        let gs = GdnShape {
-                            tokens: keep,
-                            k_heads: c.gdn_k_heads,
-                            v_heads: c.gdn_v_heads,
-                            k_dim: c.gdn_k_dim,
-                            v_dim: c.gdn_v_dim,
-                        };
-                        b.gated_delta_net(
-                            &ws.conv_out,
-                            &sp.ab[gi],
-                            self.w.param(*a_log),
-                            self.w.param(*dt_bias),
-                            &mut ssm[gi],
-                            &mut ws.o,
-                            gs,
-                        )?;
-                        gi += 1;
+            // Restore and replay are one recorded step per kept length.
+            b.graph(GRAPH_COMMIT | keep as u32, &mut || {
+                for (dst, src) in conv
+                    .iter_mut()
+                    .zip(&sp.conv)
+                    .chain(ssm.iter_mut().zip(&sp.ssm))
+                {
+                    b.copy(src, 0, dst, 0, b.len(src))?;
+                }
+                if keep > 0 {
+                    let mut gi = 0;
+                    for l in &self.w.layers {
+                        if let Mixer::Gdn {
+                            conv: cw,
+                            a_log,
+                            dt_bias,
+                            ..
+                        } = &l.mixer
+                        {
+                            let cs = ConvShape {
+                                tokens: keep,
+                                channels: c.gdn_qkv(),
+                                width: c.conv_width,
+                            };
+                            b.conv1d_silu(
+                                &sp.qkv[gi],
+                                self.w.param(*cw),
+                                &mut conv[gi],
+                                &mut ws.conv_out,
+                                cs,
+                            )?;
+                            let gs = GdnShape {
+                                tokens: keep,
+                                k_heads: c.gdn_k_heads,
+                                v_heads: c.gdn_v_heads,
+                                k_dim: c.gdn_k_dim,
+                                v_dim: c.gdn_v_dim,
+                            };
+                            b.gated_delta_net(
+                                &ws.conv_out,
+                                &sp.ab[gi],
+                                self.w.param(*a_log),
+                                self.w.param(*dt_bias),
+                                &mut ssm[gi],
+                                &mut ws.o,
+                                gs,
+                            )?;
+                            gi += 1;
+                        }
                     }
                 }
-            }
+                Ok(())
+            })?;
         }
         *pos = sp.pos0 + keep;
         Ok(())

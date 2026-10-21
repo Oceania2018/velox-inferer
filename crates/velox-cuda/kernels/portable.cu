@@ -260,18 +260,8 @@ __global__ void attention_combine_kernel(const float* __restrict__ part_acc, con
 
 // Grow-only scratch for split partials. Engine work is serialized, so one buffer suffices.
 float* split_scratch(size_t floats) {
-    static float* ptr = nullptr;
-    static size_t cap = 0;
-    if (floats > cap) {
-        if (ptr != nullptr) cudaFree(ptr);
-        if (cudaMalloc(&ptr, floats * sizeof(float)) != cudaSuccess) {
-            ptr = nullptr;
-            cap = 0;
-            return nullptr;
-        }
-        cap = floats;
-    }
-    return ptr;
+    static VeloxScratch s;
+    return static_cast<float*>(s.get(floats * sizeof(float)));
 }
 
 template <int PER>
