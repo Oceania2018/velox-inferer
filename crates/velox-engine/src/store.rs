@@ -379,10 +379,22 @@ impl<B: Backend> ContextStore<B> {
             e.root |= root;
             return Ok(e.id);
         }
+        let debug = std::env::var_os("VELOX_DEBUG_PREFIX").is_some();
+        let t0 = std::time::Instant::now();
+        let (mut fresh, mut pinned) = (0usize, 0usize);
         let hashes = page_hashes(keys);
         let mut kv = Vec::with_capacity(pos.div_ceil(KV_PAGE_ROWS));
         let (pool, page_len) = (&mut self.pages, session.kv_page_len());
-        let mut page = || pool.pop().map_or_else(|| b.alloc_host(page_len), Ok);
+        let mut page = || {
+            fresh += 1;
+            pool.pop().map_or_else(
+                || {
+                    pinned += 1;
+                    b.alloc_host(page_len)
+                },
+                Ok,
+            )
+        };
         for i in 0..pos.div_ceil(KV_PAGE_ROWS) {
             let (lo, hi) = (i * KV_PAGE_ROWS, ((i + 1) * KV_PAGE_ROWS).min(pos));
             let full = hashes.get(i);
@@ -399,6 +411,7 @@ impl<B: Backend> ContextStore<B> {
             }
             kv.push(seg);
         }
+        let t_kv = t0.elapsed();
         // Drafter context is kept only when it reaches the entry's position: it is a window that
         // ends there, and context ending earlier would leave the restored drafter without one.
         let draft = match drafter {
@@ -412,11 +425,14 @@ impl<B: Backend> ContextStore<B> {
             },
             None => None,
         };
+        let t_draft = t0.elapsed();
+        let spare = !self.spare.is_empty();
         let mut state = match self.spare.pop() {
             Some(s) => s,
             None => session.blank_checkpoint_in(b, pos, true)?,
         };
         cp.copy_into(b, &mut state)?;
+        let t_state = t0.elapsed();
         let id = self.next_id;
         self.next_id += 1;
         let mut e = Entry {
@@ -445,6 +461,17 @@ impl<B: Backend> ContextStore<B> {
         }
         self.entries.push(e);
         self.evict(b, id)?;
+        if debug {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "[store] insert {pos}: kv {:.1} ms ({fresh} pages, {pinned} pinned), draft {:.1}, state {:.1} ({}), evict {:.1} ms",
+                ms(t_kv),
+                ms(t_draft - t_kv),
+                ms(t_state - t_draft),
+                if spare { "reused" } else { "pinned" },
+                ms(t0.elapsed() - t_state)
+            );
+        }
         Ok(id)
     }
 
