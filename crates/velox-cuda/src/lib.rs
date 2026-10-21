@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
-    Copy2dShape, DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopePosShape,
-    RopeShape, WeightView, GRAPH_STATIC,
+    Copy2dShape, DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind,
+    RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
 };
-use velox_core::{check, profile, DeviceProfile, Error, GpuArch, Op, Result, VariantInfo};
+use velox_core::{
+    check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, VariantInfo,
+};
 
 pub mod portable;
 mod timing;
@@ -344,6 +346,19 @@ pub trait CudaKernels: Send + Sync {
     /// The operand precision of `attention`; see [`Backend::attention_precision`].
     fn attention_precision(&self, _s: AttnShape) -> AttnPrecision {
         AttnPrecision::Exact
+    }
+
+    /// Encodes K/V rows into caches; see [`KvStoreShape`]. Must be bit-exact with
+    /// `velox_core::kv::encode_row`.
+    fn kv_store(
+        &self,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        k_cache: &mut CudaBuffer,
+        v_cache: &mut CudaBuffer,
+        s: KvStoreShape,
+    ) -> Result<()> {
+        portable::kv_store(k, v, k_cache, v_cache, s)
     }
 
     fn conv1d_silu(
@@ -978,22 +993,39 @@ impl Backend for CudaBackend {
         s: AttnShape,
     ) -> Result<()> {
         check::attention(q.len, k.len, v.len, out.len, &s)?;
-        let op = match s.tokens {
-            1 => "attention decode",
-            2..=16 => "attention verify",
-            _ => "attention prefill",
+        let op = match (s.tokens, s.kv) {
+            (1, KvFormat::F32) => "attention decode".to_string(),
+            (2..=16, KvFormat::F32) => "attention verify".to_string(),
+            (_, KvFormat::F32) => "attention prefill".to_string(),
+            (1, f) => format!("attention decode kv {f}"),
+            (2..=16, f) => format!("attention verify kv {f}"),
+            (_, f) => format!("attention prefill kv {f}"),
         };
         if graph_mode() == GraphMode::Replay && s.tokens >= 16 {
-            // Only the portable GQA path stages its position; tuned prefill kernels do not.
+            // Only the portable GQA paths stage their position; tuned prefill kernels do not.
             return Err(Error::Backend(
                 "attention over 16+ tokens in a replayed graph step".into(),
             ));
         }
-        self.staged(op, || self.kernels.attention(q, k, v, out, s))
+        self.staged(&op, || self.kernels.attention(q, k, v, out, s))
     }
 
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
         self.kernels.attention_precision(s)
+    }
+
+    fn kv_store(
+        &self,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        k_cache: &mut CudaBuffer,
+        v_cache: &mut CudaBuffer,
+        s: KvStoreShape,
+    ) -> Result<()> {
+        check::kv_store(k.len, v.len, k_cache.len, v_cache.len, &s)?;
+        self.staged("kv_store", || {
+            self.kernels.kv_store(k, v, k_cache, v_cache, s)
+        })
     }
 
     fn conv1d_silu(

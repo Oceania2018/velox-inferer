@@ -3,9 +3,10 @@
 
 use velox_core::backend::{
     AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnShape,
-    GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    GeluKind, KvStoreShape, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
+use velox_core::kv::{hadamard_norm, KvFormat};
 use velox_core::{Result, WeightFormat, GRAPH_KV_BUCKET};
 
 use crate::{dtod, graph_mode, stage, status, CudaBuffer, GraphMode};
@@ -306,6 +307,34 @@ pub fn attention(
         return Ok(());
     };
     let kv_grid = to_i32("kv bucket", kv_bucket(s.kv_len()))?;
+    // Decode and verify windows over f32 caches also take the GQA verify kernel of the KV path,
+    // which reads each K/V tile once per block for every query row of the group.
+    let verify =
+        s.tokens <= 16 && matches!(s.head_dim, 32 | 64 | 128 | 256) && s.heads / s.kv_heads > 1;
+    if s.kv != KvFormat::F32 || verify {
+        // SAFETY: buffer extents validated above (caches sized for the format).
+        return status(
+            unsafe {
+                velox_portable_attention_kv(
+                    q.as_ptr(),
+                    k.as_ptr().cast(),
+                    v.as_ptr().cast(),
+                    out.as_mut_ptr(),
+                    to_i32("tokens", s.tokens)?,
+                    to_i32("heads", s.heads)?,
+                    to_i32("kv_heads", s.kv_heads)?,
+                    to_i32("head_dim", s.head_dim)?,
+                    s.pos0 as i32,
+                    s.scale(),
+                    kv_format_code(s.kv),
+                    hadamard_norm(s.head_dim),
+                    params,
+                    kv_grid,
+                )
+            },
+            "portable attention (KV path)",
+        );
+    }
     // SAFETY: buffer extents validated above.
     status(
         unsafe {
@@ -325,6 +354,89 @@ pub fn attention(
             )
         },
         "portable attention",
+    )
+}
+
+extern "C" {
+    fn velox_portable_attention_kv(
+        q: *const f32,
+        k: *const u8,
+        v: *const u8,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
+        format: i32,
+        norm: f32,
+        params: *const i64,
+        kv_grid: i32,
+    ) -> i32;
+    fn velox_portable_kv_store(
+        k: *const f32,
+        v: *const f32,
+        k_cache: *mut u8,
+        v_cache: *mut u8,
+        tokens: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i64,
+        format: i32,
+        norm: f32,
+        params: *const i64,
+    ) -> i32;
+}
+
+/// KV format codes shared with the kernels (`VELOX_KV_*` in portable_kv.cu).
+pub fn kv_format_code(f: KvFormat) -> i32 {
+    match f {
+        KvFormat::F32 => 0,
+        KvFormat::Bf16 => 1,
+        KvFormat::Fp8 => 2,
+        KvFormat::Nvfp4 => 3,
+    }
+}
+
+pub fn kv_store(
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    k_cache: &mut CudaBuffer,
+    v_cache: &mut CudaBuffer,
+    s: KvStoreShape,
+) -> Result<()> {
+    check::kv_store(k.len(), v.len(), k_cache.len(), v_cache.len(), &s)?;
+    if s.format == KvFormat::F32 {
+        // Rows are stored as they are: two device copies, as the model did before formats.
+        let (n, at) = (
+            s.tokens * s.kv_heads * s.head_dim,
+            s.pos0 * s.kv_heads * s.head_dim,
+        );
+        copy(k, 0, k_cache, at, n)?;
+        return copy(v, 0, v_cache, at, n);
+    }
+    let Some(params) = graph_params(&[s.pos0 as i64])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_kv_store(
+                k.as_ptr(),
+                v.as_ptr(),
+                k_cache.as_mut_ptr().cast(),
+                v_cache.as_mut_ptr().cast(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                s.pos0 as i64,
+                kv_format_code(s.format),
+                hadamard_norm(s.head_dim),
+                params,
+            )
+        },
+        "portable kv_store",
     )
 }
 

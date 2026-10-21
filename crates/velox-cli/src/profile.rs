@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use velox_core::backend::{
     ActQuant, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopePosShape, RopeShape, WeightView,
+    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind, RopePosShape,
+    RopeShape, WeightView,
 };
 use velox_core::{DeviceProfile, Op, Result};
 
@@ -178,6 +179,16 @@ impl<B: Backend> Backend for Profiled<B> {
             "attention prefill"
         };
         self.time(name, || self.inner.attention(q, k, v, out, s))
+    }
+    fn kv_store(
+        &self,
+        k: &B::Buffer,
+        v: &B::Buffer,
+        kc: &mut B::Buffer,
+        vc: &mut B::Buffer,
+        s: KvStoreShape,
+    ) -> Result<()> {
+        self.time("kv_store", || self.inner.kv_store(k, v, kc, vc, s))
     }
     fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_precision(s)

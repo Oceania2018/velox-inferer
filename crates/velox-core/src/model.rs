@@ -174,6 +174,7 @@ impl<B: Backend> Stack<B> {
             kv_heads: s.kv_heads,
             head_dim: s.head_dim,
             pos0,
+            kv: crate::kv::KvFormat::F32,
         };
 
         for l in &mut self.layers {
