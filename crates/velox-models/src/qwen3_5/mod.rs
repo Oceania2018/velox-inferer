@@ -11,7 +11,7 @@ use velox_core::backend::{
     AttnShape, Backend, ConvShape, Copy2dShape, GdnShape, NormKind, RopeLayout, RopePosShape,
     RopeShape,
 };
-use velox_core::{Error, Result};
+use velox_core::{Error, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
 pub use config::{LayerKind, TextConfig};
 pub use dflash::{BlockCandidates, DFlashConfig, DFlashModel, DFlashState, DFlashWorkspace};
@@ -31,6 +31,8 @@ pub struct Session<B: Backend> {
     ssm: Vec<B::Buffer>,
     /// Speculative-verify state, allocated on first `verify`.
     spec: Option<Spec<B>>,
+    /// Distinguishes this session's graph recordings from other sessions' (they bind its buffers).
+    id: u64,
 }
 
 /// Up to this many tokens (decode, verify) adjacent projections run as one fused linear; larger
@@ -40,10 +42,26 @@ const FUSE_MAX_TOKENS: usize = 16;
 /// Most tokens one `verify` call may feed (the anchor plus drafts).
 pub const VERIFY_MAX: usize = 16;
 
-/// Graph keys (`Backend::graph`) of the model's repeated steps; low bits carry the shape.
-const GRAPH_ADVANCE: u32 = 1 << 16;
-const GRAPH_VERIFY: u32 = 2 << 16;
-const GRAPH_COMMIT: u32 = 3 << 16;
+/// Graph keys (`Backend::graph`) of the model's repeated steps: bits 0..16 carry the shape, 16..24
+/// the kind, 24..40 the KV bucket (static steps attend over a bucket-sized grid) and 40..56 the
+/// session.
+const GRAPH_ADVANCE: u64 = 1 << 16;
+const GRAPH_VERIFY: u64 = 2 << 16;
+const GRAPH_COMMIT: u64 = 3 << 16;
+
+/// Static steps (see [`GRAPH_STATIC`]) stay under this many tokens, where attention takes the
+/// path that stages its position.
+const STATIC_MAX_TOKENS: usize = 15;
+
+fn graph_key(kind: u64, shape: u64, s: &Session<impl Backend>, kv_len: Option<usize>) -> u64 {
+    let mut key = kind | shape | (s.id & 0xffff) << 40;
+    if let Some(kv) = kv_len {
+        key |= GRAPH_STATIC | (kv.div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
+    }
+    key
+}
+
+static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What `commit` needs to keep only a prefix of a verified window: the recurrent state before
 /// the window, and per GDN layer the raw projections each token fed to the convolution and the
@@ -223,6 +241,7 @@ impl<B: Backend> Qwen35Text<B> {
             conv,
             ssm,
             spec: None,
+            id: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -355,11 +374,12 @@ impl<B: Backend> Qwen35Text<B> {
         {
             // Decode and verify steps repeat with the same structure: one recorded graph per shape.
             let recording = s.spec.as_ref().is_some_and(|sp| sp.recording);
-            let key = GRAPH_ADVANCE
-                | t as u32
-                | u32::from(recording) << 8
-                | u32::from(!ws.capture.is_empty()) << 9
-                | u32::from(ws.keep_rows) << 10;
+            let shape = t as u64
+                | u64::from(recording) << 8
+                | u64::from(!ws.capture.is_empty()) << 9
+                | u64::from(ws.keep_rows) << 10;
+            let kv = (t <= STATIC_MAX_TOKENS).then_some(s.pos + t);
+            let key = graph_key(GRAPH_ADVANCE, shape, s, kv);
             b.graph(key, &mut || {
                 self.chunk(b, s, ws, ids, 0, None, &[], &mut [])
             })?;
@@ -798,7 +818,9 @@ impl<B: Backend> Qwen35Text<B> {
         }
         let (c, w) = (&self.cfg, &self.w);
         // Snapshot, forward and output head are one recorded step per window length.
-        let key = GRAPH_VERIFY | t as u32 | u32::from(!ws.capture.is_empty()) << 9;
+        let shape = t as u64 | u64::from(!ws.capture.is_empty()) << 9;
+        let kv = (t <= STATIC_MAX_TOKENS).then_some(s.pos + t);
+        let key = graph_key(GRAPH_VERIFY, shape, s, kv);
         b.graph(key, &mut || {
             {
                 let Session {
@@ -853,6 +875,8 @@ impl<B: Backend> Qwen35Text<B> {
         keep: usize,
     ) -> Result<()> {
         let c = &self.cfg;
+        // Static, and no attention (bucket 0).
+        let key = graph_key(GRAPH_COMMIT, keep as u64, s, Some(0));
         let Session {
             spec,
             conv,
@@ -871,7 +895,7 @@ impl<B: Backend> Qwen35Text<B> {
         }
         if keep < sp.tokens {
             // Restore and replay are one recorded step per kept length.
-            b.graph(GRAPH_COMMIT | keep as u32, &mut || {
+            b.graph(key, &mut || {
                 for (dst, src) in conv
                     .iter_mut()
                     .zip(&sp.conv)

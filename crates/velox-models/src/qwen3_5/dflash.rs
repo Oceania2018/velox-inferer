@@ -26,8 +26,8 @@ use super::weights::{fuse, Loader, WDesc};
 use super::{Qwen35Text, Workspace};
 
 /// Graph keys (`Backend::graph`) of drafting steps; low bits carry the shape.
-const GRAPH_CONTEXT: u32 = 8 << 16;
-const GRAPH_BLOCK: u32 = 9 << 16;
+const GRAPH_CONTEXT: u64 = 8 << 16;
+const GRAPH_BLOCK: u64 = 9 << 16;
 /// Context rows up to this many (decode commits) materialize as a recorded step.
 const GRAPH_ROWS: usize = 16;
 
@@ -447,7 +447,7 @@ impl<B: Backend> DFlashModel<B> {
             Ok(())
         };
         if n <= GRAPH_ROWS {
-            let key = GRAPH_CONTEXT | n as u32 | u32::from(first < n) << 8;
+            let key = GRAPH_CONTEXT | n as u64 | u64::from(first < n) << 8;
             b.graph(key, &mut run)?;
         } else {
             run()?;
@@ -485,7 +485,7 @@ impl<B: Backend> DFlashModel<B> {
         let (qd, kvd) = (c.q_dim(), c.kv_dim());
         let k = drafts;
         // The block forward through the selector projection is one recorded step per width.
-        b.graph(GRAPH_BLOCK | w as u32, &mut || {
+        b.graph(GRAPH_BLOCK | w as u64, &mut || {
             b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
             for (li, l) in self.layers.iter().enumerate() {
                 // Attention branch.
