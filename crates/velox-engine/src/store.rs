@@ -17,7 +17,9 @@
 //! - Head protection: a chain's new head inherits the reference history of the point its request
 //!   resumed from, so one-off requests cannot evict it as the coldest entry.
 //! - Supersession: that point, if not a root and adopted only once, is evicted before anything
-//!   else (its KV stays shared with the new head).
+//!   else (its KV stays shared with the new head). It can still be resumed (a retry or rewind of
+//!   that step); each chain keeps its newest `superseded` such points (ninfer `--ctx-checkpoints`)
+//!   and a second adoption makes one a branch, kept under the general rules.
 //!
 //! An optional NVMe tier ([`DiskTier`]) keeps copies of evicted entries that can still be
 //! resumed.
@@ -48,6 +50,8 @@ pub(crate) struct Entry<B: Backend> {
     tail: Option<usize>,
     adopted: u32,
     superseded: bool,
+    /// When it was superseded (orders a chain's superseded points).
+    superseded_at: u64,
     last: u64,
     crf: f64,
 }
@@ -229,6 +233,7 @@ impl<B: Backend> ContextStore<B> {
             tail: None,
             adopted: 0,
             superseded: false,
+            superseded_at: 0,
             last: self.now,
             crf: 1.0,
         });
@@ -335,10 +340,14 @@ impl<B: Backend> ContextStore<B> {
         let (lambda, now) = (self.lambda, self.now);
         let mut deepest: Option<(usize, u64)> = None;
         for e in &mut self.entries {
-            if e.pos() <= start && !e.superseded && e.prefix_of(keys) {
+            if e.pos() <= start && e.prefix_of(keys) {
                 Self::reference(lambda, now, e);
                 if Some(e.id) == adopted {
                     e.adopted += 1;
+                    // A second reader makes a superseded point a branch.
+                    if e.adopted > 1 {
+                        e.superseded = false;
+                    }
                 }
                 if deepest.is_none_or(|(p, _)| e.pos() > p) {
                     deepest = Some((e.pos(), e.id));
@@ -354,6 +363,41 @@ impl<B: Backend> ContextStore<B> {
     pub fn mark_tail(&mut self, id: u64, head: usize) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
             e.tail = Some(head);
+        }
+    }
+
+    /// Entry `id` is a chain point its one request resumed from and went past: superseded (a
+    /// retry or rewind fallback, evicted first). Of the chain's superseded points (non-root
+    /// entries on its prefix), the newest `keep` stay and older ones are retired.
+    pub fn supersede(&mut self, id: u64, keep: usize) {
+        let at = self.next_id;
+        self.next_id += 1;
+        let Some(e) = self.entries.iter_mut().find(|e| e.id == id) else {
+            return;
+        };
+        if e.root {
+            return;
+        }
+        e.adopted = e.adopted.max(1);
+        e.superseded = true;
+        e.superseded_at = at;
+        let keys = e.keys.clone();
+        let mut chain: Vec<(u64, usize)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.superseded && !x.root && keys.starts_with(&x.keys))
+            .map(|(i, x)| (x.superseded_at, i))
+            .collect();
+        if chain.len() <= keep {
+            return;
+        }
+        chain.sort_unstable_by(|a, b| b.cmp(a));
+        let mut old: Vec<usize> = chain[keep..].iter().map(|&(_, i)| i).collect();
+        old.sort_unstable();
+        for i in old.into_iter().rev() {
+            let e = self.entries.swap_remove(i);
+            self.release(e);
         }
     }
 
@@ -445,6 +489,7 @@ impl<B: Backend> ContextStore<B> {
             tail: None,
             adopted: 0,
             superseded: false,
+            superseded_at: 0,
             last: now,
             crf: 1.0,
         };
@@ -454,8 +499,9 @@ impl<B: Backend> ContextStore<B> {
                 e.crf = p.crf;
                 e.last = p.last;
                 Self::reference(lambda, now, &mut e);
-                if !p.root && p.adopted <= 1 {
+                if !p.root && p.adopted <= 1 && !p.superseded {
                     p.superseded = true;
+                    p.superseded_at = id;
                 }
             }
         }

@@ -52,8 +52,11 @@ pub struct EngineConfig {
     pub default_max_tokens: usize,
     /// Default for `chat_template_kwargs.enable_thinking` (ninfer `--no-thinking` = false).
     pub enable_thinking: bool,
-    /// Recurrent-state checkpoints kept per lane for prefix reuse.
+    /// Recurrent-state checkpoints kept per lane for prefix reuse (device checkpoints).
     pub max_checkpoints: usize,
+    /// Superseded history points the context store keeps per request chain for retries and
+    /// rewinds (ninfer `--ctx-checkpoints`; `usize::MAX`: unbounded).
+    pub chain_superseded: usize,
     /// Keep checkpoints in system RAM (pinned, device-mapped) rather than device memory.
     pub host_checkpoints: bool,
     /// Take no checkpoints at or after the prompt's last image: agent screenshots are replaced in the
@@ -928,7 +931,7 @@ impl<B: Backend> Core<B> {
         lane.keys.extend_from_slice(&p.keys[pre.start..]);
         lane.checkpoints.extend(pre.snaps);
         let placed = if self.cfg.host_checkpoints {
-            self.place_checkpoints(lane, store, &pre.anchors, p.keys.len() - 1)
+            self.place_checkpoints(lane, store, &pre.anchors, p.keys.len() - 1, pre.start)
         } else {
             Self::prune_checkpoints(
                 &mut lane.checkpoints,
@@ -1566,6 +1569,7 @@ impl<B: Backend> Core<B> {
         store: &mut ContextStore<B>,
         anchors: &[usize],
         tail: usize,
+        resumed: usize,
     ) -> Result<(), CoreError> {
         lane.checkpoints.sort_by_key(|c| c.pos);
         let head = lane
@@ -1601,9 +1605,31 @@ impl<B: Backend> Core<B> {
             }
             if Some(cp.pos) == head {
                 lane.checkpoints.push(cp);
-            } else {
-                lane.spare.push(cp);
+                continue;
             }
+            // The point this request resumed from (the previous step's history point) is behind
+            // the new head now: the store keeps it superseded, for a retry or rewind of this step.
+            if store.enabled()
+                && self.cfg.chain_superseded > 0
+                && cp.pos == resumed
+                && head.is_some_and(|h| h > cp.pos)
+                && cp.pos >= MIN_CAPTURE
+                && !anchors.contains(&cp.pos)
+                && !store.holds(&lane.keys[..cp.pos])
+            {
+                let drafter = self.drafter_context(lane);
+                let id = store.insert(
+                    &self.b,
+                    &lane.session,
+                    &lane.keys,
+                    &cp,
+                    false,
+                    None,
+                    drafter,
+                )?;
+                store.supersede(id, self.cfg.chain_superseded);
+            }
+            lane.spare.push(cp);
         }
         // Device memory: one checkpoint per lane plus the shared spares (see `DEVICE_SPARE`).
         Ok(())
