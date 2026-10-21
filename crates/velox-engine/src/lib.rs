@@ -677,7 +677,7 @@ impl<B: Backend> Core<B> {
                 .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)?;
             lane.keys.extend_from_slice(&p.keys[start..]);
             if self.cfg.host_checkpoints {
-                self.place_checkpoints(lane, store, &anchors)?;
+                self.place_checkpoints(lane, store, &anchors, p.keys.len() - 1)?;
             } else {
                 Self::prune_checkpoints(
                     &mut lane.checkpoints,
@@ -1133,18 +1133,40 @@ impl<B: Backend> Core<B> {
     }
 
     /// Host checkpoint mode, after a prefill: checkpoints at `anchors` (system prompt and task:
-    /// what other conversations share) go to the context store as roots, and the lane keeps only
-    /// its deepest checkpoint (its chain head, the next request's likeliest restore point; with
-    /// several lanes, device memory holds about one checkpoint per lane).
+    /// what other conversations share) go to the context store as roots, the one at `tail` (the
+    /// prompt's end, for exact retries) goes there as an ordinary entry, and the lane keeps only
+    /// its deepest other checkpoint (its chain head, the next request's likeliest restore point;
+    /// with several lanes, device memory holds about one checkpoint per lane).
     fn place_checkpoints(
         &self,
         lane: &mut Lane<B>,
         store: &mut ContextStore<B>,
         anchors: &[usize],
+        tail: usize,
     ) -> Result<(), CoreError> {
         lane.checkpoints.sort_by_key(|c| c.pos);
-        let head = lane.checkpoints.last().map(|c| c.pos);
+        let head = lane
+            .checkpoints
+            .iter()
+            .map(|c| c.pos)
+            .filter(|&p| p != tail)
+            .max();
         for cp in std::mem::take(&mut lane.checkpoints) {
+            if cp.pos == tail && store.enabled() {
+                // The prompt's end goes straight to system RAM: only an exact retry resumes there.
+                let drafter = self.drafter_context(lane);
+                store.insert(
+                    &self.b,
+                    &lane.session,
+                    &lane.keys,
+                    &cp,
+                    false,
+                    None,
+                    drafter,
+                )?;
+                lane.spare.push(cp);
+                continue;
+            }
             if store.enabled()
                 && cp.pos >= MIN_REUSE
                 && anchors.contains(&cp.pos)
@@ -1332,12 +1354,23 @@ impl<B: Backend> Core<B> {
         lane.session.rope_delta = p.rope_delta;
         // Checkpoints are filled inside the forward pass, so the prompt is not cut into short
         // segments there (each segment would stream every weight once more).
-        let positions = self.checkpoint_positions(&p.ids, start);
+        let mut positions = self.checkpoint_positions(&p.ids, start);
         let deepest = positions.last().copied();
+        // The end of the prompt (less the token fed for logits): an exact retry or replay of this
+        // request resumes there (see `place_checkpoints`).
+        let tail = p.ids.len() - 1;
+        if self.cfg.host_checkpoints
+            && store.enabled()
+            && tail > start
+            && Some(tail) > deepest
+            && !store.holds(&p.keys[..tail])
+        {
+            positions.push(tail);
+        }
         let mut snaps = Vec::new();
         for pos in positions {
             let anchor = anchors.contains(&pos) && store.enabled() && !store.holds(&p.keys[..pos]);
-            if Some(pos) != deepest && !(anchor || !self.cfg.host_checkpoints) {
+            if Some(pos) != deepest && pos != tail && !(anchor || !self.cfg.host_checkpoints) {
                 continue;
             }
             // Storage: spare, else the lane's oldest checkpoint (its restore, if any, is queued
