@@ -123,31 +123,38 @@ __global__ void quant_fp8_kernel(const float* __restrict__ x, int m, int k, uint
 //   Small<1,4,1>:  16 x 128, 128 threads (speculative verify and short chunks), with split-K so
 //                  a handful of tokens still spreads the weight stream over every SM.
 
-constexpr int kBK = 64;  // code bytes per row per stage (two MMA k-steps)
-constexpr int kStages = 3;
 
 enum Kind { kFp4 = 0, kFp8 = 1 };
 
-template <int WM_, int WN_, int MT_>
+template <int WM_, int WN_, int MT_, int ST_, int KS_>
 struct Cfg {
-    static constexpr int WM = WM_, WN = WN_, MT = MT_;
+    // ST: cp.async pipeline stages. KS: MMA k-steps (32 code bytes each) per stage, so each weight
+    // row is read in BK-byte contiguous pieces; longer pieces keep DRAM pages open for skinny m.
+    static constexpr int WM = WM_, WN = WN_, MT = MT_, ST = ST_, KS = KS_, BK = KS_ * 32;
     static constexpr int BM = WM * MT * 16, BN = WN * 32, THREADS = WM * WN * 32;
 };
-using Big = Cfg<2, 4, 4>;
-using Small = Cfg<1, 4, 1>;
+using Big = Cfg<2, 4, 4, 3, 2>;
+// Skinny m (decode, verify, drafts) is weight-streaming: 64 rows per block, 128 contiguous bytes
+// per row per stage and four stages measured best on the RTX 5090 (m = 8: lm_head 1.05 -> 1.53
+// TB/s, MLP gate|up 0.96 -> 1.29 TB/s).
+using Small = Cfg<1, 2, 1, 4, 4>;
+using Small64 = Cfg<1, 2, 1, 3, 2>;  // K whose code bytes are not a multiple of Small::BK
 
 template <class C>
 struct Smem {
-    uint8_t a[kStages][C::BM * kBK];
-    uint8_t b[kStages][C::BN * kBK];
-    uint32_t a_scale[kStages][C::BM][2];  // FP4: per row, the scale words of the stage's two k64 steps
-    uint8_t b_scale[kStages][2][512];     // FP4: the weight's swizzled 128x4 scale tiles, as stored
+    uint8_t a[C::ST][C::BM * C::BK];
+    uint8_t b[C::ST][C::BN * C::BK];
+    uint32_t a_scale[C::ST][C::BM][C::KS];  // FP4: per row, the scale word of each of the stage's k64 steps
+    uint8_t b_scale[C::ST][C::KS][512];     // FP4: the weight's swizzled 128x4 scale tiles, as stored
 };
 
-// 16-byte chunk c of row r lives at chunk c ^ ((r >> 1) & 3): ldmatrix over 8 rows is
-// conflict-free with 64-byte rows.
+// 16-byte chunk c of row r lives at chunk c ^ ((r >> 1) & 3) for 64-byte rows and c ^ (r & 7) for
+// 128 bytes and wider: ldmatrix over 8 rows is conflict-free either way.
+template <int BK>
 __device__ __forceinline__ int swz(int row, int byte) {
-    return row * kBK + ((((byte >> 4) ^ (row >> 1)) & 3) << 4) + (byte & 15);
+    constexpr int chunks = BK / 16;
+    const int x = BK == 64 ? (row >> 1) & 3 : row & 7;
+    return row * BK + ((((byte >> 4) ^ x) & (chunks - 1)) << 4) + (byte & 15);
 }
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -215,30 +222,35 @@ template <class C, int KIND>
 __device__ __forceinline__ void load_stage(Smem<C>& s, const GemmArgs& p, int stage, int kt, int m0, int n0,
                                            const uint8_t* w_scale_plane) {
     const int t = threadIdx.x;
-    const int kbyte = kt * kBK;
+    constexpr int chunks = C::BK / 16;
+    const int kbyte = kt * C::BK;
 #pragma unroll
-    for (int idx = t; idx < C::BM * 4; idx += C::THREADS) {
-        const int row = idx >> 2, chunk = idx & 3;
-        cp_async16(s.a[stage] + swz(row, chunk * 16),
+    for (int idx = t; idx < C::BM * chunks; idx += C::THREADS) {
+        const int row = idx / chunks, chunk = idx % chunks;
+        cp_async16(s.a[stage] + swz<C::BK>(row, chunk * 16),
                    p.a + static_cast<long long>(m0 + row) * p.kb + kbyte + chunk * 16, true);
     }
 #pragma unroll
-    for (int idx = t; idx < C::BN * 4; idx += C::THREADS) {
-        const int row = idx >> 2, chunk = idx & 3;
+    for (int idx = t; idx < C::BN * chunks; idx += C::THREADS) {
+        const int row = idx / chunks, chunk = idx % chunks;
         const long long wrow = p.row_begin + n0 + row;
         const bool ok = wrow < p.parent_rows;
-        cp_async16(s.b[stage] + swz(row, chunk * 16), p.w + (ok ? wrow : 0) * p.kb + kbyte + chunk * 16, ok);
+        cp_async16(s.b[stage] + swz<C::BK>(row, chunk * 16), p.w + (ok ? wrow : 0) * p.kb + kbyte + chunk * 16, ok);
     }
     if (KIND == kFp4) {
-        // Two k64 steps per stage. A: one 8-byte copy per row. B: two contiguous 512-byte tiles.
-        const int k64 = kt * 2;
-        if (t < C::BM)
-            cp_async8(&s.a_scale[stage][t][0], p.a_scales + static_cast<long long>(m0 + t) * (p.k / 16) + k64 * 4);
-        if (t < 64) {
-            const int half = t >> 5, off = (t & 31) * 16;
-            const long long tile = (p.row_begin + n0) / 128;
-            cp_async16(&s.b_scale[stage][half][off],
-                       w_scale_plane + (tile * (p.k / 64) + k64 + half) * 512 + off, true);
+        // KS k64 steps per stage. A: 8-byte copies of two scale words per row. B: KS contiguous
+        // 512-byte tiles.
+        const int k64 = kt * C::KS;
+        for (int idx = t; idx < C::BM * (C::KS / 2); idx += C::THREADS) {
+            const int row = idx / (C::KS / 2), pair = idx % (C::KS / 2);
+            cp_async8(&s.a_scale[stage][row][2 * pair],
+                      p.a_scales + static_cast<long long>(m0 + row) * (p.k / 16) + (k64 + 2 * pair) * 4);
+        }
+        const long long tile = (p.row_begin + n0) / 128;
+        for (int idx = t; idx < C::KS * 32; idx += C::THREADS) {
+            const int step = idx >> 5, off = (idx & 31) * 16;
+            cp_async16(&s.b_scale[stage][step][off],
+                       w_scale_plane + (tile * (p.k / 64) + k64 + step) * 512 + off, true);
         }
     }
 }
@@ -251,13 +263,13 @@ __global__ void __launch_bounds__(C::THREADS) gemm_kernel(GemmArgs p) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int wm = warp / C::WN, wn = warp % C::WN;
     const int kt_begin = blockIdx.z * p.kt_per_split;
-    const int kt_end = min(p.kb / kBK, kt_begin + p.kt_per_split);
+    const int kt_end = min(p.kb / C::BK, kt_begin + p.kt_per_split);
     const int kt_count = kt_end - kt_begin;
     const uint8_t* w_scale_plane = p.w + (KIND == kFp4 ? ((p.parent_rows * p.kb + 255) / 256 * 256) : 0);
     float* y = p.y + static_cast<long long>(blockIdx.z) * p.m * p.rows;
 
 #pragma unroll
-    for (int st = 0; st < kStages - 1; ++st) {
+    for (int st = 0; st < C::ST - 1; ++st) {
         if (st < kt_count) load_stage<C, KIND>(s, p, st, kt_begin + st, m0, n0, w_scale_plane);
         cp_commit();
     }
@@ -279,32 +291,32 @@ __global__ void __launch_bounds__(C::THREADS) gemm_kernel(GemmArgs p) {
     constexpr int WROWS = C::MT * 16;
 
     for (int i = 0; i < kt_count; ++i) {
-        cp_wait<kStages - 2>();
+        cp_wait<C::ST - 2>();
         __syncthreads();
-        const int next = i + kStages - 1;
-        if (next < kt_count) load_stage<C, KIND>(s, p, next % kStages, kt_begin + next, m0, n0, w_scale_plane);
+        const int next = i + C::ST - 1;
+        if (next < kt_count) load_stage<C, KIND>(s, p, next % C::ST, kt_begin + next, m0, n0, w_scale_plane);
         cp_commit();
-        const int st = i % kStages;
+        const int st = i % C::ST;
 #pragma unroll
-        for (int ks = 0; ks < 2; ++ks) {
+        for (int ks = 0; ks < C::KS; ++ks) {
             uint32_t af[C::MT][4], bf[4][2], sfa[C::MT], sfb[4];
 #pragma unroll
             for (int mt = 0; mt < C::MT; ++mt) {
                 const int r = wm * WROWS + mt * 16 + a_row;
-                ldmatrix_x4(af[mt], s.a[st] + swz(r, ks * 32 + a_byte));
+                ldmatrix_x4(af[mt], s.a[st] + swz<C::BK>(r, ks * 32 + a_byte));
                 if (KIND == kFp4) sfa[mt] = s.a_scale[st][wm * WROWS + mt * 16 + sfa_row][ks];
             }
 #pragma unroll
             for (int nt = 0; nt < 4; nt += 2) {
                 const int r = wn * 32 + nt * 8 + b_row;
                 uint32_t t4[4];
-                ldmatrix_x4(t4, s.b[st] + swz(r, ks * 32 + b_byte));
+                ldmatrix_x4(t4, s.b[st] + swz<C::BK>(r, ks * 32 + b_byte));
                 bf[nt][0] = t4[0], bf[nt][1] = t4[1], bf[nt + 1][0] = t4[2], bf[nt + 1][1] = t4[3];
             }
             if (KIND == kFp4) {
 #pragma unroll
                 for (int nt = 0; nt < 4; ++nt) {
-                    const int r = wn * 32 + nt * 8 + sfb_row;
+                    const int r = static_cast<int>((p.row_begin + n0) & 127) + wn * 32 + nt * 8 + sfb_row;
                     sfb[nt] = *reinterpret_cast<const uint32_t*>(&s.b_scale[st][ks][(r & 31) * 16 + (r >> 5) * 4]);
                 }
             }
@@ -375,6 +387,7 @@ constexpr int kSmallMaxM = 32;
 
 // Token rows the quantizers pad to: the tile height of the configuration launch_gemm picks.
 int m_tile(int m) { return m <= kSmallMaxM ? Small::BM : Big::BM; }
+static_assert(Small::BM == Small64::BM, "small configurations share the activation tile height");
 
 template <class C, int KIND>
 int launch_cfg(GemmArgs p) {
@@ -383,13 +396,13 @@ int launch_cfg(GemmArgs p) {
         cudaFuncSetAttribute(gemm_kernel<C, KIND>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem<C>));
         configured = true;
     }
-    const int kt_total = p.kb / kBK;
+    const int kt_total = p.kb / C::BK;
     const long long blocks = static_cast<long long>((p.rows + C::BN - 1) / C::BN) * ((p.m + C::BM - 1) / C::BM);
     // Split K until the grid covers the GPU twice, keeping at least 8 stages per slice.
     int splits = 1;
     // The small tile always may split; the large one only when its grid is badly under-filled,
     // since the partial pass costs more than it saves on prefill-sized grids.
-    while ((C::BM == Small::BM || blocks < 64) && blocks * splits < 2 * kSms && kt_total / (splits * 2) >= 8) splits *= 2;
+    while ((C::BM == Small::BM || blocks < 64) && blocks * splits < 2 * kSms && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
     p.kt_per_split = (kt_total + splits - 1) / splits;
     float* y = p.y;
     if (splits > 1) {
@@ -407,7 +420,8 @@ int launch_cfg(GemmArgs p) {
 
 template <int KIND>
 int launch_gemm(const GemmArgs& p) {
-    return p.m <= kSmallMaxM ? launch_cfg<Small, KIND>(p) : launch_cfg<Big, KIND>(p);
+    if (p.m > kSmallMaxM) return launch_cfg<Big, KIND>(p);
+    return p.kb % Small::BK == 0 ? launch_cfg<Small, KIND>(p) : launch_cfg<Small64, KIND>(p);
 }
 
 }  // namespace
