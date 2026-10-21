@@ -297,21 +297,10 @@ __global__ void __launch_bounds__(kThreads, 2) flash_prefill_kernel(AttnArgs p) 
     }
 }
 
+// Grow-only and never freed (VeloxScratch): recorded CUDA graphs may still reference old buffers.
 struct Scratch {
-    std::mutex mu;
-    uint8_t* ptr = nullptr;
-    size_t bytes = 0;
-    uint8_t* get(size_t need) {
-        std::lock_guard<std::mutex> lock(mu);
-        if (need > bytes) {
-            if (ptr) cudaFree(ptr);
-            ptr = nullptr;
-            bytes = 0;
-            if (cudaMalloc(&ptr, need) != cudaSuccess) return nullptr;
-            bytes = need;
-        }
-        return ptr;
-    }
+    VeloxScratch s;
+    uint8_t* get(size_t need) { return static_cast<uint8_t*>(s.get(need)); }
 };
 Scratch g_attn_scratch;
 

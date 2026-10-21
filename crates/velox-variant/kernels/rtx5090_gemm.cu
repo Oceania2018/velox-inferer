@@ -362,23 +362,10 @@ __global__ void sum_splits(const float* __restrict__ part, int splits, long long
     }
 }
 
-// Grow-only device scratch. The engine issues kernels from one thread; the mutex only guards
-// against concurrent first use.
+// Grow-only and never freed (VeloxScratch): recorded CUDA graphs may still reference old buffers.
 struct Scratch {
-    std::mutex mu;
-    uint8_t* ptr = nullptr;
-    size_t bytes = 0;
-    uint8_t* get(size_t need) {
-        std::lock_guard<std::mutex> lock(mu);
-        if (need > bytes) {
-            if (ptr) cudaFree(ptr);
-            ptr = nullptr;
-            bytes = 0;
-            if (cudaMalloc(&ptr, need) != cudaSuccess) return nullptr;
-            bytes = need;
-        }
-        return ptr;
-    }
+    VeloxScratch s;
+    uint8_t* get(size_t need) { return static_cast<uint8_t*>(s.get(need)); }
 };
 Scratch g_scratch;  // quantized activations
 Scratch g_part;     // split-K partial sums

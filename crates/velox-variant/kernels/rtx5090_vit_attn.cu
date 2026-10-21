@@ -220,26 +220,15 @@ __global__ void __launch_bounds__(kThreads) vit_flash_kernel(VitArgs p) {
     }
 }
 
+// Grow-only and never freed (VeloxScratch): recorded CUDA graphs may still reference old buffers.
 struct Scratch {
-    std::mutex mu;
-    uint8_t* ptr = nullptr;
-    size_t bytes = 0;
-    uint8_t* get(size_t need) {
-        if (need > bytes) {
-            if (ptr) cudaFree(ptr);
-            ptr = nullptr;
-            bytes = 0;
-            if (cudaMalloc(&ptr, need) != cudaSuccess) return nullptr;
-            bytes = need;
-        }
-        return ptr;
-    }
+    VeloxScratch s;
+    uint8_t* get(size_t need) { return static_cast<uint8_t*>(s.get(need)); }
 };
 Scratch g_vit;
 
 template <int DP>
 int launch_vit(const float* q, const float* k, const float* v, float* out, int tokens, int heads, int d) {
-    std::lock_guard<std::mutex> lock(g_vit.mu);
     const long long rows = static_cast<long long>(tokens) * heads;
     const size_t each = static_cast<size_t>(rows) * DP;
     uint8_t* base = g_vit.get(3 * each * sizeof(__half));

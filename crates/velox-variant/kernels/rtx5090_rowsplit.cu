@@ -197,20 +197,10 @@ __global__ void __launch_bounds__(kThreads) rowsplit_bf16_kernel(RsArgs p) {
         }
 }
 
+// Grow-only and never freed (VeloxScratch): recorded CUDA graphs may still reference old buffers.
 struct Scratch {
-    std::mutex mu;
-    uint8_t* ptr = nullptr;
-    size_t bytes = 0;
-    uint8_t* get(size_t need) {
-        if (need > bytes) {
-            if (ptr) cudaFree(ptr);
-            ptr = nullptr;
-            bytes = 0;
-            if (cudaMalloc(&ptr, need) != cudaSuccess) return nullptr;
-            bytes = need;
-        }
-        return ptr;
-    }
+    VeloxScratch s;
+    uint8_t* get(size_t need) { return static_cast<uint8_t*>(s.get(need)); }
 };
 Scratch g_rs;
 
@@ -228,7 +218,6 @@ VELOX_API int velox_5090_linear_rowsplit(const float* x, int m, const uint8_t* w
     const long long gpr = kp / group, groups = parent_rows * gpr;
     const long long high_off = align256(groups * 32), scale_off = high_off + align256(groups * high);
     const int m_pad = (m + kBM - 1) / kBM * kBM;
-    std::lock_guard<std::mutex> lock(g_rs.mu);
     auto* xb = reinterpret_cast<__nv_bfloat16*>(g_rs.get(static_cast<size_t>(m_pad) * kp * 2));
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16_padded<<<velox_grid_1d(static_cast<long long>(m_pad) * kp, 256), 256>>>(
