@@ -798,7 +798,7 @@ impl Backend for CudaBackend {
         check::attention_block(
             q.len, k_ctx.len, v_ctx.len, k_blk.len, v_blk.len, out.len, &shape,
         )?;
-        self.timed("attention block", || {
+        self.staged("attention block", || {
             self.kernels
                 .attention_block(q, k_ctx, v_ctx, k_blk, v_blk, out, shape)
         })

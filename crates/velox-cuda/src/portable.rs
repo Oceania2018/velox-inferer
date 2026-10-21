@@ -732,6 +732,7 @@ extern "C" {
         ctx_lo: i64,
         window: i32,
         ring: i32,
+        params: *const i64,
     ) -> i32;
     fn velox_portable_dyn_conv(
         x: *const f32,
@@ -788,6 +789,9 @@ pub fn attention_block(
         out.len(),
         &s,
     )?;
+    let Some(params) = graph_params(&[s.pos0 as i64, s.ctx_lo as i64])? else {
+        return Ok(());
+    };
     // SAFETY: extents validated above.
     status(
         unsafe {
@@ -806,6 +810,7 @@ pub fn attention_block(
                 s.ctx_lo as i64,
                 to_i32("window", s.window)?,
                 to_i32("ring", s.ring)?,
+                params,
             )
         },
         "portable attention_block",
