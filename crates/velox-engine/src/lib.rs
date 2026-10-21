@@ -951,15 +951,16 @@ impl<B: Backend> Core<B> {
         let bw = bw.as_mut().expect("several lanes have a batch workspace");
         let timing = std::env::var_os("VELOX_DEBUG_BATCH").is_some();
         let t0 = Instant::now();
-        // Every sequence drafts the same number of tokens (the most any of them wants), so the
-        // batch keeps one shape and replays one recorded step.
+        // Every sequence drafts the short block (ninfer's fixed 7 drafts): one shape, so one recorded
+        // step, and two sequences fit the 16-row tiles a single long window would fill. Long
+        // blocks pay off only for a request decoding alone.
         let drafts = idx
             .iter()
             .filter_map(|&i| match &lanes[active[i].lane].drafter {
-                Some(Drafter::DFlash(d)) => Some(d.drafts),
+                Some(Drafter::DFlash(d)) => Some(d.short_block()),
                 _ => None,
             })
-            .max()
+            .min()
             .unwrap_or(1);
         let room = idx.iter().all(|&i| {
             lanes[active[i].lane].session.pos + drafts < lanes[active[i].lane].session.capacity
