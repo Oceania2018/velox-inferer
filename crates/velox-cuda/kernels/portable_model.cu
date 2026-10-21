@@ -734,15 +734,13 @@ __global__ void gelu_kernel(float* __restrict__ x, long long len, int erf_kind) 
 }
 
 // layout 0: interleaved (axis i % axes, freq theta^(-2i/R)); 1: blocked (see RopeLayout).
-__global__ void rope_positions_kernel(float* __restrict__ x, const uint32_t* __restrict__ pos, long long pairs_total,
-                                      int tokens, int heads, int head_dim, int rotary_dim, float theta, int axes,
-                                      int layout) {
-    const int half = rotary_dim / 2;
-    for (long long p = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; p < pairs_total;
-         p += static_cast<long long>(gridDim.x) * blockDim.x) {
-        const int i = static_cast<int>(p % half);
-        const long long row = p / half;  // token * heads + head
-        const int t = static_cast<int>(row / heads);
+// One block per token: the token's angles (double, slow on consumer GPUs) are computed once per pair
+// into shared memory, then every head applies them.
+__global__ void rope_positions_kernel(float* __restrict__ x, const uint32_t* __restrict__ pos, int tokens, int heads,
+                                      int head_dim, int rotary_dim, float theta, int axes, int layout) {
+    extern __shared__ float cs[];  // [half] cos, then [half] sin
+    const int half = rotary_dim / 2, t = blockIdx.x;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
         int axis;
         double freq;
         if (layout == 0) {
@@ -755,10 +753,16 @@ __global__ void rope_positions_kernel(float* __restrict__ x, const uint32_t* __r
         }
         double s, c;
         sincos(static_cast<double>(pos[static_cast<size_t>(axis) * tokens + t]) * freq, &s, &c);
-        float* base = x + row * head_dim;
-        const float a = base[i], b = base[i + half];
-        base[i] = static_cast<float>(a * c - b * s);
-        base[i + half] = static_cast<float>(a * s + b * c);
+        cs[i] = static_cast<float>(c);
+        cs[half + i] = static_cast<float>(s);
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < heads * half; p += blockDim.x) {
+        const int h = p / half, i = p % half;
+        float* base = x + (static_cast<size_t>(t) * heads + h) * head_dim;
+        const float a = base[i], b = base[i + half], c = cs[i], s = cs[half + i];
+        base[i] = a * c - b * s;
+        base[i + half] = a * s + b * c;
     }
 }
 
@@ -795,8 +799,8 @@ VELOX_API int velox_portable_gelu(float* x, long long len, int erf_kind) {
 
 VELOX_API int velox_portable_rope_positions(float* x, const uint32_t* pos, int tokens, int heads, int head_dim,
                                             int rotary_dim, float theta, int axes, int layout) {
-    const long long pairs = static_cast<long long>(tokens) * heads * (rotary_dim / 2);
-    rope_positions_kernel<<<velox_grid_1d(pairs, 256), 256>>>(x, pos, pairs, tokens, heads, head_dim, rotary_dim, theta,
-                                                              axes, layout);
+    if (tokens <= 0) return 0;
+    rope_positions_kernel<<<tokens, 256, rotary_dim * sizeof(float)>>>(x, pos, tokens, heads, head_dim, rotary_dim,
+                                                                       theta, axes, layout);
     return velox_launch_status();
 }
