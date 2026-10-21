@@ -304,6 +304,11 @@ impl<B: Backend> DFlashDrafter<B> {
         dm.rewind(&mut self.state, pos);
     }
 
+    /// Drafts in the short block.
+    pub fn short_block(&self) -> usize {
+        self.low
+    }
+
     /// Starts a request at the short block.
     pub fn reset(&mut self) {
         self.drafts = self.low;
