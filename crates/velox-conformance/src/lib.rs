@@ -1371,7 +1371,15 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     )?;
     // Batched drafting with A16-only NVFP4 weights (draft model, proposal head): 17..96 rows.
     for m in [21, 42, 48, 96] {
-        s.linear_act(WeightFormat::Nvfp4, 384, 1024, 64, 256, m, ActPolicy::A16Only)?;
+        s.linear_act(
+            WeightFormat::Nvfp4,
+            384,
+            1024,
+            64,
+            256,
+            m,
+            ActPolicy::A16Only,
+        )?;
     }
     // Groupwise integer formats; K not a multiple of 128 exercises physical padding.
     for f in [
