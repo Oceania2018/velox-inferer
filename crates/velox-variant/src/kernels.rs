@@ -56,6 +56,16 @@ extern "C" {
         params: *const i64,
         kv_grid: i32,
     ) -> i32;
+    fn velox_5090_linear_a16_fp8(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5090_linear_skinny16(
         x: *const f32,
         m: i32,
@@ -121,6 +131,16 @@ const ROWSPLIT_MIN_M: usize = 64;
 /// Up to this many tokens, A16Only NVFP4 and q4/q8 weights (draft model, proposal head) use the
 /// weight-streaming bf16 tensor-core kernel.
 const SKINNY16_MAX_M: usize = 16;
+
+/// Skinny FP8 row-scaled linears (speculative verify, drafts) take the one-kernel bf16-activation
+/// path: no activation quantizer or split-K pass, and bf16 activations (finer than E4M3).
+fn a16_fp8(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VELOX_NO_A16FP8").is_none())
+        && w.format == WeightFormat::Fp8RowBf16
+        && (2..=SKINNY16_MAX_M).contains(&m)
+        && w.k % 256 == 0
+}
 
 /// `velox_5090_linear_skinny16`'s format code for a weight it serves at `m` tokens.
 fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
@@ -262,6 +282,9 @@ impl CudaKernels for Rtx5090Kernels {
         if m <= GEMV_MAX_M {
             return ActQuant::Exact;
         }
+        if a16_fp8(w, m) {
+            return ActQuant::Bf16;
+        }
         if let Some(f) = skinny16_format(w, m) {
             // NVFP4 views the FP4 tensor-core path serves (A4 allowed, 128-row aligned) keep it.
             let a4 = matches!(w.act, ActPolicy::AllowA4 { .. }) && w.row_begin % 128 == 0;
@@ -298,6 +321,12 @@ impl CudaKernels for Rtx5090Kernels {
                 "rtx5090 linear a8",
             ),
             ActQuant::Bf16 => {
+                if a16_fp8(w, m) {
+                    return status(
+                        unsafe { velox_5090_linear_a16_fp8(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr()) },
+                        "rtx5090 linear a16 fp8",
+                    );
+                }
                 if let Some(f) = skinny16_format(w, m) {
                     return status(
                         unsafe { velox_5090_linear_skinny16(x.as_ptr(), mi, wp, pr, k, rb, rows, f, y.as_mut_ptr()) },
