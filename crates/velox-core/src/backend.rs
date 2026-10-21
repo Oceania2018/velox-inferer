@@ -122,6 +122,16 @@ pub struct GdnShape {
     pub row0: usize,
 }
 
+/// One copy of [`Backend::copy_batch`]:
+/// `dsts[dst][dst_offset ..][.. len] = src[src_offset ..][.. len]`.
+pub struct CopySpec<'a, Buf> {
+    pub src: &'a Buf,
+    pub src_offset: usize,
+    pub dst: usize,
+    pub dst_offset: usize,
+    pub len: usize,
+}
+
 /// One Gated DeltaNet layer of [`Backend::gdn_replay`].
 pub struct GdnReplayLayer<'a, Buf> {
     /// `[tokens, channels]` conv1d inputs of the window.
@@ -605,6 +615,22 @@ pub trait Backend {
         dst_offset: usize,
         len: usize,
     ) -> Result<()>;
+    /// Several independent copies into `dsts` (written ranges must not overlap each other or a
+    /// source), in stream order with other work but in any order among themselves: one submission
+    /// for many small copies, such as a checkpoint's per-layer buffers going to system RAM.
+    fn copy_batch(
+        &self,
+        dsts: &mut [&mut Self::Buffer],
+        ops: &[CopySpec<'_, Self::Buffer>],
+    ) -> Result<()> {
+        for op in ops {
+            let dst = dsts.get_mut(op.dst).ok_or_else(|| {
+                crate::Error::Shape(format!("copy_batch: no destination {}", op.dst))
+            })?;
+            self.copy(op.src, op.src_offset, dst, op.dst_offset, op.len)?;
+        }
+        Ok(())
+    }
     /// Writes `[tokens, heads, head_dim]` into `out`; see [`AttnShape`].
     fn attention(
         &self,

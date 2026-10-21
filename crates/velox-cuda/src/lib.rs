@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
-    Copy2dShape, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape,
-    NormKind, RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
+    Copy2dShape, CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind,
+    KvStoreShape, NormKind, RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
 };
 use velox_core::{
     check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, VariantInfo,
@@ -39,6 +39,12 @@ mod ffi {
         pub fn velox_cuda_profiler(on: i32) -> i32;
         pub fn velox_cuda_malloc_zeroed(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn velox_cuda_host_alloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
+        pub fn velox_cuda_copy_batch(
+            dsts: *const *mut c_void,
+            srcs: *const *const c_void,
+            sizes: *const usize,
+            count: usize,
+        ) -> i32;
         pub fn velox_cuda_free_host(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_free(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_htod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
@@ -1014,6 +1020,50 @@ impl Backend for CudaBackend {
             };
         }
         Ok(buf)
+    }
+
+    fn copy_batch(
+        &self,
+        dsts: &mut [&mut CudaBuffer],
+        ops: &[CopySpec<'_, CudaBuffer>],
+    ) -> Result<()> {
+        if graph_mode() != GraphMode::None {
+            // Recorded steps keep per-copy nodes (and staged offsets).
+            for op in ops {
+                let dst = dsts.get_mut(op.dst).ok_or_else(|| {
+                    Error::Shape(format!("copy_batch: no destination {}", op.dst))
+                })?;
+                self.copy(op.src, op.src_offset, dst, op.dst_offset, op.len)?;
+            }
+            return Ok(());
+        }
+        let mut dp = Vec::with_capacity(ops.len());
+        let mut sp = Vec::with_capacity(ops.len());
+        let mut sizes = Vec::with_capacity(ops.len());
+        for op in ops {
+            let dst = dsts
+                .get(op.dst)
+                .ok_or_else(|| Error::Shape(format!("copy_batch: no destination {}", op.dst)))?;
+            check::copy(op.src.len, op.src_offset, dst.len, op.dst_offset, op.len)?;
+            if op.len == 0 {
+                continue;
+            }
+            // SAFETY: offsets validated above.
+            unsafe {
+                dp.push(dst.ptr.add(op.dst_offset).cast::<c_void>());
+                sp.push(op.src.ptr.add(op.src_offset).cast::<c_void>().cast_const());
+            }
+            sizes.push(op.len * 4);
+        }
+        self.timed("copy_batch", || {
+            // SAFETY: arrays of equal length; every range validated above.
+            status(
+                unsafe {
+                    ffi::velox_cuda_copy_batch(dp.as_ptr(), sp.as_ptr(), sizes.as_ptr(), dp.len())
+                },
+                "cudaMemcpyBatchAsync",
+            )
+        })
     }
 
     fn host_bytes<'a>(&self, buf: &'a CudaBuffer) -> Option<&'a [u8]> {
