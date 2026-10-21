@@ -387,7 +387,7 @@ impl Backend for CpuBackend {
                 let g = h / s.group;
                 let mut y = (f64::from(base[t0 * c + h]) + f64::from(d[t0 * g_n + g]))
                     * f64::from(x[i * c + h]);
-                if i > 0 {
+                if i % s.block_rows() > 0 {
                     y += (f64::from(base[t1 * c + h]) + f64::from(d[t1 * g_n + g]))
                         * f64::from(x[(i - 1) * c + h]);
                 }

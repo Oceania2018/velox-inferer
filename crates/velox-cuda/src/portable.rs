@@ -1052,6 +1052,7 @@ extern "C" {
         group: i32,
         side: i32,
         accumulate: i32,
+        block: i32,
     ) -> i32;
     fn velox_portable_copy2d(
         src: *const f32,
@@ -1146,6 +1147,7 @@ pub fn dyn_conv(
                 to_i32("group", s.group)?,
                 s.side as i32,
                 i32::from(s.accumulate),
+                to_i32("block", s.block_rows())?,
             )
         },
         "portable dyn_conv",

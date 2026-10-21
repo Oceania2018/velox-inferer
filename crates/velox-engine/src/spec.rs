@@ -273,15 +273,44 @@ impl<B: Backend> DFlashDrafter<B> {
     }
 
     /// Activations for drafters of up to `drafts` drafts that materialize up to `ctx_rows`
-    /// context rows at once (the target's prefill chunk).
+    /// context rows at once (the target's prefill chunk), proposing for up to `seqs` sequences at
+    /// once with the short block.
     pub fn workspace(
         b: &B,
         dm: &DFlashModel<B>,
         target: &Qwen35Text<B>,
         ctx_rows: usize,
         drafts: usize,
+        seqs: usize,
     ) -> Result<DFlashWorkspace<B>> {
-        dm.workspace(b, target, ctx_rows, Self::max_drafts(drafts) + 1)
+        let max = Self::max_drafts(drafts);
+        let short = max.min(ADAPT_LOW);
+        dm.workspace(b, target, ctx_rows, max + 1, seqs * (short + 1))
+    }
+
+    /// Aligns the context with the target `frontier` before a proposal (see [`Self::draft`]).
+    pub fn align(&mut self, dm: &DFlashModel<B>, frontier: usize) {
+        let st = &mut self.state;
+        if st.end > frontier {
+            dm.rewind(st, frontier);
+        } else if st.end < frontier {
+            st.lo = frontier;
+            st.end = frontier;
+        }
+    }
+
+    /// Picks the drafts from a proposal made for this drafter's context (see
+    /// [`DFlashModel::propose_batch`]).
+    #[allow(clippy::type_complexity)]
+    pub fn pick(
+        &mut self,
+        dm: &DFlashModel<B>,
+        bc: &velox_models::qwen3_5::BlockCandidates,
+        anchor: u32,
+        temperature: f32,
+    ) -> (Vec<u32>, Vec<Vec<(u32, f32)>>) {
+        let rng = &mut self.rng;
+        dm.select(bc, anchor, temperature, &mut || rng.uniform() * 0.5 + 0.5)
     }
 
     /// The context rings (for saving them with a context-store entry).
