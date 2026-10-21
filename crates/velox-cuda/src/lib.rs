@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
-    Copy2dShape, DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind,
-    RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
+    Copy2dShape, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape,
+    NormKind, RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
 };
 use velox_core::{
     check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, VariantInfo,
@@ -169,7 +169,10 @@ pub fn mem_info() -> Result<(u64, u64)> {
 /// (`ncu --profile-from-start off`).
 pub fn profiler(on: bool) -> Result<()> {
     // SAFETY: no arguments besides the flag.
-    status(unsafe { ffi::velox_cuda_profiler(i32::from(on)) }, "cudaProfiler")
+    status(
+        unsafe { ffi::velox_cuda_profiler(i32::from(on)) },
+        "cudaProfiler",
+    )
 }
 
 /// Refuses to run a variant's arch-specific kernels on a device they were not compiled for.
@@ -422,6 +425,15 @@ pub trait CudaKernels: Send + Sync {
         s: GdnShape,
     ) -> Result<()> {
         portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s)
+    }
+
+    fn gdn_replay(
+        &self,
+        layers: &mut [GdnReplayLayer<'_, CudaBuffer>],
+        conv: ConvShape,
+        gdn: GdnShape,
+    ) -> Result<()> {
+        portable::gdn_replay(layers, conv, gdn)
     }
 
     fn attention_full(
@@ -1196,6 +1208,28 @@ impl Backend for CudaBackend {
             self.kernels
                 .gated_delta_net(qkv, ab, a_log, dt_bias, None, state, out, s)
         })
+    }
+
+    fn gdn_replay(
+        &self,
+        layers: &mut [GdnReplayLayer<'_, CudaBuffer>],
+        conv: ConvShape,
+        gdn: GdnShape,
+    ) -> Result<()> {
+        for l in layers.iter() {
+            check::gdn_replay_layer(
+                l.qkv.len,
+                l.conv_out.len,
+                l.ab.len,
+                l.a_log.len,
+                l.dt_bias.len,
+                l.conv_state.len,
+                l.ssm.len,
+                &conv,
+                &gdn,
+            )?;
+        }
+        self.timed("gdn_replay", || self.kernels.gdn_replay(layers, conv, gdn))
     }
 
     fn gated_delta_net_from(

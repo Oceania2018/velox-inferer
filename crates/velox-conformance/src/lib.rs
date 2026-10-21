@@ -7,8 +7,8 @@
 
 use velox_core::backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind, RopeLayout,
-    RopePosShape, RopeShape, WeightView,
+    DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape, NormKind,
+    RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::kv::{decode_cache, encode_cache, KvFormat};
@@ -896,6 +896,108 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `gdn_replay`: `layers` GDN layers advanced over the first `keep` rows of a `window`-row
+    /// window from its recorded inputs and conv outputs; the conv and recurrent states must equal
+    /// running `conv1d_silu` and `gated_delta_net` over those rows.
+    fn gdn_replay(&mut self, layers: usize, window: usize, keep: usize) -> Result<()> {
+        let (k_heads, v_heads, dk, width) = (2, 6, 64, 4);
+        let gs = GdnShape {
+            tokens: keep,
+            k_heads,
+            v_heads,
+            k_dim: dk,
+            v_dim: dk,
+            row0: 0,
+        };
+        let ch = gs.qkv_width();
+        let cs = ConvShape {
+            tokens: keep,
+            channels: ch,
+            width,
+            row0: 0,
+        };
+        let (state_len, conv_len) = (v_heads * dk * dk, (width - 1) * ch);
+        struct L {
+            qkv: Vec<f32>,
+            conv_out: Vec<f32>,
+            ab: Vec<f32>,
+            a_log: Vec<f32>,
+            dt: Vec<f32>,
+            c0: Vec<f32>,
+            s0: Vec<f32>,
+            want_c: Vec<f32>,
+            want_s: Vec<f32>,
+        }
+        let mut ls = Vec::new();
+        for _ in 0..layers {
+            let qkv = self.rng.vec(window * ch, 1.0);
+            let w = self.rng.vec(width * ch, 0.5);
+            let c0 = self.rng.vec(conv_len, 1.0);
+            let ab = self.rng.vec(window * 2 * v_heads, 2.0);
+            let (a_log, dt) = (self.rng.vec(v_heads, 1.0), self.rng.vec(v_heads, 1.0));
+            let s0 = self.rng.vec(state_len, 0.1);
+            // The window's conv outputs, then the reference states after `keep` rows.
+            let (mut c, mut conv_out) = (c0.clone(), vec![0.0; window * ch]);
+            let full = ConvShape {
+                tokens: window,
+                ..cs
+            };
+            CpuBackend.conv1d_silu(&qkv, &w, &mut c, &mut conv_out, full)?;
+            let (mut want_c, mut y) = (c0.clone(), vec![0.0; keep * ch]);
+            CpuBackend.conv1d_silu(&qkv, &w, &mut want_c, &mut y, cs)?;
+            let (mut want_s, mut o) = (s0.clone(), vec![0.0; keep * v_heads * dk]);
+            CpuBackend.gated_delta_net(&conv_out, &ab, &a_log, &dt, &mut want_s, &mut o, gs)?;
+            ls.push(L {
+                qkv,
+                conv_out,
+                ab,
+                a_log,
+                dt,
+                c0,
+                s0,
+                want_c,
+                want_s,
+            });
+        }
+        let up = |v: &[f32]| self.b.upload(v);
+        let mut dev = Vec::new();
+        for l in &ls {
+            dev.push((
+                up(&l.qkv)?,
+                up(&l.conv_out)?,
+                up(&l.ab)?,
+                up(&l.a_log)?,
+                up(&l.dt)?,
+                up(&l.c0)?,
+                up(&l.s0)?,
+            ));
+        }
+        let mut items: Vec<GdnReplayLayer<'_, B::Buffer>> = dev
+            .iter_mut()
+            .map(|(q, co, ab, al, dt, c, s)| GdnReplayLayer {
+                qkv: q,
+                conv_out: co,
+                ab,
+                a_log: al,
+                dt_bias: dt,
+                conv_state: c,
+                ssm: s,
+            })
+            .collect();
+        self.b.gdn_replay(&mut items, cs, gs)?;
+        drop(items);
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (l, d) in ls.iter().zip(&dev) {
+            got.extend(fetch(self.b, &d.5, conv_len)?);
+            got.extend(fetch(self.b, &d.6, state_len)?);
+            want.extend_from_slice(&l.want_c);
+            want.extend_from_slice(&l.want_s);
+        }
+        let name = format!("gdn_replay {layers} layers, {keep} of {window} rows");
+        self.record(name, Some(Op::GdnReplay), &got, &want, 1e-4);
+        Ok(())
+    }
+
     /// `add_rms_norm`: the updated residual and the normed rows.
     fn add_rms_norm(&mut self, rows: usize, dim: usize, kind: NormKind) -> Result<()> {
         let n = rows * dim;
@@ -1453,6 +1555,9 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.state_from(16, 48, 128, 8)?;
     s.state_from(2, 6, 64, 3)?;
     s.state_from(2, 4, 128, 20)?;
+    s.gdn_replay(3, 8, 5)?;
+    s.gdn_replay(2, 8, 1)?;
+    s.gdn_replay(2, 12, 12)?;
     s.gdn(1, 3, 32, 32, [4, 1])?;
     // Qwen3.5 GDN head geometry (16/48 heads scaled down to 2/6), Dk = Dv = 128.
     s.gdn(2, 6, 128, 128, [6, 1])?;
