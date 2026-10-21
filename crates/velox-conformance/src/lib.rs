@@ -966,6 +966,22 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             ring,
         })?;
     }
+    // Other GQA geometries of the shared-tile kernel: d64 with a partial row group, d256 at 16 tokens.
+    for (tokens, heads, kv_heads, head_dim, pos0, ctx_lo, window, ring) in [
+        (5, 12, 4, 64, 300, 0, 128, 256),
+        (16, 16, 2, 256, 5000, 4000, 2048, 2048),
+    ] {
+        s.attention_block(BlockAttnShape {
+            tokens,
+            heads,
+            kv_heads,
+            head_dim,
+            pos0,
+            ctx_lo,
+            window,
+            ring,
+        })?;
+    }
     s.concat_cols(7, 13, 5)?;
     s.top_k(2, 248_320, 248_077, 64)?;
     s.top_k(3, 5000, 4097, 20)?;
