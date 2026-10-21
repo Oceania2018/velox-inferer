@@ -480,6 +480,17 @@ pub trait Backend {
         v_cache: &mut Self::Buffer,
         shape: KvStoreShape,
     ) -> Result<()>;
+    /// Decodes cache rows `pos0 .. pos0 + tokens` (see [`KvStoreShape`]) into the f32 rows they
+    /// represent, `[tokens, kv_heads, head_dim]` each: lets f32 kernels (long prefill chunks) run
+    /// over a quantized cache.
+    fn kv_load(
+        &self,
+        k_cache: &Self::Buffer,
+        v_cache: &Self::Buffer,
+        k: &mut Self::Buffer,
+        v: &mut Self::Buffer,
+        shape: KvStoreShape,
+    ) -> Result<()>;
     /// The operand precision `attention` uses for this shape. For a quantized cache the rounding
     /// applies to the rows the cache represents.
     fn attention_precision(&self, _shape: AttnShape) -> AttnPrecision {

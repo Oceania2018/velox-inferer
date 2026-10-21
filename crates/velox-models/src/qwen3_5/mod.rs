@@ -200,6 +200,9 @@ pub struct Workspace<B: Backend> {
     /// (`[max_tokens, capture.len() * hidden]`, layer-major columns): DFlash conditioning.
     capture: Vec<usize>,
     features: Option<B::Buffer>,
+    /// f32 copies of a quantized cache's visible rows for long chunks (grown on demand), so they
+    /// attend with the f32 prefill kernels instead of decoding packed rows per query.
+    kv_f32: Option<(B::Buffer, B::Buffer)>,
 }
 
 pub struct Qwen35Text<B: Backend> {
@@ -289,6 +292,7 @@ impl<B: Backend> Qwen35Text<B> {
             emb: b.alloc(t * c.hidden)?,
             rows_hidden: b.alloc(t * c.hidden)?,
             capture: Vec::new(),
+            kv_f32: None,
             features: None,
         })
     }
@@ -746,7 +750,29 @@ impl<B: Backend> Qwen35Text<B> {
             pos0,
             kv: kv_format,
         };
-        b.attention(&ws.qn, kc, vc, &mut ws.attn, shape)?;
+        if kv_format != KvFormat::F32 && t > FUSE_MAX_TOKENS {
+            // Long chunk over a quantized cache: decode the visible rows once per layer (a few
+            // ms at 16k positions) and run the f32 prefill kernels on them.
+            let rows = (pos0 + t) * c.kv_dim();
+            if ws.kv_f32.as_ref().is_none_or(|(k, _)| b.len(k) < rows) {
+                let cap = rows.next_power_of_two();
+                ws.kv_f32 = Some((b.alloc(cap)?, b.alloc(cap)?));
+            }
+            let (kf, vf) = ws.kv_f32.as_mut().expect("allocated above");
+            let all = KvStoreShape {
+                tokens: pos0 + t,
+                pos0: 0,
+                ..store
+            };
+            b.kv_load(kc, vc, kf, vf, all)?;
+            let f32_shape = AttnShape {
+                kv: KvFormat::F32,
+                ..shape
+            };
+            b.attention(&ws.qn, kf, vf, &mut ws.attn, f32_shape)?;
+        } else {
+            b.attention(&ws.qn, kc, vc, &mut ws.attn, shape)?;
+        }
         b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
         b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
         Ok(())
