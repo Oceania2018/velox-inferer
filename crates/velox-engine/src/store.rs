@@ -279,6 +279,11 @@ impl<B: Backend> ContextStore<B> {
         Ok(false)
     }
 
+    /// Whether a state is ready for a capture without pinning memory on the request path.
+    pub fn has_spare_state(&self) -> bool {
+        !self.spare.is_empty()
+    }
+
     /// Whether an entry (resident or being copied to disk) holds exactly `keys`.
     pub fn holds(&self, keys: &[u32]) -> bool {
         self.entries
