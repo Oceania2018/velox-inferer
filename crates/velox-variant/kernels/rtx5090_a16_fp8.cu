@@ -184,12 +184,188 @@ int launch_a16(const A16Args& a) {
     return velox_launch_status();
 }
 
+// ---- wide batches (17..64 tokens): batched speculative verify of several sequences ----
+//
+// The skinny kernel splits K across warps and keeps every token's f32 activations of a stage in
+// shared memory; at 32-64 tokens that leaves one small block per SM and the MMAs starve. Here a
+// block owns 32 weight rows (16 per warp, each over the whole K) and all tokens, activations are
+// rounded to bf16 once per call (the same RNE rounding) and stream with the codes through a
+// three-stage cp.async pipeline in ~34 KB, so several blocks share an SM.
+constexpr int kWideK = 64;                 // K per stage
+constexpr int kWideStages = 3;
+constexpr int kWideWarps = 2;              // 16 weight rows each
+constexpr int kWideRows = 16 * kWideWarps;
+constexpr int kWideAS = kWideK + 8;        // bf16 activation row stride (elements): spreads banks
+
+template <int TOK>
+struct WideGeo {
+    static constexpr int CODE = kWideRows * kWideK;  // bytes
+    static constexpr int ACT = TOK * kWideAS * 2;    // bytes
+    static constexpr int STAGE = CODE + ACT;
+    static constexpr int SMEM = kWideStages * STAGE;
+};
+
+__global__ void to_bf16_kernel(const float2* __restrict__ x, __nv_bfloat162* __restrict__ y, long long pairs) {
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < pairs;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const float2 v = x[i];
+        y[i] = __floats2bfloat162_rn(v.x, v.y);
+    }
+}
+
+template <int TOK>
+// Split-K: blockIdx.y takes K groups [y * gps, (y + 1) * gps); with several splits it writes unscaled
+// partial sums to part[y][t][row] for wide_reduce_kernel, else the scaled outputs.
+__global__ void __launch_bounds__(kWideWarps * 32)
+    a16_fp8_wide_kernel(A16Args p, const __nv_bfloat16* __restrict__ xb, float* __restrict__ part, int gps) {
+    using G = WideGeo<TOK>;
+    extern __shared__ __align__(128) uint8_t smem[];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int gid = lane >> 2, lid = lane & 3;
+    const int row0 = blockIdx.x * kWideRows;
+    const int g0 = blockIdx.y * gps;
+    const int groups = min(gps, p.k / kWideK - g0);
+    const long long scale_plane = (p.parent_rows * p.k + 255) / 256 * 256;
+
+    auto stage = [&](int st, int k0) {
+        uint8_t* cs = smem + st * G::STAGE;
+        // Codes: 32 rows x 64 bytes, 16-byte chunks XOR-swizzled by row pair.
+        for (int i = tid; i < kWideRows * 4; i += kWideWarps * 32) {
+            const int r = i >> 2, c = i & 3;
+            const bool ok = row0 + r < p.rows;
+            const long long wr = p.row_begin + (ok ? row0 + r : 0);
+            cp_async16(cs + r * kWideK + ((c ^ ((r >> 1) & 3)) * 16), p.w + wr * p.k + k0 + c * 16, ok);
+        }
+        // Activations: TOK rows x 64 bf16 (rows past m zero-filled).
+        uint8_t* as = cs + G::CODE;
+        for (int i = tid; i < TOK * 8; i += kWideWarps * 32) {
+            const int t = i >> 3, c = i & 7;
+            const bool ok = t < p.m;
+            cp_async16(as + t * kWideAS * 2 + c * 16, xb + static_cast<long long>(ok ? t : 0) * p.k + k0 + c * 8, ok);
+        }
+    };
+
+    float acc[TOK / 8][4] = {};
+#pragma unroll
+    for (int st = 0; st < kWideStages - 1; ++st) {
+        if (st < groups) stage(st, (g0 + st) * kWideK);
+        cp_commit();
+    }
+    const int r = warp * 16 + gid;  // block-local rows r and r + 8
+    for (int g = 0; g < groups; ++g) {
+        cp_wait<kWideStages - 2>();
+        __syncthreads();
+        if (g + kWideStages - 1 < groups)
+            stage((g + kWideStages - 1) % kWideStages, (g0 + g + kWideStages - 1) * kWideK);
+        cp_commit();
+        const uint8_t* cs = smem + (g % kWideStages) * G::STAGE;
+        const __nv_bfloat16* as = reinterpret_cast<const __nv_bfloat16*>(cs + G::CODE);
+        auto pair = [&](int rr, int c) {
+            return *reinterpret_cast<const uint16_t*>(cs + rr * kWideK + (((c >> 4) ^ ((rr >> 1) & 3)) * 16) + (c & 15));
+        };
+#pragma unroll
+        for (int ks = 0; ks < kWideK / 16; ++ks) {
+            const int col = ks * 16 + 2 * lid;
+            const uint32_t a0 = e4m3x2_bf16x2(pair(r, col)), a1 = e4m3x2_bf16x2(pair(r + 8, col));
+            const uint32_t a2 = e4m3x2_bf16x2(pair(r, col + 8)), a3 = e4m3x2_bf16x2(pair(r + 8, col + 8));
+#pragma unroll
+            for (int nt = 0; nt < TOK / 8; ++nt) {
+                const __nv_bfloat16* xr = as + (nt * 8 + gid) * kWideAS + col;
+                mma_bf16(acc[nt], a0, a1, a2, a3, *reinterpret_cast<const uint32_t*>(xr),
+                         *reinterpret_cast<const uint32_t*>(xr + 8));
+            }
+        }
+    }
+    cp_wait<0>();
+    const int ra = row0 + r, rb = ra + 8;
+    if (part != nullptr) {
+        float* out = part + static_cast<long long>(blockIdx.y) * p.m * p.rows;
+#pragma unroll
+        for (int nt = 0; nt < TOK / 8; ++nt) {
+            const int t = nt * 8 + 2 * lid;
+            if (t < p.m) {
+                if (ra < p.rows) out[static_cast<long long>(t) * p.rows + ra] = acc[nt][0];
+                if (rb < p.rows) out[static_cast<long long>(t) * p.rows + rb] = acc[nt][2];
+            }
+            if (t + 1 < p.m) {
+                if (ra < p.rows) out[static_cast<long long>(t + 1) * p.rows + ra] = acc[nt][1];
+                if (rb < p.rows) out[static_cast<long long>(t + 1) * p.rows + rb] = acc[nt][3];
+            }
+        }
+        return;
+    }
+    const uint16_t* sp = reinterpret_cast<const uint16_t*>(p.w + scale_plane);
+    const float sa = ra < p.rows ? __uint_as_float(static_cast<uint32_t>(sp[p.row_begin + ra]) << 16) : 0.0f;
+    const float sb = rb < p.rows ? __uint_as_float(static_cast<uint32_t>(sp[p.row_begin + rb]) << 16) : 0.0f;
+#pragma unroll
+    for (int nt = 0; nt < TOK / 8; ++nt) {
+        const int t = nt * 8 + 2 * lid;
+        if (t < p.m) {
+            if (ra < p.rows) p.y[static_cast<long long>(t) * p.rows + ra] = acc[nt][0] * sa;
+            if (rb < p.rows) p.y[static_cast<long long>(t) * p.rows + rb] = acc[nt][2] * sb;
+        }
+        if (t + 1 < p.m) {
+            if (ra < p.rows) p.y[static_cast<long long>(t + 1) * p.rows + ra] = acc[nt][1] * sa;
+            if (rb < p.rows) p.y[static_cast<long long>(t + 1) * p.rows + rb] = acc[nt][3] * sb;
+        }
+    }
+}
+
+// y[t][row] = scale(row) x the splits' partial sums, added in split order.
+__global__ void wide_reduce_kernel(A16Args p, const float* __restrict__ part, int splits) {
+    const long long n = static_cast<long long>(p.m) * p.rows;
+    const long long scale_plane = (p.parent_rows * p.k + 255) / 256 * 256;
+    const uint16_t* sp = reinterpret_cast<const uint16_t*>(p.w + scale_plane);
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        float s = 0.0f;
+        for (int k = 0; k < splits; ++k) s += part[k * n + i];
+        const int row = static_cast<int>(i % p.rows);
+        p.y[i] = s * __uint_as_float(static_cast<uint32_t>(sp[p.row_begin + row]) << 16);
+    }
+}
+
+// Row blocks below this many get their K split across blocks (about four per SM).
+constexpr int kWideMinBlocks = 680;
+
+template <int TOK>
+int launch_wide(const A16Args& a) {
+    using G = WideGeo<TOK>;
+    // bf16 activations, grow-only and never freed (VeloxScratch): recorded graphs may hold them.
+    static VeloxScratch scratch;
+    const long long n = static_cast<long long>(a.m) * a.k;
+    auto* xb = static_cast<__nv_bfloat16*>(scratch.get(static_cast<size_t>(n) * 2));
+    if (xb == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+    to_bf16_kernel<<<velox_grid_1d(n / 2, 256), 256>>>(reinterpret_cast<const float2*>(a.x),
+                                                       reinterpret_cast<__nv_bfloat162*>(xb), n / 2);
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(a16_fp8_wide_kernel<TOK>, cudaFuncAttributeMaxDynamicSharedMemorySize, G::SMEM);
+        configured = true;
+    }
+    const int blocks = (a.rows + kWideRows - 1) / kWideRows, groups = a.k / kWideK;
+    int splits = (kWideMinBlocks + blocks - 1) / blocks;
+    splits = splits < 1 ? 1 : splits > groups ? groups : splits > 8 ? 8 : splits;
+    const int gps = (groups + splits - 1) / splits;
+    splits = (groups + gps - 1) / gps;
+    float* part = nullptr;
+    if (splits > 1) {
+        static VeloxScratch parts;
+        part = static_cast<float*>(parts.get(static_cast<size_t>(splits) * a.m * a.rows * sizeof(float)));
+        if (part == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+    }
+    a16_fp8_wide_kernel<TOK><<<dim3(blocks, splits), kWideWarps * 32, G::SMEM>>>(a, xb, part, gps);
+    if (splits > 1)
+        wide_reduce_kernel<<<velox_grid_1d(static_cast<long long>(a.m) * a.rows, 256), 256>>>(a, part, splits);
+    return velox_launch_status();
+}
+
 }  // namespace
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T x row scale, for an FP8 row-scaled weight. Requires
 // 1 <= m <= 64, k % 256 == 0 and 16-byte aligned x rows; returns VELOX_ERR_UNSUPPORTED otherwise.
 // Batched speculative verify (several sequences' windows) takes up to 64 rows in one pass over the
-// weights; wider token tiles split K over fewer warps so both pipeline stages fit shared memory.
+// weights (the wide kernel above).
 VELOX_API int velox_5090_linear_a16_fp8(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                         long long row_begin, int rows, float* y) {
     if (m < 1 || m > 64 || k % 256 != 0 || k > 0x7fffffff || reinterpret_cast<uintptr_t>(x) % 16 != 0)
@@ -198,6 +374,6 @@ VELOX_API int velox_5090_linear_a16_fp8(const float* x, int m, const uint8_t* w,
     const bool k512 = k % 512 == 0;
     if (m <= 8) return k512 ? launch_a16<8, 8>(a) : launch_a16<8, 4>(a);
     if (m <= 16) return k512 ? launch_a16<16, 8>(a) : launch_a16<16, 4>(a);
-    if (m <= 32) return launch_a16<32, 4>(a);
-    return launch_a16<64, 2>(a);
+    if (m <= 32) return launch_wide<32>(a);
+    return launch_wide<64>(a);
 }
