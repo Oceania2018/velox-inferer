@@ -114,8 +114,16 @@ pub struct LinearConfig {
 pub fn run_linear<B: Backend>(b: &B, c: &LinearConfig) -> Result<()> {
     let mut rng = velox_core::rng::Rng::new(11);
     let bytes = velox_conformance::random_weight(&mut rng, c.format, c.n, c.k);
-    let wd = b.upload_bytes(&bytes)?;
-    let view = velox_core::WeightView::full(&wd, c.format, c.n, c.k).with_act(c.act);
+    // Rotate through enough copies to exceed the L2 cache: a model never finds its weights there.
+    let copies = (384_000_000 / bytes.len().max(1)).clamp(1, 64);
+    let wds = (0..copies)
+        .map(|_| b.upload_bytes(&bytes))
+        .collect::<Result<Vec<_>>>()?;
+    let views: Vec<_> = wds
+        .iter()
+        .map(|wd| velox_core::WeightView::full(wd, c.format, c.n, c.k).with_act(c.act))
+        .collect();
+    let view = &views[0];
     println!(
         "linear {} [{}, {}]  {:.1} MB  on {}",
         c.format.name(),
@@ -127,16 +135,20 @@ pub fn run_linear<B: Backend>(b: &B, c: &LinearConfig) -> Result<()> {
     for &m in &c.ms {
         let x = b.upload(&rng.vec(m * c.k, 1.0))?;
         let mut y = b.alloc(m * c.n)?;
-        for _ in 0..3 {
-            b.linear(&x, &view, &mut y, m)?;
+        for v in &views {
+            b.linear(&x, v, &mut y, m)?;
         }
         b.synchronize()?;
-        let mut samples = Vec::with_capacity(c.iters);
-        for _ in 0..c.iters {
+        // Back-to-back batches over all copies, so host launch and sync latency amortize.
+        let rounds = c.iters.div_ceil(copies).max(5);
+        let mut samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
             let t0 = Instant::now();
-            b.linear(&x, &view, &mut y, m)?;
+            for v in &views {
+                b.linear(&x, v, &mut y, m)?;
+            }
             b.synchronize()?;
-            samples.push(t0.elapsed().as_secs_f64());
+            samples.push(t0.elapsed().as_secs_f64() / copies as f64);
         }
         let t = median(samples);
         println!(
@@ -144,7 +156,7 @@ pub fn run_linear<B: Backend>(b: &B, c: &LinearConfig) -> Result<()> {
             t * 1e6,
             bytes.len() as f64 / t / 1e9,
             2.0 * (m * c.n * c.k) as f64 / t / 1e12,
-            b.linear_act(&view, m)
+            b.linear_act(view, m)
         );
     }
     Ok(())
