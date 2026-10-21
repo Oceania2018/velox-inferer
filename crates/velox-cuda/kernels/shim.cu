@@ -198,7 +198,11 @@ int launch_slot(int slot) {
     GraphSlot& s = g_slots[slot];
     if (cudaError_t e = cudaGraphLaunch(s.exec, cudaStreamPerThread)) return static_cast<int>(e);
     s.launched = true;
-    return static_cast<int>(cudaEventRecord(s.done, cudaStreamPerThread));
+    if (cudaError_t e = cudaEventRecord(s.done, cudaStreamPerThread)) return static_cast<int>(e);
+    // WDDM (Windows, WSL) batches submissions until something flushes them; a stream query does,
+    // so a step's first segment starts while the host still submits the rest.
+    const cudaError_t q = cudaStreamQuery(cudaStreamPerThread);
+    return q == cudaErrorNotReady ? 0 : static_cast<int>(q);
 }
 }  // namespace
 
