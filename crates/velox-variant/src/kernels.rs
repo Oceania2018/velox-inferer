@@ -3,7 +3,7 @@
 
 use velox_core::backend::{ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, WeightView};
 use velox_core::check::to_i32;
-use velox_core::{Error, Op, Result, WeightFormat};
+use velox_core::{Error, KvFormat, Op, Result, WeightFormat};
 use velox_cuda::{portable, status, CudaBuffer, CudaKernels};
 
 extern "C" {
@@ -132,7 +132,13 @@ impl CudaKernels for Rtx5090Kernels {
     }
 
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
-        if s.tokens >= FLASH_MIN_TOKENS && s.head_dim == 256 && s.heads % s.kv_heads == 0 && s.kv_len() <= i32::MAX as usize {
+        // The flash kernel reads f32 caches; packed (quantized) caches take the portable KV path.
+        if s.kv == KvFormat::F32
+            && s.tokens >= FLASH_MIN_TOKENS
+            && s.head_dim == 256
+            && s.heads % s.kv_heads == 0
+            && s.kv_len() <= i32::MAX as usize
+        {
             AttnPrecision::Fp8QkF16Pv
         } else {
             AttnPrecision::Exact
