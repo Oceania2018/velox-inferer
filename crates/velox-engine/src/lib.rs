@@ -63,8 +63,9 @@ struct Lane<B: Backend> {
     keys: Vec<u32>,
     checkpoints: Vec<Checkpoint<B>>,
     /// Storage of dropped checkpoints, reused for new ones (allocating and freeing them would
-    /// synchronize the device).
+    /// synchronize the device): device storage here, system-RAM storage in `host_spare`.
     spare: Vec<Checkpoint<B>>,
+    host_spare: Vec<Checkpoint<B>>,
     zero: Checkpoint<B>,
     /// Draft model for speculative decoding (main lane only).
     drafter: Option<Drafter<B>>,
@@ -311,6 +312,7 @@ impl<B: Backend> QwenEngine<B> {
                 keys: Vec::new(),
                 checkpoints: Vec::new(),
                 spare: Vec::new(),
+                host_spare: Vec::new(),
                 spec_stats: (0, 0, 0),
                 zero,
                 drafter,
@@ -399,6 +401,47 @@ impl<B: Backend> QwenEngine<B> {
             spare.push(checkpoints.remove(drop));
         }
         spare.truncate(MAX_SPARE);
+    }
+
+    /// Host checkpoint mode: the latest prefill's checkpoints (the next request's likeliest
+    /// restore points) stay on the device; of the older ones only the two earliest (system prompt
+    /// and first turn: what a new conversation shares) are kept, moved to system RAM once; the
+    /// rest are dropped. Device memory then holds a few checkpoints however long the context.
+    fn place_checkpoints(&self, lane: &mut Lane<B>, fresh: usize) -> Result<(), CoreError> {
+        const HOST_ANCHORS: usize = 2;
+        // Pruning returns storage of either kind to `spare`; snapshots must get device storage.
+        let (host, device): (Vec<_>, Vec<_>) = lane.spare.drain(..).partition(|c| c.on_host());
+        lane.spare = device;
+        lane.host_spare.extend(host);
+        lane.checkpoints.sort_by_key(|c| c.pos);
+        let mut kept = Vec::with_capacity(lane.checkpoints.len());
+        let mut anchors = 0;
+        for cp in lane.checkpoints.drain(..) {
+            if cp.pos >= fresh {
+                kept.push(cp);
+            } else if anchors < HOST_ANCHORS {
+                anchors += 1;
+                if cp.on_host() {
+                    kept.push(cp);
+                } else {
+                    let mut h = match lane.host_spare.pop() {
+                        Some(h) => h,
+                        None => lane.session.blank_checkpoint_in(&self.b, cp.pos, true)?,
+                    };
+                    cp.copy_into(&self.b, &mut h)?;
+                    kept.push(h);
+                    lane.spare.push(cp);
+                }
+            } else if cp.on_host() {
+                lane.host_spare.push(cp);
+            } else {
+                lane.spare.push(cp);
+            }
+        }
+        lane.checkpoints = kept;
+        lane.spare.truncate(MAX_SPARE);
+        lane.host_spare.truncate(MAX_SPARE);
+        Ok(())
     }
 
     /// Restores the best reusable state for `keys` and returns how many tokens are already in it.
@@ -599,10 +642,8 @@ impl<B: Backend> QwenEngine<B> {
         for pos in self.checkpoint_positions(&p.ids, start) {
             let mut cp = match lane.spare.pop() {
                 Some(cp) => cp,
-                None => {
-                    lane.session
-                        .blank_checkpoint_in(&self.b, pos, self.cfg.host_checkpoints)?
-                }
+                // Snapshots are taken on the device (fast); see `Self::place_checkpoints`.
+                None => lane.session.blank_checkpoint(&self.b, pos)?,
             };
             cp.pos = pos;
             cp.rope_delta = p.rope_delta;
@@ -777,7 +818,13 @@ where
         let (keep, stale): (Vec<_>, Vec<_>) =
             lane.checkpoints.drain(..).partition(|c| c.pos <= start);
         lane.checkpoints = keep;
-        lane.spare.extend(stale);
+        for cp in stale {
+            if cp.on_host() {
+                lane.host_spare.push(cp);
+            } else {
+                lane.spare.push(cp);
+            }
+        }
         lane.keys.truncate(start);
         let mut t_fill = t_reuse;
         let prefilled = self.prefill(lane, ws, &p, &images, start).and_then(|()| {
@@ -801,6 +848,9 @@ where
             self.cfg.max_checkpoints,
             start + 1,
         );
+        if self.cfg.host_checkpoints {
+            self.place_checkpoints(lane, start + 1).map_err(core)?;
+        }
         let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
         if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
             eprintln!(
