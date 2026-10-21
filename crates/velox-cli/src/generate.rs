@@ -399,6 +399,7 @@ fn dflash_generate<B: Backend>(
         rounds += 1;
         proposed += window.len() - 1;
         accepted += keep - 1;
+        dr.observe(keep - 1);
         let mut stop = false;
         for &tok in window[1..keep].iter().chain(std::iter::once(&next)) {
             out.push(tok);
