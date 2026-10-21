@@ -896,6 +896,37 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `add_rms_norm`: the updated residual and the normed rows.
+    fn add_rms_norm(&mut self, rows: usize, dim: usize, kind: NormKind) -> Result<()> {
+        let n = rows * dim;
+        let (acc0, x, w) = (
+            self.rng.vec(n, 2.0),
+            self.rng.vec(n, 1.0),
+            self.rng.vec(dim, 0.5),
+        );
+        let (mut acc, mut y) = (acc0.clone(), vec![0.0; n]);
+        CpuBackend.add_rms_norm(&mut acc, &x, &w, &mut y, rows, dim, 1e-6, kind)?;
+        let (mut ad, xd, wd) = (
+            self.b.upload(&acc0)?,
+            self.b.upload(&x)?,
+            self.b.upload(&w)?,
+        );
+        let mut yd = self.b.alloc(n)?;
+        self.b
+            .add_rms_norm(&mut ad, &xd, &wd, &mut yd, rows, dim, 1e-6, kind)?;
+        let mut got = fetch(self.b, &ad, n)?;
+        got.extend(fetch(self.b, &yd, n)?);
+        acc.extend(y);
+        self.record(
+            format!("add_rms_norm {rows}x{dim} {kind:?}"),
+            Some(Op::RmsNorm),
+            &got,
+            &acc,
+            1e-5,
+        );
+        Ok(())
+    }
+
     fn attention_full(&mut self, s: FullAttnShape) -> Result<()> {
         let len = s.tokens * s.heads * s.head_dim;
         let (q, k, v) = (
@@ -1211,6 +1242,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.embed(WeightFormat::Bf16, 10, 130, &[9, 1])?;
     s.embed(WeightFormat::Nvfp4, 128, 64, &[127, 0, 64])?;
     s.embed(WeightFormat::Q5G64, 20, 200, &[19, 0])?;
+    s.add_rms_norm(8, 5120, NormKind::Offset)?;
+    s.add_rms_norm(3, 130, NormKind::Plain)?;
     s.rms_norm(1, 4096, NormKind::Plain)?;
     s.rms_norm(5, 130, NormKind::Plain)?;
     s.rms_norm(6, 256, NormKind::Offset)?;

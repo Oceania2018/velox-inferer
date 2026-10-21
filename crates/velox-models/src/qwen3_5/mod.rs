@@ -472,15 +472,30 @@ impl<B: Backend> Qwen35Text<B> {
                 // Recorded steps launch in segments, so the GPU starts while the rest is submitted.
                 b.graph_break()?;
             }
-            b.rms_norm(
-                &ws.x,
-                w.param(l.input_norm),
-                &mut ws.h,
-                t,
-                hd,
-                c.eps,
-                NormKind::Offset,
-            )?;
+            if li == 0 {
+                b.rms_norm(
+                    &ws.x,
+                    w.param(l.input_norm),
+                    &mut ws.h,
+                    t,
+                    hd,
+                    c.eps,
+                    NormKind::Offset,
+                )?;
+            } else {
+                // The previous layer's MLP residual, fused with this layer's input norm.
+                b.add_rms_norm(
+                    &mut ws.x,
+                    &ws.y,
+                    w.param(l.input_norm),
+                    &mut ws.h,
+                    t,
+                    hd,
+                    c.eps,
+                    NormKind::Offset,
+                )?;
+                self.capture_features(b, ws, li - 1, t)?;
+            }
             match &l.mixer {
                 Mixer::Gdn {
                     qkv,
@@ -613,9 +628,9 @@ impl<B: Backend> Qwen35Text<B> {
                     ai += 1;
                 }
             }
-            b.add(&mut ws.x, &ws.y, t * hd)?;
-            b.rms_norm(
-                &ws.x,
+            b.add_rms_norm(
+                &mut ws.x,
+                &ws.y,
                 w.param(l.post_norm),
                 &mut ws.h,
                 t,
@@ -624,24 +639,10 @@ impl<B: Backend> Qwen35Text<B> {
                 NormKind::Offset,
             )?;
             self.mlp(b, ws, l, t)?;
-            b.add(&mut ws.x, &ws.y, t * hd)?;
-            if let Some(j) = ws.capture.iter().position(|&x| x == li) {
-                let cols = ws.capture.len() * hd;
-                let f = ws.features.as_mut().expect("allocated with capture");
-                b.copy2d(
-                    &ws.x,
-                    f,
-                    Copy2dShape {
-                        rows: t,
-                        cols: hd,
-                        src_offset: 0,
-                        src_stride: hd,
-                        dst_offset: j * hd,
-                        dst_stride: cols,
-                    },
-                )?;
-            }
+            // The MLP residual is added by the next layer's fused input norm.
         }
+        b.add(&mut ws.x, &ws.y, t * hd)?;
+        self.capture_features(b, ws, w.layers.len() - 1, t)?;
         if ws.keep_rows {
             b.rms_norm(
                 &ws.x,
@@ -820,6 +821,28 @@ impl<B: Backend> Qwen35Text<B> {
         }
         b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
         b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
+        Ok(())
+    }
+
+    /// Copies the residual stream after layer `li` into the DFlash features when it is captured.
+    fn capture_features(&self, b: &B, ws: &mut Workspace<B>, li: usize, t: usize) -> Result<()> {
+        let hd = self.cfg.hidden;
+        if let Some(j) = ws.capture.iter().position(|&x| x == li) {
+            let cols = ws.capture.len() * hd;
+            let f = ws.features.as_mut().expect("allocated with capture");
+            b.copy2d(
+                &ws.x,
+                f,
+                Copy2dShape {
+                    rows: t,
+                    cols: hd,
+                    src_offset: 0,
+                    src_stride: hd,
+                    dst_offset: j * hd,
+                    dst_stride: cols,
+                },
+            )?;
+        }
         Ok(())
     }
 
