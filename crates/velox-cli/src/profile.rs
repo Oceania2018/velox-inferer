@@ -93,6 +93,13 @@ impl<B: Backend> Backend for Profiled<B> {
     fn upload_bytes_host(&self, data: &[u8]) -> Result<B::Buffer> {
         self.inner.upload_bytes_host(data)
     }
+    fn copy_batch(
+        &self,
+        dsts: &mut [&mut B::Buffer],
+        ops: &[velox_core::CopySpec<'_, B::Buffer>],
+    ) -> Result<()> {
+        self.time("copy_batch", || self.inner.copy_batch(dsts, ops))
+    }
     fn host_bytes<'a>(&self, buf: &'a B::Buffer) -> Option<&'a [u8]> {
         self.inner.host_bytes(buf)
     }

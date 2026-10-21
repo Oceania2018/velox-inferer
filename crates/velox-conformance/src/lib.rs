@@ -7,8 +7,8 @@
 
 use velox_core::backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape, NormKind,
-    RopeLayout, RopePosShape, RopeShape, WeightView,
+    CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape,
+    NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::kv::{decode_cache, encode_cache, KvFormat};
@@ -723,6 +723,64 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `copy_batch`: several copies from two sources into three destinations (one in system RAM
+    /// when the backend has it), some into the same destination.
+    fn copy_batch(&mut self) -> Result<()> {
+        let (a, b) = (self.rng.vec(500, 1.0), self.rng.vec(300, 1.0));
+        let lens = [200usize, 150, 400];
+        let init: Vec<Vec<f32>> = lens.iter().map(|&n| self.rng.vec(n, 1.0)).collect();
+        // (source, source offset, destination, destination offset, length)
+        let plan = [
+            (0, 7, 0, 3, 50),
+            (1, 0, 0, 100, 60),
+            (0, 100, 1, 0, 150),
+            (1, 40, 2, 10, 200),
+            (0, 300, 2, 250, 150),
+        ];
+        let mut want = init.clone();
+        for &(s, so, d, doff, n) in &plan {
+            let src = if s == 0 { &a } else { &b };
+            want[d][doff..doff + n].copy_from_slice(&src[so..so + n]);
+        }
+        let (da, db) = (self.b.upload(&a)?, self.b.upload(&b)?);
+        let mut dsts = Vec::new();
+        for (i, v) in init.iter().enumerate() {
+            let up = self.b.upload(v)?;
+            let mut d = if i == 1 {
+                self.b.alloc_host(v.len())?
+            } else {
+                self.b.alloc(v.len())?
+            };
+            self.b.copy(&up, 0, &mut d, 0, v.len())?;
+            dsts.push(d);
+        }
+        let ops: Vec<CopySpec<'_, B::Buffer>> = plan
+            .iter()
+            .map(|&(s, so, d, doff, n)| CopySpec {
+                src: if s == 0 { &da } else { &db },
+                src_offset: so,
+                dst: d,
+                dst_offset: doff,
+                len: n,
+            })
+            .collect();
+        let mut refs: Vec<&mut B::Buffer> = dsts.iter_mut().collect();
+        self.b.copy_batch(&mut refs, &ops)?;
+        let (mut got, mut all) = (Vec::new(), Vec::new());
+        for (d, w) in dsts.iter().zip(&want) {
+            got.extend(fetch(self.b, d, w.len())?);
+            all.extend_from_slice(w);
+        }
+        self.record(
+            "copy_batch 5 copies, 3 destinations".into(),
+            Some(Op::CopyBatch),
+            &got,
+            &all,
+            0.0,
+        );
+        Ok(())
+    }
+
     fn copy2d(&mut self, s: Copy2dShape) -> Result<()> {
         let src_len = s.src_offset + s.rows * s.src_stride;
         let dst_len = s.dst_offset + s.rows * s.dst_stride;
@@ -1425,6 +1483,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.elementwise(1000)?;
     s.elementwise(4097)?;
     s.copy(300, 1000, 123)?;
+    s.copy_batch()?;
     for a in [
         // Prefill at the Qwen3.5 geometry (head_dim 256, 6 query heads per KV head); tensor-core
         // kernels tile 64 queries x 32 keys, so these are ragged in both.

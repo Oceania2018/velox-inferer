@@ -35,6 +35,7 @@ pub enum Op {
     KvLoad,
     GdnReplay,
     RmsNormGated,
+    CopyBatch,
 }
 
 impl Op {
@@ -67,6 +68,7 @@ impl Op {
         Op::KvLoad,
         Op::GdnReplay,
         Op::RmsNormGated,
+        Op::CopyBatch,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -99,6 +101,7 @@ impl Op {
             Op::KvLoad => "kv_load",
             Op::GdnReplay => "gdn_replay",
             Op::RmsNormGated => "rms_norm_gated",
+            Op::CopyBatch => "copy_batch",
         }
     }
 }
