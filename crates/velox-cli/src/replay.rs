@@ -381,6 +381,9 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     let mut steps = Vec::new();
     collect_steps(&session, &dir, None, &mut steps)?;
     steps.truncate(max_steps);
+    // --from N: start at the N-th step (1-based), e.g. `--from 2 --steps 2` replays step 2 only.
+    let from: usize = a.parse("from", 1)?;
+    steps.drain(..from.saturating_sub(1).min(steps.len()));
     if steps.is_empty() {
         return Err(cfg("no steps with a recorded request found"));
     }

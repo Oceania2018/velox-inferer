@@ -29,6 +29,8 @@ pub struct Session<B: Backend> {
     /// Storage format of the attention KV caches.
     pub kv_format: KvFormat,
     kv: Vec<(B::Buffer, B::Buffer)>,
+    /// f32 slots of one cache position (all KV heads) in each attention layer's K or V cache.
+    kv_row: usize,
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
     /// Speculative-verify state, allocated on first `verify`.
@@ -122,7 +124,148 @@ impl<B: Backend> Checkpoint<B> {
     }
 }
 
+/// Cache positions per [`KvSegment`] page.
+pub const KV_PAGE_ROWS: usize = 256;
+
+/// Attention KV cache rows `lo..hi` of every attention layer, kept outside a session so the
+/// prefix they belong to can be put back into a session whose cache now holds other tokens.
+/// Stored in pages of [`KV_PAGE_ROWS`] positions, each one buffer of
+/// [`Session::kv_page_len`] slots holding every layer's K then V rows, so the storage of any
+/// segment can be recycled through a pool of equal pages.
+pub struct KvSegment<B: Backend> {
+    pub lo: usize,
+    pub hi: usize,
+    pages: Vec<B::Buffer>,
+}
+
+impl<B: Backend> KvSegment<B> {
+    /// Storage size in bytes.
+    pub fn bytes(&self, b: &B) -> usize {
+        self.pages.iter().map(|x| b.len(x) * 4).sum()
+    }
+
+    /// Storage buffers in a fixed order (for serialization).
+    pub fn buffers(&self) -> impl Iterator<Item = &B::Buffer> {
+        self.pages.iter()
+    }
+
+    /// Mutable [`Self::buffers`], same order.
+    pub fn buffers_mut(&mut self) -> impl Iterator<Item = &mut B::Buffer> {
+        self.pages.iter_mut()
+    }
+
+    /// The pages, for reuse.
+    pub fn into_pages(self) -> Vec<B::Buffer> {
+        self.pages
+    }
+}
+
+impl<B: Backend> Checkpoint<B> {
+    /// Storage size in bytes.
+    pub fn bytes(&self, b: &B) -> usize {
+        self.conv
+            .iter()
+            .chain(&self.ssm)
+            .map(|x| b.len(x) * 4)
+            .sum()
+    }
+
+    /// Storage buffers in a fixed order (for serialization).
+    pub fn buffers(&self) -> impl Iterator<Item = &B::Buffer> {
+        self.conv.iter().chain(&self.ssm)
+    }
+
+    /// Mutable [`Self::buffers`], same order.
+    pub fn buffers_mut(&mut self) -> impl Iterator<Item = &mut B::Buffer> {
+        self.conv.iter_mut().chain(self.ssm.iter_mut())
+    }
+}
+
 impl<B: Backend> Session<B> {
+    /// f32 slots of one [`KvSegment`] page of this session's shape.
+    pub fn kv_page_len(&self) -> usize {
+        2 * self.kv.len() * KV_PAGE_ROWS * self.kv_row
+    }
+
+    /// Storage for attention KV rows `lo..hi`, with pages of [`Self::kv_page_len`] slots from
+    /// `page` (a pool, or [`Backend::alloc_host`]); filled by [`Self::save_kv`] or through
+    /// [`KvSegment::buffers_mut`].
+    pub fn blank_kv(
+        &self,
+        b: &B,
+        lo: usize,
+        hi: usize,
+        page: &mut dyn FnMut() -> Result<B::Buffer>,
+    ) -> Result<KvSegment<B>> {
+        if lo > hi || hi > self.capacity {
+            return Err(Error::Config(format!(
+                "KV rows {lo}..{hi} outside session capacity {}",
+                self.capacity
+            )));
+        }
+        let mut pages = Vec::with_capacity((hi - lo).div_ceil(KV_PAGE_ROWS));
+        for _ in 0..(hi - lo).div_ceil(KV_PAGE_ROWS) {
+            let p = page()?;
+            if b.len(&p) < self.kv_page_len() {
+                return Err(Error::Config("KV page smaller than kv_page_len".into()));
+            }
+            pages.push(p);
+        }
+        Ok(KvSegment { lo, hi, pages })
+    }
+
+    /// Copies attention KV rows `lo..hi` out of the session into pages from `page`.
+    pub fn save_kv(
+        &self,
+        b: &B,
+        lo: usize,
+        hi: usize,
+        page: &mut dyn FnMut() -> Result<B::Buffer>,
+    ) -> Result<KvSegment<B>> {
+        let mut seg = self.blank_kv(b, lo, hi, page)?;
+        let row = self.kv_row;
+        for (p, buf) in seg.pages.iter_mut().enumerate() {
+            let r0 = lo + p * KV_PAGE_ROWS;
+            let n = (hi - r0).min(KV_PAGE_ROWS) * row;
+            for (l, (kc, vc)) in self.kv.iter().enumerate() {
+                b.copy(kc, r0 * row, buf, 2 * l * KV_PAGE_ROWS * row, n)?;
+                b.copy(vc, r0 * row, buf, (2 * l + 1) * KV_PAGE_ROWS * row, n)?;
+            }
+        }
+        Ok(seg)
+    }
+
+    /// Writes the rows of `seg` at or after `from` back into the session's KV caches.
+    pub fn load_kv(&mut self, b: &B, seg: &KvSegment<B>, from: usize) -> Result<()> {
+        if seg.hi > self.capacity {
+            return Err(Error::Config("KV segment beyond session capacity".into()));
+        }
+        let row = self.kv_row;
+        for (p, buf) in seg.pages.iter().enumerate() {
+            let r0 = seg.lo + p * KV_PAGE_ROWS;
+            let r1 = (r0 + KV_PAGE_ROWS).min(seg.hi);
+            let a = r0.max(from);
+            if a >= r1 {
+                continue;
+            }
+            if b.len(buf) < self.kv_page_len() {
+                return Err(Error::Config("KV segment does not fit this session".into()));
+            }
+            let n = (r1 - a) * row;
+            for (l, (kc, vc)) in self.kv.iter_mut().enumerate() {
+                b.copy(buf, (2 * l * KV_PAGE_ROWS + a - r0) * row, kc, a * row, n)?;
+                b.copy(
+                    buf,
+                    ((2 * l + 1) * KV_PAGE_ROWS + a - r0) * row,
+                    vc,
+                    a * row,
+                    n,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Device copy of the recurrent state at the current position.
     pub fn checkpoint(&self, b: &B) -> Result<Checkpoint<B>> {
         self.checkpoint_in(b, false)
@@ -301,6 +444,7 @@ impl<B: Backend> Qwen35Text<B> {
             rope_delta: 0,
             kv_format,
             kv,
+            kv_row: c.kv_heads * kv_format.row_slots(c.head_dim),
             conv,
             ssm,
             spec: None,
