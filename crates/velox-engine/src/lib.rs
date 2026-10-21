@@ -127,6 +127,18 @@ const DEVICE_HEADS: usize = 2;
 /// Checkpoint storage kept for reuse per lane beyond the live checkpoints.
 const MAX_SPARE: usize = 4;
 
+/// Prompt tokens per mixed step (see `batch_round`): `VELOX_MIXED_CHUNK`, default 512.
+fn mixed_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VELOX_MIXED_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(512)
+    })
+}
+
 /// Below this much shared prefix a request counts as unrelated to a lane.
 const MIN_REUSE: usize = 64;
 
@@ -1282,7 +1294,11 @@ impl<B: Backend> Core<B> {
                     let r = (|| -> Result<_, CoreError> {
                         let p = &active[pi].job.p;
                         let from = pstate.start + pstate.done;
-                        tp = (p.ids.len() - from).min(ws.max_tokens() - v);
+                        // Chunks short enough that the decoding requests advance several rounds
+                        // during one prompt, long enough to stay compute-bound.
+                        tp = (p.ids.len() - from)
+                            .min(ws.max_tokens() - v)
+                            .min(mixed_chunk());
                         let last = from + tp == p.ids.len();
                         let all = prefill_inserts(&pstate.embeds, pstate.start, p);
                         let inserts = shift_inserts(&all, pstate.done);
