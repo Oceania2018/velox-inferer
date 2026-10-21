@@ -375,7 +375,7 @@ fn dflash_generate<B: Backend>(
     let mut out = vec![c];
     let (mut rounds, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
     let (mut row, mut kept) = (0usize, 0usize);
-    let mut draft_s = 0.0;
+    let (mut draft_s, mut verify_s, mut commit_s) = (0.0, 0.0, 0.0);
     while out.len() < max_tokens && !fe.is_eos(c) {
         let td = Instant::now();
         let (drafts, _) = dr.draft(b, &dm, model, ws, row, kept, s.pos, c, limit, 0.0)?;
@@ -383,13 +383,18 @@ fn dflash_generate<B: Backend>(
         let mut window = vec![c];
         window.extend(drafts.iter().copied().take(max_tokens - out.len()));
         let p = s.pos;
+        let tv = Instant::now();
         let rows = model.verify(b, s, ws, &window, 1, limit)?;
+        verify_s += tv.elapsed().as_secs_f64();
         let mut keep = 1;
         while keep < window.len() && rows[keep - 1][0].0 == window[keep] {
             keep += 1;
         }
         let next = rows[keep - 1][0].0;
+        let tc = Instant::now();
         model.commit(b, s, ws, keep)?;
+        b.synchronize()?;
+        commit_s += tc.elapsed().as_secs_f64();
         rounds += 1;
         proposed += window.len() - 1;
         accepted += keep - 1;
@@ -413,12 +418,14 @@ fn dflash_generate<B: Backend>(
     }
     println!("prompt    {} tokens, prefill {prefill:.2}s", ids.len());
     println!(
-        "decode    {} tokens in {decode:.2}s ({:.2} tok/s), {rounds} rounds, accepted {accepted}/{proposed} drafts ({:.0}%), {:.2} tokens/round, drafting {:.2} ms/round",
+        "decode    {} tokens in {decode:.2}s ({:.2} tok/s), {rounds} rounds, accepted {accepted}/{proposed} drafts ({:.0}%), {:.2} tokens/round, drafting {:.2} ms, verify {:.2} ms, commit {:.2} ms per round",
         out.len(),
         out.len() as f64 / decode.max(1e-9),
         100.0 * accepted as f64 / proposed.max(1) as f64,
         out.len() as f64 / rounds.max(1) as f64,
-        draft_s * 1e3 / rounds.max(1) as f64
+        draft_s * 1e3 / rounds.max(1) as f64,
+        verify_s * 1e3 / rounds.max(1) as f64,
+        commit_s * 1e3 / rounds.max(1) as f64
     );
     println!("ids       {out:?}");
     println!("text      {:?}", fe.decode(&out)?);
