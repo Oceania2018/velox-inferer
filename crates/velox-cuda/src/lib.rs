@@ -8,8 +8,9 @@ use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
 use velox_core::backend::{
-    ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape,
-    GeluKind, NormKind, RopePosShape, RopeShape, WeightView,
+    ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
+    Copy2dShape, DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopePosShape,
+    RopeShape, WeightView,
 };
 use velox_core::{check, profile, DeviceProfile, Error, GpuArch, Op, Result, VariantInfo};
 
@@ -456,6 +457,35 @@ pub trait CudaKernels: Send + Sync {
     ) -> Result<()> {
         portable::swiglu(src, rows, src_cols, gate, up, width, out)
     }
+
+    fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {
+        portable::copy2d(src, dst, shape)
+    }
+
+    fn dyn_conv(
+        &self,
+        x: &CudaBuffer,
+        base: &CudaBuffer,
+        delta: &CudaBuffer,
+        out: &mut CudaBuffer,
+        shape: DynConvShape,
+    ) -> Result<()> {
+        portable::dyn_conv(x, base, delta, out, shape)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_block(
+        &self,
+        q: &CudaBuffer,
+        k_ctx: &CudaBuffer,
+        v_ctx: &CudaBuffer,
+        k_blk: &CudaBuffer,
+        v_blk: &CudaBuffer,
+        out: &mut CudaBuffer,
+        shape: BlockAttnShape,
+    ) -> Result<()> {
+        portable::attention_block(q, k_ctx, v_ctx, k_blk, v_blk, out, shape)
+    }
 }
 
 /// Every op on the portable kernels; the CUDA kernel set of the generic variant on main.
@@ -585,6 +615,44 @@ impl Backend for CudaBackend {
         self.timed("swiglu", || {
             self.kernels
                 .swiglu(src, rows, src_cols, gate, up, width, out)
+        })
+    }
+
+    fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {
+        check::copy2d(src.len, dst.len, &shape)?;
+        self.timed("copy2d", || self.kernels.copy2d(src, dst, shape))
+    }
+
+    fn dyn_conv(
+        &self,
+        x: &CudaBuffer,
+        base: &CudaBuffer,
+        delta: &CudaBuffer,
+        out: &mut CudaBuffer,
+        shape: DynConvShape,
+    ) -> Result<()> {
+        check::dyn_conv(x.len, base.len, delta.len, out.len, &shape)?;
+        self.timed("dyn_conv", || {
+            self.kernels.dyn_conv(x, base, delta, out, shape)
+        })
+    }
+
+    fn attention_block(
+        &self,
+        q: &CudaBuffer,
+        k_ctx: &CudaBuffer,
+        v_ctx: &CudaBuffer,
+        k_blk: &CudaBuffer,
+        v_blk: &CudaBuffer,
+        out: &mut CudaBuffer,
+        shape: BlockAttnShape,
+    ) -> Result<()> {
+        check::attention_block(
+            q.len, k_ctx.len, v_ctx.len, k_blk.len, v_blk.len, out.len, &shape,
+        )?;
+        self.timed("attention block", || {
+            self.kernels
+                .attention_block(q, k_ctx, v_ctx, k_blk, v_blk, out, shape)
         })
     }
 

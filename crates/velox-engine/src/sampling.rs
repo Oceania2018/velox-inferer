@@ -87,20 +87,45 @@ impl Sampler {
     /// removed (the residual max(p - q, 0) for a one-hot q), so the output distribution is exactly
     /// that of [`Self::sample`]. Greedy accepts iff the draft is the argmax.
     pub fn verify_draft(&mut self, cands: &[(u32, f32)], draft: u32) -> Result<(), u32> {
+        self.verify_draft_q(cands, draft, &[(draft, 1.0)])
+    }
+
+    /// Speculative sampling with a draft drawn from the proposal distribution `q` (id,
+    /// probability): accepts with probability min(1, p(draft) / q(draft)); on rejection returns a
+    /// token drawn from the residual max(p - q, 0), so the output follows this step's distribution
+    /// exactly. Greedy accepts iff the draft is the argmax.
+    pub fn verify_draft_q(
+        &mut self,
+        cands: &[(u32, f32)],
+        draft: u32,
+        q: &[(u32, f32)],
+    ) -> Result<(), u32> {
         let d = self.distribution(cands);
-        let p = d
-            .iter()
-            .find(|&&(id, _)| id == draft)
-            .map_or(0.0, |&(_, p)| p);
-        if p > 0.0 && (p >= 1.0 || f64::from(self.rng.uniform() * 0.5 + 0.5) <= p) {
+        let prob = |dist: &[(u32, f64)], id: u32| {
+            dist.iter()
+                .find(|&&(t, _)| t == id)
+                .map_or(0.0, |&(_, p)| p)
+        };
+        let qf: Vec<(u32, f64)> = q.iter().map(|&(t, p)| (t, f64::from(p))).collect();
+        let (p, qd) = (prob(&d, draft), prob(&qf, draft).max(1e-12));
+        if p > 0.0 && (p >= qd || f64::from(self.rng.uniform() * 0.5 + 0.5) * qd <= p) {
             return Ok(());
         }
-        let rest: Vec<(u32, f64)> = d.into_iter().filter(|&(id, _)| id != draft).collect();
+        let rest: Vec<(u32, f64)> = d
+            .iter()
+            .map(|&(id, pv)| (id, (pv - prob(&qf, id)).max(0.0)))
+            .filter(|&(_, r)| r > 0.0)
+            .collect();
         if rest.is_empty() {
-            // p(draft) == 1 handled above; an empty residual only arises from rounding.
-            return Ok(());
+            // Only reachable through rounding (p <= q everywhere means p == q): draw from p.
+            return Err(self.draw(&d));
         }
         Err(self.draw(&rest))
+    }
+
+    /// Sampling temperature (0: greedy).
+    pub fn temperature(&self) -> f32 {
+        self.temperature
     }
 
     /// The step's distribution over the kept candidates (presence penalty, then greedy, or
@@ -222,6 +247,40 @@ mod tests {
         for _ in 0..n {
             let tok = match s.verify_draft(&c, 1) {
                 Ok(()) => 1,
+                Err(t) => t,
+            };
+            counts[tok as usize] += 1;
+        }
+        for &(id, prob) in &p {
+            let got = counts[id as usize] as f64 / n as f64;
+            assert!((got - prob).abs() < 0.01, "token {id}: {got} vs {prob}");
+        }
+    }
+
+    #[test]
+    fn proposal_distribution_verification_preserves_the_distribution() {
+        let c = cands(&[2.0, 1.0, 0.5, 0.0]);
+        let mut s = Sampler::from_request(
+            &json!({"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0, "seed": 5}),
+            false,
+        );
+        let p = s.distribution(&c);
+        // A proposal that over-weights token 2 and ignores token 0.
+        let q = [(1u32, 0.3f32), (2, 0.6), (3, 0.1)];
+        let mut rng = Rng::new(11);
+        let mut counts = [0usize; 4];
+        let n = 300_000;
+        for _ in 0..n {
+            let u = rng.uniform() * 0.5 + 0.5;
+            let d = if u < 0.3 {
+                1
+            } else if u < 0.9 {
+                2
+            } else {
+                3
+            };
+            let tok = match s.verify_draft_q(&c, d, &q) {
+                Ok(()) => d,
                 Err(t) => t,
             };
             counts[tok as usize] += 1;

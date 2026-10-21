@@ -322,6 +322,145 @@ VELOX_API int velox_portable_attention(const float* q, const float* k, const flo
 }
 
 namespace {
+// Block attention partials (DFlash drafts): token t's keys are its visible context positions
+// [ctx_start(t), pos0), read from the ring at p % ring, then the block's own rows.
+template <int PER>
+__global__ void attention_block_partial_kernel(const float* __restrict__ q, const float* __restrict__ k_ctx,
+                                               const float* __restrict__ v_ctx, const float* __restrict__ k_blk,
+                                               const float* __restrict__ v_blk, float* __restrict__ part_acc,
+                                               float* __restrict__ part_ml, int tokens, int heads, int kv_heads,
+                                               int head_dim, long long pos0, long long ctx_lo, int window, int ring,
+                                               float scale, int splits, int split_keys) {
+    const int h = blockIdx.x, t = blockIdx.y, sp = blockIdx.z, lane = threadIdx.x;
+    const int kvh = h / (heads / kv_heads);
+    const size_t q_off = (static_cast<size_t>(t) * heads + h) * head_dim;
+    long long start = pos0 + t + 1 - window;
+    if (start < ctx_lo) start = ctx_lo;
+    const int n_ctx = static_cast<int>(pos0 - start);
+    const int total = n_ctx + tokens;
+    const int j0 = sp * split_keys, j1 = min(j0 + split_keys, total);
+    float qr[PER], acc[PER];
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int d = lane + p * VELOX_WARP;
+        qr[p] = d < head_dim ? q[q_off + d] * scale : 0.0f;
+        acc[p] = 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+    for (int j = j0; j < j1; ++j) {
+        const float* kr;
+        const float* vr;
+        if (j < n_ctx) {
+            const size_t row = static_cast<size_t>((start + j) % ring);
+            kr = k_ctx + (row * kv_heads + kvh) * head_dim;
+            vr = v_ctx + (row * kv_heads + kvh) * head_dim;
+        } else {
+            const size_t row = static_cast<size_t>(j - n_ctx);
+            kr = k_blk + (row * kv_heads + kvh) * head_dim;
+            vr = v_blk + (row * kv_heads + kvh) * head_dim;
+        }
+        float s = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            if (d < head_dim) s += qr[p] * kr[d];
+        }
+        s = velox_warp_sum(s);
+        const float m_new = fmaxf(m, s);
+        const float corr = expf(m - m_new), pj = expf(s - m_new);
+        l = l * corr + pj;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            if (d < head_dim) acc[p] = acc[p] * corr + pj * vr[d];
+        }
+        m = m_new;
+    }
+    const size_t idx = (static_cast<size_t>(t) * heads + h) * splits + sp;
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int d = lane + p * VELOX_WARP;
+        if (d < head_dim) part_acc[idx * head_dim + d] = acc[p];
+    }
+    if (lane == 0) {
+        part_ml[2 * idx] = m;
+        part_ml[2 * idx + 1] = l;
+    }
+}
+
+template <int PER>
+int attention_block_split(const float* q, const float* k_ctx, const float* v_ctx, const float* k_blk,
+                          const float* v_blk, float* out, int tokens, int heads, int kv_heads, int head_dim,
+                          long long pos0, long long ctx_lo, int window, int ring) {
+    long long most = pos0 - ctx_lo;  // token 0 sees the most context
+    if (most > window - 1) most = window - 1;
+    const int kv = static_cast<int>(most) + tokens;
+    const int want = (1024 + tokens * heads - 1) / (tokens * heads);
+    int split_keys = (kv + want - 1) / want;
+    split_keys = split_keys < 16 ? 16 : split_keys > kSplitKeys ? kSplitKeys : split_keys;
+    const int splits = (kv + split_keys - 1) / split_keys;
+    const size_t parts = static_cast<size_t>(tokens) * heads * splits;
+    float* scratch = split_scratch(parts * (head_dim + 2));
+    if (scratch == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+    float* part_acc = scratch;
+    float* part_ml = scratch + parts * head_dim;
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    attention_block_partial_kernel<PER><<<dim3(heads, tokens, splits), VELOX_WARP>>>(
+        q, k_ctx, v_ctx, k_blk, v_blk, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, ctx_lo, window,
+        ring, scale, splits, split_keys);
+    attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
+                                                                       splits);
+    return velox_launch_status();
+}
+
+__global__ void dyn_conv_kernel(const float* __restrict__ x, const float* __restrict__ base,
+                                const float* __restrict__ delta, float* __restrict__ out, int rows, int channels,
+                                int group, int side, int accumulate) {
+    const long long n = static_cast<long long>(rows) * channels;
+    const int g_n = channels / group;
+    for (long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+         idx += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const int i = static_cast<int>(idx / channels), h = static_cast<int>(idx % channels), g = h / group;
+        const float* d = delta + static_cast<size_t>(i) * 4 * g_n;
+        const int t0 = 2 * side, t1 = 2 * side + 1;
+        float y = (base[t0 * channels + h] + d[t0 * g_n + g]) * x[idx];
+        if (i > 0) y += (base[t1 * channels + h] + d[t1 * g_n + g]) * x[idx - channels];
+        out[idx] = accumulate ? out[idx] + y : y;
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_attention_block(const float* q, const float* k_ctx, const float* v_ctx,
+                                             const float* k_blk, const float* v_blk, float* out, int tokens,
+                                             int heads, int kv_heads, int head_dim, long long pos0, long long ctx_lo,
+                                             int window, int ring) {
+    if (tokens > 65535 || head_dim > 256) return VELOX_ERR_UNSUPPORTED;
+    if (head_dim <= 64)
+        return attention_block_split<2>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
+                                        ctx_lo, window, ring);
+    if (head_dim <= 128)
+        return attention_block_split<4>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
+                                        ctx_lo, window, ring);
+    return attention_block_split<8>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
+                                    ctx_lo, window, ring);
+}
+
+VELOX_API int velox_portable_dyn_conv(const float* x, const float* base, const float* delta, float* out, int rows,
+                                      int channels, int group, int side, int accumulate) {
+    const long long n = static_cast<long long>(rows) * channels;
+    if (n == 0) return 0;
+    dyn_conv_kernel<<<velox_grid_1d(n, 256), 256>>>(x, base, delta, out, rows, channels, group, side, accumulate);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_copy2d(const float* src, long long src_stride, float* dst, long long dst_stride,
+                                    long long rows, long long cols) {
+    if (rows == 0 || cols == 0) return 0;
+    return static_cast<int>(cudaMemcpy2DAsync(dst, dst_stride * sizeof(float), src, src_stride * sizeof(float),
+                                              cols * sizeof(float), rows, cudaMemcpyDeviceToDevice, 0));
+}
+
+namespace {
 __global__ void concat_cols_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out,
                                    long long rows, int a_cols, int b_cols) {
     const int w = a_cols + b_cols;
