@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>velox benchmark 2026-10-21</title>
+<style>
+:root { --bg: #ffffff; --fg: #1f2328; --muted: #57606a; --line: #d0d7de; --accent: #0072B2; --row: #f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #30363d; --accent: #4493f8; --row: #161b22; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 18px; margin: 32px 0 8px; }
+.sub { color: var(--muted); margin: 0 0 16px; }
+fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; margin: 0 12px 12px 0; display: inline-block; }
+legend { color: var(--muted); font-size: 13px; padding: 0 4px; }
+label { margin-right: 12px; cursor: pointer; }
+input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+figure { margin: 0; overflow-x: auto; }
+figure svg { max-width: 100%; height: auto; border-radius: 6px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: right; white-space: nowrap; }
+thead th { position: sticky; top: 0; background: var(--bg); }
+tbody tr:nth-child(even) { background: var(--row); }
+.setup th, .setup td { text-align: left; white-space: normal; vertical-align: top; }
+.setup th { width: 120px; color: var(--muted); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+<h1>Response speed at 1, 2, 4 and 6 concurrent requests</h1>
+<p class="sub">2026-10-21 · qwen3.8-27b · 24 configurations, 5 rounds each</p>
+
+<h2>Charts</h2>
+<form id="pick" aria-label="Chart selection">
+<fieldset><legend>Metric</legend>
+<label><input type="radio" name="metric" value="throughput" checked> Throughput, all requests (tok/s)</label>
+<label><input type="radio" name="metric" value="latency"> Latency per request (s)</label>
+<label><input type="radio" name="metric" value="decode"> Decode rate per request (tok/s)</label>
+</fieldset>
+<fieldset><legend>Output tokens</legend>
+<label><input type="radio" name="output" value="32"> 32</label>
+<label><input type="radio" name="output" value="128" checked> 128</label>
+</fieldset>
+</form>
+<div aria-live="polite">
+<figure data-chart="throughput-32" hidden><svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Throughput, all requests (tok/s) by concurrency, 32 output tokens">
+<rect width="720" height="360" fill="#ffffff"/>
+<text x="64" y="24" font-size="16" font-weight="600" fill="#1f2328">Throughput, all requests (tok/s), 32 output tokens</text>
+<rect x="64" y="34" width="12" height="12" fill="#0072B2"/>
+<text x="82" y="44" font-size="12" fill="#1f2328">1K input</text>
+<rect x="174" y="34" width="12" height="12" fill="#E69F00"/>
+<text x="192" y="44" font-size="12" fill="#1f2328">4K input</text>
+<rect x="284" y="34" width="12" height="12" fill="#009E73"/>
+<text x="302" y="44" font-size="12" fill="#1f2328">8K input</text>
+<line x1="64" x2="696" y1="304" y2="304" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="308" font-size="11" text-anchor="end" fill="#57606a">0</text>
+<line x1="64" x2="696" y1="242" y2="242" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="246" font-size="11" text-anchor="end" fill="#57606a">50</text>
+<line x1="64" x2="696" y1="180" y2="180" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="184" font-size="11" text-anchor="end" fill="#57606a">100</text>
+<line x1="64" x2="696" y1="118" y2="118" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="122" font-size="11" text-anchor="end" fill="#57606a">150</text>
+<line x1="64" x2="696" y1="56" y2="56" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="60" font-size="11" text-anchor="end" fill="#57606a">200</text>
+<rect x="84" y="232.22382214441967" width="38" height="71.77617785558033" fill="#0072B2"><title>1 at once, 1K input: 58 tok/s</title></rect>
+<text x="103" y="228.22382214441967" font-size="10" text-anchor="middle" fill="#1f2328">58</text>
+<rect x="124" y="249.51121289431" width="38" height="54.488787105689994" fill="#E69F00"><title>1 at once, 4K input: 44 tok/s</title></rect>
+<text x="143" y="245.51121289431" font-size="10" text-anchor="middle" fill="#1f2328">44</text>
+<rect x="164" y="273.0203033187125" width="38" height="30.97969668128752" fill="#009E73"><title>1 at once, 8K input: 25 tok/s</title></rect>
+<text x="183" y="269.0203033187125" font-size="10" text-anchor="middle" fill="#1f2328">25</text>
+<text x="143" y="322" font-size="12" text-anchor="middle" fill="#1f2328">1</text>
+<rect x="242" y="234.62985330976193" width="38" height="69.37014669023807" fill="#0072B2"><title>2 at once, 1K input: 56 tok/s</title></rect>
+<text x="261" y="230.62985330976193" font-size="10" text-anchor="middle" fill="#1f2328">56</text>
+<rect x="282" y="246.55343883830545" width="38" height="57.44656116169455" fill="#E69F00"><title>2 at once, 4K input: 46 tok/s</title></rect>
+<text x="301" y="242.55343883830545" font-size="10" text-anchor="middle" fill="#1f2328">46</text>
+<rect x="322" y="272.396132056125" width="38" height="31.603867943875002" fill="#009E73"><title>2 at once, 8K input: 25 tok/s</title></rect>
+<text x="341" y="268.396132056125" font-size="10" text-anchor="middle" fill="#1f2328">25</text>
+<text x="301" y="322" font-size="12" text-anchor="middle" fill="#1f2328">2</text>
+<rect x="400" y="216.52995499095246" width="38" height="87.47004500904754" fill="#0072B2"><title>4 at once, 1K input: 71 tok/s</title></rect>
+<text x="419" y="212.52995499095246" font-size="10" text-anchor="middle" fill="#1f2328">71</text>
+<rect x="440" y="243.9804573464949" width="38" height="60.01954265350511" fill="#E69F00"><title>4 at once, 4K input: 48 tok/s</title></rect>
+<text x="459" y="239.9804573464949" font-size="10" text-anchor="middle" fill="#1f2328">48</text>
+<rect x="480" y="271.70016637507547" width="38" height="32.29983362492453" fill="#009E73"><title>4 at once, 8K input: 26 tok/s</title></rect>
+<text x="499" y="267.70016637507547" font-size="10" text-anchor="middle" fill="#1f2328">26</text>
+<text x="459" y="322" font-size="12" text-anchor="middle" fill="#1f2328">4</text>
+<rect x="558" y="134.88428566951453" width="38" height="169.11571433048547" fill="#0072B2"><title>6 at once, 1K input: 136 tok/s</title></rect>
+<text x="577" y="130.88428566951453" font-size="10" text-anchor="middle" fill="#1f2328">136</text>
+<rect x="598" y="243.55198883401738" width="38" height="60.44801116598262" fill="#E69F00"><title>6 at once, 4K input: 49 tok/s</title></rect>
+<text x="617" y="239.55198883401738" font-size="10" text-anchor="middle" fill="#1f2328">49</text>
+<rect x="638" y="271.5559355607788" width="38" height="32.44406443922122" fill="#009E73"><title>6 at once, 8K input: 26 tok/s</title></rect>
+<text x="657" y="267.5559355607788" font-size="10" text-anchor="middle" fill="#1f2328">26</text>
+<text x="617" y="322" font-size="12" text-anchor="middle" fill="#1f2328">6</text>
+<text x="380" y="348" font-size="12" text-anchor="middle" fill="#57606a">requests at once</text>
+</svg></figure>
+<figure data-chart="throughput-128"><svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Throughput, all requests (tok/s) by concurrency, 128 output tokens">
+<rect width="720" height="360" fill="#ffffff"/>
+<text x="64" y="24" font-size="16" font-weight="600" fill="#1f2328">Throughput, all requests (tok/s), 128 output tokens</text>
+<rect x="64" y="34" width="12" height="12" fill="#0072B2"/>
+<text x="82" y="44" font-size="12" fill="#1f2328">1K input</text>
+<rect x="174" y="34" width="12" height="12" fill="#E69F00"/>
+<text x="192" y="44" font-size="12" fill="#1f2328">4K input</text>
+<rect x="284" y="34" width="12" height="12" fill="#009E73"/>
+<text x="302" y="44" font-size="12" fill="#1f2328">8K input</text>
+<line x1="64" x2="696" y1="304" y2="304" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="308" font-size="11" text-anchor="end" fill="#57606a">0</text>
+<line x1="64" x2="696" y1="242" y2="242" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="246" font-size="11" text-anchor="end" fill="#57606a">125</text>
+<line x1="64" x2="696" y1="180" y2="180" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="184" font-size="11" text-anchor="end" fill="#57606a">250</text>
+<line x1="64" x2="696" y1="118" y2="118" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="122" font-size="11" text-anchor="end" fill="#57606a">375</text>
+<line x1="64" x2="696" y1="56" y2="56" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="60" font-size="11" text-anchor="end" fill="#57606a">500</text>
+<rect x="84" y="163.03869308832606" width="38" height="140.96130691167394" fill="#0072B2"><title>1 at once, 1K input: 284 tok/s</title></rect>
+<text x="103" y="159.03869308832606" font-size="10" text-anchor="middle" fill="#1f2328">284</text>
+<rect x="124" y="228.0964049303766" width="38" height="75.9035950696234" fill="#E69F00"><title>1 at once, 4K input: 153 tok/s</title></rect>
+<text x="143" y="224.0964049303766" font-size="10" text-anchor="middle" fill="#1f2328">153</text>
+<rect x="164" y="258.9501982133095" width="38" height="45.04980178669052" fill="#009E73"><title>1 at once, 8K input: 91 tok/s</title></rect>
+<text x="183" y="254.95019821330948" font-size="10" text-anchor="middle" fill="#1f2328">91</text>
+<text x="143" y="322" font-size="12" text-anchor="middle" fill="#1f2328">1</text>
+<rect x="242" y="163.10910207839345" width="38" height="140.89089792160655" fill="#0072B2"><title>2 at once, 1K input: 284 tok/s</title></rect>
+<text x="261" y="159.10910207839345" font-size="10" text-anchor="middle" fill="#1f2328">284</text>
+<rect x="282" y="223.97764193869347" width="38" height="80.02235806130653" fill="#E69F00"><title>2 at once, 4K input: 161 tok/s</title></rect>
+<text x="301" y="219.97764193869347" font-size="10" text-anchor="middle" fill="#1f2328">161</text>
+<rect x="322" y="257.51941823894134" width="38" height="46.48058176105866" fill="#009E73"><title>2 at once, 8K input: 94 tok/s</title></rect>
+<text x="341" y="253.51941823894134" font-size="10" text-anchor="middle" fill="#1f2328">94</text>
+<text x="301" y="322" font-size="12" text-anchor="middle" fill="#1f2328">2</text>
+<rect x="400" y="146.23227416058728" width="38" height="157.76772583941272" fill="#0072B2"><title>4 at once, 1K input: 318 tok/s</title></rect>
+<text x="419" y="142.23227416058728" font-size="10" text-anchor="middle" fill="#1f2328">318</text>
+<rect x="440" y="219.9721027328133" width="38" height="84.02789726718669" fill="#E69F00"><title>4 at once, 4K input: 169 tok/s</title></rect>
+<text x="459" y="215.9721027328133" font-size="10" text-anchor="middle" fill="#1f2328">169</text>
+<rect x="480" y="256.2170369496958" width="38" height="47.782963050304204" fill="#009E73"><title>4 at once, 8K input: 96 tok/s</title></rect>
+<text x="499" y="252.2170369496958" font-size="10" text-anchor="middle" fill="#1f2328">96</text>
+<text x="459" y="322" font-size="12" text-anchor="middle" fill="#1f2328">4</text>
+<rect x="558" y="138.80873402331048" width="38" height="165.19126597668952" fill="#0072B2"><title>6 at once, 1K input: 333 tok/s</title></rect>
+<text x="577" y="134.80873402331048" font-size="10" text-anchor="middle" fill="#1f2328">333</text>
+<rect x="598" y="219.15996093947928" width="38" height="84.84003906052072" fill="#E69F00"><title>6 at once, 4K input: 171 tok/s</title></rect>
+<text x="617" y="215.15996093947928" font-size="10" text-anchor="middle" fill="#1f2328">171</text>
+<rect x="638" y="255.80699588467058" width="38" height="48.193004115329416" fill="#009E73"><title>6 at once, 8K input: 97 tok/s</title></rect>
+<text x="657" y="251.80699588467058" font-size="10" text-anchor="middle" fill="#1f2328">97</text>
+<text x="617" y="322" font-size="12" text-anchor="middle" fill="#1f2328">6</text>
+<text x="380" y="348" font-size="12" text-anchor="middle" fill="#57606a">requests at once</text>
+</svg></figure>
+<figure data-chart="latency-32" hidden><svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Latency per request (s) by concurrency, 32 output tokens">
+<rect width="720" height="360" fill="#ffffff"/>
+<text x="64" y="24" font-size="16" font-weight="600" fill="#1f2328">Latency per request (s), 32 output tokens</text>
+<rect x="64" y="34" width="12" height="12" fill="#0072B2"/>
+<text x="82" y="44" font-size="12" fill="#1f2328">1K input</text>
+<rect x="174" y="34" width="12" height="12" fill="#E69F00"/>
+<text x="192" y="44" font-size="12" fill="#1f2328">4K input</text>
+<rect x="284" y="34" width="12" height="12" fill="#009E73"/>
+<text x="302" y="44" font-size="12" fill="#1f2328">8K input</text>
+<line x1="64" x2="696" y1="304" y2="304" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="308" font-size="11" text-anchor="end" fill="#57606a">0</text>
+<line x1="64" x2="696" y1="242" y2="242" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="246" font-size="11" text-anchor="end" fill="#57606a">2.5</text>
+<line x1="64" x2="696" y1="180" y2="180" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="184" font-size="11" text-anchor="end" fill="#57606a">5</text>
+<line x1="64" x2="696" y1="118" y2="118" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="122" font-size="11" text-anchor="end" fill="#57606a">7.5</text>
+<line x1="64" x2="696" y1="56" y2="56" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="60" font-size="11" text-anchor="end" fill="#57606a">10</text>
+<rect x="84" y="290.82269112" width="38" height="13.177308879999998" fill="#0072B2"><title>1 at once, 1K input: 0.53 s</title></rect>
+<text x="103" y="286.82269112" font-size="10" text-anchor="middle" fill="#1f2328">0.53</text>
+<rect x="124" y="286.0941148" width="38" height="17.9058852" fill="#E69F00"><title>1 at once, 4K input: 0.72 s</title></rect>
+<text x="143" y="282.0941148" font-size="10" text-anchor="middle" fill="#1f2328">0.72</text>
+<rect x="164" y="272.29307104000003" width="38" height="31.70692895999997" fill="#009E73"><title>1 at once, 8K input: 1.28 s</title></rect>
+<text x="183" y="268.29307104000003" font-size="10" text-anchor="middle" fill="#1f2328">1.28</text>
+<text x="143" y="322" font-size="12" text-anchor="middle" fill="#1f2328">1</text>
+<rect x="242" y="275.26558167999997" width="38" height="28.73441832000003" fill="#0072B2"><title>2 at once, 1K input: 1.16 s</title></rect>
+<text x="261" y="271.26558167999997" font-size="10" text-anchor="middle" fill="#1f2328">1.16</text>
+<rect x="282" y="270.2838916" width="38" height="33.716108399999996" fill="#E69F00"><title>2 at once, 4K input: 1.36 s</title></rect>
+<text x="301" y="266.2838916" font-size="10" text-anchor="middle" fill="#1f2328">1.36</text>
+<rect x="322" y="244.59265648000002" width="38" height="59.40734351999998" fill="#009E73"><title>2 at once, 8K input: 2.40 s</title></rect>
+<text x="341" y="240.59265648000002" font-size="10" text-anchor="middle" fill="#1f2328">2.40</text>
+<text x="301" y="322" font-size="12" text-anchor="middle" fill="#1f2328">2</text>
+<rect x="400" y="250.20443644" width="38" height="53.795563560000005" fill="#0072B2"><title>4 at once, 1K input: 2.17 s</title></rect>
+<text x="419" y="246.20443644" font-size="10" text-anchor="middle" fill="#1f2328">2.17</text>
+<rect x="440" y="244.11951712" width="38" height="59.88048287999999" fill="#E69F00"><title>4 at once, 4K input: 2.41 s</title></rect>
+<text x="459" y="240.11951712" font-size="10" text-anchor="middle" fill="#1f2328">2.41</text>
+<rect x="480" y="201.48516627999985" width="38" height="102.51483372000015" fill="#009E73"><title>4 at once, 8K input: 4.13 s</title></rect>
+<text x="499" y="197.48516627999985" font-size="10" text-anchor="middle" fill="#1f2328">4.13</text>
+<text x="459" y="322" font-size="12" text-anchor="middle" fill="#1f2328">4</text>
+<rect x="558" y="270.40147088000003" width="38" height="33.59852911999997" fill="#0072B2"><title>6 at once, 1K input: 1.35 s</title></rect>
+<text x="577" y="266.40147088000003" font-size="10" text-anchor="middle" fill="#1f2328">1.35</text>
+<rect x="598" y="224.98992055999997" width="38" height="79.01007944000003" fill="#E69F00"><title>6 at once, 4K input: 3.19 s</title></rect>
+<text x="617" y="220.98992055999997" font-size="10" text-anchor="middle" fill="#1f2328">3.19</text>
+<rect x="638" y="169.99242623999987" width="38" height="134.00757376000013" fill="#009E73"><title>6 at once, 8K input: 5.40 s</title></rect>
+<text x="657" y="165.99242623999987" font-size="10" text-anchor="middle" fill="#1f2328">5.40</text>
+<text x="617" y="322" font-size="12" text-anchor="middle" fill="#1f2328">6</text>
+<text x="380" y="348" font-size="12" text-anchor="middle" fill="#57606a">requests at once</text>
+</svg></figure>
+<figure data-chart="latency-128" hidden><svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Latency per request (s) by concurrency, 128 output tokens">
+<rect width="720" height="360" fill="#ffffff"/>
+<text x="64" y="24" font-size="16" font-weight="600" fill="#1f2328">Latency per request (s), 128 output tokens</text>
+<rect x="64" y="34" width="12" height="12" fill="#0072B2"/>
+<text x="82" y="44" font-size="12" fill="#1f2328">1K input</text>
+<rect x="174" y="34" width="12" height="12" fill="#E69F00"/>
+<text x="192" y="44" font-size="12" fill="#1f2328">4K input</text>
+<rect x="284" y="34" width="12" height="12" fill="#009E73"/>
+<text x="302" y="44" font-size="12" fill="#1f2328">8K input</text>
+<line x1="64" x2="696" y1="304" y2="304" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="308" font-size="11" text-anchor="end" fill="#57606a">0</text>
+<line x1="64" x2="696" y1="242" y2="242" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="246" font-size="11" text-anchor="end" fill="#57606a">2.5</text>
+<line x1="64" x2="696" y1="180" y2="180" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="184" font-size="11" text-anchor="end" fill="#57606a">5</text>
+<line x1="64" x2="696" y1="118" y2="118" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="122" font-size="11" text-anchor="end" fill="#57606a">7.5</text>
+<line x1="64" x2="696" y1="56" y2="56" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="60" font-size="11" text-anchor="end" fill="#57606a">10</text>
+<rect x="84" y="293.43431711999995" width="38" height="10.565682880000054" fill="#0072B2"><title>1 at once, 1K input: 0.43 s</title></rect>
+<text x="103" y="289.43431711999995" font-size="10" text-anchor="middle" fill="#1f2328">0.43</text>
+<rect x="124" y="283.26421408" width="38" height="20.735785920000012" fill="#E69F00"><title>1 at once, 4K input: 0.84 s</title></rect>
+<text x="143" y="279.26421408" font-size="10" text-anchor="middle" fill="#1f2328">0.84</text>
+<rect x="164" y="269.2668956799997" width="38" height="34.73310432000028" fill="#009E73"><title>1 at once, 8K input: 1.40 s</title></rect>
+<text x="183" y="265.2668956799997" font-size="10" text-anchor="middle" fill="#1f2328">1.40</text>
+<text x="143" y="322" font-size="12" text-anchor="middle" fill="#1f2328">1</text>
+<rect x="242" y="282.6145259999999" width="38" height="21.3854740000001" fill="#0072B2"><title>2 at once, 1K input: 0.86 s</title></rect>
+<text x="261" y="278.6145259999999" font-size="10" text-anchor="middle" fill="#1f2328">0.86</text>
+<rect x="282" y="265.13009447999997" width="38" height="38.86990552000003" fill="#E69F00"><title>2 at once, 4K input: 1.57 s</title></rect>
+<text x="301" y="261.13009447999997" font-size="10" text-anchor="middle" fill="#1f2328">1.57</text>
+<rect x="322" y="237.35363196000003" width="38" height="66.64636803999997" fill="#009E73"><title>2 at once, 8K input: 2.69 s</title></rect>
+<text x="341" y="233.35363196000003" font-size="10" text-anchor="middle" fill="#1f2328">2.69</text>
+<text x="301" y="322" font-size="12" text-anchor="middle" fill="#1f2328">2</text>
+<rect x="400" y="265.0908385600001" width="38" height="38.90916143999988" fill="#0072B2"><title>4 at once, 1K input: 1.57 s</title></rect>
+<text x="419" y="261.0908385600001" font-size="10" text-anchor="middle" fill="#1f2328">1.57</text>
+<rect x="440" y="230.90950448000024" width="38" height="73.09049551999976" fill="#E69F00"><title>4 at once, 4K input: 2.95 s</title></rect>
+<text x="459" y="226.90950448000024" font-size="10" text-anchor="middle" fill="#1f2328">2.95</text>
+<rect x="480" y="175.38075820000043" width="38" height="128.61924179999957" fill="#009E73"><title>4 at once, 8K input: 5.19 s</title></rect>
+<text x="499" y="171.38075820000043" font-size="10" text-anchor="middle" fill="#1f2328">5.19</text>
+<text x="459" y="322" font-size="12" text-anchor="middle" fill="#1f2328">4</text>
+<rect x="558" y="248.31460204000004" width="38" height="55.68539795999996" fill="#0072B2"><title>6 at once, 1K input: 2.25 s</title></rect>
+<text x="577" y="244.31460204000004" font-size="10" text-anchor="middle" fill="#1f2328">2.25</text>
+<rect x="598" y="196.5884099999999" width="38" height="107.4115900000001" fill="#E69F00"><title>6 at once, 4K input: 4.33 s</title></rect>
+<text x="617" y="192.5884099999999" font-size="10" text-anchor="middle" fill="#1f2328">4.33</text>
+<rect x="638" y="114.92983935999973" width="38" height="189.07016064000027" fill="#009E73"><title>6 at once, 8K input: 7.62 s</title></rect>
+<text x="657" y="110.92983935999973" font-size="10" text-anchor="middle" fill="#1f2328">7.62</text>
+<text x="617" y="322" font-size="12" text-anchor="middle" fill="#1f2328">6</text>
+<text x="380" y="348" font-size="12" text-anchor="middle" fill="#57606a">requests at once</text>
+</svg></figure>
+<figure data-chart="decode-32" hidden><svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Decode rate per request (tok/s) by concurrency, 32 output tokens">
+<rect width="720" height="360" fill="#ffffff"/>
+<text x="64" y="24" font-size="16" font-weight="600" fill="#1f2328">Decode rate per request (tok/s), 32 output tokens</text>
+<rect x="64" y="34" width="12" height="12" fill="#0072B2"/>
+<text x="82" y="44" font-size="12" fill="#1f2328">1K input</text>
+<rect x="174" y="34" width="12" height="12" fill="#E69F00"/>
+<text x="192" y="44" font-size="12" fill="#1f2328">4K input</text>
+<rect x="284" y="34" width="12" height="12" fill="#009E73"/>
+<text x="302" y="44" font-size="12" fill="#1f2328">8K input</text>
+<line x1="64" x2="696" y1="304" y2="304" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="308" font-size="11" text-anchor="end" fill="#57606a">0</text>
+<line x1="64" x2="696" y1="242" y2="242" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="246" font-size="11" text-anchor="end" fill="#57606a">125</text>
+<line x1="64" x2="696" y1="180" y2="180" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="184" font-size="11" text-anchor="end" fill="#57606a">250</text>
+<line x1="64" x2="696" y1="118" y2="118" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="122" font-size="11" text-anchor="end" fill="#57606a">375</text>
+<line x1="64" x2="696" y1="56" y2="56" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="60" font-size="11" text-anchor="end" fill="#57606a">500</text>
+<rect x="84" y="92.6213945365312" width="38" height="211.3786054634688" fill="#0072B2"><title>1 at once, 1K input: 426 tok/s</title></rect>
+<text x="103" y="88.6213945365312" font-size="10" text-anchor="middle" fill="#1f2328">426</text>
+<rect x="124" y="84.30119597250484" width="38" height="219.69880402749516" fill="#E69F00"><title>1 at once, 4K input: 443 tok/s</title></rect>
+<text x="143" y="80.30119597250484" font-size="10" text-anchor="middle" fill="#1f2328">443</text>
+<rect x="164" y="82.92364802666356" width="38" height="221.07635197333644" fill="#009E73"><title>1 at once, 8K input: 446 tok/s</title></rect>
+<text x="183" y="78.92364802666356" font-size="10" text-anchor="middle" fill="#1f2328">446</text>
+<text x="143" y="322" font-size="12" text-anchor="middle" fill="#1f2328">1</text>
+<rect x="242" y="261.68263957474176" width="38" height="42.317360425258244" fill="#0072B2"><title>2 at once, 1K input: 85 tok/s</title></rect>
+<text x="261" y="257.68263957474176" font-size="10" text-anchor="middle" fill="#1f2328">85</text>
+<rect x="282" y="203.52591119875333" width="38" height="100.47408880124667" fill="#E69F00"><title>2 at once, 4K input: 203 tok/s</title></rect>
+<text x="301" y="199.52591119875333" font-size="10" text-anchor="middle" fill="#1f2328">203</text>
+<rect x="322" y="234.37820424985617" width="38" height="69.62179575014383" fill="#009E73"><title>2 at once, 8K input: 140 tok/s</title></rect>
+<text x="341" y="230.37820424985617" font-size="10" text-anchor="middle" fill="#1f2328">140</text>
+<text x="301" y="322" font-size="12" text-anchor="middle" fill="#1f2328">2</text>
+<rect x="400" y="279.75257645497084" width="38" height="24.247423545029164" fill="#0072B2"><title>4 at once, 1K input: 49 tok/s</title></rect>
+<text x="419" y="275.75257645497084" font-size="10" text-anchor="middle" fill="#1f2328">49</text>
+<rect x="440" y="284.21165363893573" width="38" height="19.78834636106427" fill="#E69F00"><title>4 at once, 4K input: 40 tok/s</title></rect>
+<text x="459" y="280.21165363893573" font-size="10" text-anchor="middle" fill="#1f2328">40</text>
+<rect x="480" y="290.01437804472" width="38" height="13.98562195528001" fill="#009E73"><title>4 at once, 8K input: 28 tok/s</title></rect>
+<text x="499" y="286.01437804472" font-size="10" text-anchor="middle" fill="#1f2328">28</text>
+<text x="459" y="322" font-size="12" text-anchor="middle" fill="#1f2328">4</text>
+<rect x="558" y="275.0439262667156" width="38" height="28.956073733284427" fill="#0072B2"><title>6 at once, 1K input: 58 tok/s</title></rect>
+<text x="577" y="271.0439262667156" font-size="10" text-anchor="middle" fill="#1f2328">58</text>
+<rect x="598" y="286.33921578818723" width="38" height="17.660784211812768" fill="#E69F00"><title>6 at once, 4K input: 36 tok/s</title></rect>
+<text x="617" y="282.33921578818723" font-size="10" text-anchor="middle" fill="#1f2328">36</text>
+<rect x="638" y="290.0313859652208" width="38" height="13.968614034779193" fill="#009E73"><title>6 at once, 8K input: 28 tok/s</title></rect>
+<text x="657" y="286.0313859652208" font-size="10" text-anchor="middle" fill="#1f2328">28</text>
+<text x="617" y="322" font-size="12" text-anchor="middle" fill="#1f2328">6</text>
+<text x="380" y="348" font-size="12" text-anchor="middle" fill="#57606a">requests at once</text>
+</svg></figure>
+<figure data-chart="decode-128" hidden><svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Decode rate per request (tok/s) by concurrency, 128 output tokens">
+<rect width="720" height="360" fill="#ffffff"/>
+<text x="64" y="24" font-size="16" font-weight="600" fill="#1f2328">Decode rate per request (tok/s), 128 output tokens</text>
+<rect x="64" y="34" width="12" height="12" fill="#0072B2"/>
+<text x="82" y="44" font-size="12" fill="#1f2328">1K input</text>
+<rect x="174" y="34" width="12" height="12" fill="#E69F00"/>
+<text x="192" y="44" font-size="12" fill="#1f2328">4K input</text>
+<rect x="284" y="34" width="12" height="12" fill="#009E73"/>
+<text x="302" y="44" font-size="12" fill="#1f2328">8K input</text>
+<line x1="64" x2="696" y1="304" y2="304" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="308" font-size="11" text-anchor="end" fill="#57606a">0</text>
+<line x1="64" x2="696" y1="242" y2="242" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="246" font-size="11" text-anchor="end" fill="#57606a">250</text>
+<line x1="64" x2="696" y1="180" y2="180" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="184" font-size="11" text-anchor="end" fill="#57606a">500</text>
+<line x1="64" x2="696" y1="118" y2="118" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="122" font-size="11" text-anchor="end" fill="#57606a">750</text>
+<line x1="64" x2="696" y1="56" y2="56" stroke="#d0d7de" stroke-width="1"/>
+<text x="56" y="60" font-size="11" text-anchor="end" fill="#57606a">1000</text>
+<rect x="84" y="162.8323668105948" width="38" height="141.1676331894052" fill="#0072B2"><title>1 at once, 1K input: 569 tok/s</title></rect>
+<text x="103" y="158.8323668105948" font-size="10" text-anchor="middle" fill="#1f2328">569</text>
+<rect x="124" y="165.70850986800843" width="38" height="138.29149013199157" fill="#E69F00"><title>1 at once, 4K input: 558 tok/s</title></rect>
+<text x="143" y="161.70850986800843" font-size="10" text-anchor="middle" fill="#1f2328">558</text>
+<rect x="164" y="163.68926982422536" width="38" height="140.31073017577464" fill="#009E73"><title>1 at once, 8K input: 566 tok/s</title></rect>
+<text x="183" y="159.68926982422536" font-size="10" text-anchor="middle" fill="#1f2328">566</text>
+<text x="143" y="322" font-size="12" text-anchor="middle" fill="#1f2328">1</text>
+<rect x="242" y="229.48040632339234" width="38" height="74.51959367660766" fill="#0072B2"><title>2 at once, 1K input: 300 tok/s</title></rect>
+<text x="261" y="225.48040632339234" font-size="10" text-anchor="middle" fill="#1f2328">300</text>
+<rect x="282" y="240.00107985478363" width="38" height="63.998920145216374" fill="#E69F00"><title>2 at once, 4K input: 258 tok/s</title></rect>
+<text x="301" y="236.00107985478363" font-size="10" text-anchor="middle" fill="#1f2328">258</text>
+<rect x="322" y="246.68585504196926" width="38" height="57.31414495803074" fill="#009E73"><title>2 at once, 8K input: 231 tok/s</title></rect>
+<text x="341" y="242.68585504196926" font-size="10" text-anchor="middle" fill="#1f2328">231</text>
+<text x="301" y="322" font-size="12" text-anchor="middle" fill="#1f2328">2</text>
+<rect x="400" y="264.1459538350507" width="38" height="39.854046164949295" fill="#0072B2"><title>4 at once, 1K input: 161 tok/s</title></rect>
+<text x="419" y="260.1459538350507" font-size="10" text-anchor="middle" fill="#1f2328">161</text>
+<rect x="440" y="279.0552826939488" width="38" height="24.94471730605119" fill="#E69F00"><title>4 at once, 4K input: 101 tok/s</title></rect>
+<text x="459" y="275.0552826939488" font-size="10" text-anchor="middle" fill="#1f2328">101</text>
+<rect x="480" y="288.0845320505446" width="38" height="15.915467949455376" fill="#009E73"><title>4 at once, 8K input: 64 tok/s</title></rect>
+<text x="499" y="284.0845320505446" font-size="10" text-anchor="middle" fill="#1f2328">64</text>
+<text x="459" y="322" font-size="12" text-anchor="middle" fill="#1f2328">4</text>
+<rect x="558" y="276.2875490987614" width="38" height="27.712450901238583" fill="#0072B2"><title>6 at once, 1K input: 112 tok/s</title></rect>
+<text x="577" y="272.2875490987614" font-size="10" text-anchor="middle" fill="#1f2328">112</text>
+<rect x="598" y="287.9253020730895" width="38" height="16.074697926910517" fill="#E69F00"><title>6 at once, 4K input: 65 tok/s</title></rect>
+<text x="617" y="283.9253020730895" font-size="10" text-anchor="middle" fill="#1f2328">65</text>
+<rect x="638" y="294.10878395968837" width="38" height="9.891216040311633" fill="#009E73"><title>6 at once, 8K input: 40 tok/s</title></rect>
+<text x="657" y="290.10878395968837" font-size="10" text-anchor="middle" fill="#1f2328">40</text>
+<text x="617" y="322" font-size="12" text-anchor="middle" fill="#1f2328">6</text>
+<text x="380" y="348" font-size="12" text-anchor="middle" fill="#57606a">requests at once</text>
+</svg></figure>
+</div>
+<noscript><p>Switching charts needs JavaScript; the table below has every number.</p></noscript>
+
+<h2>Setup</h2>
+<div class="scroll"><table class="setup"><tr><th scope="row">Model</th><td>Qwen3.8-27B NVFP4 + DFlash2 drafter (7 drafts per block), NVFP4 KV cache, vision on</td></tr>
+<tr><th scope="row">GPU</th><td>RTX 5090 32 GB desktop (32,607 MiB), driver 616.56</td></tr>
+<tr><th scope="row">Host</th><td>Intel Core Ultra 9 285K (24 cores), 63.4 GB RAM; Windows 11 + WSL2 (WDDM), WSL VM capped at 48 GB</td></tr>
+<tr><th scope="row">Offload</th><td>Context store in pinned system RAM: 16 GiB (--host-context-mib 16384). NVMe tier off. Weights fully in VRAM</td></tr>
+<tr><th scope="row">Software</th><td>velox main 15e5e24, branch rtx-5090-32g f2cd49b, CUDA 13.1</td></tr>
+<tr><th scope="row">Server</th><td>velox serve --max-context 32768 --kv-format nvfp4 --prefill-chunk 2048; 6 lanes, paged KV on; through llm-inference-daemon</td></tr>
+<tr><th scope="row">Client</th><td>scripts/speed-test.mjs, 5 rounds per row plus one discarded warm-up round</td></tr></table></div>
+
+<h2>Results</h2>
+<p class="sub">Medians per request. Throughput: completion tokens of all requests per second of round wall time.</p>
+<div class="scroll"><table>
+<thead><tr><th scope="col">At once</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Decode tok/s</th><th scope="col">Prefill s</th><th scope="col">Prefill tok/s</th><th scope="col">Latency s</th><th scope="col">End-to-end tok/s</th><th scope="col">Throughput tok/s</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>1K</td><td>32</td><td>426</td><td>0.34</td><td>2,998</td><td>0.53</td><td>60.2</td><td>58</td></tr>
+<tr><td>2</td><td>1K</td><td>32</td><td>85</td><td>0.62</td><td>1,846</td><td>1.16</td><td>27.6</td><td>56</td></tr>
+<tr><td>4</td><td>1K</td><td>32</td><td>49</td><td>0.66</td><td>1,575</td><td>2.17</td><td>14.8</td><td>71</td></tr>
+<tr><td>6</td><td>1K</td><td>32</td><td>58</td><td>0.58</td><td>1,788</td><td>1.35</td><td>23.6</td><td>136</td></tr>
+<tr><td>1</td><td>4K</td><td>32</td><td>443</td><td>0.64</td><td>6,438</td><td>0.72</td><td>44.3</td><td>44</td></tr>
+<tr><td>2</td><td>4K</td><td>32</td><td>203</td><td>0.64</td><td>6,388</td><td>1.36</td><td>23.5</td><td>46</td></tr>
+<tr><td>4</td><td>4K</td><td>32</td><td>40</td><td>0.99</td><td>4,477</td><td>2.41</td><td>13.3</td><td>48</td></tr>
+<tr><td>6</td><td>4K</td><td>32</td><td>36</td><td>1.65</td><td>2,540</td><td>3.19</td><td>10.1</td><td>49</td></tr>
+<tr><td>1</td><td>8K</td><td>32</td><td>446</td><td>1.18</td><td>6,971</td><td>1.28</td><td>25.0</td><td>25</td></tr>
+<tr><td>2</td><td>8K</td><td>32</td><td>140</td><td>1.20</td><td>6,818</td><td>2.40</td><td>13.4</td><td>25</td></tr>
+<tr><td>4</td><td>8K</td><td>32</td><td>28</td><td>1.85</td><td>4,876</td><td>4.13</td><td>7.9</td><td>26</td></tr>
+<tr><td>6</td><td>8K</td><td>32</td><td>28</td><td>3.09</td><td>2,748</td><td>5.40</td><td>6.0</td><td>26</td></tr>
+<tr><td>1</td><td>1K</td><td>128</td><td>569</td><td>0.19</td><td>5,466</td><td>0.43</td><td>300.4</td><td>284</td></tr>
+<tr><td>2</td><td>1K</td><td>128</td><td>300</td><td>0.30</td><td>3,446</td><td>0.86</td><td>148.4</td><td>284</td></tr>
+<tr><td>4</td><td>1K</td><td>128</td><td>161</td><td>0.47</td><td>2,231</td><td>1.57</td><td>81.6</td><td>318</td></tr>
+<tr><td>6</td><td>1K</td><td>128</td><td>112</td><td>0.78</td><td>1,316</td><td>2.25</td><td>57.0</td><td>333</td></tr>
+<tr><td>1</td><td>4K</td><td>128</td><td>558</td><td>0.59</td><td>7,005</td><td>0.84</td><td>153.1</td><td>153</td></tr>
+<tr><td>2</td><td>4K</td><td>128</td><td>258</td><td>0.62</td><td>6,640</td><td>1.57</td><td>81.7</td><td>161</td></tr>
+<tr><td>4</td><td>4K</td><td>128</td><td>101</td><td>1.00</td><td>4,466</td><td>2.95</td><td>43.4</td><td>169</td></tr>
+<tr><td>6</td><td>4K</td><td>128</td><td>65</td><td>1.71</td><td>2,461</td><td>4.33</td><td>29.6</td><td>171</td></tr>
+<tr><td>1</td><td>8K</td><td>128</td><td>566</td><td>1.16</td><td>7,088</td><td>1.40</td><td>91.4</td><td>91</td></tr>
+<tr><td>2</td><td>8K</td><td>128</td><td>231</td><td>1.18</td><td>6,920</td><td>2.69</td><td>47.6</td><td>94</td></tr>
+<tr><td>4</td><td>8K</td><td>128</td><td>64</td><td>1.87</td><td>4,891</td><td>5.19</td><td>24.7</td><td>96</td></tr>
+<tr><td>6</td><td>8K</td><td>128</td><td>40</td><td>3.17</td><td>2,676</td><td>7.62</td><td>16.8</td><td>97</td></tr>
+</tbody>
+</table></div>
+<p class="sub">Method and notes: README.md in this folder.</p>
+</main>
+<script>
+const form = document.getElementById("pick");
+function show() {
+  const key = form.metric.value + "-" + form.output.value;
+  for (const f of document.querySelectorAll("figure[data-chart]")) f.hidden = f.dataset.chart !== key;
+}
+form.addEventListener("change", show);
+show();
+</script>
+</body>
+</html>
