@@ -120,6 +120,10 @@ struct Lanes<B: Backend> {
 /// Device checkpoint storage kept for reuse across lanes.
 const DEVICE_SPARE: usize = 2;
 
+/// Lanes whose chain head stays in device memory (the most recently admitted); other heads move
+/// to the context store, from where their next request restores them (~5 ms over PCIe).
+const DEVICE_HEADS: usize = 2;
+
 /// Checkpoint storage kept for reuse per lane beyond the live checkpoints.
 const MAX_SPARE: usize = 4;
 
@@ -651,7 +655,12 @@ impl<B: Backend> Core<B> {
                 };
                 let job = waiting.pop_front().expect("checked");
                 match self.admit(&mut st, li, job) {
-                    Ok(a) => active.push(a),
+                    Ok(a) => {
+                        active.push(a);
+                        if let Err(e) = self.evict_heads(&mut st, li) {
+                            eprintln!("context store: moving a chain head failed: {e}");
+                        }
+                    }
                     Err((job, e)) => {
                         let _ = job.reply.send(Err(e));
                     }
@@ -677,6 +686,55 @@ impl<B: Backend> Core<B> {
                 self.complete(&st, a);
             }
         }
+    }
+
+    /// Keeps device checkpoints on the [`DEVICE_HEADS`] most recently admitted lanes: older lanes'
+    /// chain heads go to the context store (their KV rows are still in the lane) and their storage
+    /// to the shared spares.
+    fn evict_heads(&self, st: &mut Lanes<B>, current: usize) -> Result<(), CoreError> {
+        let Lanes {
+            lanes,
+            store,
+            spare,
+            ..
+        } = st;
+        loop {
+            let holders: Vec<usize> = (0..lanes.len())
+                .filter(|&i| !lanes[i].checkpoints.is_empty())
+                .collect();
+            if holders.len() <= DEVICE_HEADS {
+                break;
+            }
+            let Some(j) = holders
+                .into_iter()
+                .filter(|&i| i != current)
+                .min_by_key(|&i| lanes[i].last_used)
+            else {
+                break;
+            };
+            let lane = &mut lanes[j];
+            for cp in std::mem::take(&mut lane.checkpoints) {
+                if store.enabled()
+                    && cp.pos >= MIN_CAPTURE
+                    && cp.pos <= lane.keys.len()
+                    && !store.holds(&lane.keys[..cp.pos])
+                {
+                    let drafter = self.drafter_context(lane);
+                    store.insert(
+                        &self.b,
+                        &lane.session,
+                        &lane.keys,
+                        &cp,
+                        false,
+                        lane.chain,
+                        drafter,
+                    )?;
+                }
+                spare.push(cp);
+            }
+        }
+        spare.truncate(DEVICE_SPARE);
+        Ok(())
     }
 
     /// A free lane for a prompt of `keys`: the one that can reuse the most, else the least
