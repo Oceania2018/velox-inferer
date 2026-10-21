@@ -2,16 +2,19 @@
 //! The mathematics is specified in docs/qwen3_5-text.md.
 
 mod config;
+mod dflash;
 mod mtp;
 mod vision;
 mod weights;
 
 use velox_core::backend::{
-    AttnShape, Backend, ConvShape, GdnShape, NormKind, RopeLayout, RopePosShape, RopeShape,
+    AttnShape, Backend, ConvShape, Copy2dShape, GdnShape, NormKind, RopeLayout, RopePosShape,
+    RopeShape,
 };
 use velox_core::{Error, Result};
 
 pub use config::{LayerKind, TextConfig};
+pub use dflash::{BlockCandidates, DFlashConfig, DFlashModel, DFlashState, DFlashWorkspace};
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use vision::{Qwen35Vision, VisionConfig};
 pub use weights::{Layer, Mixer, TextWeights, WDesc};
@@ -152,6 +155,10 @@ pub struct Workspace<B: Backend> {
     pub rows_hidden: B::Buffer,
     /// Row of the last token of the latest `advance`, inside the final chunk.
     last_row: usize,
+    /// Target layers whose residual outputs (after the FFN) each chunk copies into `features`
+    /// (`[max_tokens, capture.len() * hidden]`, layer-major columns): DFlash conditioning.
+    capture: Vec<usize>,
+    features: Option<B::Buffer>,
 }
 
 pub struct Qwen35Text<B: Backend> {
@@ -232,7 +239,20 @@ impl<B: Backend> Qwen35Text<B> {
             keep_rows: false,
             emb: b.alloc(t * c.hidden)?,
             rows_hidden: b.alloc(t * c.hidden)?,
+            capture: Vec::new(),
+            features: None,
         })
+    }
+
+    /// Makes every chunk of `ws` keep the residual outputs of target `layers` (block indices) in
+    /// its feature buffer, for a draft model conditioned on them.
+    pub fn enable_capture(&self, b: &B, ws: &mut Workspace<B>, layers: &[usize]) -> Result<()> {
+        if let Some(&bad) = layers.iter().find(|&&l| l >= self.cfg.layers.len()) {
+            return Err(Error::Config(format!("capture layer {bad} out of range")));
+        }
+        ws.features = Some(b.alloc(ws.max_tokens * layers.len() * self.cfg.hidden)?);
+        ws.capture = layers.to_vec();
+        Ok(())
     }
 
     /// Feeds `ids` (any length, processed in workspace-sized chunks) and returns the logits after
@@ -338,7 +358,7 @@ impl<B: Backend> Qwen35Text<B> {
                 .map_err(|_| Error::Shape("negative rotary position".into()))?,
         };
         let (mut ai, mut gi) = (0, 0);
-        for l in &w.layers {
+        for (li, l) in w.layers.iter().enumerate() {
             b.rms_norm(
                 &ws.x,
                 w.param(l.input_norm),
@@ -446,6 +466,22 @@ impl<B: Backend> Qwen35Text<B> {
             )?;
             self.mlp(b, ws, l, t)?;
             b.add(&mut ws.x, &ws.y, t * hd)?;
+            if let Some(j) = ws.capture.iter().position(|&x| x == li) {
+                let cols = ws.capture.len() * hd;
+                let f = ws.features.as_mut().expect("allocated with capture");
+                b.copy2d(
+                    &ws.x,
+                    f,
+                    Copy2dShape {
+                        rows: t,
+                        cols: hd,
+                        src_offset: 0,
+                        src_stride: hd,
+                        dst_offset: j * hd,
+                        dst_stride: cols,
+                    },
+                )?;
+            }
         }
         if ws.keep_rows {
             b.rms_norm(

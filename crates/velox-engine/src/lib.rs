@@ -10,7 +10,7 @@ mod prompt;
 mod sampling;
 pub mod spec;
 
-use spec::MtpDrafter;
+use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -20,7 +20,7 @@ use velox_core::{Backend, Error as CoreError};
 use velox_frontend::image::{decode_data_url, preprocess, ImagePatches};
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
-    Checkpoint, EmbedInsert, Qwen35Text, Qwen35Vision, Session, Workspace,
+    Checkpoint, DFlashModel, EmbedInsert, Qwen35Text, Qwen35Vision, Session, Workspace,
 };
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
 
@@ -43,6 +43,9 @@ pub struct EngineConfig {
     pub scratch_capacity: usize,
     /// MTP drafts per speculative round on the main lane (0: plain decoding).
     pub mtp_drafts: usize,
+    /// DFlash2 drafts per block on the main lane when the engine has a DFlash2 model (0: use MTP
+    /// instead).
+    pub dflash_drafts: usize,
 }
 
 /// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
@@ -53,8 +56,8 @@ struct Lane<B: Backend> {
     keys: Vec<u32>,
     checkpoints: Vec<Checkpoint<B>>,
     zero: Checkpoint<B>,
-    /// MTP drafter for speculative decoding (main lane only).
-    drafter: Option<MtpDrafter<B>>,
+    /// Draft model for speculative decoding (main lane only).
+    drafter: Option<Drafter<B>>,
 }
 
 /// All lanes plus the activation workspace they share (requests run one at a time).
@@ -70,6 +73,8 @@ pub struct QwenEngine<B: Backend> {
     b: B,
     model: Qwen35Text<B>,
     vision: Option<Qwen35Vision<B>>,
+    /// DFlash2 block drafter weights, when loaded.
+    dflash: Option<DFlashModel<B>>,
     fe: Frontend,
     cfg: EngineConfig,
     state: Mutex<Lanes<B>>,
@@ -253,10 +258,15 @@ impl<B: Backend> QwenEngine<B> {
         b: B,
         model: Qwen35Text<B>,
         vision: Option<Qwen35Vision<B>>,
+        dflash: Option<DFlashModel<B>>,
         fe: Frontend,
         cfg: EngineConfig,
     ) -> Result<Self, CoreError> {
-        let ws = model.workspace(&b, cfg.chunk)?;
+        let dflash = dflash.filter(|_| cfg.dflash_drafts > 0);
+        let mut ws = model.workspace(&b, cfg.chunk)?;
+        if let Some(dm) = &dflash {
+            model.enable_capture(&b, &mut ws, &dm.cfg.target_layers)?;
+        }
         let mut lanes = Vec::new();
         for (i, capacity) in [cfg.capacity, cfg.scratch_capacity.min(cfg.capacity)]
             .into_iter()
@@ -267,16 +277,18 @@ impl<B: Backend> QwenEngine<B> {
             }
             let session = model.session(&b, capacity)?;
             let zero = session.checkpoint(&b)?;
-            let drafter = if i == 0 && cfg.mtp_drafts > 0 && model.has_mtp() {
-                Some(MtpDrafter::new(
+            let drafter = match &dflash {
+                Some(dm) if i == 0 => Some(Drafter::DFlash(DFlashDrafter::new(
                     &b,
+                    dm,
                     &model,
-                    capacity,
                     cfg.chunk,
-                    cfg.mtp_drafts,
-                )?)
-            } else {
-                None
+                    cfg.dflash_drafts,
+                )?)),
+                None if i == 0 && cfg.mtp_drafts > 0 && model.has_mtp() => Some(Drafter::Mtp(
+                    MtpDrafter::new(&b, &model, capacity, cfg.chunk, cfg.mtp_drafts)?,
+                )),
+                _ => None,
             };
             lanes.push(Lane {
                 session,
@@ -296,6 +308,7 @@ impl<B: Backend> QwenEngine<B> {
             b,
             model,
             vision,
+            dflash,
             fe,
             cfg,
             state,
@@ -415,6 +428,7 @@ impl<B: Backend> QwenEngine<B> {
         let mut c = sampler.sample(&cands);
         // Rows of the previous verify still to be paired in MTP (none: the prefill carry).
         let (mut row0, mut kept_next) = (0usize, Vec::new());
+        let mut first = true;
         loop {
             if self.fe.is_eos(c) {
                 return Ok("stop");
@@ -424,9 +438,37 @@ impl<B: Backend> QwenEngine<B> {
             if out.len() >= max_tokens {
                 return Ok("length");
             }
-            let drafts = dr
-                .draft(b, model, session, ws, row0, &kept_next, c, limit)
-                .map_err(core)?;
+            let (drafts, qs) = match dr {
+                Drafter::Mtp(m) => (
+                    m.draft(b, model, session, ws, row0, &kept_next, c, limit)
+                        .map_err(core)?,
+                    None,
+                ),
+                Drafter::DFlash(d) => {
+                    let dm = self
+                        .dflash
+                        .as_ref()
+                        .expect("a DFlash drafter has its model");
+                    let kept = if first { 0 } else { kept_next.len() + 1 };
+                    let temperature = sampler.temperature();
+                    let (drafts, qs) = d
+                        .draft(
+                            b,
+                            dm,
+                            model,
+                            ws,
+                            row0,
+                            kept,
+                            session.pos,
+                            c,
+                            limit,
+                            temperature,
+                        )
+                        .map_err(core)?;
+                    (drafts, Some(qs))
+                }
+            };
+            first = false;
             let mut window = vec![c];
             window.extend(drafts.into_iter().take(max_tokens - out.len()));
             let p = session.pos;
@@ -441,7 +483,11 @@ impl<B: Backend> QwenEngine<B> {
                     next = Some(sampler.sample(&rows[j]));
                     break;
                 }
-                match sampler.verify_draft(&rows[j], window[j + 1]) {
+                let verdict = match &qs {
+                    Some(q) => sampler.verify_draft_q(&rows[j], window[j + 1], &q[j]),
+                    None => sampler.verify_draft(&rows[j], window[j + 1]),
+                };
+                match verdict {
                     Ok(()) => {
                         keep += 1;
                         let d = window[j + 1];
@@ -463,7 +509,9 @@ impl<B: Backend> QwenEngine<B> {
                 }
             }
             model.commit(b, session, ws, keep).map_err(core)?;
-            dr.record(keep - 1, window.len() - 1);
+            if let Drafter::Mtp(m) = dr {
+                m.record(keep - 1, window.len() - 1);
+            }
             keys.extend_from_slice(&window[..keep]);
             if let Some(f) = finish {
                 return Ok(f);
@@ -526,6 +574,7 @@ impl<B: Backend> QwenEngine<B> {
                     Some(dr) => {
                         let (row0, delta) = (session.pos, session.rope_delta);
                         let model = &self.model;
+                        let dflash = self.dflash.as_ref();
                         let b = &self.b;
                         model.advance_rows(
                             b,
@@ -536,7 +585,18 @@ impl<B: Backend> QwenEngine<B> {
                             &inserts,
                             &mut |ws, base, t| {
                                 let rows = positions.map(|v| &v[base..base + t]);
-                                dr.prefill_chunk(b, model, ws, row0 + base, t, delta, rows)
+                                match &mut *dr {
+                                    Drafter::Mtp(m) => {
+                                        m.prefill_chunk(b, model, ws, row0 + base, t, delta, rows)
+                                    }
+                                    Drafter::DFlash(d) => d.prefill_chunk(
+                                        b,
+                                        dflash.expect("a DFlash drafter has its model"),
+                                        ws,
+                                        row0 + base,
+                                        t,
+                                    ),
+                                }
                             },
                         )?;
                     }
@@ -637,8 +697,8 @@ where
                 self.checkpoint_positions(&p.ids, 0)
             );
         }
-        if let Some(dr) = lane.drafter.as_mut() {
-            dr.reset();
+        if let Some(Drafter::Mtp(m)) = lane.drafter.as_mut() {
+            m.reset();
         }
         let start = self.reuse(lane, &p.keys).map_err(core)?;
         // Checkpoints still valid for this prompt are those inside the shared prefix.

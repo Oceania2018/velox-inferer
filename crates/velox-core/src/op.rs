@@ -28,6 +28,9 @@ pub enum Op {
     ConcatCols,
     SplitCols,
     Swiglu,
+    Copy2d,
+    DynConv,
+    AttentionBlock,
 }
 
 impl Op {
@@ -53,6 +56,9 @@ impl Op {
         Op::ConcatCols,
         Op::SplitCols,
         Op::Swiglu,
+        Op::Copy2d,
+        Op::DynConv,
+        Op::AttentionBlock,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -78,6 +84,9 @@ impl Op {
             Op::ConcatCols => "concat_cols",
             Op::SplitCols => "split_cols",
             Op::Swiglu => "swiglu",
+            Op::Copy2d => "copy2d",
+            Op::DynConv => "dyn_conv",
+            Op::AttentionBlock => "attention_block",
         }
     }
 }

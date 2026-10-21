@@ -48,12 +48,12 @@ COMMANDS:
       --act <a16|a8|a4>     activation policy (default a16); --divisor <f> for a4 (default 500)
       --iters <n>           timed iterations (default 20)
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
-      --artifact <path>
+      --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
-      [--max-tokens 64] [--chunk 256] [--capacity 4096]
+      [--max-tokens 64] [--chunk 256] [--capacity 4096] [--mtp N | --dflash N] (speculative)
   serve                   OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
@@ -61,6 +61,7 @@ COMMANDS:
       --chat-template <file> --max-context <n> (32768) --prefill-chunk <n> (512)
       --ctx-checkpoints <n> (8) --enable-thinking true|false (false)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
+      --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
   replay                  Replay a recorded agent session against an OpenAI-compatible server
       --session <dir>       directory with session.json and screenshots/
       --endpoint <url>      e.g. http://127.0.0.1:8010 (default)

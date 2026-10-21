@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use velox_core::backend::{
-    ActQuant, AttnShape, Backend, BackendKind, ConvShape, FullAttnShape, GdnShape, GeluKind,
-    NormKind, RopePosShape, RopeShape, WeightView,
+    ActQuant, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
+    DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{DeviceProfile, Op, Result};
 
@@ -297,5 +297,34 @@ impl<B: Backend> Backend for Profiled<B> {
     }
     fn rope_positions(&self, x: &mut B::Buffer, p: &[u32], s: RopePosShape) -> Result<()> {
         self.time("rope_positions", || self.inner.rope_positions(x, p, s))
+    }
+    fn copy2d(&self, src: &B::Buffer, dst: &mut B::Buffer, s: Copy2dShape) -> Result<()> {
+        self.time("copy2d", || self.inner.copy2d(src, dst, s))
+    }
+    fn dyn_conv(
+        &self,
+        x: &B::Buffer,
+        base: &B::Buffer,
+        delta: &B::Buffer,
+        out: &mut B::Buffer,
+        s: DynConvShape,
+    ) -> Result<()> {
+        self.time("dyn_conv", || self.inner.dyn_conv(x, base, delta, out, s))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn attention_block(
+        &self,
+        q: &B::Buffer,
+        k_ctx: &B::Buffer,
+        v_ctx: &B::Buffer,
+        k_blk: &B::Buffer,
+        v_blk: &B::Buffer,
+        out: &mut B::Buffer,
+        s: BlockAttnShape,
+    ) -> Result<()> {
+        self.time("attention_block", || {
+            self.inner
+                .attention_block(q, k_ctx, v_ctx, k_blk, v_blk, out, s)
+        })
     }
 }
