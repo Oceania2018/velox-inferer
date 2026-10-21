@@ -44,6 +44,8 @@ pub(crate) struct Entry<B: Backend> {
     /// The DFlash drafter's context rows ending at `pos`, when it had them.
     pub draft: Option<DraftContext<B>>,
     root: bool,
+    /// A prompt's end (see `ContextStore::mark_tail`).
+    tail: bool,
     adopted: u32,
     superseded: bool,
     last: u64,
@@ -224,6 +226,7 @@ impl<B: Backend> ContextStore<B> {
             kv: pages,
             draft,
             root,
+            tail: false,
             adopted: 0,
             superseded: false,
             last: self.now,
@@ -307,6 +310,27 @@ impl<B: Backend> ContextStore<B> {
     /// (ancestor references), counts an adoption of `adopted` (the entry it was restored from),
     /// and returns the deepest such entry, the parent of what the request captures next.
     pub fn resumed(&mut self, keys: &[u32], start: usize, adopted: Option<u64>) -> Option<u64> {
+        // Resuming from a conversation's own history point (not a shared root) retires the private
+        // end of the step that published it: the prompt-end entries this request diverges from
+        // after that point (ninfer retires private endpoints beyond the divergence the same way).
+        let from_root = self
+            .entries
+            .iter()
+            .any(|e| e.root && e.pos() == start && e.prefix_of(keys));
+        if start > 0 && !from_root {
+            let dead: Vec<usize> = (0..self.entries.len())
+                .filter(|&i| {
+                    let e = &self.entries[i];
+                    e.tail
+                        && !e.prefix_of(keys)
+                        && e.keys.iter().zip(keys).take_while(|(a, b)| a == b).count() >= start
+                })
+                .collect();
+            for i in dead.into_iter().rev() {
+                let e = self.entries.swap_remove(i);
+                self.release(e);
+            }
+        }
         let (lambda, now) = (self.lambda, self.now);
         let mut deepest: Option<(usize, u64)> = None;
         for e in &mut self.entries {
@@ -321,6 +345,14 @@ impl<B: Backend> ContextStore<B> {
             }
         }
         deepest.map(|(_, id)| id)
+    }
+
+    /// Marks entry `id` as a prompt's end, kept for an exact retry until the conversation moves on
+    /// (see `Self::resumed`).
+    pub fn mark_tail(&mut self, id: u64) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.tail = true;
+        }
     }
 
     /// Stores `cp` (state of `session` at `cp.pos`, whose KV rows below it are intact) under
@@ -392,6 +424,7 @@ impl<B: Backend> ContextStore<B> {
             kv,
             draft,
             root,
+            tail: false,
             adopted: 0,
             superseded: false,
             last: now,
