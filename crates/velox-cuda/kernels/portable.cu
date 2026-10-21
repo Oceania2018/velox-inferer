@@ -146,6 +146,56 @@ VELOX_API int velox_portable_matmul(const float* x, const float* w, float* y, in
     return velox_launch_status();
 }
 
+namespace {
+// Residual add fused with the RMS norm that follows it: acc += x, y = norm(acc). One block per
+// row; float4 accesses when the width allows.
+__global__ void add_rms_norm_kernel(float* __restrict__ acc, const float* __restrict__ x, const float* __restrict__ weight,
+                                    float* __restrict__ y, int dim, float eps, float offset) {
+    __shared__ float scratch[VELOX_WARP];
+    const size_t base = static_cast<size_t>(blockIdx.x) * dim;
+    float ss = 0.0f;
+    if ((dim & 3) == 0) {
+        float4* a4 = reinterpret_cast<float4*>(acc + base);
+        const float4* x4 = reinterpret_cast<const float4*>(x + base);
+        for (int i = threadIdx.x; i < dim / 4; i += blockDim.x) {
+            float4 a = a4[i];
+            const float4 b = x4[i];
+            a.x += b.x, a.y += b.y, a.z += b.z, a.w += b.w;
+            a4[i] = a;
+            ss += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+        }
+    } else {
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            const float a = acc[base + i] + x[base + i];
+            acc[base + i] = a;
+            ss += a * a;
+        }
+    }
+    ss = velox_block_sum(ss, scratch);
+    const float inv = rsqrtf(ss / dim + eps);
+    // Each thread re-reads only the elements it wrote, so no barrier is needed before this pass.
+    if ((dim & 3) == 0) {
+        const float4* a4 = reinterpret_cast<const float4*>(acc + base);
+        const float4* w4 = reinterpret_cast<const float4*>(weight);
+        float4* y4 = reinterpret_cast<float4*>(y + base);
+        for (int i = threadIdx.x; i < dim / 4; i += blockDim.x) {
+            const float4 a = a4[i], w = w4[i];
+            y4[i] = make_float4(a.x * inv * (offset + w.x), a.y * inv * (offset + w.y), a.z * inv * (offset + w.z),
+                                a.w * inv * (offset + w.w));
+        }
+    } else {
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) y[base + i] = acc[base + i] * inv * (offset + weight[i]);
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_add_rms_norm(float* acc, const float* x, const float* weight, float* y, int rows, int dim,
+                                          float eps, int offset) {
+    if (rows <= 0) return 0;
+    add_rms_norm_kernel<<<rows, 256>>>(acc, x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
+    return velox_launch_status();
+}
+
 VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float* y, int rows, int dim, float eps,
                                       int offset) {
     if (dim <= 1024) {

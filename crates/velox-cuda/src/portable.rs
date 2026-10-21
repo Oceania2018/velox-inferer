@@ -20,6 +20,16 @@ extern "C" {
         n: i32,
         k: i32,
     ) -> i32;
+    fn velox_portable_add_rms_norm(
+        acc: *mut f32,
+        x: *const f32,
+        weight: *const f32,
+        y: *mut f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
     fn velox_portable_rms_norm(
         x: *const f32,
         weight: *const f32,
@@ -185,6 +195,38 @@ pub fn embed(ids: &[u32], table: &WeightView<'_, CudaBuffer>, out: &mut CudaBuff
             )
         },
         "portable embed",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_rms_norm(
+    acc: &mut CudaBuffer,
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    y: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    kind: NormKind,
+) -> Result<()> {
+    check::rms_norm(acc.len(), weight.len(), y.len(), rows, dim)?;
+    check::elementwise("add_rms_norm", &[x.len()], rows * dim)?;
+    let (rows, dim) = (to_i32("rows", rows)?, to_i32("dim", dim)?);
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_add_rms_norm(
+                acc.as_mut_ptr(),
+                x.as_ptr(),
+                weight.as_ptr(),
+                y.as_mut_ptr(),
+                rows,
+                dim,
+                eps,
+                i32::from(kind == NormKind::Offset),
+            )
+        },
+        "portable add_rms_norm",
     )
 }
 
