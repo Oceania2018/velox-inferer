@@ -597,6 +597,12 @@ pub trait Backend {
     fn graph(&self, _key: u64, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         f()
     }
+    /// Inside [`Self::graph`]: ends the recording here and continues in a new one, launched after
+    /// it. A long step split this way starts executing while the rest is still being submitted.
+    /// A no-op elsewhere.
+    fn graph_break(&self) -> Result<()> {
+        Ok(())
+    }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
     /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.
