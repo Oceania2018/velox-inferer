@@ -31,6 +31,8 @@ pub(crate) struct Record {
     pub rope_delta: i64,
     /// KV segment ranges, in file order after the state.
     pub segs: Vec<(usize, usize)>,
+    /// Drafter context rows, in file order after the KV.
+    pub draft: Option<(usize, usize)>,
     pub root: bool,
     bytes: u64,
     last: u64,
@@ -90,7 +92,7 @@ impl DiskTier {
         self.records.iter().any(|r| r.keys == keys)
     }
 
-    /// Queues a copy of `parts` (state then KV buffers) as a record of `keys`; returns its id, or
+    /// Queues a copy of `parts` (state, KV, then drafter-context buffers) as a record of `keys`; returns its id, or
     /// `None` when it cannot fit. The caller keeps the memory alive until [`Self::completed`]
     /// reports the id.
     #[allow(clippy::too_many_arguments)]
@@ -99,6 +101,7 @@ impl DiskTier {
         keys: &[u32],
         rope_delta: i64,
         segs: Vec<(usize, usize)>,
+        draft: Option<(usize, usize)>,
         root: bool,
         parts: Vec<(*const u8, usize)>,
         now: u64,
@@ -120,6 +123,7 @@ impl DiskTier {
             keys: keys.to_vec(),
             rope_delta,
             segs,
+            draft,
             root,
             bytes,
             last: now,
@@ -184,7 +188,7 @@ impl DiskTier {
             .max_by_key(|r| r.keys.len())
     }
 
-    /// Reads record `id` into `bufs` (state then KV buffers, as written). A failed read drops
+    /// Reads record `id` into `bufs` (in the order written). A failed read drops
     /// the record.
     pub fn read(&mut self, id: u64, bufs: &mut [&mut [u8]], now: u64) -> std::io::Result<()> {
         let path = self.path(id);

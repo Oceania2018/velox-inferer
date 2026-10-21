@@ -27,7 +27,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 
 use velox_core::{Backend, Error as CoreError};
-use velox_models::qwen3_5::{Checkpoint, KvSegment, Session, KV_PAGE_ROWS};
+use velox_models::qwen3_5::{
+    Checkpoint, DFlashModel, DFlashState, DraftContext, KvSegment, Session, KV_PAGE_ROWS,
+};
 
 use crate::disk::DiskTier;
 
@@ -39,6 +41,8 @@ pub(crate) struct Entry<B: Backend> {
     pub state: Checkpoint<B>,
     /// KV pages covering rows `0..pos` in order (page `i` holds rows `i * KV_PAGE_ROWS ..`).
     pub kv: Vec<Arc<KvSegment<B>>>,
+    /// The DFlash drafter's context rows ending at `pos`, when it had them.
+    pub draft: Option<DraftContext<B>>,
     root: bool,
     adopted: u32,
     superseded: bool,
@@ -66,6 +70,7 @@ pub(crate) struct ContextStore<B: Backend> {
     /// 0.4 ms per MB, ten times the copy.
     spare: Vec<Checkpoint<B>>,
     pages: Vec<B::Buffer>,
+    draft_pages: Vec<B::Buffer>,
     /// Full KV pages by the hash of their whole prefix (see [`page_hashes`]).
     shared: HashMap<u64, Weak<KvSegment<B>>>,
     budget: usize,
@@ -91,6 +96,7 @@ impl<B: Backend> ContextStore<B> {
             entries: Vec::new(),
             spare: Vec::new(),
             pages: Vec::new(),
+            draft_pages: Vec::new(),
             shared: HashMap::new(),
             budget,
             lambda: lambda.max(0.0),
@@ -112,7 +118,7 @@ impl<B: Backend> ContextStore<B> {
         for id in disk.completed() {
             if let Some(i) = self.inflight.iter().position(|(r, _)| *r == id) {
                 let (_, e) = self.inflight.swap_remove(i);
-                Self::release(&mut self.spare, &mut self.pages, e);
+                self.release(e);
             }
         }
     }
@@ -128,6 +134,7 @@ impl<B: Backend> ContextStore<B> {
         limit: usize,
         resident: usize,
         gain: usize,
+        dm: Option<&DFlashModel<B>>,
     ) -> Result<bool, CoreError> {
         let Some(disk) = self.disk.as_mut() else {
             return Ok(false);
@@ -138,8 +145,14 @@ impl<B: Backend> ContextStore<B> {
         if r.keys.len() < resident + gain {
             return Ok(false);
         }
-        let (id, rkeys, rope_delta, segs, root) =
-            (r.id, r.keys.clone(), r.rope_delta, r.segs.clone(), r.root);
+        let (id, rkeys, rope_delta, segs, root, draft_rows) = (
+            r.id,
+            r.keys.clone(),
+            r.rope_delta,
+            r.segs.clone(),
+            r.root,
+            r.draft,
+        );
         let pos = rkeys.len();
         let mut state = match self.spare.pop() {
             Some(s) => s,
@@ -151,11 +164,22 @@ impl<B: Backend> ContextStore<B> {
         for &(lo, hi) in &segs {
             kv.push(session.blank_kv(b, lo, hi, &mut page)?);
         }
+        // A record written with drafter context is read whole, so it needs a DFlash drafter.
+        let mut draft = match (draft_rows, dm) {
+            (Some((lo, hi)), Some(dm)) => {
+                let (pool, len) = (&mut self.draft_pages, dm.context_page_len());
+                let mut page = || pool.pop().map_or_else(|| b.alloc_host(len), Ok);
+                Some(dm.blank_context(b, lo, hi, &mut page)?)
+            }
+            (Some(_), None) => return Ok(false),
+            _ => None,
+        };
         let read = {
             let mut bufs: Vec<&mut [u8]> = Vec::new();
             for buf in state
                 .buffers_mut()
                 .chain(kv.iter_mut().flat_map(|s| s.buffers_mut()))
+                .chain(draft.iter_mut().flat_map(|d| d.buffers_mut()))
             {
                 match b.host_bytes_mut(buf) {
                     Some(x) => bufs.push(x),
@@ -198,6 +222,7 @@ impl<B: Backend> ContextStore<B> {
             keys: rkeys,
             state,
             kv: pages,
+            draft,
             root,
             adopted: 0,
             superseded: false,
@@ -302,6 +327,7 @@ impl<B: Backend> ContextStore<B> {
         cp: &Checkpoint<B>,
         root: bool,
         chain: Option<u64>,
+        drafter: Option<(&DFlashModel<B>, &DFlashState<B>)>,
     ) -> Result<u64, CoreError> {
         let pos = cp.pos;
         let keys = &keys[..pos];
@@ -331,6 +357,19 @@ impl<B: Backend> ContextStore<B> {
             }
             kv.push(seg);
         }
+        // Drafter context is kept only when it reaches the entry's position: it is a window that
+        // ends there, and context ending earlier would leave the restored drafter without one.
+        let draft = match drafter {
+            Some((dm, st)) => match dm.context_rows(st, pos) {
+                Some((lo, hi)) if hi == pos => {
+                    let (pool, len) = (&mut self.draft_pages, dm.context_page_len());
+                    let mut page = || pool.pop().map_or_else(|| b.alloc_host(len), Ok);
+                    Some(dm.save_context(b, st, lo, hi, &mut page)?)
+                }
+                _ => None,
+            },
+            None => None,
+        };
         let mut state = match self.spare.pop() {
             Some(s) => s,
             None => session.blank_checkpoint_in(b, pos, true)?,
@@ -343,6 +382,7 @@ impl<B: Backend> ContextStore<B> {
             keys: keys.to_vec(),
             state,
             kv,
+            draft,
             root,
             adopted: 0,
             superseded: false,
@@ -376,6 +416,7 @@ impl<B: Backend> ContextStore<B> {
                     total += s.bytes(b);
                 }
             }
+            total += e.draft.as_ref().map_or(0, |d| d.bytes(b));
         }
         total
     }
@@ -408,7 +449,7 @@ impl<B: Backend> ContextStore<B> {
             }
             let e = self.entries.swap_remove(i);
             if let Some(e) = self.spill(b, e) {
-                Self::release(&mut self.spare, &mut self.pages, e);
+                self.release(e);
             }
         }
         self.shared.retain(|_, w| w.strong_count() > 0);
@@ -416,14 +457,17 @@ impl<B: Backend> ContextStore<B> {
     }
 
     /// Returns an entry's storage to the pools (KV pages once no other entry shares them).
-    fn release(spare: &mut Vec<Checkpoint<B>>, pages: &mut Vec<B::Buffer>, e: Entry<B>) {
-        if spare.len() < MAX_SPARE {
-            spare.push(e.state);
+    fn release(&mut self, e: Entry<B>) {
+        if self.spare.len() < MAX_SPARE {
+            self.spare.push(e.state);
         }
         for seg in e.kv {
             if let Ok(seg) = Arc::try_unwrap(seg) {
-                pages.extend(seg.into_pages());
+                self.pages.extend(seg.into_pages());
             }
+        }
+        if let Some(d) = e.draft {
+            self.draft_pages.extend(d.into_pages());
         }
     }
 
@@ -440,13 +484,23 @@ impl<B: Backend> ContextStore<B> {
             .state
             .buffers()
             .chain(e.kv.iter().flat_map(|s| s.buffers()))
+            .chain(e.draft.iter().flat_map(|d| d.buffers()))
             .map(|buf| b.host_bytes(buf).map(|x| (x.as_ptr(), x.len())))
             .collect();
         let Some(parts) = parts else {
             return Some(e);
         };
         let segs = e.kv.iter().map(|s| (s.lo, s.hi)).collect();
-        match disk.write(&e.keys, e.state.rope_delta, segs, e.root, parts, self.now) {
+        let draft = e.draft.as_ref().map(|d| (d.lo, d.hi));
+        match disk.write(
+            &e.keys,
+            e.state.rope_delta,
+            segs,
+            draft,
+            e.root,
+            parts,
+            self.now,
+        ) {
             Some(id) => {
                 self.inflight.push((id, e));
                 None
