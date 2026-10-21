@@ -6,8 +6,9 @@
 //! must fall back correctly.
 
 use velox_core::backend::{
-    ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, ConvShape, FullAttnShape, GdnShape,
-    GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
+    DynConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape,
+    WeightView,
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::model::{HostLayer, Stack};
@@ -529,6 +530,82 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn attention_block(&mut self, s: BlockAttnShape) -> Result<()> {
+        let q_len = s.tokens * s.heads * s.head_dim;
+        let ctx_len = s.ring * s.kv_heads * s.head_dim;
+        let blk_len = s.tokens * s.kv_heads * s.head_dim;
+        let q = self.rng.vec(q_len, 2.0);
+        let (kc, vc) = (self.rng.vec(ctx_len, 2.0), self.rng.vec(ctx_len, 1.0));
+        let (kb, vb) = (self.rng.vec(blk_len, 2.0), self.rng.vec(blk_len, 1.0));
+        let mut want = vec![0.0; q_len];
+        CpuBackend.attention_block(&q, &kc, &vc, &kb, &vb, &mut want, s)?;
+        let up = |x: &Vec<f32>| self.b.upload(x);
+        let (qd, kcd, vcd, kbd, vbd) = (up(&q)?, up(&kc)?, up(&vc)?, up(&kb)?, up(&vb)?);
+        let mut od = self.b.alloc(q_len)?;
+        self.b
+            .attention_block(&qd, &kcd, &vcd, &kbd, &vbd, &mut od, s)?;
+        let got = fetch(self.b, &od, q_len)?;
+        let name = format!(
+            "attention_block t={} h={}/{} d={} pos0={} lo={} window={} ring={}",
+            s.tokens, s.heads, s.kv_heads, s.head_dim, s.pos0, s.ctx_lo, s.window, s.ring
+        );
+        self.record(name, Some(Op::AttentionBlock), &got, &want, 2e-4);
+        Ok(())
+    }
+
+    fn dyn_conv(
+        &mut self,
+        rows: usize,
+        channels: usize,
+        side: usize,
+        accumulate: bool,
+    ) -> Result<()> {
+        let s = DynConvShape {
+            rows,
+            channels,
+            group: 16,
+            side,
+            accumulate,
+        };
+        let x = self.rng.vec(rows * channels, 2.0);
+        let base = self.rng.vec(4 * channels, 1.0);
+        let delta = self.rng.vec(rows * 4 * channels / 16, 0.5);
+        let out0 = self.rng.vec(rows * channels, 1.0);
+        let mut want = out0.clone();
+        CpuBackend.dyn_conv(&x, &base, &delta, &mut want, s)?;
+        let (xd, bd, dd) = (
+            self.b.upload(&x)?,
+            self.b.upload(&base)?,
+            self.b.upload(&delta)?,
+        );
+        let mut od = self.b.upload(&out0)?;
+        self.b.dyn_conv(&xd, &bd, &dd, &mut od, s)?;
+        let got = fetch(self.b, &od, rows * channels)?;
+        self.record(
+            format!("dyn_conv rows={rows} channels={channels} side={side} acc={accumulate}"),
+            Some(Op::DynConv),
+            &got,
+            &want,
+            1e-5,
+        );
+        Ok(())
+    }
+
+    fn copy2d(&mut self, s: Copy2dShape) -> Result<()> {
+        let src_len = s.src_offset + s.rows * s.src_stride;
+        let dst_len = s.dst_offset + s.rows * s.dst_stride;
+        let src = self.rng.vec(src_len, 1.0);
+        let dst0 = self.rng.vec(dst_len, 1.0);
+        let mut want = dst0.clone();
+        CpuBackend.copy2d(&src, &mut want, s)?;
+        let sd = self.b.upload(&src)?;
+        let mut dd = self.b.upload(&dst0)?;
+        self.b.copy2d(&sd, &mut dd, s)?;
+        let got = fetch(self.b, &dd, dst_len)?;
+        self.record(format!("copy2d {s:?}"), Some(Op::Copy2d), &got, &want, 0.0);
+        Ok(())
+    }
+
     /// Two calls (prefill chunk, then one token) so the rolling state is exercised.
     fn conv1d(&mut self, channels: usize, width: usize, chunks: [usize; 2]) -> Result<()> {
         let w = self.rng.vec(width * channels, 0.5);
@@ -830,6 +907,35 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.split_cols(2, &[7, 5, 3, 9, 4])?;
     s.swiglu(3, 17408)?;
     s.swiglu(5, 77)?;
+    // DFlash2 drafting: feature placement, dynamic convolution, windowed block attention.
+    s.copy2d(Copy2dShape {
+        rows: 7,
+        cols: 64,
+        src_offset: 3,
+        src_stride: 64,
+        dst_offset: 128,
+        dst_stride: 320,
+    })?;
+    s.dyn_conv(8, 5120, 0, false)?;
+    s.dyn_conv(8, 5120, 1, true)?;
+    s.dyn_conv(1, 64, 0, false)?;
+    for (pos0, ctx_lo, window, ring) in [
+        (3000, 1000, 2048, 2048),
+        (40, 0, 2048, 2048),
+        (100, 50, 16, 64),
+        (0, 0, 8, 8),
+    ] {
+        s.attention_block(BlockAttnShape {
+            tokens: 8,
+            heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            pos0,
+            ctx_lo,
+            window,
+            ring,
+        })?;
+    }
     s.concat_cols(7, 13, 5)?;
     s.top_k(2, 248_320, 248_077, 64)?;
     s.top_k(3, 5000, 4097, 20)?;

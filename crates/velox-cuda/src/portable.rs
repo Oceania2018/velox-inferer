@@ -2,8 +2,8 @@
 //! tuned kernels do not cover. Each wrapper re-validates, so it is safe to call directly.
 
 use velox_core::backend::{
-    AttnShape, ConvShape, FullAttnShape, GdnShape, GeluKind, NormKind, RopeLayout, RopePosShape,
-    RopeShape, WeightView,
+    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnShape,
+    GeluKind, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
 use velox_core::{Result, WeightFormat};
@@ -682,5 +682,134 @@ pub fn swiglu(
             )
         },
         "portable swiglu",
+    )
+}
+
+extern "C" {
+    fn velox_portable_attention_block(
+        q: *const f32,
+        k_ctx: *const f32,
+        v_ctx: *const f32,
+        k_blk: *const f32,
+        v_blk: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i64,
+        ctx_lo: i64,
+        window: i32,
+        ring: i32,
+    ) -> i32;
+    fn velox_portable_dyn_conv(
+        x: *const f32,
+        base: *const f32,
+        delta: *const f32,
+        out: *mut f32,
+        rows: i32,
+        channels: i32,
+        group: i32,
+        side: i32,
+        accumulate: i32,
+    ) -> i32;
+    fn velox_portable_copy2d(
+        src: *const f32,
+        src_stride: i64,
+        dst: *mut f32,
+        dst_stride: i64,
+        rows: i64,
+        cols: i64,
+    ) -> i32;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_block(
+    q: &CudaBuffer,
+    k_ctx: &CudaBuffer,
+    v_ctx: &CudaBuffer,
+    k_blk: &CudaBuffer,
+    v_blk: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: BlockAttnShape,
+) -> Result<()> {
+    check::attention_block(
+        q.len(),
+        k_ctx.len(),
+        v_ctx.len(),
+        k_blk.len(),
+        v_blk.len(),
+        out.len(),
+        &s,
+    )?;
+    // SAFETY: extents validated above.
+    status(
+        unsafe {
+            velox_portable_attention_block(
+                q.as_ptr(),
+                k_ctx.as_ptr(),
+                v_ctx.as_ptr(),
+                k_blk.as_ptr(),
+                v_blk.as_ptr(),
+                out.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("heads", s.heads)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                s.pos0 as i64,
+                s.ctx_lo as i64,
+                to_i32("window", s.window)?,
+                to_i32("ring", s.ring)?,
+            )
+        },
+        "portable attention_block",
+    )
+}
+
+pub fn dyn_conv(
+    x: &CudaBuffer,
+    base: &CudaBuffer,
+    delta: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: DynConvShape,
+) -> Result<()> {
+    check::dyn_conv(x.len(), base.len(), delta.len(), out.len(), &s)?;
+    // SAFETY: extents validated above.
+    status(
+        unsafe {
+            velox_portable_dyn_conv(
+                x.as_ptr(),
+                base.as_ptr(),
+                delta.as_ptr(),
+                out.as_mut_ptr(),
+                to_i32("rows", s.rows)?,
+                to_i32("channels", s.channels)?,
+                to_i32("group", s.group)?,
+                s.side as i32,
+                i32::from(s.accumulate),
+            )
+        },
+        "portable dyn_conv",
+    )
+}
+
+pub fn copy2d(src: &CudaBuffer, dst: &mut CudaBuffer, s: Copy2dShape) -> Result<()> {
+    check::copy2d(src.len(), dst.len(), &s)?;
+    if s.rows == 0 || s.cols == 0 {
+        return Ok(());
+    }
+    // SAFETY: both strided ranges validated above, so the offset pointers are in bounds.
+    status(
+        unsafe {
+            velox_portable_copy2d(
+                src.as_ptr().add(s.src_offset),
+                s.src_stride as i64,
+                dst.as_mut_ptr().add(s.dst_offset),
+                s.dst_stride as i64,
+                s.rows as i64,
+                s.cols as i64,
+            )
+        },
+        "portable copy2d",
     )
 }

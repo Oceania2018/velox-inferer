@@ -67,6 +67,16 @@ pub fn inspect(a: &Args) -> Result<ExitCode> {
         println!("  {key:<48} {n:>5} objects {:>9.3} GB", gb(bytes));
     }
     println!("structure  ok");
+    if let Some(id) = a.get("component") {
+        let c = art
+            .components()
+            .get(id)
+            .ok_or_else(|| Error::Config(format!("no component '{id}'")))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(c).map_err(|e| Error::Config(e.to_string()))?
+        );
+    }
     if a.parse("uses", false)? {
         print_uses(&art)?;
     }

@@ -7,7 +7,7 @@ use std::time::Instant;
 use velox_core::{Backend, Error, Result};
 use velox_engine::{EngineConfig, QwenEngine};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{Qwen35Text, Qwen35Vision, TextConfig, TextWeights};
+use velox_models::qwen3_5::{DFlashModel, Qwen35Text, Qwen35Vision, TextConfig, TextWeights};
 use velox_serve::{ChatEngine, Config, Server, UnimplementedEngine};
 use velox_weights::Artifact;
 
@@ -27,8 +27,13 @@ where
     };
     let fe = Frontend::from_artifact(art, template)?;
     let cfg = TextConfig::from_json(&art.components()["text"]["config"])?;
+    let dflash_drafts: usize = a.parse("dflash-drafts", 7)?;
+    let use_dflash = dflash_drafts > 0 && art.components().contains_key("dflash2");
     let t0 = Instant::now();
-    let w = TextWeights::load(&b, art, &cfg, |line| eprint!("\rloading {line}   "))?;
+    // With DFlash2 the MTP predictor is never used: skip its weights.
+    let w = TextWeights::load_with(&b, art, &cfg, !use_dflash, |line| {
+        eprint!("\rloading {line}   ")
+    })?;
     eprintln!(
         "\nloaded {:.2} GB in {:.1}s on {}",
         w.bytes as f64 / 1e9,
@@ -43,6 +48,7 @@ where
         max_checkpoints: a.parse("ctx-checkpoints", 8)?,
         scratch_capacity: a.parse("scratch-context", 8192)?,
         mtp_drafts: a.parse("mtp-drafts", 7)?,
+        dflash_drafts,
     };
     let vision = if art.components().contains_key("vision")
         && a.get("vision").is_none_or(|v| v != "false")
@@ -58,8 +64,25 @@ where
     } else {
         None
     };
+    let dflash = if use_dflash {
+        let t2 = Instant::now();
+        let d = DFlashModel::load(&b, art, cfg.hidden)?;
+        if let Some(d) = &d {
+            eprintln!(
+                "dflash2 drafter loaded ({:.2} GB, {} drafts per block) in {:.1}s",
+                d.bytes as f64 / 1e9,
+                dflash_drafts,
+                t2.elapsed().as_secs_f64()
+            );
+        }
+        d
+    } else {
+        None
+    };
     let model = Qwen35Text::new(cfg, w);
-    Ok(Box::new(QwenEngine::new(b, model, vision, fe, engine_cfg)?))
+    Ok(Box::new(QwenEngine::new(
+        b, model, vision, dflash, fe, engine_cfg,
+    )?))
 }
 
 pub fn run(a: &Args) -> Result<ExitCode> {
