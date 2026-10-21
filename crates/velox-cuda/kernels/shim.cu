@@ -105,3 +105,55 @@ VELOX_API int velox_cuda_event_elapsed(void* start, void* end, float* ms) {
     return static_cast<int>(cudaEventElapsedTime(ms, static_cast<cudaEvent_t>(start), static_cast<cudaEvent_t>(end)));
 }
 VELOX_API int velox_cuda_event_destroy(void* e) { return static_cast<int>(cudaEventDestroy(static_cast<cudaEvent_t>(e))); }
+
+// CUDA graphs over the (per-thread) default stream. A step is captured, then either patched into
+// the executable graph of its slot (same topology, new parameters: cudaGraphExecUpdate) or
+// instantiated afresh, and launched as one submission instead of one per kernel.
+namespace {
+constexpr int kGraphSlots = 256;
+cudaGraphExec_t g_exec[kGraphSlots] = {};
+}  // namespace
+
+// Waits for queued work (so the staging ring can restart) and starts capturing. Relaxed mode lets
+// grow-only scratch allocate during capture.
+VELOX_API int velox_cuda_graph_begin() {
+    if (cudaError_t e = cudaStreamSynchronize(cudaStreamPerThread)) return static_cast<int>(e);
+    {
+        std::lock_guard<std::mutex> lock(g_stage.mu);
+        g_stage.off = 0;
+    }
+    return static_cast<int>(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed));
+}
+
+// Ends the capture and launches it as slot `slot`'s graph.
+VELOX_API int velox_cuda_graph_end_launch(int slot) {
+    if (slot < 0 || slot >= kGraphSlots) return VELOX_ERR_UNSUPPORTED;
+    cudaGraph_t g = nullptr;
+    if (cudaError_t e = cudaStreamEndCapture(cudaStreamPerThread, &g)) return static_cast<int>(e);
+    cudaGraphExec_t& exec = g_exec[slot];
+    if (exec != nullptr) {
+        cudaGraphExecUpdateResultInfo info;
+        if (cudaGraphExecUpdate(exec, g, &info) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cudaGraphExecDestroy(exec);
+            exec = nullptr;
+        }
+    }
+    if (exec == nullptr) {
+        if (cudaError_t e = cudaGraphInstantiate(&exec, g, 0)) {
+            cudaGraphDestroy(g);
+            exec = nullptr;
+            return static_cast<int>(e);
+        }
+    }
+    cudaGraphDestroy(g);
+    return static_cast<int>(cudaGraphLaunch(exec, cudaStreamPerThread));
+}
+
+// Ends a capture whose recording failed, discarding it.
+VELOX_API int velox_cuda_graph_abort() {
+    cudaGraph_t g = nullptr;
+    cudaStreamEndCapture(cudaStreamPerThread, &g);
+    if (g != nullptr) cudaGraphDestroy(g);
+    return static_cast<int>(cudaGetLastError());
+}
