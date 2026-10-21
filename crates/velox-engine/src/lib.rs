@@ -61,6 +61,8 @@ struct Lane<B: Backend> {
     zero: Checkpoint<B>,
     /// Draft model for speculative decoding (main lane only).
     drafter: Option<Drafter<B>>,
+    /// Speculative rounds of the current request: (rounds, drafted, accepted).
+    spec_stats: (usize, usize, usize),
 }
 
 /// All lanes plus the activation workspace they share (requests run one at a time).
@@ -301,6 +303,7 @@ impl<B: Backend> QwenEngine<B> {
                 keys: Vec::new(),
                 checkpoints: Vec::new(),
                 spare: Vec::new(),
+                spec_stats: (0, 0, 0),
                 zero,
                 drafter,
             });
@@ -441,6 +444,7 @@ impl<B: Backend> QwenEngine<B> {
             session,
             keys,
             drafter,
+            spec_stats,
             ..
         } = lane;
         let dr = drafter.as_mut().expect("caller checked");
@@ -528,6 +532,9 @@ impl<B: Backend> QwenEngine<B> {
                     }
                 }
             }
+            spec_stats.0 += 1;
+            spec_stats.1 += window.len() - 1;
+            spec_stats.2 += keep - 1;
             model.commit(b, session, ws, keep).map_err(core)?;
             if let Drafter::Mtp(m) = dr {
                 m.record(keep - 1, window.len() - 1);
@@ -766,6 +773,7 @@ where
         let mut out = Vec::new();
         let mut finish = "length";
         if lane.drafter.is_some() {
+            lane.spec_stats = (0, 0, 0);
             finish =
                 self.decode_speculative(lane, ws, &mut sampler, cands, max_tokens, &mut out)?;
         } else {
@@ -792,6 +800,14 @@ where
             }
         }
         let predicted_ms = t1.elapsed().as_secs_f64() * 1e3;
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() && lane.drafter.is_some() {
+            let (rounds, drafted, accepted) = lane.spec_stats;
+            eprintln!(
+                "[decode] {} tokens in {predicted_ms:.0} ms, {rounds} rounds, accepted {accepted}/{drafted} drafts, {:.2} tokens/round",
+                out.len(),
+                out.len() as f64 / rounds.max(1) as f64
+            );
+        }
 
         let text = self.fe.decode(&out).map_err(core)?;
         let parsed = parse_output(&text, tools);
