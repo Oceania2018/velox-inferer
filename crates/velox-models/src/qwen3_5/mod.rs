@@ -57,6 +57,7 @@ pub const VERIFY_MAX: usize = 16;
 const GRAPH_ADVANCE: u64 = 1 << 16;
 const GRAPH_VERIFY: u64 = 2 << 16;
 const GRAPH_COMMIT: u64 = 3 << 16;
+const GRAPH_VERIFY_BATCH: u64 = 4 << 16;
 
 /// Static steps (see [`GRAPH_STATIC`]) stay under this many tokens, where attention takes the
 /// path that stages its position.
@@ -1361,18 +1362,39 @@ impl<B: Backend> Qwen35Text<B> {
         if t > ws.max_tokens {
             return Err(Error::Shape("verify batch exceeds the workspace".into()));
         }
-        self.chunk_batch(b, sessions, ws, bw, &ids, &rows)?;
         let (c, w) = (&self.cfg, &self.w);
-        b.rms_norm(
-            &ws.x,
-            w.param(w.final_norm),
-            &mut bw.hidden,
-            t,
-            c.hidden,
-            c.eps,
-            NormKind::Offset,
-        )?;
-        b.linear(&bw.hidden, &w.view(&w.head), &mut bw.logits, t)?;
+        let run = |sessions: &mut [&mut Session<B>],
+                   ws: &mut Workspace<B>,
+                   bw: &mut BatchWorkspace<B>|
+         -> Result<()> {
+            self.chunk_batch(b, sessions, ws, bw, &ids, &rows)?;
+            b.rms_norm(
+                &ws.x,
+                w.param(w.final_norm),
+                &mut bw.hidden,
+                t,
+                c.hidden,
+                c.eps,
+                NormKind::Offset,
+            )?;
+            b.linear(&bw.hidden, &w.view(&w.head), &mut bw.logits, t)
+        };
+        // Equal windows: one recorded step per (sequences, window, largest KV bucket). Caches,
+        // states and positions are per-call values (see `Backend::graph`), so the recording
+        // serves whichever sequences the batch holds.
+        let m = windows[0].len();
+        if windows.iter().all(|w| w.len() == m) {
+            let kv = sessions.iter().map(|s| s.pos + m).max().unwrap_or(0);
+            let key = GRAPH_VERIFY_BATCH
+                | GRAPH_STATIC
+                | n as u64
+                | (m as u64) << 4
+                | u64::from(!ws.capture.is_empty()) << 9
+                | (kv.div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
+            b.graph(key, &mut || run(sessions, ws, bw))?;
+        } else {
+            run(sessions, ws, bw)?;
+        }
         let mut all = b.top_k(&bw.logits, t, c.vocab, limit.min(c.vocab), k)?;
         let mut out = Vec::with_capacity(n);
         for &(_, m) in rows.iter().rev() {
@@ -1484,6 +1506,9 @@ impl<B: Backend> Qwen35Text<B> {
         b.embed(ids, &w.view(&w.embed), &mut ws.x)?;
         let (mut ai, mut gi) = (0, 0);
         for (li, l) in w.layers.iter().enumerate() {
+            if GRAPH_SEGMENT_STARTS.contains(&li) {
+                b.graph_break()?;
+            }
             if li == 0 {
                 b.rms_norm(
                     &ws.x,
