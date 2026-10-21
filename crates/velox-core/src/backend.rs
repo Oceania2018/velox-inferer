@@ -535,6 +535,14 @@ pub trait Backend {
         positions: &[u32],
         shape: RopePosShape,
     ) -> Result<()>;
+    /// Runs `f`, which must only queue device work: no host readback and no synchronization. A
+    /// backend may record the work once per `key` and replay it as one submission (CUDA graphs);
+    /// work under one key must keep the same structure (the same ops in the same order) for
+    /// replays to stay cheap. `f` runs exactly once either way, so its host-side effects happen
+    /// once.
+    fn graph(&self, _key: u32, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        f()
+    }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
     /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.
