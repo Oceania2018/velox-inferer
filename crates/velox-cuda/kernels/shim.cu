@@ -78,6 +78,16 @@ VELOX_API int velox_cuda_dtod(void* dst, const void* src, size_t bytes) {
     return static_cast<int>(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, 0));
 }
 
+// Many independent copies in one submission (CUDA 12.8+ batch API), on the per-thread stream.
+VELOX_API int velox_cuda_copy_batch(void* const* dsts, const void* const* srcs, const size_t* sizes, size_t count) {
+    if (count == 0) return 0;
+    cudaMemcpyAttributes attr = {};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t idx = 0;
+    return static_cast<int>(
+        cudaMemcpyBatchAsync(dsts, srcs, sizes, count, &attr, &idx, 1, cudaStreamPerThread));
+}
+
 VELOX_API int velox_cuda_synchronize() { return static_cast<int>(cudaDeviceSynchronize()); }
 
 VELOX_API const char* velox_cuda_error_string(int code) {
