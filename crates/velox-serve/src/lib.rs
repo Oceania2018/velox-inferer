@@ -76,6 +76,9 @@ pub trait ChatEngine: Send + Sync {
     /// Runs one chat request (already validated to have `messages`), emitting deltas as they
     /// are produced.
     fn generate(&self, request: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError>;
+    /// Housekeeping after a response has been delivered, while no request may be waiting (e.g.
+    /// preparing memory the next one would otherwise allocate). Returns promptly once one is.
+    fn idle(&self) {}
 }
 
 /// Engine for a model whose execution path velox does not implement yet. Loading, health,
@@ -281,7 +284,14 @@ impl Server {
                 "text/plain; version=0.0.4",
                 self.metrics().as_bytes(),
             ),
-            ("POST", "/v1/chat/completions") => self.chat(&mut w, &req.body),
+            ("POST", "/v1/chat/completions") => {
+                let r = self.chat(&mut w, &req.body);
+                // The response is complete: let the client go before the engine's idle work.
+                let _ = w.flush();
+                let _ = w.shutdown(std::net::Shutdown::Write);
+                self.engine.idle();
+                r
+            }
             (_, "/health" | "/v1/models" | "/metrics" | "/v1/chat/completions") => {
                 respond_json(&mut w, 405, &ApiError::invalid("method not allowed").body())
             }
