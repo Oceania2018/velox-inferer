@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_profiler_api.h>
 
 #include "velox_common.cuh"
@@ -56,6 +58,103 @@ VELOX_API int velox_cuda_host_alloc(void** ptr, size_t bytes) {
 }
 
 VELOX_API int velox_cuda_free_host(void* ptr) { return static_cast<int>(cudaFreeHost(ptr)); }
+
+// Virtual memory (driver cuMem* API, fetched through the runtime so nothing links libcuda).
+namespace {
+struct Vmm {
+    PFN_cuMemGetAllocationGranularity_v10020 granularity = nullptr;
+    PFN_cuMemAddressReserve_v10020 reserve = nullptr;
+    PFN_cuMemAddressFree_v10020 address_free = nullptr;
+    PFN_cuMemCreate_v10020 create = nullptr;
+    PFN_cuMemRelease_v10020 release = nullptr;
+    PFN_cuMemMap_v10020 map = nullptr;
+    PFN_cuMemUnmap_v10020 unmap = nullptr;
+    PFN_cuMemSetAccess_v10020 set_access = nullptr;
+    bool ok = false;
+};
+template <typename F>
+bool vmm_entry(const char* name, F& f) {
+    void* p = nullptr;
+    cudaDriverEntryPointQueryResult q;
+    if (cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+        q != cudaDriverEntryPointSuccess)
+        return false;
+    f = reinterpret_cast<F>(p);
+    return true;
+}
+const Vmm& vmm() {
+    static const Vmm v = [] {
+        Vmm v;
+        v.ok = vmm_entry("cuMemGetAllocationGranularity", v.granularity) &&
+               vmm_entry("cuMemAddressReserve", v.reserve) && vmm_entry("cuMemAddressFree", v.address_free) &&
+               vmm_entry("cuMemCreate", v.create) && vmm_entry("cuMemRelease", v.release) &&
+               vmm_entry("cuMemMap", v.map) && vmm_entry("cuMemUnmap", v.unmap) &&
+               vmm_entry("cuMemSetAccess", v.set_access);
+        return v;
+    }();
+    return v;
+}
+CUmemAllocationProp vmm_prop() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    CUmemAllocationProp p = {};
+    p.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    p.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    p.location.id = dev;
+    return p;
+}
+// Driver codes share the runtime's numbering for the failures that matter here (2: out of memory).
+int vmm_status(CUresult r) { return static_cast<int>(r); }
+}  // namespace
+
+// Chunk size in bytes (0: no virtual memory management on this device or driver).
+VELOX_API int velox_vmm_granularity(size_t* bytes) {
+    *bytes = 0;
+    const Vmm& v = vmm();
+    if (!v.ok) return 0;
+    // Devices without virtual memory management fail the granularity query.
+    const CUmemAllocationProp p = vmm_prop();
+    return vmm_status(v.granularity(bytes, &p, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+}
+
+VELOX_API int velox_vmm_reserve(void** va, size_t bytes) {
+    CUdeviceptr p = 0;
+    const int e = vmm_status(vmm().reserve(&p, bytes, 0, 0, 0));
+    *va = reinterpret_cast<void*>(p);
+    return e;
+}
+
+VELOX_API int velox_vmm_free(void* va, size_t bytes) {
+    return vmm_status(vmm().address_free(reinterpret_cast<CUdeviceptr>(va), bytes));
+}
+
+VELOX_API int velox_vmm_create(unsigned long long* handle, size_t bytes) {
+    const CUmemAllocationProp p = vmm_prop();
+    CUmemGenericAllocationHandle h = 0;
+    const int e = vmm_status(vmm().create(&h, bytes, &p, 0));
+    *handle = h;
+    return e;
+}
+
+VELOX_API int velox_vmm_release(unsigned long long handle) { return vmm_status(vmm().release(handle)); }
+
+VELOX_API int velox_vmm_map(void* va, size_t bytes, unsigned long long handle) {
+    const Vmm& v = vmm();
+    const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
+    if (const int e = vmm_status(v.map(p, bytes, 0, handle, 0))) return e;
+    CUmemAccessDesc a = {};
+    a.location = vmm_prop().location;
+    a.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (const int e = vmm_status(v.set_access(p, bytes, &a, 1))) {
+        v.unmap(p, bytes);
+        return e;
+    }
+    return 0;
+}
+
+VELOX_API int velox_vmm_unmap(void* va, size_t bytes) {
+    return vmm_status(vmm().unmap(reinterpret_cast<CUdeviceptr>(va), bytes));
+}
 
 VELOX_API int velox_cuda_malloc_zeroed(void** ptr, size_t bytes) {
     cudaError_t e = cudaMalloc(ptr, bytes);

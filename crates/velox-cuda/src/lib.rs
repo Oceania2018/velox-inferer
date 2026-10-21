@@ -46,6 +46,13 @@ mod ffi {
             count: usize,
         ) -> i32;
         pub fn velox_cuda_free_host(ptr: *mut c_void) -> i32;
+        pub fn velox_vmm_granularity(bytes: *mut usize) -> i32;
+        pub fn velox_vmm_reserve(va: *mut *mut c_void, bytes: usize) -> i32;
+        pub fn velox_vmm_free(va: *mut c_void, bytes: usize) -> i32;
+        pub fn velox_vmm_create(handle: *mut u64, bytes: usize) -> i32;
+        pub fn velox_vmm_release(handle: u64) -> i32;
+        pub fn velox_vmm_map(va: *mut c_void, bytes: usize, handle: u64) -> i32;
+        pub fn velox_vmm_unmap(va: *mut c_void, bytes: usize) -> i32;
         pub fn velox_cuda_free(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_htod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_dtoh(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
@@ -214,6 +221,27 @@ pub struct CudaBuffer {
     len: usize,
     /// Pinned, mapped system memory (see `Backend::alloc_host`) rather than device memory.
     host: bool,
+    /// A reserved address range backed chunk by chunk (see `Backend::alloc_virtual`).
+    vm: Option<Box<VmRange>>,
+}
+
+/// The chunks of a virtual [`CudaBuffer`]: which are mapped, and the range's size.
+struct VmRange {
+    chunk_bytes: usize,
+    mapped: Vec<bool>,
+}
+
+/// Physical device memory of one virtual-memory chunk (released on drop; the memory stays alive
+/// while a buffer still maps it).
+pub struct CudaChunk {
+    handle: u64,
+}
+
+impl Drop for CudaChunk {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from cuMemCreate and is released exactly once.
+        unsafe { ffi::velox_vmm_release(self.handle) };
+    }
 }
 
 // SAFETY: a device pointer is a plain address; synchronisation is CUDA's stream ordering.
@@ -237,6 +265,7 @@ impl CudaBuffer {
             ptr: ptr.cast(),
             len,
             host: false,
+            vm: None,
         })
     }
 
@@ -259,6 +288,18 @@ impl CudaBuffer {
 
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
+        if let Some(vm) = self.vm.take() {
+            // SAFETY: the range came from cuMemAddressReserve; mapped chunks are unmapped before
+            // the range is freed. Callers synchronize before dropping a buffer work still uses.
+            unsafe {
+                for (i, _) in vm.mapped.iter().enumerate().filter(|(_, m)| **m) {
+                    let va = self.ptr.cast::<u8>().add(i * vm.chunk_bytes);
+                    ffi::velox_vmm_unmap(va.cast(), vm.chunk_bytes);
+                }
+                ffi::velox_vmm_free(self.ptr.cast(), vm.mapped.len() * vm.chunk_bytes);
+            }
+            return;
+        }
         if !self.ptr.is_null() {
             // SAFETY: ptr came from cudaMalloc (or cudaHostAlloc) and is freed exactly once.
             // Errors at teardown (e.g. after a sticky kernel fault) cannot be reported from Drop.
@@ -291,6 +332,7 @@ impl CudaBuffer {
             ptr: ptr.cast(),
             len,
             host: true,
+            vm: None,
         })
     }
 }
@@ -652,6 +694,22 @@ pub enum GraphMode {
 }
 
 /// The KV bucket (in keys) a static graph step's key carries, while one is recorded or replayed.
+/// Bytes of one virtual-memory chunk on the current device (0: none).
+fn vm_chunk_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        if std::env::var_os("VELOX_NO_VMM").is_some() {
+            return 0;
+        }
+        let mut b = 0usize;
+        // SAFETY: out-pointer to a live local.
+        match unsafe { ffi::velox_vmm_granularity(&mut b) } {
+            0 => b,
+            _ => 0,
+        }
+    })
+}
+
 pub(crate) fn static_kv_bucket() -> Option<usize> {
     if graph_mode() == GraphMode::None {
         return None;
@@ -971,6 +1029,7 @@ impl Backend for CudaBackend {
     }
 
     type Buffer = CudaBuffer;
+    type Chunk = CudaChunk;
 
     fn kind(&self) -> BackendKind {
         BackendKind::Cuda
@@ -1009,6 +1068,92 @@ impl Backend for CudaBackend {
 
     fn alloc_host(&self, len: usize) -> Result<CudaBuffer> {
         CudaBuffer::new_host(len)
+    }
+
+    fn vm_chunk_len(&self) -> usize {
+        vm_chunk_bytes() / 4
+    }
+
+    fn alloc_virtual(&self, len: usize) -> Result<CudaBuffer> {
+        let chunk = vm_chunk_bytes();
+        if chunk == 0 {
+            return Err(Error::Unsupported("virtual memory on this device".into()));
+        }
+        let chunks = (len.max(1) * 4).div_ceil(chunk);
+        let mut va: *mut c_void = std::ptr::null_mut();
+        // SAFETY: out-pointer to a live local.
+        status(
+            unsafe { ffi::velox_vmm_reserve(&mut va, chunks * chunk) },
+            "cuMemAddressReserve",
+        )?;
+        Ok(CudaBuffer {
+            ptr: va.cast(),
+            len,
+            host: false,
+            vm: Some(Box::new(VmRange {
+                chunk_bytes: chunk,
+                mapped: vec![false; chunks],
+            })),
+        })
+    }
+
+    fn alloc_chunk(&self) -> Result<CudaChunk> {
+        let chunk = vm_chunk_bytes();
+        if chunk == 0 {
+            return Err(Error::Unsupported("virtual memory on this device".into()));
+        }
+        let mut handle = 0u64;
+        // SAFETY: out-pointer to a live local.
+        status(
+            unsafe { ffi::velox_vmm_create(&mut handle, chunk) },
+            "cuMemCreate",
+        )?;
+        Ok(CudaChunk { handle })
+    }
+
+    fn map_chunk(&self, buf: &mut CudaBuffer, index: usize, chunk: &CudaChunk) -> Result<()> {
+        let ptr = buf.ptr;
+        let vm = buf
+            .vm
+            .as_mut()
+            .ok_or_else(|| Error::Shape("map_chunk on a buffer that is not virtual".into()))?;
+        match vm.mapped.get(index) {
+            None => {
+                return Err(Error::Shape(format!(
+                    "map_chunk: chunk {index} of {}",
+                    vm.mapped.len()
+                )))
+            }
+            Some(true) => return Err(Error::Shape(format!("chunk {index} is already mapped"))),
+            Some(false) => {}
+        }
+        // SAFETY: the address lies inside the reserved range (checked index); the handle is live.
+        let va = unsafe { ptr.cast::<u8>().add(index * vm.chunk_bytes) };
+        status(
+            unsafe { ffi::velox_vmm_map(va.cast(), vm.chunk_bytes, chunk.handle) },
+            "cuMemMap",
+        )?;
+        vm.mapped[index] = true;
+        Ok(())
+    }
+
+    fn unmap_chunk(&self, buf: &mut CudaBuffer, index: usize) -> Result<()> {
+        let ptr = buf.ptr;
+        let vm = buf
+            .vm
+            .as_mut()
+            .ok_or_else(|| Error::Shape("unmap_chunk on a buffer that is not virtual".into()))?;
+        if !vm.mapped.get(index).copied().unwrap_or(false) {
+            return Err(Error::Shape(format!("chunk {index} is not mapped")));
+        }
+        // SAFETY: a mapped chunk inside the reserved range; the caller synchronized its users.
+        let va = unsafe { ptr.cast::<u8>().add(index * vm.chunk_bytes) };
+        status(
+            unsafe { ffi::velox_vmm_unmap(va.cast(), vm.chunk_bytes) },
+            "cuMemUnmap",
+        )?;
+        vm.mapped[index] = false;
+        Ok(())
     }
 
     fn host_alloc(&self) -> Option<velox_core::backend::HostAlloc<CudaBuffer>> {

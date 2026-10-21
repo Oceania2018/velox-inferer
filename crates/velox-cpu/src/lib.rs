@@ -64,6 +64,8 @@ fn decode_view(w: &WeightView<'_, Vec<f32>>) -> Result<Vec<f32>> {
 
 impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
+    /// No virtual memory: callers allocate whole buffers.
+    type Chunk = ();
 
     fn kind(&self) -> BackendKind {
         BackendKind::Cpu
