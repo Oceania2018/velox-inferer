@@ -122,6 +122,22 @@ pub struct GdnShape {
     pub row0: usize,
 }
 
+/// One Gated DeltaNet layer of [`Backend::gdn_replay`].
+pub struct GdnReplayLayer<'a, Buf> {
+    /// `[tokens, channels]` conv1d inputs of the window.
+    pub qkv: &'a Buf,
+    /// `[tokens, channels]` conv1d_silu outputs of the window (from the same starting state).
+    pub conv_out: &'a Buf,
+    /// `[tokens, 2 * v_heads]` gate inputs.
+    pub ab: &'a Buf,
+    pub a_log: &'a Buf,
+    pub dt_bias: &'a Buf,
+    /// `[width - 1, channels]` conv state, advanced in place.
+    pub conv_state: &'a mut Buf,
+    /// `[v_heads, v_dim, k_dim]` recurrent state, advanced in place.
+    pub ssm: &'a mut Buf,
+}
+
 /// [`Backend::graph`] key flag: the recorded work is static (see there).
 pub const GRAPH_STATIC: u64 = 1 << 63;
 
@@ -472,6 +488,45 @@ pub trait Backend {
     ) -> Result<()> {
         self.copy(state_in, 0, state_out, 0, self.len(state_in))?;
         self.gated_delta_net(qkv, ab, a_log, dt_bias, state_out, out, shape)
+    }
+    /// Advances several GDN layers over the first `gdn.tokens` rows of a window whose conv outputs
+    /// are known (a speculative window replayed after a partial accept): each layer's conv state
+    /// as [`Self::conv1d_silu`] and its recurrent state as [`Self::gated_delta_net`] would leave
+    /// them; nothing else is written. `conv.tokens == gdn.tokens`, `row0 == 0` in both.
+    fn gdn_replay(
+        &self,
+        layers: &mut [GdnReplayLayer<'_, Self::Buffer>],
+        conv: ConvShape,
+        gdn: GdnShape,
+    ) -> Result<()> {
+        let (ch, w1) = (conv.channels, conv.width - 1);
+        let mut rows = self.alloc(w1 * ch)?;
+        let mut out = self.alloc(gdn.tokens * gdn.v_heads * gdn.v_dim)?;
+        for l in layers.iter_mut() {
+            crate::check::gdn_replay_layer(
+                self.len(l.qkv),
+                self.len(l.conv_out),
+                self.len(l.ab),
+                self.len(l.a_log),
+                self.len(l.dt_bias),
+                self.len(l.conv_state),
+                self.len(l.ssm),
+                &conv,
+                &gdn,
+            )?;
+            // New state row j is row tokens + j of [old state; inputs].
+            for j in 0..w1 {
+                let r = conv.tokens + j;
+                if r < w1 {
+                    self.copy(l.conv_state, r * ch, &mut rows, j * ch, ch)?;
+                } else {
+                    self.copy(l.qkv, (r - w1) * ch, &mut rows, j * ch, ch)?;
+                }
+            }
+            self.copy(&rows, 0, l.conv_state, 0, w1 * ch)?;
+            self.gated_delta_net(l.conv_out, l.ab, l.a_log, l.dt_bias, l.ssm, &mut out, gdn)?;
+        }
+        Ok(())
     }
     /// Gated DeltaNet gating, L2 norm and recurrence over `tokens` steps; see [`GdnShape`].
     #[allow(clippy::too_many_arguments)]

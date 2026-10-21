@@ -33,6 +33,7 @@ pub enum Op {
     AttentionBlock,
     KvStore,
     KvLoad,
+    GdnReplay,
 }
 
 impl Op {
@@ -63,6 +64,7 @@ impl Op {
         Op::AttentionBlock,
         Op::KvStore,
         Op::KvLoad,
+        Op::GdnReplay,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -93,6 +95,7 @@ impl Op {
             Op::AttentionBlock => "attention_block",
             Op::KvStore => "kv_store",
             Op::KvLoad => "kv_load",
+            Op::GdnReplay => "gdn_replay",
         }
     }
 }

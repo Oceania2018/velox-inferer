@@ -221,6 +221,36 @@ pub fn gdn(
     )
 }
 
+/// One layer of `Backend::gdn_replay`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_replay_layer(
+    qkv: usize,
+    conv_out: usize,
+    ab: usize,
+    a_log: usize,
+    dt_bias: usize,
+    conv_state: usize,
+    ssm: usize,
+    cs: &ConvShape,
+    gs: &GdnShape,
+) -> Result<()> {
+    if cs.tokens != gs.tokens || cs.row0 != 0 || gs.row0 != 0 || cs.channels != gs.qkv_width() {
+        return Err(Error::Shape(format!(
+            "gdn_replay shapes disagree: {cs:?} {gs:?}"
+        )));
+    }
+    conv1d(qkv, cs.width * cs.channels, conv_state, conv_out, cs)?;
+    gdn(
+        conv_out,
+        ab,
+        a_log,
+        dt_bias,
+        ssm,
+        gs.tokens * gs.v_heads * gs.v_dim,
+        gs,
+    )
+}
+
 pub fn elementwise(what: &str, lens: &[usize], len: usize) -> Result<()> {
     for &have in lens {
         need(what, have, len)?;
