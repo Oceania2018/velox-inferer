@@ -9,8 +9,10 @@
 //        [--input 1024,4096,8192] [--output 32,128] [--rounds 5] [--json out.json]
 //
 // Each round starts `c` requests at once and waits for all of them; one warm-up round per
-// configuration is discarded. Counting is easy to draft, so speculative decoding accepts more
-// than on real agent steps: treat decode rates as an upper bound.
+// configuration is discarded. Decode is time-weighted over all requests of a configuration
+// (decode tokens over decode time); the other per-request columns are medians. Counting is easy
+// to draft, so speculative decoding accepts more than on real agent steps: treat decode rates as
+// an upper bound.
 
 import { writeFileSync } from "node:fs";
 
@@ -78,6 +80,8 @@ async function one(input, output) {
     promptTokens: j.usage?.prompt_tokens,
     completion,
     decode: t.predicted_per_second,
+    decodeTokens: t.predicted_n,
+    decodeMs: t.predicted_ms,
     prefillMs: t.prompt_ms,
     prefillRate: t.prompt_n && t.prompt_ms ? (t.prompt_n * 1000) / t.prompt_ms : undefined,
     serverMs: t.total_ms ?? (t.prompt_ms ?? 0) + (t.predicted_ms ?? 0),
@@ -85,6 +89,7 @@ async function one(input, output) {
   };
 }
 
+const sum = (xs) => xs.reduce((a, x) => a + (x ?? 0), 0);
 const median = (xs) => {
   const v = xs.filter((x) => x != null).sort((a, b) => a - b);
   if (!v.length) return NaN;
@@ -125,7 +130,13 @@ for (const output of outputs) {
         input,
         output,
         promptTokens: median(reqs.map((x) => x.promptTokens)),
-        decode: median(reqs.map((x) => x.decode)),
+        // Time-weighted over all requests: decode tokens over decode time. Under concurrency the
+        // per-request rate splits into two groups (requests whose rounds also carried another
+        // request's prefill, and the rest), so a median flips between them from run to run.
+        decode:
+          (sum(reqs.map((x) => x.decodeTokens)) * 1000) / sum(reqs.map((x) => x.decodeMs)),
+        decodeMin: Math.min(...reqs.map((x) => x.decode)),
+        decodeMax: Math.max(...reqs.map((x) => x.decode)),
         prefillS: median(reqs.map((x) => x.prefillMs)) / 1000,
         prefillRate: median(reqs.map((x) => x.prefillRate)),
         latencyS: median(reqs.map((x) => x.ms)) / 1000,
@@ -136,6 +147,14 @@ for (const output of outputs) {
         throughput: (tokens * 1000) / walls,
         requests: reqs.length,
         errors,
+        // Per-request timings (no prompt or output text).
+        raw: reqs.map((x) => ({
+          latencyMs: +x.ms.toFixed(1),
+          promptTokens: x.promptTokens,
+          prefillMs: x.prefillMs,
+          decodeTokens: x.decodeTokens,
+          decodeMs: x.decodeMs,
+        })),
       };
       results.push(row);
       const f = (x, w, d = 0) => (Number.isFinite(x) ? x.toFixed(d) : "-").padStart(w);
