@@ -628,7 +628,8 @@ int kvq_verify(const float* q, const unsigned char* k, const unsigned char* v, f
                int kv_heads, int head_dim, int pos0, float scale, float norm, const long long* pp, int kv_grid) {
     constexpr int TK = KvTile<FMT>::keys;
     // Graph steps size the grid for their KV bucket; the kernel reads the actual position.
-    const int kv = pp != nullptr ? kv_grid : pos0 + tokens;
+    // Sized for the KV bucket in every mode, so eager and recorded steps reduce in the same order.
+    const int kv = kv_grid >= pos0 + tokens ? kv_grid : pos0 + tokens;
     const int rows = tokens * (heads / kv_heads);
     const int rgs = (rows + kVerifyWarps * RW - 1) / (kVerifyWarps * RW);
     // One wave of resident blocks; splits of whole tiles.

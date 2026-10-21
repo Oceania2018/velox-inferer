@@ -383,7 +383,8 @@ int attention_gqa(const float* q, const float* k, const float* v, float* out, in
     constexpr int TK = PER >= 8 ? 16 : 32;
     // Graph steps size the grid for a bucket of context lengths (kv_grid); the kernel reads the
     // actual position and leaves splits past it empty.
-    const int kv = params != nullptr ? kv_grid : pos0 + tokens;
+    // Sized for the KV bucket in every mode, so eager and recorded steps reduce in the same order.
+    const int kv = kv_grid >= pos0 + tokens ? kv_grid : pos0 + tokens;
     const int group_rows = tokens * (heads / kv_heads);
     const int rgs = (group_rows + kGqaRows - 1) / kGqaRows;
     // About two blocks per SM, at least two tiles of keys per split.
@@ -616,7 +617,8 @@ int attention_block_gqa(const float* q, const float* k_ctx, const float* v_ctx, 
     long long start0 = pos0 + 1 - window;  // token 0 sees the most context
     if (start0 < ctx_lo) start0 = ctx_lo;
     // Graph steps size the grid for a full window; the kernel reads the actual span.
-    const int kv = params != nullptr ? window - 1 + tokens : static_cast<int>(pos0 - start0) + tokens;
+    // Sized for a full window in every mode, so eager and recorded steps reduce in the same order.
+    const int kv = window - 1 + tokens;
     const int rgs = (tokens * (heads / kv_heads) + kGqaRows - 1) / kGqaRows;
     // About two blocks per SM, at least two tiles of keys per split.
     const int want = (340 + kv_heads * rgs - 1) / (kv_heads * rgs);
