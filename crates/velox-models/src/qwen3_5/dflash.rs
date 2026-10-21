@@ -150,6 +150,41 @@ pub struct DFlashModel<B: Backend> {
     pub bytes: u64,
 }
 
+/// Cache positions per [`DraftContext`] page.
+pub const DRAFT_PAGE_ROWS: usize = 256;
+
+/// Drafter context rows `lo..hi` (every layer's K and V) kept outside the rings, so a prefix
+/// restored into another sequence drafts with the context the drafter had there. Stored in pages
+/// of [`DRAFT_PAGE_ROWS`] positions, each one buffer of [`DFlashModel::context_page_len`] slots
+/// laid out `[layer][K | V][row][kv_dim]`, so storage recycles through a pool of equal pages.
+pub struct DraftContext<B: Backend> {
+    pub lo: usize,
+    pub hi: usize,
+    pages: Vec<B::Buffer>,
+}
+
+impl<B: Backend> DraftContext<B> {
+    /// Storage size in bytes.
+    pub fn bytes(&self, b: &B) -> usize {
+        self.pages.iter().map(|x| b.len(x) * 4).sum()
+    }
+
+    /// Storage buffers in a fixed order (for serialization).
+    pub fn buffers(&self) -> impl Iterator<Item = &B::Buffer> {
+        self.pages.iter()
+    }
+
+    /// Mutable [`Self::buffers`], same order.
+    pub fn buffers_mut(&mut self) -> impl Iterator<Item = &mut B::Buffer> {
+        self.pages.iter_mut()
+    }
+
+    /// The pages, for reuse.
+    pub fn into_pages(self) -> Vec<B::Buffer> {
+        self.pages
+    }
+}
+
 /// Context rings of one sequence and their live interval `[lo, end)`.
 pub struct DFlashState<B: Backend> {
     k: Vec<B::Buffer>,
@@ -360,6 +395,118 @@ impl<B: Backend> DFlashModel<B> {
             logits: b.alloc(w * head_rows)?,
             g: b.alloc(w * c.rank)?,
         })
+    }
+
+    /// f32 slots of one [`DraftContext`] page.
+    pub fn context_page_len(&self) -> usize {
+        2 * self.cfg.layers * DRAFT_PAGE_ROWS * self.cfg.kv_dim()
+    }
+
+    /// The live context rows of `st` below `hi` as `(lo, hi)`, if any.
+    pub fn context_rows(&self, st: &DFlashState<B>, hi: usize) -> Option<(usize, usize)> {
+        let lo = st.lo.max(st.end.saturating_sub(self.cfg.window));
+        let hi = hi.min(st.end);
+        (lo < hi).then_some((lo, hi))
+    }
+
+    /// Storage for context rows `lo..hi` with pages of [`Self::context_page_len`] slots from
+    /// `page`; filled by [`Self::save_context`] or through [`DraftContext::buffers_mut`].
+    pub fn blank_context(
+        &self,
+        b: &B,
+        lo: usize,
+        hi: usize,
+        page: &mut dyn FnMut() -> Result<B::Buffer>,
+    ) -> Result<DraftContext<B>> {
+        if lo > hi || hi - lo > self.cfg.window {
+            return Err(Error::Shape(format!(
+                "dflash2 context rows {lo}..{hi} exceed the window {}",
+                self.cfg.window
+            )));
+        }
+        let mut pages = Vec::new();
+        for _ in 0..(hi - lo).div_ceil(DRAFT_PAGE_ROWS) {
+            let p = page()?;
+            if b.len(&p) < self.context_page_len() {
+                return Err(Error::Config("draft context page too small".into()));
+            }
+            pages.push(p);
+        }
+        Ok(DraftContext { lo, hi, pages })
+    }
+
+    /// Ring runs covering rows `lo..hi`: `(row, ring slot, rows)`, each contiguous in the ring.
+    fn ring_runs(&self, lo: usize, hi: usize) -> Vec<(usize, usize, usize)> {
+        let w = self.cfg.window;
+        let mut runs = Vec::new();
+        let mut r = lo;
+        while r < hi {
+            let slot = r % w;
+            let n = (hi - r).min(w - slot);
+            runs.push((r, slot, n));
+            r += n;
+        }
+        runs
+    }
+
+    /// Copies context rows `lo..hi` (live in `st`, see [`Self::context_rows`]) out of the rings.
+    pub fn save_context(
+        &self,
+        b: &B,
+        st: &DFlashState<B>,
+        lo: usize,
+        hi: usize,
+        page: &mut dyn FnMut() -> Result<B::Buffer>,
+    ) -> Result<DraftContext<B>> {
+        if self
+            .context_rows(st, hi)
+            .is_none_or(|(l, h)| lo < l || hi > h)
+        {
+            return Err(Error::Shape(format!(
+                "dflash2 context rows {lo}..{hi} are not live"
+            )));
+        }
+        let mut ctx = self.blank_context(b, lo, hi, page)?;
+        let kvd = self.cfg.kv_dim();
+        for (p, buf) in ctx.pages.iter_mut().enumerate() {
+            let r0 = lo + p * DRAFT_PAGE_ROWS;
+            let r1 = (r0 + DRAFT_PAGE_ROWS).min(hi);
+            for (row, slot, n) in self.ring_runs(r0, r1) {
+                for li in 0..self.cfg.layers {
+                    let at = |kind: usize| ((2 * li + kind) * DRAFT_PAGE_ROWS + row - r0) * kvd;
+                    b.copy(&st.k[li], slot * kvd, buf, at(0), n * kvd)?;
+                    b.copy(&st.v[li], slot * kvd, buf, at(1), n * kvd)?;
+                }
+            }
+        }
+        Ok(ctx)
+    }
+
+    /// Replaces the context of `st` with `ctx`: the live interval becomes `ctx.lo .. ctx.hi`.
+    pub fn load_context(
+        &self,
+        b: &B,
+        st: &mut DFlashState<B>,
+        ctx: &DraftContext<B>,
+    ) -> Result<()> {
+        if ctx.hi - ctx.lo > self.cfg.window {
+            return Err(Error::Shape("dflash2 context exceeds the window".into()));
+        }
+        let kvd = self.cfg.kv_dim();
+        for (p, buf) in ctx.pages.iter().enumerate() {
+            let r0 = ctx.lo + p * DRAFT_PAGE_ROWS;
+            let r1 = (r0 + DRAFT_PAGE_ROWS).min(ctx.hi);
+            for (row, slot, n) in self.ring_runs(r0, r1) {
+                for li in 0..self.cfg.layers {
+                    let at = |kind: usize| ((2 * li + kind) * DRAFT_PAGE_ROWS + row - r0) * kvd;
+                    b.copy(buf, at(0), &mut st.k[li], slot * kvd, n * kvd)?;
+                    b.copy(buf, at(1), &mut st.v[li], slot * kvd, n * kvd)?;
+                }
+            }
+        }
+        st.lo = ctx.lo;
+        st.end = ctx.hi;
+        Ok(())
     }
 
     /// Forgets context at and after `pos` (the target rewound to `pos`).

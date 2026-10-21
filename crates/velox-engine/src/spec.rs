@@ -11,8 +11,8 @@ use velox_core::backend::Backend;
 use velox_core::rng::Rng;
 use velox_core::Result;
 use velox_models::qwen3_5::{
-    DFlashModel, DFlashState, DFlashWorkspace, MtpNext, MtpRope, MtpSession, MtpWorkspace,
-    Qwen35Text, Session, Workspace,
+    DFlashModel, DFlashState, DFlashWorkspace, DraftContext, MtpNext, MtpRope, MtpSession,
+    MtpWorkspace, Qwen35Text, Session, Workspace,
 };
 
 /// The last prompt row, waiting for the first sampled token.
@@ -272,6 +272,21 @@ impl<B: Backend> DFlashDrafter<B> {
             dw: dm.workspace(b, target, ctx_rows, max + 1)?,
             rng: Rng::new(0x5eed_df1a),
         })
+    }
+
+    /// The context rings (for saving them with a context-store entry).
+    pub fn context(&self) -> &DFlashState<B> {
+        &self.state
+    }
+
+    /// Replaces the context with `ctx` (restored with the target state it belongs to).
+    pub fn restore_context(
+        &mut self,
+        b: &B,
+        dm: &DFlashModel<B>,
+        ctx: &DraftContext<B>,
+    ) -> Result<()> {
+        dm.load_context(b, &mut self.state, ctx)
     }
 
     /// Drops context rows from `pos` on (the target state there was replaced).
