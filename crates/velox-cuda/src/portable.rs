@@ -312,10 +312,10 @@ pub fn conv1d_silu(
     status(
         unsafe {
             velox_portable_conv1d_silu(
-                x.as_ptr(),
+                x.as_ptr().add(s.row0 * s.channels),
                 weight.as_ptr(),
                 state.as_mut_ptr(),
-                out.as_mut_ptr(),
+                out.as_mut_ptr().add(s.row0 * s.channels),
                 to_i32("tokens", s.tokens)?,
                 to_i32("channels", s.channels)?,
                 to_i32("width", s.width)?,
@@ -348,12 +348,12 @@ pub fn gated_delta_net(
     status(
         unsafe {
             velox_portable_gated_delta_net(
-                qkv.as_ptr(),
-                ab.as_ptr(),
+                qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                ab.as_ptr().add(s.row0 * 2 * s.v_heads),
                 a_log.as_ptr(),
                 dt_bias.as_ptr(),
                 state.as_mut_ptr(),
-                out.as_mut_ptr(),
+                out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
                 to_i32("tokens", s.tokens)?,
                 to_i32("k_heads", s.k_heads)?,
                 to_i32("v_heads", s.v_heads)?,

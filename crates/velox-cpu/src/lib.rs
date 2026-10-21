@@ -397,13 +397,13 @@ impl Backend for CpuBackend {
         let (c, w) = (s.channels, s.width);
         // u = [state; x], rows of `c` channels.
         let mut u = state[..(w - 1) * c].to_vec();
-        u.extend_from_slice(&x[..s.tokens * c]);
+        u.extend_from_slice(&x[s.row0 * c..][..s.tokens * c]);
         for t in 0..s.tokens {
             for ch in 0..c {
                 let acc: f64 = (0..w)
                     .map(|j| f64::from(weight[j * c + ch]) * f64::from(u[(t + j) * c + ch]))
                     .sum();
-                out[t * c + ch] = silu(acc) as f32;
+                out[(s.row0 + t) * c + ch] = silu(acc) as f32;
             }
         }
         state[..(w - 1) * c].copy_from_slice(&u[s.tokens * c..]);
@@ -437,14 +437,15 @@ impl Backend for CpuBackend {
             x.iter().map(|&v| f64::from(v) * inv).collect()
         };
         for t in 0..s.tokens {
-            let row = &qkv[t * w..(t + 1) * w];
+            let r = s.row0 + t;
+            let row = &qkv[r * w..(r + 1) * w];
             for h in 0..s.v_heads {
                 let kh = h / group;
                 let q = l2(&row[kh * dk..(kh + 1) * dk]);
                 let k = l2(&row[(s.k_heads + kh) * dk..(s.k_heads + kh + 1) * dk]);
                 let v = &row[2 * s.k_heads * dk + h * dv..][..dv];
-                let a = f64::from(ab[t * 2 * s.v_heads + h]);
-                let b = f64::from(ab[t * 2 * s.v_heads + s.v_heads + h]);
+                let a = f64::from(ab[r * 2 * s.v_heads + h]);
+                let b = f64::from(ab[r * 2 * s.v_heads + s.v_heads + h]);
                 let g = -f64::from(a_log[h]).exp() * softplus(a + f64::from(dt_bias[h]));
                 let (alpha, beta) = (g.exp(), sigmoid(b));
                 let st = &mut state[h * dv * dk..(h + 1) * dv * dk];
@@ -461,7 +462,7 @@ impl Backend for CpuBackend {
                         *sv = (f64::from(*sv) + delta * kv) as f32;
                         o += f64::from(*sv) * qv;
                     }
-                    out[(t * s.v_heads + h) * dv + i] = (o / (dk as f64).sqrt()) as f32;
+                    out[(r * s.v_heads + h) * dv + i] = (o / (dk as f64).sqrt()) as f32;
                 }
             }
         }
@@ -774,6 +775,7 @@ mod tests {
             tokens: 1,
             channels: 1,
             width: 3,
+            row0: 0,
         };
         let w = vec![1.0, 1.0, 1.0];
         let mut state = vec![0.0; 2];
@@ -797,6 +799,7 @@ mod tests {
             v_heads: 1,
             k_dim: 2,
             v_dim: 2,
+            row0: 0,
         };
         let qkv = vec![1.0, 0.0, 1.0, 0.0, 2.0, -4.0];
         let ab = vec![0.0, 0.0]; // β = 0.5

@@ -73,22 +73,38 @@ pub struct Checkpoint<B: Backend> {
 impl<B: Backend> Session<B> {
     /// Device copy of the recurrent state at the current position.
     pub fn checkpoint(&self, b: &B) -> Result<Checkpoint<B>> {
-        let dup = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
-            bufs.iter()
-                .map(|s| {
-                    let n = b.len(s);
-                    let mut d = b.alloc(n)?;
-                    b.copy(s, 0, &mut d, 0, n)?;
-                    Ok(d)
-                })
-                .collect()
+        let mut cp = self.blank_checkpoint(b, self.pos)?;
+        self.snapshot_into(b, &mut cp)?;
+        Ok(cp)
+    }
+
+    /// Checkpoint storage for this session's state, to be filled at `pos` by an advance (see
+    /// [`Qwen35Text::advance_rows`]) or by [`Self::snapshot_into`].
+    pub fn blank_checkpoint(&self, b: &B, pos: usize) -> Result<Checkpoint<B>> {
+        let like = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
+            bufs.iter().map(|s| b.alloc(b.len(s))).collect()
         };
         Ok(Checkpoint {
-            pos: self.pos,
+            pos,
             rope_delta: self.rope_delta,
-            conv: dup(&self.conv)?,
-            ssm: dup(&self.ssm)?,
+            conv: like(&self.conv)?,
+            ssm: like(&self.ssm)?,
         })
+    }
+
+    /// Copies the current recurrent state into `cp` (reused storage) and stamps its position.
+    pub fn snapshot_into(&self, b: &B, cp: &mut Checkpoint<B>) -> Result<()> {
+        for (src, dst) in self
+            .conv
+            .iter()
+            .zip(cp.conv.iter_mut())
+            .chain(self.ssm.iter().zip(cp.ssm.iter_mut()))
+        {
+            b.copy(src, 0, dst, 0, b.len(src))?;
+        }
+        cp.pos = self.pos;
+        cp.rope_delta = self.rope_delta;
+        Ok(())
     }
 
     /// Rewinds to `cp`, which must have been taken from this session (or a session with the
@@ -298,6 +314,22 @@ impl<B: Backend> Qwen35Text<B> {
         positions: Option<&[[u32; 3]]>,
         inserts: &[EmbedInsert<'_, B::Buffer>],
     ) -> Result<()> {
+        self.advance_snap(b, s, ws, ids, positions, inserts, &mut [])
+    }
+
+    /// [`Self::advance`] that also fills each of `snaps` with the recurrent state at its `pos`
+    /// (inside `s.pos ..= s.pos + ids.len()`), without splitting the chunk's projections there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_snap(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        ids: &[u32],
+        positions: Option<&[[u32; 3]]>,
+        inserts: &[EmbedInsert<'_, B::Buffer>],
+        snaps: &mut [Checkpoint<B>],
+    ) -> Result<()> {
         if positions.is_some_and(|p| p.len() != ids.len()) {
             return Err(Error::Shape(
                 "one position triple per token is required".into(),
@@ -315,7 +347,12 @@ impl<B: Backend> Qwen35Text<B> {
             )));
         }
         let t = ids.len();
-        if t <= FUSE_MAX_TOKENS && t <= ws.max_tokens && positions.is_none() && inserts.is_empty() {
+        if t <= FUSE_MAX_TOKENS
+            && t <= ws.max_tokens
+            && positions.is_none()
+            && inserts.is_empty()
+            && snaps.is_empty()
+        {
             // Decode and verify steps repeat with the same structure: one recorded graph per shape.
             let recording = s.spec.as_ref().is_some_and(|sp| sp.recording);
             let key = GRAPH_ADVANCE
@@ -323,14 +360,19 @@ impl<B: Backend> Qwen35Text<B> {
                 | u32::from(recording) << 8
                 | u32::from(!ws.capture.is_empty()) << 9
                 | u32::from(ws.keep_rows) << 10;
-            b.graph(key, &mut || self.chunk(b, s, ws, ids, 0, None, &[]))?;
+            b.graph(key, &mut || {
+                self.chunk(b, s, ws, ids, 0, None, &[], &mut [])
+            })?;
             ws.last_row = t - 1;
             return Ok(());
+        }
+        for cp in snaps.iter_mut().filter(|cp| cp.pos == s.pos) {
+            s.snapshot_into(b, cp)?;
         }
         for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
             let base = i * ws.max_tokens;
             let pos = positions.map(|p| &p[base..base + chunk.len()]);
-            self.chunk(b, s, ws, chunk, base, pos, inserts)?;
+            self.chunk(b, s, ws, chunk, base, pos, inserts, snaps)?;
             ws.last_row = chunk.len() - 1;
         }
         Ok(())
@@ -347,11 +389,21 @@ impl<B: Backend> Qwen35Text<B> {
         base: usize,
         positions: Option<&[[u32; 3]]>,
         inserts: &[EmbedInsert<'_, B::Buffer>],
+        snaps: &mut [Checkpoint<B>],
     ) -> Result<()> {
         let c = &self.cfg;
         let w = &self.w;
         let t = ids.len();
         let pos0 = s.pos;
+        // GDN segments end at each snapshot inside this chunk, then at its end.
+        let mut cuts: Vec<usize> = snaps
+            .iter()
+            .filter(|cp| cp.pos > pos0 && cp.pos <= pos0 + t)
+            .map(|cp| cp.pos - pos0)
+            .chain(std::iter::once(t))
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
         let hd = c.hidden;
         b.embed(ids, &w.view(&w.embed), &mut ws.x)?;
         for ins in inserts {
@@ -421,34 +473,44 @@ impl<B: Backend> Qwen35Text<B> {
                         b.copy(&ws.qkv, 0, &mut sp.qkv[gi], 0, t * c.gdn_qkv())?;
                         b.copy(&ws.ab, 0, &mut sp.ab[gi], 0, t * 2 * c.gdn_v_heads)?;
                     }
-                    let cs = ConvShape {
-                        tokens: t,
-                        channels: c.gdn_qkv(),
-                        width: c.conv_width,
-                    };
-                    b.conv1d_silu(
-                        &ws.qkv,
-                        w.param(*conv),
-                        &mut s.conv[gi],
-                        &mut ws.conv_out,
-                        cs,
-                    )?;
-                    let gs = GdnShape {
-                        tokens: t,
-                        k_heads: c.gdn_k_heads,
-                        v_heads: c.gdn_v_heads,
-                        k_dim: c.gdn_k_dim,
-                        v_dim: c.gdn_v_dim,
-                    };
-                    b.gated_delta_net(
-                        &ws.conv_out,
-                        &ws.ab,
-                        w.param(*a_log),
-                        w.param(*dt_bias),
-                        &mut s.ssm[gi],
-                        &mut ws.o,
-                        gs,
-                    )?;
+                    let mut row0 = 0;
+                    for &end in &cuts {
+                        let cs = ConvShape {
+                            tokens: end - row0,
+                            channels: c.gdn_qkv(),
+                            width: c.conv_width,
+                            row0,
+                        };
+                        b.conv1d_silu(
+                            &ws.qkv,
+                            w.param(*conv),
+                            &mut s.conv[gi],
+                            &mut ws.conv_out,
+                            cs,
+                        )?;
+                        let gs = GdnShape {
+                            tokens: end - row0,
+                            k_heads: c.gdn_k_heads,
+                            v_heads: c.gdn_v_heads,
+                            k_dim: c.gdn_k_dim,
+                            v_dim: c.gdn_v_dim,
+                            row0,
+                        };
+                        b.gated_delta_net(
+                            &ws.conv_out,
+                            &ws.ab,
+                            w.param(*a_log),
+                            w.param(*dt_bias),
+                            &mut s.ssm[gi],
+                            &mut ws.o,
+                            gs,
+                        )?;
+                        for cp in snaps.iter_mut().filter(|cp| cp.pos == pos0 + end) {
+                            b.copy(&s.conv[gi], 0, &mut cp.conv[gi], 0, b.len(&s.conv[gi]))?;
+                            b.copy(&s.ssm[gi], 0, &mut cp.ssm[gi], 0, b.len(&s.ssm[gi]))?;
+                        }
+                        row0 = end;
+                    }
                     b.rms_norm(
                         &ws.o,
                         w.param(*norm),
@@ -676,7 +738,8 @@ impl<B: Backend> Qwen35Text<B> {
 
     /// [`Self::advance`] that also hands every chunk's rows to `on_chunk` (with `ws.keep_rows`
     /// set): composed embeddings in `ws.emb`, final-normed hidden rows in `ws.rows_hidden`, and
-    /// the chunk's offset into `ids` and its token count.
+    /// the chunk's offset into `ids` and its token count. Each of `snaps` is filled with the recurrent state at its
+    /// `pos` (within `s.pos ..= s.pos + ids.len()`; positions outside are left untouched).
     #[allow(clippy::too_many_arguments)]
     pub fn advance_rows(
         &self,
@@ -686,6 +749,7 @@ impl<B: Backend> Qwen35Text<B> {
         ids: &[u32],
         positions: Option<&[[u32; 3]]>,
         inserts: &[EmbedInsert<'_, B::Buffer>],
+        snaps: &mut [Checkpoint<B>],
         on_chunk: &mut dyn FnMut(&Workspace<B>, usize, usize) -> Result<()>,
     ) -> Result<()> {
         ws.keep_rows = true;
@@ -694,7 +758,7 @@ impl<B: Backend> Qwen35Text<B> {
             let base = i * ws.max_tokens;
             let pos = positions.map(|p| &p[base..base + chunk.len()]);
             r = self
-                .advance(b, s, ws, chunk, pos, &shift_inserts(inserts, base))
+                .advance_snap(b, s, ws, chunk, pos, &shift_inserts(inserts, base), snaps)
                 .and_then(|()| on_chunk(ws, base, chunk.len()));
             if r.is_err() {
                 break;
@@ -757,7 +821,7 @@ impl<B: Backend> Qwen35Text<B> {
                 sp.tokens = t;
                 sp.recording = true;
             }
-            let r = self.chunk(b, s, ws, ids, 0, None, &[]);
+            let r = self.chunk(b, s, ws, ids, 0, None, &[], &mut []);
             if let Some(sp) = s.spec.as_mut() {
                 sp.recording = false;
             }
@@ -829,6 +893,7 @@ impl<B: Backend> Qwen35Text<B> {
                                 tokens: keep,
                                 channels: c.gdn_qkv(),
                                 width: c.conv_width,
+                                row0: 0,
                             };
                             b.conv1d_silu(
                                 &sp.qkv[gi],
@@ -843,6 +908,7 @@ impl<B: Backend> Qwen35Text<B> {
                                 v_heads: c.gdn_v_heads,
                                 k_dim: c.gdn_k_dim,
                                 v_dim: c.gdn_v_dim,
+                                row0: 0,
                             };
                             b.gated_delta_net(
                                 &ws.conv_out,
