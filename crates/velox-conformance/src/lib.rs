@@ -889,7 +889,15 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         (256, 5120, 0, 256, 16),
         (384, 1024, 128, 192, 2),
     ] {
-        s.linear_act(WeightFormat::Nvfp4, n, k, begin, rows, m, ActPolicy::A16Only)?;
+        s.linear_act(
+            WeightFormat::Nvfp4,
+            n,
+            k,
+            begin,
+            rows,
+            m,
+            ActPolicy::A16Only,
+        )?;
     }
     // A16-only views stay exact even where a kernel could round.
     s.linear_act(
