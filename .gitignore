@@ -29,3 +29,4 @@ rustc-ice-*.txt
 *.vi.part-*
 *.ninfer
 *.ninfer.part-*
+.claude/worktrees/
