@@ -192,7 +192,8 @@ __global__ void add_rms_norm_kernel(float* __restrict__ acc, const float* __rest
 VELOX_API int velox_portable_add_rms_norm(float* acc, const float* x, const float* weight, float* y, int rows, int dim,
                                           float eps, int offset) {
     if (rows <= 0) return 0;
-    add_rms_norm_kernel<<<rows, 256>>>(acc, x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
+    // Few rows per call (the residual stream): the widest block shortens each row's serial work.
+    add_rms_norm_kernel<<<rows, 1024>>>(acc, x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
     return velox_launch_status();
 }
 
