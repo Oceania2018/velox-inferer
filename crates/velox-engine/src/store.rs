@@ -44,8 +44,8 @@ pub(crate) struct Entry<B: Backend> {
     /// The DFlash drafter's context rows ending at `pos`, when it had them.
     pub draft: Option<DraftContext<B>>,
     root: bool,
-    /// A prompt's end (see `ContextStore::mark_tail`).
-    tail: bool,
+    /// A prompt's end: the history point its request published (see `ContextStore::mark_tail`).
+    tail: Option<usize>,
     adopted: u32,
     superseded: bool,
     last: u64,
@@ -226,7 +226,7 @@ impl<B: Backend> ContextStore<B> {
             kv: pages,
             draft,
             root,
-            tail: false,
+            tail: None,
             adopted: 0,
             superseded: false,
             last: self.now,
@@ -311,8 +311,8 @@ impl<B: Backend> ContextStore<B> {
     /// and returns the deepest such entry, the parent of what the request captures next.
     pub fn resumed(&mut self, keys: &[u32], start: usize, adopted: Option<u64>) -> Option<u64> {
         // Resuming from a conversation's own history point (not a shared root) retires the private
-        // end of the step that published it: the prompt-end entries this request diverges from
-        // after that point (ninfer retires private endpoints beyond the divergence the same way).
+        // end of the step that published it, when this request diverges from it after that point
+        // (ninfer retires private endpoints beyond the divergence the same way).
         let from_root = self
             .entries
             .iter()
@@ -321,9 +321,10 @@ impl<B: Backend> ContextStore<B> {
             let dead: Vec<usize> = (0..self.entries.len())
                 .filter(|&i| {
                     let e = &self.entries[i];
-                    e.tail
+                    e.tail == Some(start)
                         && !e.prefix_of(keys)
-                        && e.keys.iter().zip(keys).take_while(|(a, b)| a == b).count() >= start
+                        && keys.len() >= start
+                        && e.keys[..start] == keys[..start]
                 })
                 .collect();
             for i in dead.into_iter().rev() {
@@ -347,11 +348,12 @@ impl<B: Backend> ContextStore<B> {
         deepest.map(|(_, id)| id)
     }
 
-    /// Marks entry `id` as a prompt's end, kept for an exact retry until the conversation moves on
-    /// (see `Self::resumed`).
-    pub fn mark_tail(&mut self, id: u64) {
+    /// Marks entry `id` as a prompt's end whose request published its history point at `head`:
+    /// kept for an exact retry until the conversation resumes from that point (see
+    /// `Self::resumed`).
+    pub fn mark_tail(&mut self, id: u64, head: usize) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
-            e.tail = true;
+            e.tail = Some(head);
         }
     }
 
@@ -424,7 +426,7 @@ impl<B: Backend> ContextStore<B> {
             kv,
             draft,
             root,
-            tail: false,
+            tail: None,
             adopted: 0,
             superseded: false,
             last: now,
