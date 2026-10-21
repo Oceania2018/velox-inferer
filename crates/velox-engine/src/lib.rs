@@ -286,7 +286,8 @@ impl<B: Backend> QwenEngine<B> {
             let session = model.session(&b, capacity)?;
             let zero = session.checkpoint(&b)?;
             let drafter = match &dflash {
-                Some(dm) if i == 0 => Some(Drafter::DFlash(DFlashDrafter::new(
+                // Every lane drafts: short unrelated requests (System One, probes) land on the scratch lane.
+                Some(dm) => Some(Drafter::DFlash(DFlashDrafter::new(
                     &b,
                     dm,
                     &model,
