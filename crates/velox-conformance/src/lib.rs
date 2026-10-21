@@ -998,6 +998,31 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `rms_norm_gated`: the gated rows.
+    fn rms_norm_gated(&mut self, rows: usize, dim: usize, kind: NormKind) -> Result<()> {
+        let n = rows * dim;
+        let (x, w, g0) = (
+            self.rng.vec(n, 2.0),
+            self.rng.vec(dim, 0.5),
+            self.rng.vec(n, 3.0),
+        );
+        let mut want = g0.clone();
+        CpuBackend.rms_norm_gated(&x, &w, &mut want, rows, dim, 1e-6, kind)?;
+        let (xd, wd) = (self.b.upload(&x)?, self.b.upload(&w)?);
+        let mut gd = self.b.upload(&g0)?;
+        self.b
+            .rms_norm_gated(&xd, &wd, &mut gd, rows, dim, 1e-6, kind)?;
+        let got = fetch(self.b, &gd, n)?;
+        self.record(
+            format!("rms_norm_gated {rows}x{dim} {kind:?}"),
+            Some(Op::RmsNormGated),
+            &got,
+            &want,
+            1e-5,
+        );
+        Ok(())
+    }
+
     /// `add_rms_norm`: the updated residual and the normed rows.
     fn add_rms_norm(&mut self, rows: usize, dim: usize, kind: NormKind) -> Result<()> {
         let n = rows * dim;
@@ -1349,6 +1374,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.embed(WeightFormat::Nvfp4, 128, 64, &[127, 0, 64])?;
     s.embed(WeightFormat::Q5G64, 20, 200, &[19, 0])?;
     s.add_rms_norm(8, 5120, NormKind::Offset)?;
+    s.rms_norm_gated(8 * 48, 128, NormKind::Plain)?;
+    s.rms_norm_gated(5, 96, NormKind::Offset)?;
     s.add_rms_norm(3, 130, NormKind::Plain)?;
     s.rms_norm(1, 4096, NormKind::Plain)?;
     s.rms_norm(5, 130, NormKind::Plain)?;

@@ -274,6 +274,11 @@ impl<B: Backend> DFlashDrafter<B> {
         })
     }
 
+    /// Drops context rows from `pos` on (the target state there was replaced).
+    pub fn forget(&mut self, dm: &DFlashModel<B>, pos: usize) {
+        dm.rewind(&mut self.state, pos);
+    }
+
     /// Starts a request at the short block.
     pub fn reset(&mut self) {
         self.drafts = self.low;
