@@ -89,6 +89,16 @@ impl Backend for CpuBackend {
         Ok(data.to_vec())
     }
 
+    fn host_bytes<'a>(&self, buf: &'a Vec<f32>) -> Option<&'a [u8]> {
+        // SAFETY: f32 storage viewed as its bytes, same lifetime.
+        Some(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * 4) })
+    }
+
+    fn host_bytes_mut<'a>(&self, buf: &'a mut Vec<f32>) -> Option<&'a mut [u8]> {
+        // SAFETY: as above; any bit pattern is a valid f32.
+        Some(unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len() * 4) })
+    }
+
     fn upload_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
         let mut v = vec![0f32; data.len().div_ceil(4)];
         // SAFETY: v holds at least data.len() bytes; any bit pattern is a valid f32.

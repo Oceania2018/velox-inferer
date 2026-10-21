@@ -6,9 +6,14 @@
 //! request restores the latest checkpoint inside the common prefix and prefills only the rest;
 //! the vision tower runs only for images in that remainder.
 
+mod disk;
 mod prompt;
 mod sampling;
 pub mod spec;
+mod store;
+
+use disk::DiskTier;
+use store::ContextStore;
 
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
@@ -38,6 +43,20 @@ pub struct EngineConfig {
     pub enable_thinking: bool,
     /// Recurrent-state checkpoints kept per lane for prefix reuse.
     pub max_checkpoints: usize,
+    /// Keep checkpoints in system RAM (pinned, device-mapped) rather than device memory.
+    pub host_checkpoints: bool,
+    /// Take no checkpoints at or after the prompt's last image: agent screenshots are replaced in the
+    /// next request's history, so state past them is never shared (ninfer's media-tail skip).
+    pub skip_media_tail: bool,
+    /// System RAM for the context store (prefixes any lane can resume after other conversations
+    /// overwrote it; see `store`). 0 disables it.
+    pub host_context_bytes: usize,
+    /// LRFU decay per request of the context store (0: least recently used).
+    pub lrfu_lambda: f64,
+    /// NVMe tier below the context store (see `disk`); 0 disables it.
+    pub disk_context_bytes: u64,
+    /// Directory of the NVMe tier's files (a private subdirectory is created and removed).
+    pub disk_context_dir: std::path::PathBuf,
     /// Capacity of a second, small lane for requests that share nothing with the main lane
     /// (probes, side questions), so they do not evict the agent's context. 0 disables it.
     pub scratch_capacity: usize,
@@ -56,11 +75,14 @@ struct Lane<B: Backend> {
     session: Session<B>,
     /// Keys of the tokens the session state has consumed, in order (see `Prompt::keys`).
     keys: Vec<u32>,
+    /// Device checkpoints of the lane's own state (valid while its KV holds `keys`).
     checkpoints: Vec<Checkpoint<B>>,
     /// Storage of dropped checkpoints, reused for new ones (allocating and freeing them would
     /// synchronize the device).
     spare: Vec<Checkpoint<B>>,
     zero: Checkpoint<B>,
+    /// The deepest context-store entry on the prefix the current request resumed from.
+    chain: Option<u64>,
     /// Draft model for speculative decoding (main lane only).
     drafter: Option<Drafter<B>>,
     /// Speculative rounds of the current request: (rounds, drafted, accepted).
@@ -71,6 +93,7 @@ struct Lane<B: Backend> {
 struct Lanes<B: Backend> {
     ws: Workspace<B>,
     lanes: Vec<Lane<B>>,
+    store: ContextStore<B>,
 }
 
 /// Checkpoint storage kept for reuse per lane beyond the live checkpoints.
@@ -78,6 +101,17 @@ const MAX_SPARE: usize = 4;
 
 /// Below this much shared prefix a request counts as unrelated to a lane.
 const MIN_REUSE: usize = 64;
+
+/// A lane's chain head shorter than this is not worth storing when another request takes the
+/// lane (prefilling it again costs about as much as the copies).
+const MIN_CAPTURE: usize = 1024;
+
+/// Tokens a context-store entry must cover beyond the lane's own best restore point to be used
+/// instead (its state and KV come over PCIe).
+const STORE_GAIN: usize = 128;
+
+/// Tokens a disk record must cover beyond every resident source to be read back.
+const DISK_GAIN: usize = 1024;
 
 pub struct QwenEngine<B: Backend> {
     b: B,
@@ -286,7 +320,7 @@ impl<B: Backend> QwenEngine<B> {
                 continue;
             }
             let session = model.session_with(&b, capacity, cfg.kv_format)?;
-            let zero = session.checkpoint(&b)?;
+            let zero = session.checkpoint_in(&b, cfg.host_checkpoints)?;
             let drafter = match &dflash {
                 // Every lane drafts: short unrelated requests (System One, probes) land on the scratch lane.
                 Some(dm) => Some(Drafter::DFlash(DFlashDrafter::new(
@@ -306,6 +340,7 @@ impl<B: Backend> QwenEngine<B> {
                 keys: Vec::new(),
                 checkpoints: Vec::new(),
                 spare: Vec::new(),
+                chain: None,
                 spec_stats: (0, 0, 0),
                 zero,
                 drafter,
@@ -316,7 +351,16 @@ impl<B: Backend> QwenEngine<B> {
             vision_start: single_token(&fe, "<|vision_start|>"),
             image_pad: single_token(&fe, "<|image_pad|>"),
         };
-        let state = Mutex::new(Lanes { ws, lanes });
+        let disk = if cfg.disk_context_bytes > 0 && cfg.host_context_bytes > 0 {
+            Some(
+                DiskTier::new(cfg.disk_context_dir.clone(), cfg.disk_context_bytes)
+                    .map_err(|e| CoreError::Config(format!("disk context tier: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let store = ContextStore::new(cfg.host_context_bytes, cfg.lrfu_lambda, disk);
+        let state = Mutex::new(Lanes { ws, lanes, store });
         Ok(QwenEngine {
             b,
             model,
@@ -358,9 +402,13 @@ impl<B: Backend> QwenEngine<B> {
             .enumerate()
             .filter(|&(_, &t)| Some(t) == self.special.im_start)
             .map(|(i, _)| i);
+        let tail = match image {
+            Some(p) if self.cfg.skip_media_tail => p,
+            _ => usize::MAX,
+        };
         let mut v: Vec<usize> = turns
             .chain(image)
-            .filter(|&p| p > after && p < ids.len())
+            .filter(|&p| p > after && p < ids.len() && p < tail)
             .collect();
         v.sort_unstable();
         v.dedup();
@@ -392,23 +440,117 @@ impl<B: Backend> QwenEngine<B> {
         spare.truncate(MAX_SPARE);
     }
 
-    /// Restores the best reusable state for `keys` and returns how many tokens are already in it.
-    fn reuse(&self, lane: &mut Lane<B>, keys: &[u32]) -> Result<usize, CoreError> {
-        // At least the last prompt token must be fed to produce logits.
-        let target = common_prefix(&lane.keys, keys).min(keys.len() - 1);
-        if lane.session.pos == lane.keys.len() && lane.keys.len() <= target {
-            return Ok(lane.keys.len());
+    /// Host checkpoint mode: the latest prefill's checkpoints (the next request's likeliest
+    /// restore points) stay on the device; older ones at `anchors` (system prompt and task: what
+    /// other conversations share) go to the context store as roots; the rest are dropped. Device
+    /// memory then holds a few checkpoints however long the context.
+    fn place_checkpoints(
+        &self,
+        lane: &mut Lane<B>,
+        store: &mut ContextStore<B>,
+        fresh: usize,
+        anchors: &[usize],
+    ) -> Result<(), CoreError> {
+        lane.checkpoints.sort_by_key(|c| c.pos);
+        // A request that took no checkpoint of its own (a retry) keeps the one it resumed from.
+        let head = match lane.checkpoints.last() {
+            Some(c) if c.pos < fresh => Some(c.pos),
+            _ => None,
+        };
+        let mut kept = Vec::with_capacity(lane.checkpoints.len());
+        for cp in std::mem::take(&mut lane.checkpoints) {
+            if cp.pos < fresh && store.enabled() && cp.pos >= MIN_REUSE && anchors.contains(&cp.pos)
+            {
+                store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None)?;
+            }
+            if cp.pos >= fresh || Some(cp.pos) == head {
+                kept.push(cp);
+            } else {
+                lane.spare.push(cp);
+            }
         }
+        lane.checkpoints = kept;
+        // A request snapshots about two points before its last image; keep storage for that.
+        lane.spare.truncate(2);
+        Ok(())
+    }
+
+    /// Before a request overwrites a lane that holds another conversation, stores the lane's
+    /// deepest checkpoint beyond the `shared` prefix (that conversation's chain head) so it can
+    /// resume there later instead of prefilling its history again.
+    fn capture_head(
+        &self,
+        lane: &Lane<B>,
+        store: &mut ContextStore<B>,
+        shared: usize,
+    ) -> Result<(), CoreError> {
+        let head = lane
+            .checkpoints
+            .iter()
+            .filter(|c| c.pos > shared && c.pos <= lane.keys.len() && c.pos >= MIN_CAPTURE)
+            .max_by_key(|c| c.pos);
+        if let Some(cp) = head {
+            store.insert(&self.b, &lane.session, &lane.keys, cp, false, lane.chain)?;
+        }
+        Ok(())
+    }
+
+    /// Restores the best reusable state for `keys`: the lane's own state or checkpoints, or a
+    /// context-store entry when that covers more. Returns how many tokens are already in the
+    /// state and the store entry restored, if any.
+    fn reuse(
+        &self,
+        lane: &mut Lane<B>,
+        store: &mut ContextStore<B>,
+        keys: &[u32],
+    ) -> Result<(usize, Option<u64>), CoreError> {
+        // At least the last prompt token must be fed to produce logits.
+        let limit = keys.len() - 1;
+        let shared = common_prefix(&lane.keys, keys);
+        let target = shared.min(limit);
+        let live = lane.session.pos == lane.keys.len() && lane.keys.len() <= target;
         let best = lane
             .checkpoints
             .iter()
             .filter(|c| c.pos <= target)
             .max_by_key(|c| c.pos);
+        let own = if live {
+            lane.keys.len()
+        } else {
+            best.map_or(0, |c| c.pos)
+        };
+        let reach = limit.min(lane.session.capacity);
+        let resident = own.max(store.best_pos(keys, reach));
+        if store.promote(&self.b, &lane.session, keys, reach, resident, DISK_GAIN)?
+            && std::env::var_os("VELOX_DEBUG_PREFIX").is_some()
+        {
+            eprintln!("[disk] read back a prefix beyond {resident}");
+        }
+        if let Some(e) = store.best(keys, reach) {
+            if e.pos() >= own + STORE_GAIN {
+                lane.session.restore(&self.b, &e.state)?;
+                // KV rows below the shared prefix are already the same.
+                for seg in &e.kv {
+                    lane.session.load_kv(&self.b, seg, shared)?;
+                }
+                // The drafter's context past the shared prefix belongs to the other conversation
+                // (MTP KV rows there only cost acceptance until overwritten).
+                if let (Some(Drafter::DFlash(d)), Some(dm)) =
+                    (lane.drafter.as_mut(), self.dflash.as_ref())
+                {
+                    d.forget(dm, shared);
+                }
+                return Ok((e.pos(), Some(e.id)));
+            }
+        }
+        if live {
+            return Ok((own, None));
+        }
         match best {
             Some(cp) => lane.session.restore(&self.b, cp)?,
             None => lane.session.restore(&self.b, &lane.zero)?,
         }
-        Ok(lane.session.pos)
+        Ok((lane.session.pos, None))
     }
 
     fn load_images(&self, urls: &[String]) -> Result<Vec<ImagePatches>, ApiError> {
@@ -590,6 +732,7 @@ impl<B: Backend> QwenEngine<B> {
         for pos in self.checkpoint_positions(&p.ids, start) {
             let mut cp = match lane.spare.pop() {
                 Some(cp) => cp,
+                // Snapshots are taken on the device (fast); see `Self::place_checkpoints`.
                 None => lane.session.blank_checkpoint(&self.b, pos)?,
             };
             cp.pos = pos;
@@ -736,7 +879,7 @@ where
             .state
             .lock()
             .map_err(|_| core(CoreError::Backend("engine lanes poisoned".into())))?;
-        let Lanes { ws, lanes } = &mut *state;
+        let Lanes { ws, lanes, store } = &mut *state;
         let li = Self::pick_lane(lanes, &p.keys, p.ids.len() + max_tokens)
             .ok_or_else(|| ApiError::invalid("no lane can hold this request"))?;
         let lane = &mut lanes[li];
@@ -745,13 +888,14 @@ where
             let shared = common_prefix(&lane.keys, &p.keys);
             let cps: Vec<usize> = lane.checkpoints.iter().map(|c| c.pos).collect();
             eprintln!(
-                "[prefix] lane {li} prompt {} held {} pos {} shared {} checkpoints {:?} next {:?}",
+                "[prefix] lane {li} prompt {} held {} pos {} shared {} checkpoints {:?} next {:?} store [{}]",
                 p.keys.len(),
                 lane.keys.len(),
                 lane.session.pos,
                 shared,
                 cps,
-                self.checkpoint_positions(&p.ids, 0)
+                self.checkpoint_positions(&p.ids, 0),
+                store.describe()
             );
         }
         match lane.drafter.as_mut() {
@@ -759,14 +903,31 @@ where
             Some(Drafter::DFlash(d)) => d.reset(),
             None => {}
         }
-        let start = self.reuse(lane, &p.keys).map_err(core)?;
+        store.tick();
+        let shared = common_prefix(&lane.keys, &p.keys);
+        if store.enabled() {
+            self.capture_head(lane, store, shared.min(p.keys.len() - 1))
+                .map_err(core)?;
+        }
+        let (start, adopted) = self.reuse(lane, store, &p.keys).map_err(core)?;
+        lane.chain = store.resumed(&p.keys, start, adopted);
         let t_reuse = t0.elapsed();
-        // Checkpoints still valid for this prompt are those inside the shared prefix.
-        let (keep, stale): (Vec<_>, Vec<_>) =
-            lane.checkpoints.drain(..).partition(|c| c.pos <= start);
+        if adopted.is_some() && std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+            eprintln!(
+                "[store] resumed at {start} ({} entries, {:.2} GB; {} on disk)",
+                store.len(),
+                store.bytes(&self.b) as f64 / 1e9,
+                store.disk_len()
+            );
+        }
+        // Checkpoints still valid for this prompt are the lane's own inside the shared prefix.
+        let (keep, stale): (Vec<_>, Vec<_>) = lane
+            .checkpoints
+            .drain(..)
+            .partition(|c| c.pos <= start && c.pos <= shared);
         lane.checkpoints = keep;
         lane.spare.extend(stale);
-        lane.keys.truncate(start);
+        lane.keys = p.keys[..start].to_vec();
         let mut t_fill = t_reuse;
         let prefilled = self.prefill(lane, ws, &p, &images, start).and_then(|()| {
             t_fill = t0.elapsed();
@@ -789,13 +950,23 @@ where
             self.cfg.max_checkpoints,
             start + 1,
         );
+        if self.cfg.host_checkpoints {
+            let anchors: Vec<usize> = self
+                .checkpoint_positions(&p.ids, 0)
+                .into_iter()
+                .take(2)
+                .collect();
+            self.place_checkpoints(lane, store, start + 1, &anchors)
+                .map_err(core)?;
+        }
         let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
         if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
             eprintln!(
-                "[prompt] reuse {:.1} ms, prefill {:.1} ms, candidates+prune {:.1} ms, total {prompt_ms:.1} ms",
+                "[prompt] reuse {:.1} ms, prefill {:.1} ms, candidates+prune {:.1} ms, total {prompt_ms:.1} ms, top {:?}",
                 t_reuse.as_secs_f64() * 1e3,
                 (t_fill - t_reuse).as_secs_f64() * 1e3,
-                (t0.elapsed() - t_fill).as_secs_f64() * 1e3
+                (t0.elapsed() - t_fill).as_secs_f64() * 1e3,
+                &cands[..cands.len().min(3)]
             );
         }
 

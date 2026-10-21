@@ -447,6 +447,44 @@ pub trait Backend {
         self.add(acc, x, rows * dim)?;
         self.rms_norm(acc, weight, y, rows, dim, eps, kind)
     }
+    /// Gated RMS norm: `gate[i] = silu(gate[i]) * rms_norm(x)[i]` over `rows * dim` elements (see
+    /// [`Self::rms_norm`]). One pass where a backend fuses it.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_gated(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        gate: &mut Self::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        let mut y = self.alloc(rows * dim)?;
+        self.rms_norm(x, weight, &mut y, rows, dim, eps, kind)?;
+        self.silu_mul(gate, &y, rows * dim)
+    }
+    /// Zeroed storage in system RAM that kernels read and write directly (pinned and mapped):
+    /// no device memory, slower access. Backends without such memory return device storage.
+    fn alloc_host(&self, len: usize) -> Result<Self::Buffer> {
+        self.alloc(len)
+    }
+    /// [`Self::upload_bytes`] into storage from [`Self::alloc_host`].
+    fn upload_bytes_host(&self, data: &[u8]) -> Result<Self::Buffer> {
+        self.upload_bytes(data)
+    }
+    /// The bytes of `buf` when the host can address them directly (storage from
+    /// [`Self::alloc_host`] on a backend with such memory), else `None`. Callers synchronize
+    /// with pending device work on `buf` first.
+    fn host_bytes<'a>(&self, buf: &'a Self::Buffer) -> Option<&'a [u8]> {
+        let _ = buf;
+        None
+    }
+    /// Mutable [`Self::host_bytes`].
+    fn host_bytes_mut<'a>(&self, buf: &'a mut Self::Buffer) -> Option<&'a mut [u8]> {
+        let _ = buf;
+        None
+    }
     /// `x[i] *= sigmoid(gate[i])` for the first `len` elements.
     fn sigmoid_mul(&self, x: &mut Self::Buffer, gate: &Self::Buffer, len: usize) -> Result<()>;
     /// Causal depthwise convolution + SiLU with a rolling state; see [`ConvShape`].
