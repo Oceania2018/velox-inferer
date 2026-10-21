@@ -1011,6 +1011,18 @@ impl Backend for CudaBackend {
         CudaBuffer::new_host(len)
     }
 
+    fn host_alloc(&self) -> Option<velox_core::backend::HostAlloc<CudaBuffer>> {
+        let device = self.device.index;
+        Some(std::sync::Arc::new(move |len| {
+            // SAFETY: plain runtime call; the calling thread then allocates for this device.
+            status(
+                unsafe { ffi::velox_cuda_set_device(device) },
+                "cudaSetDevice",
+            )?;
+            CudaBuffer::new_host(len)
+        }))
+    }
+
     fn upload_bytes_host(&self, data: &[u8]) -> Result<CudaBuffer> {
         let buf = CudaBuffer::new_host(data.len().div_ceil(4))?;
         if !data.is_empty() {
