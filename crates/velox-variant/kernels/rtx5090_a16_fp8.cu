@@ -1,4 +1,4 @@
-// RTX 5090 skinny linear (2..16 tokens) for FP8 E4M3 row-scaled weights with bf16 activations
+// RTX 5090 skinny linear (2..64 tokens) for FP8 E4M3 row-scaled weights with bf16 activations
 // (ActQuant::Bf16): one kernel per call, no activation quantizer and no split-K pass.
 //
 // A block owns 16 weight rows over the whole K and splits each stage's K across KW warps (64 K
@@ -187,13 +187,17 @@ int launch_a16(const A16Args& a) {
 }  // namespace
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T x row scale, for an FP8 row-scaled weight. Requires
-// 2 <= m <= 16, k % 256 == 0 and 16-byte aligned x rows; returns VELOX_ERR_UNSUPPORTED otherwise.
+// 1 <= m <= 64, k % 256 == 0 and 16-byte aligned x rows; returns VELOX_ERR_UNSUPPORTED otherwise.
+// Batched speculative verify (several sequences' windows) takes up to 64 rows in one pass over the
+// weights; wider token tiles split K over fewer warps so both pipeline stages fit shared memory.
 VELOX_API int velox_5090_linear_a16_fp8(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                         long long row_begin, int rows, float* y) {
-    if (m < 1 || m > 16 || k % 256 != 0 || k > 0x7fffffff || reinterpret_cast<uintptr_t>(x) % 16 != 0)
+    if (m < 1 || m > 64 || k % 256 != 0 || k > 0x7fffffff || reinterpret_cast<uintptr_t>(x) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const A16Args a{x, w, parent_rows, row_begin, rows, m, static_cast<int>(k), y};
     const bool k512 = k % 512 == 0;
     if (m <= 8) return k512 ? launch_a16<8, 8>(a) : launch_a16<8, 4>(a);
-    return k512 ? launch_a16<16, 8>(a) : launch_a16<16, 4>(a);
+    if (m <= 16) return k512 ? launch_a16<16, 8>(a) : launch_a16<16, 4>(a);
+    if (m <= 32) return launch_a16<32, 4>(a);
+    return launch_a16<64, 2>(a);
 }

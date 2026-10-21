@@ -142,9 +142,10 @@ fn a16_fp8(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
         && w.k % 256 == 0
 }
 
-/// Batched speculative verify (up to 6 sequences x 16 rows) keeps the bf16-activation path, run
-/// in 16-row blocks, so a sequence's rounding does not depend on what it is batched with.
+/// Batched speculative verify (up to 6 sequences x 16 rows) keeps the bf16-activation path: one
+/// pass over the weights per 64 rows.
 const A16_FP8_MAX_M: usize = 96;
+const A16_FP8_BLOCK_M: usize = 64;
 
 /// `velox_5090_linear_skinny16`'s format code for a weight it serves at `m` tokens.
 fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
@@ -327,10 +328,10 @@ impl CudaKernels for Rtx5090Kernels {
             ),
             ActQuant::Bf16 => {
                 if a16_fp8(w, m) {
-                    // The kernel takes up to 16 rows; larger m runs in blocks (activations [m, k],
+                    // The kernel takes up to 64 rows; larger m runs in blocks (activations [m, k],
                     // outputs [m, rows]).
-                    for r0 in (0..m).step_by(SKINNY16_MAX_M) {
-                        let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
+                    for r0 in (0..m).step_by(A16_FP8_BLOCK_M) {
+                        let mb = to_i32("m", (m - r0).min(A16_FP8_BLOCK_M))?;
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
                         let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
                         status(
