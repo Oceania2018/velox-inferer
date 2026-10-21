@@ -119,6 +119,39 @@ pub struct BatchWorkspace<B: Backend> {
     /// Final-normed rows and their logits.
     hidden: B::Buffer,
     logits: B::Buffer,
+    /// GDN outputs of the verify rows when a prefill chunk occupies the workspace's first rows.
+    o: B::Buffer,
+}
+
+/// The prefill part of a [`Qwen35Text::mixed_step`]: one chunk of a prompt, fed to `session`
+/// from its current position.
+pub struct PrefillChunk<'a, 'b, B: Backend> {
+    pub session: &'a mut Session<B>,
+    pub ids: &'a [u32],
+    /// Explicit per-token MRoPE positions of the chunk, else cache position + rope_delta.
+    pub positions: Option<&'a [[u32; 3]]>,
+    /// Embedding rows replacing tokens of the chunk (relative to its first token).
+    pub inserts: &'a [EmbedInsert<'b, B::Buffer>],
+    /// Each is filled with the recurrent state at its `pos` when that lies inside the chunk.
+    pub snaps: &'a mut [Checkpoint<B>],
+    /// Whether the candidates after the chunk's last token are wanted (the prompt's last chunk).
+    pub candidates: bool,
+}
+
+/// The prefill rows of a mixed step inside the forward pass.
+struct PrefillRows<'a, B: Backend> {
+    s: &'a mut Session<B>,
+    t: usize,
+    axis_positions: Option<Vec<u32>>,
+    rope_pos0: usize,
+    snaps: &'a mut [Checkpoint<B>],
+}
+
+impl<B: Backend> Workspace<B> {
+    /// Most rows (tokens) one forward pass takes.
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
 }
 
 impl<B: Backend> BatchWorkspace<B> {
@@ -1016,6 +1049,26 @@ impl<B: Backend> Qwen35Text<B> {
             c.eps,
             NormKind::Offset,
         )?;
+        self.attend_rows(b, ws, kv, kv_format, t, pos0, rope)?;
+        b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
+        b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
+        Ok(())
+    }
+
+    /// Rotates rows `0 .. t` of `ws.qn` / `ws.kn`, appends them with `ws.v` to `kv` at cache rows
+    /// `pos0 ..` and attends, into rows `0 .. t` of `ws.attn`.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_rows(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        kv: &mut (B::Buffer, B::Buffer),
+        kv_format: KvFormat,
+        t: usize,
+        pos0: usize,
+        rope: Rope<'_>,
+    ) -> Result<()> {
+        let c = &self.cfg;
         match rope {
             Rope::Axes(p) => {
                 let rope = |heads| RopePosShape {
@@ -1083,8 +1136,6 @@ impl<B: Backend> Qwen35Text<B> {
         } else {
             b.attention(&ws.qn, kc, vc, &mut ws.attn, shape)?;
         }
-        b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
-        b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
         Ok(())
     }
 
@@ -1382,6 +1433,7 @@ impl<B: Backend> Qwen35Text<B> {
             attn: b.alloc(VERIFY_MAX * c.q_dim())?,
             hidden: b.alloc(rows * c.hidden)?,
             logits: b.alloc(rows * c.vocab)?,
+            o: b.alloc(rows * c.gdn_v())?,
         })
     }
 
@@ -1436,7 +1488,7 @@ impl<B: Backend> Qwen35Text<B> {
                    ws: &mut Workspace<B>,
                    bw: &mut BatchWorkspace<B>|
          -> Result<()> {
-            self.chunk_batch(b, sessions, ws, bw, &ids, &rows)?;
+            self.chunk_batch(b, None, &[], sessions, ws, bw, &ids, &rows)?;
             b.rms_norm(
                 &ws.x,
                 w.param(w.final_norm),
@@ -1557,12 +1609,141 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
-    /// The forward pass of [`Self::verify_batch`]: `ids` holds every window, sequence `i` at
-    /// rows `rows[i]` (start, length). GDN state advances into each session's spec buffers (the
-    /// state to roll back to stays in place); attention appends to each session's cache.
+    /// One forward pass carrying a prefill chunk of one sequence and speculative verify windows of
+    /// others (see [`Self::verify_batch`]): the chunk takes rows `0 .. T` of the workspace and
+    /// window `i` the rows after it (plus the earlier windows' lengths). Projections and MLPs run
+    /// once over every row, so the windows ride along a compute-bound prefill almost for free.
+    /// Returns the candidates after the chunk's last token (when asked) and, per window, after
+    /// each of its tokens. The verified sessions are committed with [`Self::commit_batched`];
+    /// their DFlash features sit at rows `T + ...` of `ws`, the chunk's at rows `0 .. T`.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn mixed_step(
+        &self,
+        b: &B,
+        prefill: PrefillChunk<'_, '_, B>,
+        sessions: &mut [&mut Session<B>],
+        ws: &mut Workspace<B>,
+        bw: &mut BatchWorkspace<B>,
+        windows: &[&[u32]],
+        k: usize,
+        limit: usize,
+    ) -> Result<(Option<Vec<(u32, f32)>>, Vec<Vec<Vec<(u32, f32)>>>)> {
+        let (c, w) = (&self.cfg, &self.w);
+        let n = windows.len();
+        let tp = prefill.ids.len();
+        if n != sessions.len() || n > bw.max_seqs || tp == 0 {
+            return Err(Error::Shape(format!(
+                "mixed_step: {tp} prefill tokens, {n} windows for {} sessions (at most {})",
+                sessions.len(),
+                bw.max_seqs
+            )));
+        }
+        let ps = prefill.session;
+        if ps.pos + tp > ps.capacity {
+            return Err(Error::Config(format!(
+                "{} + {tp} tokens exceed session capacity {}",
+                ps.pos, ps.capacity
+            )));
+        }
+        let mut ids = prefill.ids.to_vec();
+        let mut rows = Vec::with_capacity(n);
+        for (s, win) in sessions.iter_mut().zip(windows) {
+            if win.is_empty() || win.len() > VERIFY_MAX {
+                return Err(Error::Shape(format!(
+                    "verify takes 1..={VERIFY_MAX} tokens per sequence"
+                )));
+            }
+            if s.pos + win.len() > s.capacity {
+                return Err(Error::Config(
+                    "verify window exceeds session capacity".into(),
+                ));
+            }
+            self.ensure_spec(b, s)?;
+            rows.push((ids.len() - tp, win.len()));
+            ids.extend_from_slice(win);
+        }
+        let t = ids.len();
+        if t > ws.max_tokens {
+            return Err(Error::Shape("mixed step exceeds the workspace".into()));
+        }
+        let axis_positions: Option<Vec<u32>> = prefill.positions.map(|p| {
+            (0..3)
+                .flat_map(|a| p.iter().map(move |tri| tri[a]))
+                .collect()
+        });
+        let rope_pos0 = match axis_positions {
+            Some(_) => 0,
+            None => usize::try_from(ps.pos as i64 + ps.rope_delta)
+                .map_err(|_| Error::Shape("negative rotary position".into()))?,
+        };
+        let mut pre = PrefillRows {
+            s: ps,
+            t: tp,
+            axis_positions,
+            rope_pos0,
+            snaps: prefill.snaps,
+        };
+        self.chunk_batch(
+            b,
+            Some(&mut pre),
+            prefill.inserts,
+            sessions,
+            ws,
+            bw,
+            &ids,
+            &rows,
+        )?;
+        pre.s.pos += tp;
+        let cands = if prefill.candidates {
+            ws.last_row = tp - 1;
+            Some(self.candidates(b, ws, k, limit)?)
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(n);
+        let v = t - tp;
+        if v > 0 {
+            // The windows' rows, final-normed from row 0 of a scratch copy.
+            b.copy(&ws.x, tp * c.hidden, &mut ws.h, 0, v * c.hidden)?;
+            b.rms_norm(
+                &ws.h,
+                w.param(w.final_norm),
+                &mut bw.hidden,
+                v,
+                c.hidden,
+                c.eps,
+                NormKind::Offset,
+            )?;
+            b.linear(&bw.hidden, &w.view(&w.head), &mut bw.logits, v)?;
+            let mut all = b.top_k(&bw.logits, v, c.vocab, limit.min(c.vocab), k)?;
+            for &(_, m) in rows.iter().rev() {
+                out.push(all.split_off(all.len() - m));
+            }
+            out.reverse();
+        }
+        for (s, &(r0, m)) in sessions.iter_mut().zip(&rows) {
+            let pos = s.pos;
+            let sp = s.spec.as_mut().expect("allocated above");
+            sp.pos0 = pos;
+            sp.tokens = m;
+            sp.batch_row0 = Some(r0);
+            s.pos += m;
+        }
+        Ok((cands, out))
+    }
+
+    /// The forward pass of [`Self::verify_batch`] and [`Self::mixed_step`]: `ids` holds an
+    /// optional prefill chunk (rows `0 .. T`, `inserts` relative to it) then every window, window
+    /// `i` at verify rows `rows[i]` (start, length) after `T`. A prefill advances its session's
+    /// state in place (snapshotting on the way); windows advance into each session's spec buffers
+    /// (the state to roll back to stays in place) and keep their replay inputs in `bw` at their
+    /// verify rows; attention appends to each session's cache.
+    #[allow(clippy::too_many_arguments)]
     fn chunk_batch(
         &self,
         b: &B,
+        mut pre: Option<&mut PrefillRows<'_, B>>,
+        inserts: &[EmbedInsert<'_, B::Buffer>],
         sessions: &mut [&mut Session<B>],
         ws: &mut Workspace<B>,
         bw: &mut BatchWorkspace<B>,
@@ -1571,8 +1752,39 @@ impl<B: Backend> Qwen35Text<B> {
     ) -> Result<()> {
         let (c, w) = (&self.cfg, &self.w);
         let t = ids.len();
+        let tp = pre.as_ref().map_or(0, |p| p.t);
+        let v = t - tp;
         let hd = c.hidden;
         b.embed(ids, &w.view(&w.embed), &mut ws.x)?;
+        for ins in inserts {
+            let (lo, hi) = (ins.token, (ins.token + ins.rows).min(tp));
+            if lo < hi {
+                b.copy(
+                    ins.buf,
+                    ins.row_offset * hd,
+                    &mut ws.x,
+                    lo * hd,
+                    (hi - lo) * hd,
+                )?;
+            }
+        }
+        // GDN segments of the prefill end at each snapshot inside the chunk, then at its end.
+        let cuts: Vec<usize> = match pre.as_ref() {
+            Some(p) => {
+                let pos0 = p.s.pos;
+                let mut v: Vec<usize> = p
+                    .snaps
+                    .iter()
+                    .filter(|cp| cp.pos > pos0 && cp.pos <= pos0 + p.t)
+                    .map(|cp| cp.pos - pos0)
+                    .chain(std::iter::once(p.t))
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            }
+            None => Vec::new(),
+        };
         let (mut ai, mut gi) = (0, 0);
         for (li, l) in w.layers.iter().enumerate() {
             if GRAPH_SEGMENT_STARTS.contains(&li) {
@@ -1613,28 +1825,79 @@ impl<B: Backend> Qwen35Text<B> {
                     dt_bias,
                     norm,
                 } => {
-                    let (qkv_buf, ab_buf, co_buf) =
-                        (&mut bw.qkv[gi], &mut bw.ab[gi], &mut bw.conv_out[gi]);
-                    match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
-                        Some(f) => {
-                            b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
-                            b.split_cols(
-                                &ws.fused,
-                                t,
-                                f.rows,
-                                &mut [
-                                    (&mut *qkv_buf, qkv.row_begin - f.row_begin, qkv.rows),
-                                    (&mut ws.z, z.row_begin - f.row_begin, z.rows),
-                                ],
-                            )?;
+                    let (cw, al, dt) = (w.param(*conv), w.param(*a_log), w.param(*dt_bias));
+                    {
+                        // Without a prefill the projections land in the replay buffers directly.
+                        let (qkv_buf, ab_buf) = if tp > 0 {
+                            (&mut ws.qkv, &mut ws.ab)
+                        } else {
+                            (&mut bw.qkv[gi], &mut bw.ab[gi])
+                        };
+                        match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
+                            Some(f) => {
+                                b.linear(&ws.h, &w.view(f), &mut ws.fused, t)?;
+                                b.split_cols(
+                                    &ws.fused,
+                                    t,
+                                    f.rows,
+                                    &mut [
+                                        (&mut *qkv_buf, qkv.row_begin - f.row_begin, qkv.rows),
+                                        (&mut ws.z, z.row_begin - f.row_begin, z.rows),
+                                    ],
+                                )?;
+                            }
+                            None => {
+                                b.linear(&ws.h, &w.view(qkv), qkv_buf, t)?;
+                                b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
+                            }
                         }
-                        None => {
-                            b.linear(&ws.h, &w.view(qkv), qkv_buf, t)?;
-                            b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
+                        b.linear(&ws.h, &w.view(ab), ab_buf, t)?;
+                    }
+                    if let Some(p) = pre.as_deref_mut() {
+                        if v > 0 {
+                            let (qw, abw) = (c.gdn_qkv(), 2 * c.gdn_v_heads);
+                            b.copy(&ws.qkv, tp * qw, &mut bw.qkv[gi], 0, v * qw)?;
+                            b.copy(&ws.ab, tp * abw, &mut bw.ab[gi], 0, v * abw)?;
+                        }
+                        let pos0 = p.s.pos;
+                        let Session {
+                            conv: s_conv,
+                            ssm: s_ssm,
+                            ..
+                        } = &mut *p.s;
+                        let mut row0 = 0;
+                        for &end in &cuts {
+                            let cs = ConvShape {
+                                tokens: end - row0,
+                                channels: c.gdn_qkv(),
+                                width: c.conv_width,
+                                row0,
+                            };
+                            let gs = GdnShape {
+                                tokens: end - row0,
+                                k_heads: c.gdn_k_heads,
+                                v_heads: c.gdn_v_heads,
+                                k_dim: c.gdn_k_dim,
+                                v_dim: c.gdn_v_dim,
+                                row0,
+                            };
+                            b.conv1d_silu(&ws.qkv, cw, &mut s_conv[gi], &mut ws.conv_out, cs)?;
+                            b.gated_delta_net(
+                                &ws.conv_out,
+                                &ws.ab,
+                                al,
+                                dt,
+                                &mut s_ssm[gi],
+                                &mut ws.o,
+                                gs,
+                            )?;
+                            for cp in p.snaps.iter_mut().filter(|cp| cp.pos == pos0 + end) {
+                                b.copy(&s_conv[gi], 0, &mut cp.conv[gi], 0, b.len(&s_conv[gi]))?;
+                                b.copy(&s_ssm[gi], 0, &mut cp.ssm[gi], 0, b.len(&s_ssm[gi]))?;
+                            }
+                            row0 = end;
                         }
                     }
-                    b.linear(&ws.h, &w.view(ab), ab_buf, t)?;
-                    let (cw, al, dt) = (w.param(*conv), w.param(*a_log), w.param(*dt_bias));
                     for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
                         let Session {
                             spec,
@@ -1657,17 +1920,30 @@ impl<B: Backend> Qwen35Text<B> {
                             v_dim: c.gdn_v_dim,
                             row0: r0,
                         };
-                        b.conv1d_silu_from(qkv_buf, cw, &s_conv[gi], &mut sp.conv[gi], co_buf, cs)?;
+                        b.conv1d_silu_from(
+                            &bw.qkv[gi],
+                            cw,
+                            &s_conv[gi],
+                            &mut sp.conv[gi],
+                            &mut bw.conv_out[gi],
+                            cs,
+                        )?;
+                        // Window outputs go to the workspace's rows after the prefill.
+                        let o = if tp > 0 { &mut bw.o } else { &mut ws.o };
                         b.gated_delta_net_from(
-                            co_buf,
-                            ab_buf,
+                            &bw.conv_out[gi],
+                            &bw.ab[gi],
                             al,
                             dt,
                             &s_ssm[gi],
                             &mut sp.ssm[gi],
-                            &mut ws.o,
+                            o,
                             gs,
                         )?;
+                    }
+                    if tp > 0 && v > 0 {
+                        let ow = c.gdn_v();
+                        b.copy(&bw.o, 0, &mut ws.o, tp * ow, v * ow)?;
                     }
                     b.rms_norm_gated(
                         &ws.o,
@@ -1682,7 +1958,16 @@ impl<B: Backend> Qwen35Text<B> {
                     gi += 1;
                 }
                 Mixer::Attention { .. } => {
-                    self.attention_batch(b, sessions, ws, bw, &l.mixer, ai, rows)?;
+                    self.attention_batch(
+                        b,
+                        pre.as_deref_mut(),
+                        sessions,
+                        ws,
+                        bw,
+                        &l.mixer,
+                        ai,
+                        rows,
+                    )?;
                     ai += 1;
                 }
             }
@@ -1704,12 +1989,14 @@ impl<B: Backend> Qwen35Text<B> {
     }
 
     /// The attention mixer of layer `ai` (attention-layer index) for a batch: projections and
-    /// norms over all rows, then per sequence its rows are staged, rotated at its positions,
-    /// appended to its cache and attended, and the outputs gathered back.
+    /// norms over all rows; the prefill rows (first) rotate, append and attend in place; then per
+    /// window its rows are staged, rotated at its positions, appended to its cache and attended,
+    /// and the outputs gathered back.
     #[allow(clippy::too_many_arguments)]
     fn attention_batch(
         &self,
         b: &B,
+        pre: Option<&mut PrefillRows<'_, B>>,
         sessions: &mut [&mut Session<B>],
         ws: &mut Workspace<B>,
         bw: &mut BatchWorkspace<B>,
@@ -1718,7 +2005,8 @@ impl<B: Backend> Qwen35Text<B> {
         rows: &[(usize, usize)],
     ) -> Result<()> {
         let (c, w) = (&self.cfg, &self.w);
-        let t: usize = rows.iter().map(|r| r.1).sum();
+        let tp = pre.as_ref().map_or(0, |p| p.t);
+        let t: usize = tp + rows.iter().map(|r| r.1).sum::<usize>();
         let Mixer::Attention {
             query,
             gate,
@@ -1774,10 +2062,22 @@ impl<B: Backend> Qwen35Text<B> {
             NormKind::Offset,
         )?;
         let (qd, kd) = (c.q_dim(), c.kv_dim());
+        if let Some(p) = pre {
+            // The prefill rows rotate and attend in place; attend_rows touches only rows 0 .. tp,
+            // so the windows' rows after them stay as they are.
+            let rope = match &p.axis_positions {
+                Some(a) => Rope::Axes(a),
+                None => Rope::At(p.rope_pos0),
+            };
+            let kv_format = p.s.kv_format;
+            let pos0 = p.s.pos;
+            self.attend_rows(b, ws, &mut p.s.kv[ai], kv_format, tp, pos0, rope)?;
+        }
         for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
-            b.copy(&ws.qn, r0 * qd, &mut bw.q, 0, m * qd)?;
-            b.copy(&ws.kn, r0 * kd, &mut bw.k, 0, m * kd)?;
-            b.copy(&ws.v, r0 * kd, &mut bw.v, 0, m * kd)?;
+            let r = tp + r0;
+            b.copy(&ws.qn, r * qd, &mut bw.q, 0, m * qd)?;
+            b.copy(&ws.kn, r * kd, &mut bw.k, 0, m * kd)?;
+            b.copy(&ws.v, r * kd, &mut bw.v, 0, m * kd)?;
             let pos0 = s.pos;
             let rope_pos0 = usize::try_from(pos0 as i64 + s.rope_delta)
                 .map_err(|_| Error::Shape("negative rotary position".into()))?;
@@ -1810,7 +2110,7 @@ impl<B: Backend> Qwen35Text<B> {
                 kv: kv_format,
             };
             b.attention(&bw.q, kc, vc, &mut bw.attn, shape)?;
-            b.copy(&bw.attn, 0, &mut ws.attn, r0 * qd, m * qd)?;
+            b.copy(&bw.attn, 0, &mut ws.attn, r * qd, m * qd)?;
         }
         b.sigmoid_mul(&mut ws.attn, &ws.g, t * qd)?;
         b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
@@ -1856,7 +2156,7 @@ enum Rope<'a> {
 
 /// `inserts` relative to a sub-call starting at token `base` of the original call (rows before
 /// `base` are dropped; the chunk loop clips the rest).
-fn shift_inserts<'a, Buf>(
+pub fn shift_inserts<'a, Buf>(
     inserts: &[EmbedInsert<'a, Buf>],
     base: usize,
 ) -> Vec<EmbedInsert<'a, Buf>> {
