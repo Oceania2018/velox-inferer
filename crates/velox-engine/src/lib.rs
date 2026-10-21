@@ -40,7 +40,7 @@ pub struct EngineConfig {
     pub max_checkpoints: usize,
     /// Keep checkpoints in system RAM (pinned, device-mapped) rather than device memory.
     pub host_checkpoints: bool,
-    /// Take no checkpoints after the prompt's last image: agent screenshots are replaced in the
+    /// Take no checkpoints at or after the prompt's last image: agent screenshots are replaced in the
     /// next request's history, so state past them is never shared (ninfer's media-tail skip).
     pub skip_media_tail: bool,
     /// Capacity of a second, small lane for requests that share nothing with the main lane
@@ -371,7 +371,7 @@ impl<B: Backend> QwenEngine<B> {
         };
         let mut v: Vec<usize> = turns
             .chain(image)
-            .filter(|&p| p > after && p < ids.len() && p <= tail)
+            .filter(|&p| p > after && p < ids.len() && p < tail)
             .collect();
         v.sort_unstable();
         v.dedup();
@@ -439,7 +439,8 @@ impl<B: Backend> QwenEngine<B> {
             }
         }
         lane.checkpoints = kept;
-        lane.spare.truncate(MAX_SPARE);
+        // A request snapshots about two points before its last image; keep storage for that.
+        lane.spare.truncate(2);
         lane.host_spare.truncate(MAX_SPARE);
         Ok(())
     }
