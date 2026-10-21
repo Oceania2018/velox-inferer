@@ -3,6 +3,9 @@
 // works on every branch immediately. Shapes are validated on the Rust side before launch.
 #include <math.h>
 
+#include <mutex>
+#include <vector>
+
 #include "velox_common.cuh"
 
 namespace {
@@ -53,17 +56,24 @@ __global__ void rms_norm_warp_kernel(const float* __restrict__ x, const float* _
 // One block per token: the token's rotary/2 angles are formed once (in double) into shared
 // memory, then every head applies them. Double is slow on consumer GPUs, so it runs once per
 // pair per token rather than once per pair per head.
+// The cos/sin of one position, as the table stores and the kernels apply them.
+__device__ __forceinline__ float2 rope_angle(int pos, int i, int rotary_dim, float theta) {
+    const double freq = pow(static_cast<double>(theta), -2.0 * i / rotary_dim);
+    double s, c;
+    sincos(static_cast<double>(pos) * freq, &s, &c);
+    return make_float2(static_cast<float>(c), static_cast<float>(s));
+}
+
+// table: [table_len][half] (cos, sin) of positions 0.., or null; positions past it are computed.
 __global__ void rope_kernel(float* __restrict__ x, int heads, int head_dim, int rotary_dim, int pos0, float theta,
-                            const long long* __restrict__ params) {
+                            const long long* __restrict__ params, const float2* __restrict__ table, int table_len) {
     if (params != nullptr) pos0 = static_cast<int>(params[0]);  // staged by a graph step
     extern __shared__ float cs[];  // [half] cos, then [half] sin
-    const int half = rotary_dim / 2, t = blockIdx.x;
+    const int half = rotary_dim / 2, t = blockIdx.x, pos = pos0 + t;
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
-        const double freq = pow(static_cast<double>(theta), -2.0 * i / rotary_dim);
-        double s, c;
-        sincos(static_cast<double>(pos0 + t) * freq, &s, &c);
-        cs[i] = static_cast<float>(c);
-        cs[half + i] = static_cast<float>(s);
+        const float2 a = pos < table_len ? table[static_cast<size_t>(pos) * half + i] : rope_angle(pos, i, rotary_dim, theta);
+        cs[i] = a.x;
+        cs[half + i] = a.y;
     }
     __syncthreads();
     for (int p = threadIdx.x; p < heads * half; p += blockDim.x) {
@@ -209,11 +219,59 @@ VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float
     return velox_launch_status();
 }
 
+namespace {
+__global__ void rope_table_kernel(float2* __restrict__ table, int len, int rotary_dim, float theta) {
+    const int half = rotary_dim / 2;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < static_cast<long long>(len) * half;
+         i += static_cast<long long>(gridDim.x) * blockDim.x)
+        table[i] = rope_angle(static_cast<int>(i / half), static_cast<int>(i % half), rotary_dim, theta);
+}
+
+// Angle tables per (theta, rotary_dim), grown in steps of kRopeTableStep positions. Grow-only and never
+// freed: recorded graphs keep the pointer and length they were captured with (positions past that
+// length are computed in the kernel), so an outgrown table stays valid for them.
+constexpr int kRopeTableStep = 1 << 16;
+struct RopeTable {
+    float theta;
+    int rotary_dim;
+    float2* table;
+    int len;
+};
+std::mutex g_rope_mu;
+std::vector<RopeTable> g_rope_tables;
+
+RopeTable rope_table(int needed, int rotary_dim, float theta) {
+    std::lock_guard<std::mutex> lock(g_rope_mu);
+    RopeTable* t = nullptr;
+    for (auto& e : g_rope_tables)
+        if (e.theta == theta && e.rotary_dim == rotary_dim) t = &e;
+    if (t != nullptr && t->len >= needed) return *t;
+    const int len = (needed + kRopeTableStep - 1) / kRopeTableStep * kRopeTableStep;
+    float2* table = nullptr;
+    if (cudaMalloc(&table, static_cast<size_t>(len) * (rotary_dim / 2) * sizeof(float2)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return t ? *t : RopeTable{theta, rotary_dim, nullptr, 0};  // the kernel computes what is missing
+    }
+    rope_table_kernel<<<velox_grid_1d(static_cast<long long>(len) * (rotary_dim / 2), 256), 256>>>(table, len, rotary_dim,
+                                                                                                    theta);
+    if (t == nullptr) {
+        g_rope_tables.push_back(RopeTable{theta, rotary_dim, table, len});
+        return g_rope_tables.back();
+    }
+    t->table = table;
+    t->len = len;
+    return *t;
+}
+}  // namespace
+
 // params: null, or device [pos0] (graph steps stage per-call values; see velox_cuda_stage).
 VELOX_API int velox_portable_rope(float* x, int tokens, int heads, int head_dim, int rotary_dim, int pos0, float theta,
                                   const long long* params) {
     if (tokens <= 0) return 0;
-    rope_kernel<<<tokens, 256, rotary_dim * sizeof(float)>>>(x, heads, head_dim, rotary_dim, pos0, theta, params);
+    // Cover this call's positions (a recorded step covers its KV bucket the same way).
+    const RopeTable tab = rope_table(pos0 + tokens + 1024, rotary_dim, theta);
+    rope_kernel<<<tokens, 256, rotary_dim * sizeof(float)>>>(x, heads, head_dim, rotary_dim, pos0, theta, params,
+                                                             tab.table, tab.len);
     return velox_launch_status();
 }
 
