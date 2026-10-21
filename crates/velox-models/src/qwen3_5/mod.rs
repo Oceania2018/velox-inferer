@@ -368,6 +368,36 @@ impl<B: Backend> Session<B> {
 
     /// [`Self::blank_checkpoint`] in system RAM ([`Backend::alloc_host`]) when `host`: no device
     /// memory per checkpoint, at the cost of PCIe copies when one is taken or restored.
+    /// Lengths of a checkpoint's buffers (see [`Self::host_checkpoint_from`]).
+    pub fn state_lens(&self, b: &B) -> Vec<usize> {
+        self.conv
+            .iter()
+            .chain(&self.ssm)
+            .map(|s| b.len(s))
+            .collect()
+    }
+
+    /// A system-RAM checkpoint over `bufs` (from [`Backend::alloc_host`], one per
+    /// [`Self::state_lens`] entry).
+    pub fn host_checkpoint_from(&self, bufs: Vec<B::Buffer>) -> Result<Checkpoint<B>> {
+        if bufs.len() != self.conv.len() + self.ssm.len() {
+            return Err(Error::Shape(format!(
+                "checkpoint of {} buffers (state has {})",
+                bufs.len(),
+                self.conv.len() + self.ssm.len()
+            )));
+        }
+        let mut conv = bufs;
+        let ssm = conv.split_off(self.conv.len());
+        Ok(Checkpoint {
+            pos: 0,
+            rope_delta: self.rope_delta,
+            conv,
+            ssm,
+            host: true,
+        })
+    }
+
     pub fn blank_checkpoint_in(&self, b: &B, pos: usize, host: bool) -> Result<Checkpoint<B>> {
         let like = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
             bufs.iter()

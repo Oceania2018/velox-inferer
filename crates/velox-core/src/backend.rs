@@ -12,6 +12,10 @@ use crate::kv::KvFormat;
 use crate::op::Op;
 use crate::profile::DeviceProfile;
 
+/// [`Backend::alloc_host`] callable from any thread: pinning system RAM is slow (about 1 ms per
+/// MiB), so a background thread can prepare it while the device works.
+pub type HostAlloc<T> = std::sync::Arc<dyn Fn(usize) -> Result<T> + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Cpu,
@@ -491,6 +495,10 @@ pub trait Backend {
     /// no device memory, slower access. Backends without such memory return device storage.
     fn alloc_host(&self, len: usize) -> Result<Self::Buffer> {
         self.alloc(len)
+    }
+    /// [`Self::alloc_host`] for another thread, when the backend has pinned memory (else `None`).
+    fn host_alloc(&self) -> Option<HostAlloc<Self::Buffer>> {
+        None
     }
     /// [`Self::upload_bytes`] into storage from [`Self::alloc_host`].
     fn upload_bytes_host(&self, data: &[u8]) -> Result<Self::Buffer> {
