@@ -234,7 +234,7 @@ pub fn gdn_replay_layer(
     cs: &ConvShape,
     gs: &GdnShape,
 ) -> Result<()> {
-    if cs.tokens != gs.tokens || cs.row0 != 0 || gs.row0 != 0 || cs.channels != gs.qkv_width() {
+    if cs.tokens != gs.tokens || cs.row0 != gs.row0 || cs.channels != gs.qkv_width() {
         return Err(Error::Shape(format!(
             "gdn_replay shapes disagree: {cs:?} {gs:?}"
         )));
@@ -246,7 +246,7 @@ pub fn gdn_replay_layer(
         a_log,
         dt_bias,
         ssm,
-        gs.tokens * gs.v_heads * gs.v_dim,
+        (gs.row0 + gs.tokens) * gs.v_heads * gs.v_dim,
         gs,
     )
 }

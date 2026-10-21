@@ -30,6 +30,12 @@ const GRAPH_CONTEXT: u64 = 8 << 16;
 const GRAPH_BLOCK: u64 = 9 << 16;
 
 static NEXT_DRAFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Graph-key id of drafting steps that bind workspace `dw` and rings `st` (several sequences
+/// can share one workspace).
+fn graph_id<B: Backend>(dw: &DFlashWorkspace<B>, st: &DFlashState<B>) -> u64 {
+    dw.id.wrapping_mul(97) ^ st.id.wrapping_mul(0x9e37)
+}
 /// Context rows up to this many (decode commits) materialize as a recorded step.
 const GRAPH_ROWS: usize = 16;
 
@@ -187,6 +193,8 @@ impl<B: Backend> DraftContext<B> {
 
 /// Context rings of one sequence and their live interval `[lo, end)`.
 pub struct DFlashState<B: Backend> {
+    /// Distinguishes graph recordings that bind these rings (with a shared workspace).
+    id: u64,
     k: Vec<B::Buffer>,
     v: Vec<B::Buffer>,
     pub lo: usize,
@@ -200,6 +208,8 @@ pub struct DFlashWorkspace<B: Backend> {
     ctx_rows: usize,
     block: usize,
     ctx_raw: B::Buffer,
+    /// Feature rows staged from an offset of the target's capture (batched verify).
+    feat: B::Buffer,
     ctx: B::Buffer,
     kr: B::Buffer,
     kn: B::Buffer,
@@ -348,6 +358,7 @@ impl<B: Backend> DFlashModel<B> {
         let alloc =
             || -> Result<Vec<B::Buffer>> { (0..self.cfg.layers).map(|_| b.alloc(n)).collect() };
         Ok(DFlashState {
+            id: NEXT_DRAFTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             k: alloc()?,
             v: alloc()?,
             lo: 0,
@@ -371,6 +382,7 @@ impl<B: Backend> DFlashModel<B> {
             ctx_rows,
             block,
             ctx_raw: b.alloc(r * h)?,
+            feat: b.alloc(super::VERIFY_MAX * self.feature_projection.k)?,
             ctx: b.alloc(r * h)?,
             kr: b.alloc(r * c.kv_dim())?,
             kn: b.alloc(r * c.kv_dim())?,
@@ -518,13 +530,16 @@ impl<B: Backend> DFlashModel<B> {
     }
 
     /// Materializes context rows for cache positions `pos0 .. pos0 + n` from the features the
-    /// target captured in `ws` (rows `0 .. n` of its latest chunk or verify).
+    /// target captured in `ws` (rows `feat_row .. feat_row + n` of its latest chunk or verify;
+    /// a batched verify leaves each sequence's rows after the earlier sequences').
+    #[allow(clippy::too_many_arguments)]
     pub fn materialize(
         &self,
         b: &B,
         st: &mut DFlashState<B>,
         dw: &mut DFlashWorkspace<B>,
         ws: &Workspace<B>,
+        feat_row: usize,
         pos0: usize,
         n: usize,
     ) -> Result<()> {
@@ -550,10 +565,19 @@ impl<B: Backend> DFlashModel<B> {
         let (h, kvd) = (self.hidden, c.kv_dim());
         let slot = pos0 % c.window;
         let first = n.min(c.window - slot);
-        let id = dw.id;
+        let id = graph_id(dw, st);
+        // Rows past the first stage through `feat` (the projection reads from row 0).
+        let cols = self.feature_projection.k;
+        if feat_row > 0 {
+            if n > super::VERIFY_MAX {
+                return Err(Error::Shape(format!("dflash2 context: {n} offset rows")));
+            }
+            b.copy(features, feat_row * cols, &mut dw.feat, 0, n * cols)?;
+        }
+        let src: &B::Buffer = if feat_row > 0 { &dw.feat } else { features };
         let mut run = || -> Result<()> {
             b.linear(
-                features,
+                src,
                 &self.view(&self.feature_projection),
                 &mut dw.ctx_raw,
                 n,
@@ -605,6 +629,7 @@ impl<B: Backend> DFlashModel<B> {
             let key = GRAPH_CONTEXT
                 | n as u64
                 | u64::from(wrap) << 8
+                | u64::from(feat_row > 0) << 9
                 | (id & 0xffff) << 40
                 | if wrap { 0 } else { GRAPH_STATIC };
             b.graph(key, &mut run)?;
@@ -645,7 +670,7 @@ impl<B: Backend> DFlashModel<B> {
         let k = drafts;
         // The block forward through the selector projection is one recorded step per width.
         // Static: positions are staged and block attention spans a full window of grid.
-        let key = GRAPH_BLOCK | w as u64 | (dw.id & 0xffff) << 40 | GRAPH_STATIC;
+        let key = GRAPH_BLOCK | w as u64 | (graph_id(dw, st) & 0xffff) << 40 | GRAPH_STATIC;
         b.graph(key, &mut || {
             b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
             for (li, l) in self.layers.iter().enumerate() {
