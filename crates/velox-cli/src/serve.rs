@@ -59,7 +59,14 @@ where
         chunk: a.parse("prefill-chunk", 512)?,
         default_max_tokens: a.parse("default-max-tokens", 4096)?,
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
+        // --ctx-checkpoints N (ninfer's name): with the host store, superseded history points kept
+        // per request chain (default 1, as ninfer is deployed; 0: unbounded); with
+        // --ctx-checkpoint-store device, checkpoints per lane (default 8).
         max_checkpoints: a.parse("ctx-checkpoints", 8)?,
+        chain_superseded: match a.parse("ctx-checkpoints", 1)? {
+            0 => usize::MAX,
+            n => n,
+        },
         // --ctx-checkpoint-store host|device (default host: system RAM).
         host_checkpoints: a.get("ctx-checkpoint-store").is_none_or(|v| v != "device"),
         // --ctx-checkpoint-skip-media-tail on|off (default on).
