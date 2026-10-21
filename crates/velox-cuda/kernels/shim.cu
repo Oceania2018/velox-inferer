@@ -58,11 +58,16 @@ VELOX_API int velox_cuda_runtime_version(int* v) { return static_cast<int>(cudaR
 
 VELOX_API int velox_cuda_driver_version(int* v) { return static_cast<int>(cudaDriverGetVersion(v)); }
 
-// Small per-call uploads (token ids, rope positions) without cudaMalloc/cudaFree, whose free
-// synchronizes the device. Bytes go through a pinned ring and an async copy queued on the default
-// stream ahead of the kernel that reads them. When the ring wraps, the stream is synchronized once
-// so no queued copy still reads a slot being overwritten.
+// Small per-call uploads (token ids, positions, offsets) without cudaMalloc/cudaFree, whose free
+// synchronizes the device. Outside graphs, bytes go through a pinned ring and an async copy queued
+// on the default stream ahead of the kernel that reads them; when the ring wraps, the stream is
+// synchronized once so no queued copy still reads a slot being overwritten.
+//
+// Inside a graph (capture or replay) bytes go to that graph's own pinned region instead, at the
+// same offsets on every run, and no copy is queued: the graph's first node copies the whole region
+// to the device when it executes. Replaying a graph therefore only rewrites the region on the host.
 #include <mutex>
+#include <vector>
 
 namespace {
 struct StageRing {
@@ -73,10 +78,48 @@ struct StageRing {
 };
 StageRing g_stage;
 constexpr size_t kStageBytes = 8u << 20;
+
+constexpr size_t kRegionBytes = 64u << 10;
+constexpr int kGraphSlots = 4096;
+struct GraphSlot {
+    cudaGraphExec_t exec = nullptr;
+    unsigned char* host = nullptr;  // pinned staging region
+    unsigned char* dev = nullptr;
+    cudaEvent_t done = nullptr;     // recorded after each launch
+    bool launched = false;
+};
+std::vector<GraphSlot> g_slots(kGraphSlots);
+int g_region = -1;  // slot whose region stage() fills, -1 outside graphs
+size_t g_region_off = 0;
+
+// Allocates the slot's region and event on first use and waits until its previous launch has
+// consumed the region, so the host may rewrite it.
+int prepare_slot(int slot) {
+    GraphSlot& s = g_slots[slot];
+    if (!s.host) {
+        if (cudaError_t e = cudaMallocHost(&s.host, kRegionBytes)) return static_cast<int>(e);
+        std::memset(s.host, 0, kRegionBytes);
+        if (cudaError_t e = cudaMalloc(&s.dev, kRegionBytes)) return static_cast<int>(e);
+        if (cudaError_t e = cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming)) return static_cast<int>(e);
+    }
+    if (s.launched) {
+        if (cudaError_t e = cudaEventSynchronize(s.done)) return static_cast<int>(e);
+    }
+    return 0;
+}
 }  // namespace
 
 VELOX_API int velox_cuda_stage(const void* src, size_t bytes, void** dev_out) {
     std::lock_guard<std::mutex> lock(g_stage.mu);
+    if (g_region >= 0) {
+        GraphSlot& s = g_slots[g_region];
+        const size_t n = (bytes + 15) / 16 * 16;
+        if (g_region_off + n > kRegionBytes) return VELOX_ERR_UNSUPPORTED;
+        std::memcpy(s.host + g_region_off, src, bytes);
+        *dev_out = s.dev + g_region_off;
+        g_region_off += n;
+        return 0;
+    }
     if (bytes > kStageBytes / 2) return VELOX_ERR_UNSUPPORTED;
     if (!g_stage.host) {
         if (cudaError_t e = cudaMallocHost(&g_stage.host, kStageBytes)) return static_cast<int>(e);
@@ -97,6 +140,12 @@ VELOX_API int velox_cuda_stage(const void* src, size_t bytes, void** dev_out) {
     return 0;
 }
 
+// 1 while a graph is being captured or replayed (its region is the staging target).
+VELOX_API int velox_cuda_in_graph() {
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    return g_region >= 0 ? 1 : 0;
+}
+
 // CUDA events for op timing (VELOX_GPU_TIMING): recorded on the default stream around each op.
 VELOX_API int velox_cuda_event_create(void** e) {
     return static_cast<int>(cudaEventCreate(reinterpret_cast<cudaEvent_t*>(e)));
@@ -108,31 +157,59 @@ VELOX_API int velox_cuda_event_elapsed(void* start, void* end, float* ms) {
 }
 VELOX_API int velox_cuda_event_destroy(void* e) { return static_cast<int>(cudaEventDestroy(static_cast<cudaEvent_t>(e))); }
 
-// CUDA graphs over the (per-thread) default stream. A step is captured, then either patched into
-// the executable graph of its slot (same topology, new parameters: cudaGraphExecUpdate) or
-// instantiated afresh, and launched as one submission instead of one per kernel.
-namespace {
-constexpr int kGraphSlots = 256;
-cudaGraphExec_t g_exec[kGraphSlots] = {};
-}  // namespace
+// CUDA graphs over the (per-thread) default stream, one per slot. A step is captured (again
+// whenever the caller cannot promise an identical recording), patched into the slot's executable
+// graph (cudaGraphExecUpdate) or instantiated, and launched as one submission. A static step is
+// afterwards replayed: the caller re-runs its host code with launches skipped, so staged inputs
+// land in the slot's region, and the executable graph is launched as it is.
 
-// Waits for queued work (so the staging ring can restart) and starts capturing. Relaxed mode lets
-// grow-only scratch allocate during capture.
-VELOX_API int velox_cuda_graph_begin() {
-    if (cudaError_t e = cudaStreamSynchronize(cudaStreamPerThread)) return static_cast<int>(e);
-    {
-        std::lock_guard<std::mutex> lock(g_stage.mu);
-        g_stage.off = 0;
+// Starts capturing slot `slot`; its region becomes the staging target and is copied to the device
+// by the graph's first node. Relaxed mode lets grow-only scratch allocate during capture.
+VELOX_API int velox_cuda_graph_begin(int slot) {
+    if (slot < 0 || slot >= kGraphSlots) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    if (const int e = prepare_slot(slot)) return e;
+    if (cudaError_t e = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed))
+        return static_cast<int>(e);
+    GraphSlot& s = g_slots[slot];
+    if (cudaError_t e = cudaMemcpyAsync(s.dev, s.host, kRegionBytes, cudaMemcpyHostToDevice, cudaStreamPerThread)) {
+        cudaGraph_t g = nullptr;
+        cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (g != nullptr) cudaGraphDestroy(g);
+        return static_cast<int>(e);
     }
-    return static_cast<int>(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed));
+    g_region = slot;
+    g_region_off = 0;
+    return 0;
 }
+
+// Starts a replay of slot `slot` (captured before): staging goes to its region again.
+VELOX_API int velox_cuda_graph_replay_begin(int slot) {
+    if (slot < 0 || slot >= kGraphSlots || g_slots[slot].exec == nullptr) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    if (const int e = prepare_slot(slot)) return e;
+    g_region = slot;
+    g_region_off = 0;
+    return 0;
+}
+
+namespace {
+int launch_slot(int slot) {
+    GraphSlot& s = g_slots[slot];
+    if (cudaError_t e = cudaGraphLaunch(s.exec, cudaStreamPerThread)) return static_cast<int>(e);
+    s.launched = true;
+    return static_cast<int>(cudaEventRecord(s.done, cudaStreamPerThread));
+}
+}  // namespace
 
 // Ends the capture and launches it as slot `slot`'s graph.
 VELOX_API int velox_cuda_graph_end_launch(int slot) {
     if (slot < 0 || slot >= kGraphSlots) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    g_region = -1;
     cudaGraph_t g = nullptr;
     if (cudaError_t e = cudaStreamEndCapture(cudaStreamPerThread, &g)) return static_cast<int>(e);
-    cudaGraphExec_t& exec = g_exec[slot];
+    cudaGraphExec_t& exec = g_slots[slot].exec;
     if (exec != nullptr) {
         cudaGraphExecUpdateResultInfo info;
         if (cudaGraphExecUpdate(exec, g, &info) != cudaSuccess) {
@@ -152,13 +229,26 @@ VELOX_API int velox_cuda_graph_end_launch(int slot) {
         }
     }
     cudaGraphDestroy(g);
-    return static_cast<int>(cudaGraphLaunch(exec, cudaStreamPerThread));
+    return launch_slot(slot);
 }
 
-// Ends a capture whose recording failed, discarding it.
+// Launches slot `slot`'s graph as captured, its region rewritten by the replayed host code.
+VELOX_API int velox_cuda_graph_replay_launch(int slot) {
+    if (slot < 0 || slot >= kGraphSlots || g_slots[slot].exec == nullptr) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    g_region = -1;
+    return launch_slot(slot);
+}
+
+// Ends a capture or replay whose host code failed, discarding a capture.
 VELOX_API int velox_cuda_graph_abort() {
-    cudaGraph_t g = nullptr;
-    cudaStreamEndCapture(cudaStreamPerThread, &g);
-    if (g != nullptr) cudaGraphDestroy(g);
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    g_region = -1;
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &status) == cudaSuccess && status != cudaStreamCaptureStatusNone) {
+        cudaGraph_t g = nullptr;
+        cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (g != nullptr) cudaGraphDestroy(g);
+    }
     return static_cast<int>(cudaGetLastError());
 }

@@ -106,6 +106,13 @@ pub struct GdnShape {
     pub row0: usize,
 }
 
+/// [`Backend::graph`] key flag: the recorded work is static (see there).
+pub const GRAPH_STATIC: u64 = 1 << 63;
+
+/// Static graph steps that attend over a KV cache are recorded per bucket of this many keys: the
+/// backend sizes attention grids for the bucket and reads the actual length on the device.
+pub const GRAPH_KV_BUCKET: usize = 1024;
+
 /// Non-causal attention of a query block over a sliding-window context (DFlash drafting).
 ///
 /// `q` is `[tokens, heads, head_dim]` for positions `pos0 .. pos0 + tokens`. Context keys live in
@@ -545,7 +552,12 @@ pub trait Backend {
     /// work under one key must keep the same structure (the same ops in the same order) for
     /// replays to stay cheap. `f` runs exactly once either way, so its host-side effects happen
     /// once.
-    fn graph(&self, _key: u32, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+    ///
+    /// With [`GRAPH_STATIC`] set in `key`, the caller promises more: every run under the key
+    /// issues the same ops on the same buffers with the same shapes, differing only in the
+    /// per-call values ops take from the host (token ids, positions, copy offsets). A backend
+    /// may then skip recording and launch the recorded work with those values refreshed.
+    fn graph(&self, _key: u64, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         f()
     }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
