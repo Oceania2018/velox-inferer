@@ -14,7 +14,10 @@ use velox_core::backend::{
 use velox_core::{Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
 pub use config::{LayerKind, TextConfig};
-pub use dflash::{BlockCandidates, DFlashConfig, DFlashModel, DFlashState, DFlashWorkspace};
+pub use dflash::{
+    BlockCandidates, DFlashConfig, DFlashModel, DFlashState, DFlashWorkspace, DraftContext,
+    DRAFT_PAGE_ROWS,
+};
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use vision::{Qwen35Vision, VisionConfig};
 pub use weights::{Layer, Mixer, TextWeights, WDesc};
