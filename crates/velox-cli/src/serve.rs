@@ -25,7 +25,14 @@ where
         }
         None => None,
     };
-    let fe = Frontend::from_artifact(art, template)?;
+    let mut fe = Frontend::from_artifact(art, template)?;
+    // --max-vision-tokens N (default 1024, ninfer NINFER_MAX_VISION_ITEM_TOKENS as deployed): images
+    // with more merged tokens are downscaled to fit (one token covers 32 x 32 pixels), which bounds
+    // the vision tower's device workspace.
+    let max_vision: u64 = a.parse("max-vision-tokens", 1024)?;
+    if let Some((lo, hi)) = fe.vision_pixels {
+        fe.vision_pixels = Some((lo.min(max_vision * 1024), hi.min(max_vision * 1024)));
+    }
     let cfg = TextConfig::from_json(&art.components()["text"]["config"])?;
     let dflash_drafts: usize = a.parse("dflash-drafts", 11)?;
     let use_dflash = dflash_drafts > 0 && art.components().contains_key("dflash2");
