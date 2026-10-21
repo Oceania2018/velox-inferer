@@ -132,6 +132,11 @@ const ROWSPLIT_MIN_M: usize = 64;
 /// weight-streaming bf16 tensor-core kernel.
 const SKINNY16_MAX_M: usize = 16;
 
+/// Batched drafting (up to 6 sequences x 8-row blocks, or their 7 proposal rows each) runs the
+/// skinny kernel in blocks of 16 rows up to this many rows, rather than the exact portable path.
+/// Groupwise-integer weights hand over to the row-split kernel at `ROWSPLIT_MIN_M`.
+const SKINNY_MAX_M: usize = 96;
+
 /// Skinny FP8 row-scaled linears (speculative verify, drafts) take the one-kernel bf16-activation
 /// path: no activation quantizer or split-K pass, and bf16 activations (finer than E4M3).
 fn a16_fp8(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
@@ -149,7 +154,8 @@ const A16_FP8_BLOCK_M: usize = 64;
 
 /// `velox_5090_linear_skinny16`'s format code for a weight it serves at `m` tokens.
 fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
-    if !(2..=SKINNY16_MAX_M).contains(&m) {
+    let max = if w.format.row_split().is_some() { ROWSPLIT_MIN_M - 1 } else { SKINNY_MAX_M };
+    if !(2..=max).contains(&m) {
         return None;
     }
     match w.format {
@@ -342,10 +348,18 @@ impl CudaKernels for Rtx5090Kernels {
                     return Ok(());
                 }
                 if let Some(f) = skinny16_format(w, m) {
-                    return status(
-                        unsafe { velox_5090_linear_skinny16(x.as_ptr(), mi, wp, pr, k, rb, rows, f, y.as_mut_ptr()) },
-                        "rtx5090 linear skinny16",
-                    );
+                    // The kernel takes up to 16 rows; larger m runs in blocks (activations [m, k],
+                    // outputs [m, rows]).
+                    for r0 in (0..m).step_by(SKINNY16_MAX_M) {
+                        let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
+                        // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
+                        let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
+                        status(
+                            unsafe { velox_5090_linear_skinny16(xp, mb, wp, pr, k, rb, rows, f, yp) },
+                            "rtx5090 linear skinny16",
+                        )?;
+                    }
+                    return Ok(());
                 }
                 let bits = w.format.row_split().map_or(0, |r| r.bits as i32);
                 status(
