@@ -19,7 +19,7 @@
 use serde_json::Value;
 use velox_core::backend::{Backend, BlockAttnShape, DynConvShape, NormKind, RopeShape, WeightView};
 use velox_core::format::WeightFormat;
-use velox_core::{Error, Result};
+use velox_core::{Error, Result, GRAPH_STATIC};
 use velox_weights::{Artifact, ObjectKind};
 
 use super::weights::{fuse, Loader, WDesc};
@@ -28,6 +28,8 @@ use super::{Qwen35Text, Workspace};
 /// Graph keys (`Backend::graph`) of drafting steps; low bits carry the shape.
 const GRAPH_CONTEXT: u64 = 8 << 16;
 const GRAPH_BLOCK: u64 = 9 << 16;
+
+static NEXT_DRAFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Context rows up to this many (decode commits) materialize as a recorded step.
 const GRAPH_ROWS: usize = 16;
 
@@ -158,6 +160,8 @@ pub struct DFlashState<B: Backend> {
 
 /// Activations: context materialization of up to `ctx_rows` rows, and blocks of up to `block`.
 pub struct DFlashWorkspace<B: Backend> {
+    /// Distinguishes this drafter's graph recordings (they bind its buffers and context state).
+    id: u64,
     ctx_rows: usize,
     block: usize,
     ctx_raw: B::Buffer,
@@ -328,6 +332,7 @@ impl<B: Backend> DFlashModel<B> {
         let tw = &target.w;
         let head_rows = tw.proposal.as_ref().map_or(tw.head.rows, |p| p.head.rows);
         Ok(DFlashWorkspace {
+            id: NEXT_DRAFTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ctx_rows,
             block,
             ctx_raw: b.alloc(r * h)?,
@@ -398,6 +403,7 @@ impl<B: Backend> DFlashModel<B> {
         let (h, kvd) = (self.hidden, c.kv_dim());
         let slot = pos0 % c.window;
         let first = n.min(c.window - slot);
+        let id = dw.id;
         let mut run = || -> Result<()> {
             b.linear(
                 features,
@@ -447,7 +453,13 @@ impl<B: Backend> DFlashModel<B> {
             Ok(())
         };
         if n <= GRAPH_ROWS {
-            let key = GRAPH_CONTEXT | n as u64 | u64::from(first < n) << 8;
+            // Static unless the rows wrap around the ring (copy lengths then depend on the position).
+            let wrap = first < n;
+            let key = GRAPH_CONTEXT
+                | n as u64
+                | u64::from(wrap) << 8
+                | (id & 0xffff) << 40
+                | if wrap { 0 } else { GRAPH_STATIC };
             b.graph(key, &mut run)?;
         } else {
             run()?;
@@ -485,7 +497,9 @@ impl<B: Backend> DFlashModel<B> {
         let (qd, kvd) = (c.q_dim(), c.kv_dim());
         let k = drafts;
         // The block forward through the selector projection is one recorded step per width.
-        b.graph(GRAPH_BLOCK | w as u64, &mut || {
+        // Static: positions are staged and block attention spans a full window of grid.
+        let key = GRAPH_BLOCK | w as u64 | (dw.id & 0xffff) << 40 | GRAPH_STATIC;
+        b.graph(key, &mut || {
             b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
             for (li, l) in self.layers.iter().enumerate() {
                 // Attention branch.

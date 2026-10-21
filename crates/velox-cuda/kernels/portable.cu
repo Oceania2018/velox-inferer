@@ -522,7 +522,14 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
                                const float* __restrict__ v_blk, float* __restrict__ part_acc,
                                float* __restrict__ part_ml, int tokens, int heads, int kv_heads, int head_dim,
                                long long pos0, long long start0, int window, int ring, float scale, int splits,
-                               int split_keys) {
+                               int split_keys,
+                               const long long* __restrict__ params) {
+    if (params != nullptr) {
+        // Staged by a graph step: the block's position and context start (window-clamped here).
+        pos0 = params[0];
+        start0 = pos0 + 1 - window;
+        if (start0 < params[1]) start0 = params[1];
+    }
     extern __shared__ float gqa_smem[];
     float* ks = gqa_smem;
     float* vs = gqa_smem + TK * head_dim;
@@ -604,11 +611,12 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
 template <int PER>
 int attention_block_gqa(const float* q, const float* k_ctx, const float* v_ctx, const float* k_blk,
                         const float* v_blk, float* out, int tokens, int heads, int kv_heads, int head_dim,
-                        long long pos0, long long ctx_lo, int window, int ring) {
+                        long long pos0, long long ctx_lo, int window, int ring, const long long* params) {
     constexpr int TK = PER >= 8 ? 16 : 32;
     long long start0 = pos0 + 1 - window;  // token 0 sees the most context
     if (start0 < ctx_lo) start0 = ctx_lo;
-    const int kv = static_cast<int>(pos0 - start0) + tokens;
+    // Graph steps size the grid for a full window; the kernel reads the actual span.
+    const int kv = params != nullptr ? window - 1 + tokens : static_cast<int>(pos0 - start0) + tokens;
     const int rgs = (tokens * (heads / kv_heads) + kGqaRows - 1) / kGqaRows;
     // About two blocks per SM, at least two tiles of keys per split.
     const int want = (340 + kv_heads * rgs - 1) / (kv_heads * rgs);
@@ -624,7 +632,7 @@ int attention_block_gqa(const float* q, const float* k_ctx, const float* v_ctx, 
     const size_t smem = static_cast<size_t>(2) * TK * head_dim * sizeof(float);
     attention_block_gqa_kernel<PER, TK><<<dim3(kv_heads, splits, rgs), kGqaWarps * VELOX_WARP, smem>>>(
         q, k_ctx, v_ctx, k_blk, v_blk, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, start0, window,
-        ring, scale, splits, split_keys);
+        ring, scale, splits, split_keys, params);
     attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
                                                                        splits);
     return velox_launch_status();
@@ -675,18 +683,21 @@ __global__ void dyn_conv_kernel(const float* __restrict__ x, const float* __rest
 VELOX_API int velox_portable_attention_block(const float* q, const float* k_ctx, const float* v_ctx,
                                              const float* k_blk, const float* v_blk, float* out, int tokens,
                                              int heads, int kv_heads, int head_dim, long long pos0, long long ctx_lo,
-                                             int window, int ring) {
+                                             int window, int ring, const long long* params) {
     if (tokens > 65535 || head_dim > 256) return VELOX_ERR_UNSUPPORTED;
+    const bool gqa = tokens <= 16 && head_dim % 32 == 0 && heads % kv_heads == 0 && heads / kv_heads > 1;
+    // params: null, or device [pos0, ctx_lo] staged by a graph step (GQA path only).
+    if (params != nullptr && !gqa) return VELOX_ERR_UNSUPPORTED;
     // Draft blocks: share each K/V tile across the group's query heads and the block's tokens.
-    if (tokens <= 16 && head_dim % 32 == 0 && heads % kv_heads == 0 && heads / kv_heads > 1) {
+    if (gqa) {
         if (head_dim <= 64)
             return attention_block_gqa<2>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                          ctx_lo, window, ring);
+                                          ctx_lo, window, ring, params);
         if (head_dim <= 128)
             return attention_block_gqa<4>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                          ctx_lo, window, ring);
+                                          ctx_lo, window, ring, params);
         return attention_block_gqa<8>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                      ctx_lo, window, ring);
+                                      ctx_lo, window, ring, params);
     }
     if (head_dim <= 64)
         return attention_block_split<2>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
