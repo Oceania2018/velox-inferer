@@ -516,7 +516,9 @@ where
             None
         };
         let mut store = ContextStore::new(cfg.host_context_bytes, cfg.lrfu_lambda, disk);
-        if store.enabled() && std::env::var_os("VELOX_NO_PINNER").is_none() {
+        // Opt-in (VELOX_PINNER=1): under WSL/WDDM, pinning on another thread stalled the device
+        // (6-agent replays 74-79 s against 37-44 s) more than pinning on the engine thread costs.
+        if store.enabled() && std::env::var("VELOX_PINNER").is_ok_and(|v| v == "1") {
             if let Some(alloc) = b.host_alloc() {
                 store.set_pinner(
                     Pinner::spawn(alloc)
