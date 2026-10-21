@@ -1087,6 +1087,14 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.gdn(1, 3, 32, 32, [4, 1])?;
     // Qwen3.5 GDN head geometry (16/48 heads scaled down to 2/6), Dk = Dv = 128.
     s.gdn(2, 6, 128, 128, [6, 1])?;
+    // Prefill chunks (chunkwise-parallel kernels): full model heads with a ragged second chunk,
+    // a decode step before and after a chunk, and small or uneven head dims.
+    s.gdn(16, 48, 128, 128, [512, 200])?;
+    s.gdn(2, 6, 128, 128, [64, 1])?;
+    s.gdn(2, 6, 128, 128, [16, 31])?;
+    s.gdn(2, 6, 128, 128, [1, 77])?;
+    s.gdn(1, 3, 32, 32, [100, 3])?;
+    s.gdn(1, 2, 64, 48, [70, 65])?;
     // Vision tower geometry: 16 heads x 72, hidden 1152.
     s.attention_full(FullAttnShape {
         tokens: 64,

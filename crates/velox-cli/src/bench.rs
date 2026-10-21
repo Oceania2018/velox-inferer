@@ -149,3 +149,61 @@ pub fn run_linear<B: Backend>(b: &B, c: &LinearConfig) -> Result<()> {
     }
     Ok(())
 }
+
+/// `velox bench-gdn`: one `gated_delta_net` call at a model head geometry with random inputs,
+/// timed per token count (decode/verify sizes and prefill chunks).
+pub struct GdnConfig {
+    pub k_heads: usize,
+    pub v_heads: usize,
+    pub k_dim: usize,
+    pub v_dim: usize,
+    pub tokens: Vec<usize>,
+    pub iters: usize,
+}
+
+pub fn run_gdn<B: Backend>(b: &B, c: &GdnConfig) -> Result<()> {
+    let mut rng = Rng::new(13);
+    let a_log = b.upload(&rng.vec(c.v_heads, 1.0))?;
+    let dt_bias = b.upload(&rng.vec(c.v_heads, 1.0))?;
+    let mut state = b.upload(&rng.vec(c.v_heads * c.v_dim * c.k_dim, 0.1))?;
+    println!(
+        "gated_delta_net heads {}/{} d {}/{}  on {}",
+        c.k_heads,
+        c.v_heads,
+        c.k_dim,
+        c.v_dim,
+        b.describe()
+    );
+    for &tokens in &c.tokens {
+        let s = velox_core::GdnShape {
+            tokens,
+            k_heads: c.k_heads,
+            v_heads: c.v_heads,
+            k_dim: c.k_dim,
+            v_dim: c.v_dim,
+        };
+        let qkv = b.upload(&rng.vec(tokens * s.qkv_width(), 1.0))?;
+        let ab = b.upload(&rng.vec(tokens * 2 * c.v_heads, 2.0))?;
+        let mut out = b.alloc(tokens * c.v_heads * c.v_dim)?;
+        for _ in 0..3 {
+            b.gated_delta_net(&qkv, &ab, &a_log, &dt_bias, &mut state, &mut out, s)?;
+        }
+        b.synchronize()?;
+        let mut samples = Vec::with_capacity(c.iters);
+        for _ in 0..c.iters {
+            let t0 = Instant::now();
+            b.gated_delta_net(&qkv, &ab, &a_log, &dt_bias, &mut state, &mut out, s)?;
+            b.synchronize()?;
+            samples.push(t0.elapsed().as_secs_f64());
+        }
+        let best = samples.iter().copied().fold(f64::INFINITY, f64::min);
+        let t = median(samples);
+        println!(
+            "  tokens={tokens:<5} {:>9.1} us (min {:>9.1})  {:>8.3} us/token",
+            t * 1e6,
+            best * 1e6,
+            t * 1e6 / tokens as f64
+        );
+    }
+    Ok(())
+}
