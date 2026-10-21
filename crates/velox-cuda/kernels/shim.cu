@@ -35,6 +35,28 @@ VELOX_API int velox_cuda_profiler(int on) {
     return static_cast<int>(on ? cudaProfilerStart() : cudaProfilerStop());
 }
 
+// Zeroed pinned host memory mapped into the device address space (the same address on both
+// sides under unified addressing, which is required).
+VELOX_API int velox_cuda_host_alloc(void** ptr, size_t bytes) {
+    void* h = nullptr;
+    if (cudaError_t e = cudaHostAlloc(&h, bytes, cudaHostAllocMapped | cudaHostAllocPortable))
+        return static_cast<int>(e);
+    void* d = nullptr;
+    if (cudaError_t e = cudaHostGetDevicePointer(&d, h, 0)) {
+        cudaFreeHost(h);
+        return static_cast<int>(e);
+    }
+    if (d != h) {
+        cudaFreeHost(h);
+        return VELOX_ERR_UNSUPPORTED;
+    }
+    memset(h, 0, bytes);
+    *ptr = h;
+    return 0;
+}
+
+VELOX_API int velox_cuda_free_host(void* ptr) { return static_cast<int>(cudaFreeHost(ptr)); }
+
 VELOX_API int velox_cuda_malloc_zeroed(void** ptr, size_t bytes) {
     cudaError_t e = cudaMalloc(ptr, bytes);
     if (e != cudaSuccess) return static_cast<int>(e);
@@ -44,15 +66,16 @@ VELOX_API int velox_cuda_malloc_zeroed(void** ptr, size_t bytes) {
 VELOX_API int velox_cuda_free(void* ptr) { return static_cast<int>(cudaFree(ptr)); }
 
 VELOX_API int velox_cuda_htod(void* dst, const void* src, size_t bytes) {
-    return static_cast<int>(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice));
+    return static_cast<int>(cudaMemcpy(dst, src, bytes, cudaMemcpyDefault));
 }
 
 VELOX_API int velox_cuda_dtoh(void* dst, const void* src, size_t bytes) {
-    return static_cast<int>(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost));
+    return static_cast<int>(cudaMemcpy(dst, src, bytes, cudaMemcpyDefault));
 }
 
 VELOX_API int velox_cuda_dtod(void* dst, const void* src, size_t bytes) {
-    return static_cast<int>(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, 0));
+    // Default: either side may be mapped host memory (unified addressing).
+    return static_cast<int>(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, 0));
 }
 
 VELOX_API int velox_cuda_synchronize() { return static_cast<int>(cudaDeviceSynchronize()); }
@@ -74,6 +97,7 @@ VELOX_API int velox_cuda_driver_version(int* v) { return static_cast<int>(cudaDr
 // same offsets on every run, and no copy is queued: the graph's first node copies the whole region
 // to the device when it executes. Replaying a graph therefore only rewrites the region on the host.
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -201,9 +225,49 @@ VELOX_API int velox_cuda_graph_replay_begin(int slot) {
 }
 
 namespace {
+// VELOX_GAP_TRACE=1: GPU time between consecutive graph launches (the stream idles while the host
+// prepares the next one), reported every 2000 launches; gaps over 20 ms (between requests) are
+// left out.
+struct GapTrace {
+    bool on = getenv("VELOX_GAP_TRACE") != nullptr;
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> ev;
+    void report() {
+        double busy = 0, gaps = 0;
+        int counted = 0;
+        for (size_t i = 0; i < ev.size(); ++i) {
+            float ms = 0;
+            cudaEventSynchronize(ev[i].second);
+            cudaEventElapsedTime(&ms, ev[i].first, ev[i].second);
+            busy += ms;
+            if (i + 1 < ev.size()) {
+                float g = 0;
+                cudaEventSynchronize(ev[i + 1].first);
+                cudaEventElapsedTime(&g, ev[i].second, ev[i + 1].first);
+                if (g < 20.0f) gaps += g, ++counted;
+            }
+        }
+        fprintf(stderr, "[gaps] %zu launches: busy %.1f ms, gaps %.1f ms (%.1f us per gap)\n", ev.size(), busy, gaps,
+                counted ? 1000.0 * gaps / counted : 0.0);
+        for (auto& p : ev) cudaEventDestroy(p.first), cudaEventDestroy(p.second);
+        ev.clear();
+    }
+};
+GapTrace g_gaps;
+
 int launch_slot(int slot) {
     GraphSlot& s = g_slots[slot];
+    cudaEvent_t t0 = nullptr, t1 = nullptr;
+    if (g_gaps.on) {
+        cudaEventCreate(&t0);
+        cudaEventRecord(t0, cudaStreamPerThread);
+    }
     if (cudaError_t e = cudaGraphLaunch(s.exec, cudaStreamPerThread)) return static_cast<int>(e);
+    if (g_gaps.on) {
+        cudaEventCreate(&t1);
+        cudaEventRecord(t1, cudaStreamPerThread);
+        g_gaps.ev.emplace_back(t0, t1);
+        if (g_gaps.ev.size() >= 2000) g_gaps.report();
+    }
     s.launched = true;
     if (cudaError_t e = cudaEventRecord(s.done, cudaStreamPerThread)) return static_cast<int>(e);
     // WDDM (Windows, WSL) batches submissions until something flushes them; a stream query does,

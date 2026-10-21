@@ -38,6 +38,11 @@ pub struct EngineConfig {
     pub enable_thinking: bool,
     /// Recurrent-state checkpoints kept per lane for prefix reuse.
     pub max_checkpoints: usize,
+    /// Keep checkpoints in system RAM (pinned, device-mapped) rather than device memory.
+    pub host_checkpoints: bool,
+    /// Take no checkpoints after the prompt's last image: agent screenshots are replaced in the
+    /// next request's history, so state past them is never shared (ninfer's media-tail skip).
+    pub skip_media_tail: bool,
     /// Capacity of a second, small lane for requests that share nothing with the main lane
     /// (probes, side questions), so they do not evict the agent's context. 0 disables it.
     pub scratch_capacity: usize,
@@ -286,7 +291,7 @@ impl<B: Backend> QwenEngine<B> {
                 continue;
             }
             let session = model.session_with(&b, capacity, cfg.kv_format)?;
-            let zero = session.checkpoint(&b)?;
+            let zero = session.checkpoint_in(&b, cfg.host_checkpoints)?;
             let drafter = match &dflash {
                 // Every lane drafts: short unrelated requests (System One, probes) land on the scratch lane.
                 Some(dm) => Some(Drafter::DFlash(DFlashDrafter::new(
@@ -358,9 +363,13 @@ impl<B: Backend> QwenEngine<B> {
             .enumerate()
             .filter(|&(_, &t)| Some(t) == self.special.im_start)
             .map(|(i, _)| i);
+        let tail = match image {
+            Some(p) if self.cfg.skip_media_tail => p,
+            _ => usize::MAX,
+        };
         let mut v: Vec<usize> = turns
             .chain(image)
-            .filter(|&p| p > after && p < ids.len())
+            .filter(|&p| p > after && p < ids.len() && p <= tail)
             .collect();
         v.sort_unstable();
         v.dedup();
@@ -590,7 +599,10 @@ impl<B: Backend> QwenEngine<B> {
         for pos in self.checkpoint_positions(&p.ids, start) {
             let mut cp = match lane.spare.pop() {
                 Some(cp) => cp,
-                None => lane.session.blank_checkpoint(&self.b, pos)?,
+                None => {
+                    lane.session
+                        .blank_checkpoint_in(&self.b, pos, self.cfg.host_checkpoints)?
+                }
             };
             cp.pos = pos;
             cp.rope_delta = p.rope_delta;

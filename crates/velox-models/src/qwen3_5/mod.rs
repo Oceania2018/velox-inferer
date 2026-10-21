@@ -102,7 +102,12 @@ pub struct Checkpoint<B: Backend> {
 impl<B: Backend> Session<B> {
     /// Device copy of the recurrent state at the current position.
     pub fn checkpoint(&self, b: &B) -> Result<Checkpoint<B>> {
-        let mut cp = self.blank_checkpoint(b, self.pos)?;
+        self.checkpoint_in(b, false)
+    }
+
+    /// Copy of the recurrent state at the current position, in system RAM when `host`.
+    pub fn checkpoint_in(&self, b: &B, host: bool) -> Result<Checkpoint<B>> {
+        let mut cp = self.blank_checkpoint_in(b, self.pos, host)?;
         self.snapshot_into(b, &mut cp)?;
         Ok(cp)
     }
@@ -110,8 +115,22 @@ impl<B: Backend> Session<B> {
     /// Checkpoint storage for this session's state, to be filled at `pos` by an advance (see
     /// [`Qwen35Text::advance_rows`]) or by [`Self::snapshot_into`].
     pub fn blank_checkpoint(&self, b: &B, pos: usize) -> Result<Checkpoint<B>> {
+        self.blank_checkpoint_in(b, pos, false)
+    }
+
+    /// [`Self::blank_checkpoint`] in system RAM ([`Backend::alloc_host`]) when `host`: no device
+    /// memory per checkpoint, at the cost of PCIe copies when one is taken or restored.
+    pub fn blank_checkpoint_in(&self, b: &B, pos: usize, host: bool) -> Result<Checkpoint<B>> {
         let like = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
-            bufs.iter().map(|s| b.alloc(b.len(s))).collect()
+            bufs.iter()
+                .map(|s| {
+                    if host {
+                        b.alloc_host(b.len(s))
+                    } else {
+                        b.alloc(b.len(s))
+                    }
+                })
+                .collect()
         };
         Ok(Checkpoint {
             pos,
