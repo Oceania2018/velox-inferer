@@ -2,8 +2,8 @@
 //! tuned kernels do not cover. Each wrapper re-validates, so it is safe to call directly.
 
 use velox_core::backend::{
-    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnShape,
-    GeluKind, KvStoreShape, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnReplayLayer,
+    GdnShape, GeluKind, KvStoreShape, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
 use velox_core::kv::{hadamard_norm, KvFormat};
@@ -583,7 +583,66 @@ pub fn gated_delta_net(
     )
 }
 
+/// Shapes validated by the caller (`check::gdn_replay_layer` per layer).
+pub fn gdn_replay(
+    layers: &mut [GdnReplayLayer<'_, CudaBuffer>],
+    conv: ConvShape,
+    gdn: GdnShape,
+) -> Result<()> {
+    let qkv: Vec<*const f32> = layers.iter().map(|l| l.qkv.as_ptr()).collect();
+    let conv_out: Vec<*const f32> = layers.iter().map(|l| l.conv_out.as_ptr()).collect();
+    let ab: Vec<*const f32> = layers.iter().map(|l| l.ab.as_ptr()).collect();
+    let a_log: Vec<*const f32> = layers.iter().map(|l| l.a_log.as_ptr()).collect();
+    let dt_bias: Vec<*const f32> = layers.iter().map(|l| l.dt_bias.as_ptr()).collect();
+    let conv_state: Vec<*mut f32> = layers
+        .iter_mut()
+        .map(|l| l.conv_state.as_mut_ptr())
+        .collect();
+    let ssm: Vec<*mut f32> = layers.iter_mut().map(|l| l.ssm.as_mut_ptr()).collect();
+    // SAFETY: one pointer per layer in every array; extents validated by the caller.
+    status(
+        unsafe {
+            velox_portable_gdn_replay(
+                qkv.as_ptr(),
+                conv_out.as_ptr(),
+                ab.as_ptr(),
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                conv_state.as_ptr(),
+                ssm.as_ptr(),
+                to_i32("layers", layers.len())?,
+                to_i32("tokens", gdn.tokens)?,
+                to_i32("channels", conv.channels)?,
+                to_i32("width", conv.width)?,
+                to_i32("k_heads", gdn.k_heads)?,
+                to_i32("v_heads", gdn.v_heads)?,
+                to_i32("k_dim", gdn.k_dim)?,
+                to_i32("v_dim", gdn.v_dim)?,
+            )
+        },
+        "portable gdn_replay",
+    )
+}
+
 extern "C" {
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_gdn_replay(
+        qkv: *const *const f32,
+        conv_out: *const *const f32,
+        ab: *const *const f32,
+        a_log: *const *const f32,
+        dt_bias: *const *const f32,
+        conv_state: *const *mut f32,
+        ssm: *const *mut f32,
+        layers: i32,
+        tokens: i32,
+        channels: i32,
+        width: i32,
+        k_heads: i32,
+        v_heads: i32,
+        k_dim: i32,
+        v_dim: i32,
+    ) -> i32;
     fn velox_portable_attention_full(
         q: *const f32,
         k: *const f32,
@@ -1079,7 +1138,7 @@ pub fn copy2d(src: &CudaBuffer, dst: &mut CudaBuffer, s: Copy2dShape) -> Result<
 /// refreshes them without re-recording. `Ok(None)` means the step is a replay and the caller
 /// must return without launching; outside graphs the result is a null pointer (values are
 /// passed by value).
-fn graph_params(values: &[i64]) -> Result<Option<*const i64>> {
+pub fn graph_params(values: &[i64]) -> Result<Option<*const i64>> {
     match graph_mode() {
         GraphMode::None => Ok(Some(std::ptr::null())),
         mode => {

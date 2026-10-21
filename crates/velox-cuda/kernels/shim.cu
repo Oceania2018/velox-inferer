@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <cuda_profiler_api.h>
+
 #include "velox_common.cuh"
 
 VELOX_API int velox_cuda_device_count(int* count) { return static_cast<int>(cudaGetDeviceCount(count)); }
@@ -26,6 +28,11 @@ VELOX_API int velox_cuda_set_device(int device) { return static_cast<int>(cudaSe
 
 VELOX_API int velox_cuda_mem_info(size_t* free_bytes, size_t* total_bytes) {
     return static_cast<int>(cudaMemGetInfo(free_bytes, total_bytes));
+}
+
+// Brackets the region an external profiler (ncu --profile-from-start off) collects.
+VELOX_API int velox_cuda_profiler(int on) {
+    return static_cast<int>(on ? cudaProfilerStart() : cudaProfilerStop());
 }
 
 VELOX_API int velox_cuda_malloc_zeroed(void** ptr, size_t bytes) {

@@ -377,7 +377,19 @@ fn dflash_generate<B: Backend>(
     let (mut rounds, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
     let (mut row, mut kept) = (0usize, 0usize);
     let (mut draft_s, mut verify_s, mut commit_s) = (0.0, 0.0, 0.0);
+    // VELOX_PROFILE_ROUNDS=a..b brackets those rounds for `ncu --profile-from-start off`.
+    let profile_rounds = std::env::var("VELOX_PROFILE_ROUNDS").ok().and_then(|r| {
+        let (a, b) = r.split_once("..")?;
+        Some(a.parse::<usize>().ok()?..b.parse::<usize>().ok()?)
+    });
     while out.len() < max_tokens && !fe.is_eos(c) {
+        if let Some(r) = &profile_rounds {
+            if rounds == r.start || rounds == r.end {
+                b.synchronize()?;
+                #[cfg(feature = "cuda")]
+                velox_cuda::profiler(rounds == r.start)?;
+            }
+        }
         let td = Instant::now();
         let (drafts, _) = dr.draft(b, &dm, model, ws, row, kept, s.pos, c, limit, 0.0)?;
         draft_s += td.elapsed().as_secs_f64();

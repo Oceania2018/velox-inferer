@@ -8,7 +8,8 @@ mod vision;
 mod weights;
 
 use velox_core::backend::{
-    AttnShape, Backend, ConvShape, Copy2dShape, GdnShape, NormKind, RopeLayout, RopePosShape,
+    AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, NormKind, RopeLayout,
+    RopePosShape,
     RopeShape,
 };
 use velox_core::{Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
@@ -79,8 +80,10 @@ static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 struct Spec<B: Backend> {
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
-    /// Per GDN layer: `[VERIFY_MAX, gdn_qkv]` raw qkv and `[VERIFY_MAX, 2 * v_heads]` a/b rows.
+    /// Per GDN layer: `[VERIFY_MAX, gdn_qkv]` raw qkv and conv outputs, `[VERIFY_MAX, 2 *
+    /// v_heads]` a/b rows (what commit replays a partially accepted window from).
     qkv: Vec<B::Buffer>,
+    conv_out: Vec<B::Buffer>,
     ab: Vec<B::Buffer>,
     pos0: usize,
     tokens: usize,
@@ -523,11 +526,16 @@ impl<B: Backend> Qwen35Text<B> {
                         match spec.as_mut().filter(|sp| sp.recording) {
                             Some(Spec {
                                 qkv: sq,
+                                conv_out: so,
                                 ab: sa,
                                 conv: sc,
                                 ssm: ss,
                                 ..
-                            }) => (&mut sq[gi], &mut sa[gi], Some((&mut sc[gi], &mut ss[gi]))),
+                            }) => (
+                                &mut sq[gi],
+                                &mut sa[gi],
+                                Some((&mut sc[gi], &mut ss[gi], &mut so[gi])),
+                            ),
                             None => (&mut ws.qkv, &mut ws.ab, None),
                         };
                     match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
@@ -567,17 +575,10 @@ impl<B: Backend> Qwen35Text<B> {
                         };
                         let (cw, al, dt) = (w.param(*conv), w.param(*a_log), w.param(*dt_bias));
                         match &mut state_out {
-                            Some((sc, ss)) => {
-                                b.conv1d_silu_from(
-                                    qkv_buf,
-                                    cw,
-                                    &s_conv[gi],
-                                    sc,
-                                    &mut ws.conv_out,
-                                    cs,
-                                )?;
+                            Some((sc, ss, so)) => {
+                                b.conv1d_silu_from(qkv_buf, cw, &s_conv[gi], sc, so, cs)?;
                                 b.gated_delta_net_from(
-                                    &ws.conv_out,
+                                    so,
                                     ab_buf,
                                     al,
                                     dt,
@@ -972,7 +973,7 @@ impl<B: Backend> Qwen35Text<B> {
         &self,
         b: &B,
         s: &mut Session<B>,
-        ws: &mut Workspace<B>,
+        _ws: &mut Workspace<B>,
         keep: usize,
     ) -> Result<()> {
         let c = &self.cfg;
@@ -1002,55 +1003,49 @@ impl<B: Backend> Qwen35Text<B> {
             std::mem::swap(ssm, &mut sp.ssm);
             *parity = !*parity;
         } else {
-            // The session still holds the state before the window: replay the kept prefix onto
-            // it, one recorded step per kept length.
+            // The session still holds the state before the window: advance it over the kept
+            // prefix from the recorded inputs, every GDN layer in one step per kept length.
             let sp = &*sp;
             b.graph(key, &mut || {
-                if keep > 0 {
-                    let mut gi = 0;
-                    for l in &self.w.layers {
-                        if let Mixer::Gdn {
-                            conv: cw,
-                            a_log,
-                            dt_bias,
-                            ..
-                        } = &l.mixer
-                        {
-                            let cs = ConvShape {
-                                tokens: keep,
-                                channels: c.gdn_qkv(),
-                                width: c.conv_width,
-                                row0: 0,
-                            };
-                            b.conv1d_silu(
-                                &sp.qkv[gi],
-                                self.w.param(*cw),
-                                &mut conv[gi],
-                                &mut ws.conv_out,
-                                cs,
-                            )?;
-                            let gs = GdnShape {
-                                tokens: keep,
-                                k_heads: c.gdn_k_heads,
-                                v_heads: c.gdn_v_heads,
-                                k_dim: c.gdn_k_dim,
-                                v_dim: c.gdn_v_dim,
-                                row0: 0,
-                            };
-                            b.gated_delta_net(
-                                &ws.conv_out,
-                                &sp.ab[gi],
-                                self.w.param(*a_log),
-                                self.w.param(*dt_bias),
-                                &mut ssm[gi],
-                                &mut ws.o,
-                                gs,
-                            )?;
-                            gi += 1;
-                        }
-                    }
+                if keep == 0 {
+                    return Ok(());
                 }
-                Ok(())
+                let gdn_params = self.w.layers.iter().filter_map(|l| match &l.mixer {
+                    Mixer::Gdn { a_log, dt_bias, .. } => Some((*a_log, *dt_bias)),
+                    _ => None,
+                });
+                let mut layers: Vec<GdnReplayLayer<'_, B::Buffer>> = conv
+                    .iter_mut()
+                    .zip(ssm.iter_mut())
+                    .zip(gdn_params)
+                    .enumerate()
+                    .map(|(gi, ((cs, ss), (a_log, dt_bias)))| GdnReplayLayer {
+                        qkv: &sp.qkv[gi],
+                        conv_out: &sp.conv_out[gi],
+                        ab: &sp.ab[gi],
+                        a_log: self.w.param(a_log),
+                        dt_bias: self.w.param(dt_bias),
+                        conv_state: cs,
+                        ssm: ss,
+                    })
+                    .collect();
+                b.gdn_replay(
+                    &mut layers,
+                    ConvShape {
+                        tokens: keep,
+                        channels: c.gdn_qkv(),
+                        width: c.conv_width,
+                        row0: 0,
+                    },
+                    GdnShape {
+                        tokens: keep,
+                        k_heads: c.gdn_k_heads,
+                        v_heads: c.gdn_v_heads,
+                        k_dim: c.gdn_k_dim,
+                        v_dim: c.gdn_v_dim,
+                        row0: 0,
+                    },
+                )
             })?;
         }
         *pos = sp.pos0 + keep;
@@ -1070,6 +1065,9 @@ impl<B: Backend> Qwen35Text<B> {
             conv: like(&s.conv)?,
             ssm: like(&s.ssm)?,
             qkv: (0..gdn)
+                .map(|_| b.alloc(VERIFY_MAX * c.gdn_qkv()))
+                .collect::<Result<_>>()?,
+            conv_out: (0..gdn)
                 .map(|_| b.alloc(VERIFY_MAX * c.gdn_qkv()))
                 .collect::<Result<_>>()?,
             ab: (0..gdn)
