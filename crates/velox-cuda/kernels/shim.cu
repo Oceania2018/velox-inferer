@@ -1,5 +1,7 @@
 // C ABI over the CUDA runtime. Rust binds only to these functions, never to cudaDeviceProp,
 // whose layout changes between toolkit versions.
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "velox_common.cuh"
@@ -135,6 +137,9 @@ VELOX_API int velox_cuda_graph_end_launch(int slot) {
         cudaGraphExecUpdateResultInfo info;
         if (cudaGraphExecUpdate(exec, g, &info) != cudaSuccess) {
             (void)cudaGetLastError();
+            if (getenv("VELOX_GRAPH_DEBUG"))
+                fprintf(stderr, "[graph] slot %d update failed (result %d, node %p)\n", slot,
+                        static_cast<int>(info.result), static_cast<void*>(info.errorNode));
             cudaGraphExecDestroy(exec);
             exec = nullptr;
         }
