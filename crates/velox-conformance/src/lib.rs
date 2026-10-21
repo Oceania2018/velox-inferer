@@ -883,6 +883,14 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             ActPolicy::AllowA8,
         )?;
     }
+    // A16-only skinny windows (draft models): tuned kernels may round activations to bf16 only.
+    for (n, k, begin, rows, m) in [
+        (512, 2048, 64, 384, 8),
+        (256, 5120, 0, 256, 16),
+        (384, 1024, 128, 192, 2),
+    ] {
+        s.linear_act(WeightFormat::Nvfp4, n, k, begin, rows, m, ActPolicy::A16Only)?;
+    }
     // A16-only views stay exact even where a kernel could round.
     s.linear_act(
         WeightFormat::Nvfp4,
@@ -910,6 +918,9 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         WeightFormat::Q8G32,
     ] {
         s.linear(f, 40, 130, 3, 30, 2)?;
+        // Draft-sized windows: many K stages (split-K) and a row view.
+        s.linear(f, 512, 4096, 0, 512, 8)?;
+        s.linear(f, 384, 2560, 64, 256, 16)?;
         s.linear(f, 72, 1152, 0, 72, 20)?;
         // Vision-tower sizes, where tuned kernels switch to tensor cores (bf16 activations):
         // ragged token counts, a row view, and K = 4304 padded to 4352 in storage.
