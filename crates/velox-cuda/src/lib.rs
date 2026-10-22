@@ -1029,6 +1029,15 @@ impl Backend for CudaBackend {
         velox_core::backend::linear_swiglu_composed(self, x, gate, up, out, m, scratch)
     }
 
+    fn fuses_swiglu(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> bool {
+        self.kernels.linear_swiglu_act(gate, up, m).is_some()
+    }
+
     fn linear_swiglu_act(
         &self,
         gate: &WeightView<'_, CudaBuffer>,

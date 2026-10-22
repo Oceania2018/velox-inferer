@@ -191,6 +191,14 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> ActQuant {
         self.inner.linear_swiglu_act(gate, up, m)
     }
+    fn fuses_swiglu(
+        &self,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        m: usize,
+    ) -> bool {
+        self.inner.fuses_swiglu(gate, up, m)
+    }
     fn embed(
         &self,
         ids: &[u32],

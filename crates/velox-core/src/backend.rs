@@ -461,6 +461,16 @@ pub trait Backend {
     ) -> Result<()> {
         linear_swiglu_composed(self, x, gate, up, out, m, scratch)
     }
+    /// Whether `linear_swiglu` at `m` rows runs fused (no `scratch`, no intermediate): callers
+    /// then use it at widths their scratch was not sized for.
+    fn fuses_swiglu(
+        &self,
+        _gate: &WeightView<'_, Self::Buffer>,
+        _up: &WeightView<'_, Self::Buffer>,
+        _m: usize,
+    ) -> bool {
+        false
+    }
     /// The activation rounding `linear_swiglu` applies at `m` rows (that of the projection the
     /// default runs).
     fn linear_swiglu_act(
