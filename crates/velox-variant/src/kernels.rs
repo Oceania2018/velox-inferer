@@ -193,6 +193,40 @@ extern "C" {
         bits: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_linear_iq3_q8(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5060_linear_swiglu_iq3_q8(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        gate_begin: i64,
+        up_w: *const u8,
+        up_parent_rows: i64,
+        up_begin: i64,
+        k: i64,
+        rows: i32,
+        out: *mut f32,
+    ) -> i32;
+    fn velox_5060_linear_rs_q8(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        format: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_a8(
         x: *const f32,
         m: i32,
@@ -308,6 +342,29 @@ const NVFP4_SLICED_MAX_ROWS: usize = 8192;
 /// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
 fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     w.format == WeightFormat::Iq3Xxs && m >= 1
+}
+
+/// Prefill on int8 tensor cores (ActQuant::Int8G256, ninfer's int8 path and thresholds on this
+/// card): IQ3_XXS from this many tokens, q4/q5 from `RS_Q8_MIN_M`.
+const IQ3_Q8_MIN_M: usize = 33;
+const RS_Q8_MIN_M: usize = 64;
+
+/// Format code of the int8 prefill kernel serving `w` at `m` tokens (3: IQ3_XXS, 4/5: q4/q5), when
+/// its activation policy permits 8-bit activations. `VELOX_NO_Q8` turns the path off.
+fn q8_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VELOX_NO_Q8").is_none())
+        || !matches!(w.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. })
+        || w.k % 256 != 0
+    {
+        return None;
+    }
+    match w.format {
+        WeightFormat::Iq3Xxs if m >= IQ3_Q8_MIN_M => Some(3),
+        WeightFormat::Q4G64 if m >= RS_Q8_MIN_M => Some(4),
+        WeightFormat::Q5G64 if m >= RS_Q8_MIN_M => Some(5),
+        _ => None,
+    }
 }
 
 pub struct Rtx5060Kernels;
@@ -469,6 +526,9 @@ impl CudaKernels for Rtx5060Kernels {
     }
 
     fn linear_act(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> ActQuant {
+        if q8_format(w, m).is_some() {
+            return ActQuant::Int8G256;
+        }
         if m >= ROWSPLIT_MIN_M && w.format.row_split().is_some() {
             return ActQuant::Bf16;
         }
@@ -514,12 +574,15 @@ impl CudaKernels for Rtx5060Kernels {
     ) -> Option<ActQuant> {
         // IQ3_XXS gate / up (the dense MLP) at decode and verify widths: the IQ3 kernels with
         // gate and up rows paired in each MMA tile and SwiGLU in the epilogue.
-        let fused = gate.format == WeightFormat::Iq3Xxs
+        let pair = gate.format == WeightFormat::Iq3Xxs
             && up.format == WeightFormat::Iq3Xxs
             && gate.k == up.k
-            && gate.rows == up.rows
-            && (1..=SKINNY16_MAX_M).contains(&m);
-        fused.then_some(ActQuant::Bf16)
+            && gate.rows == up.rows;
+        if pair && q8_format(gate, m).is_some() && q8_format(up, m).is_some() {
+            // Prefill: the int8 kernel, gate and up paired the same way.
+            return Some(ActQuant::Int8G256);
+        }
+        (pair && (1..=SKINNY16_MAX_M).contains(&m)).then_some(ActQuant::Bf16)
     }
 
     fn linear_swiglu(
@@ -530,13 +593,11 @@ impl CudaKernels for Rtx5060Kernels {
         out: &mut CudaBuffer,
         m: usize,
     ) -> Result<()> {
-        if self.linear_swiglu_act(gate, up, m).is_none() {
-            return Err(Error::Unsupported("linear_swiglu shape".into()));
-        }
-        let launch = if iq3_direct(gate, m) {
-            velox_5060_linear_swiglu_iq3_direct
-        } else {
-            velox_5060_linear_swiglu_skinny_iq3
+        let launch = match self.linear_swiglu_act(gate, up, m) {
+            None => return Err(Error::Unsupported("linear_swiglu shape".into())),
+            Some(ActQuant::Int8G256) => velox_5060_linear_swiglu_iq3_q8,
+            Some(_) if iq3_direct(gate, m) => velox_5060_linear_swiglu_iq3_direct,
+            Some(_) => velox_5060_linear_swiglu_skinny_iq3,
         };
         // SAFETY: both views and the output were validated by CudaBackend (check::linear).
         status(
@@ -604,6 +665,40 @@ impl CudaKernels for Rtx5060Kernels {
                 },
                 "rtx5060 linear a8",
             ),
+            ActQuant::Int8G256 => match q8_format(w, m) {
+                Some(3) => status(
+                    unsafe {
+                        velox_5060_linear_iq3_q8(
+                            x.as_ptr(),
+                            mi,
+                            wp,
+                            pr,
+                            k,
+                            rb,
+                            rows,
+                            y.as_mut_ptr(),
+                        )
+                    },
+                    "rtx5060 linear iq3 q8",
+                ),
+                Some(f) => status(
+                    unsafe {
+                        velox_5060_linear_rs_q8(
+                            x.as_ptr(),
+                            mi,
+                            wp,
+                            pr,
+                            k,
+                            rb,
+                            rows,
+                            f,
+                            y.as_mut_ptr(),
+                        )
+                    },
+                    "rtx5060 linear rs q8",
+                ),
+                None => Err(Error::Unsupported("int8 linear shape".into())),
+            },
             ActQuant::Bf16 => {
                 if skinny_iq3(w, m) && m > SKINNY16_MAX_M {
                     // Prefill: the staged kernel tiles the tokens itself (64 per weight pass).
