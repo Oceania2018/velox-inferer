@@ -36,6 +36,7 @@ pub enum Op {
     GdnReplay,
     RmsNormGated,
     CopyBatch,
+    LinearSwiglu,
 }
 
 impl Op {
@@ -69,6 +70,7 @@ impl Op {
         Op::GdnReplay,
         Op::RmsNormGated,
         Op::CopyBatch,
+        Op::LinearSwiglu,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -102,6 +104,7 @@ impl Op {
             Op::GdnReplay => "gdn_replay",
             Op::RmsNormGated => "rms_norm_gated",
             Op::CopyBatch => "copy_batch",
+            Op::LinearSwiglu => "linear_swiglu",
         }
     }
 }
