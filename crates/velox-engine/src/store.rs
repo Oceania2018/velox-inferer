@@ -408,6 +408,11 @@ impl<B: Backend> ContextStore<B> {
         !self.spare.is_empty()
     }
 
+    /// A pinned state ready for use (a prefill snapshot when every device state is taken).
+    pub fn take_spare_state(&mut self) -> Option<Checkpoint<B>> {
+        self.spare.pop()
+    }
+
     /// Whether an entry (resident or being copied to disk) holds exactly `keys`.
     pub fn holds(&self, keys: &[u32]) -> bool {
         self.entries
