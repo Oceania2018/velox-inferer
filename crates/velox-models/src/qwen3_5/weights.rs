@@ -27,15 +27,35 @@ pub struct WDesc {
     pub act: ActPolicy,
 }
 
+/// A projection's output rows as runs of adjacent rows of one parent each, in output order.
+/// Artifacts usually store a projection as one run; mixed-precision ones need several (the IQ3_XXS
+/// Qwen3.8-27B artifact keeps GDN q|k in a Q4 parent and v|z in a Q5 parent).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Runs(pub Vec<WDesc>);
+
+impl Runs {
+    pub fn rows(&self) -> usize {
+        self.0.iter().map(|d| d.rows).sum()
+    }
+
+    /// The projection as one view, when it is a single run.
+    pub fn single(&self) -> Option<&WDesc> {
+        match self.0.as_slice() {
+            [d] => Some(d),
+            _ => None,
+        }
+    }
+}
+
 pub enum Mixer {
     Gdn {
-        /// q | k | v projection rows, contiguous in one parent.
-        qkv: WDesc,
+        /// q | k | v projection rows.
+        qkv: Runs,
         z: WDesc,
         /// qkv and z as one view when they are adjacent in one parent (one GEMM, then a split).
         qkvz: Option<WDesc>,
-        /// a | b projection rows, contiguous in one parent.
-        ab: WDesc,
+        /// a | b projection rows.
+        ab: Runs,
         out: WDesc,
         conv: usize,
         a_log: usize,
@@ -238,14 +258,14 @@ impl<B: Backend> TextWeights<B> {
             let input_norm = l.param(&p("input_norm"), cfg.hidden)?;
             let mixer = match kind {
                 LayerKind::Gdn => {
-                    let qkv = l.rows_of(&[&p("gdn/query"), &p("gdn/key"), &p("gdn/value")])?;
-                    let ab = l.rows_of(&[&p("gdn/a_projection"), &p("gdn/b_projection")])?;
+                    let qkv = l.runs_of(&[&p("gdn/query"), &p("gdn/key"), &p("gdn/value")])?;
+                    let ab = l.runs_of(&[&p("gdn/a_projection"), &p("gdn/b_projection")])?;
                     let z = l.matrix(&p("gdn/z"))?;
                     let out = l.matrix(&p("gdn/output"))?;
-                    expect(&p("gdn qkv"), qkv.rows, cfg.gdn_qkv())?;
-                    expect(&p("gdn ab"), ab.rows, 2 * cfg.gdn_v_heads)?;
+                    expect(&p("gdn qkv"), qkv.rows(), cfg.gdn_qkv())?;
+                    expect(&p("gdn ab"), ab.rows(), 2 * cfg.gdn_v_heads)?;
                     expect(&p("gdn z"), z.rows, cfg.gdn_v())?;
-                    let qkvz = fuse(&[&qkv, &z]);
+                    let qkvz = qkv.single().and_then(|q| fuse(&[q, &z]));
                     Mixer::Gdn {
                         qkv,
                         z,
@@ -472,6 +492,26 @@ impl<'a, B: Backend> Loader<'a, B> {
             });
         }
         acc.ok_or_else(|| Error::Config("empty row list".into()))
+    }
+
+    /// The named row views in order, merging each into the previous run when adjacent in one
+    /// parent.
+    pub(crate) fn runs_of(&mut self, names: &[&str]) -> Result<Runs> {
+        let mut runs: Vec<WDesc> = Vec::new();
+        for name in names {
+            let d = self.matrix(name)?;
+            match runs.last_mut() {
+                Some(a) if a.parent == d.parent && a.row_begin + a.rows == d.row_begin => {
+                    a.rows += d.rows;
+                    a.act = a.act.meet(d.act);
+                }
+                _ => runs.push(d),
+            }
+        }
+        if runs.is_empty() {
+            return Err(Error::Config("empty row list".into()));
+        }
+        Ok(Runs(runs))
     }
 
     /// Decodes a small direct-format parameter to f32 and uploads it.

@@ -99,6 +99,18 @@ pub fn random_weight(rng: &mut Rng, fmt: WeightFormat, n: usize, k: usize) -> Ve
             p.extend_from_slice(&96.0f32.to_le_bytes());
             p
         }
+        WeightFormat::Iq3Xxs => {
+            // Every code byte is legal (grid index, sign index, 4-bit scale). Block scales are
+            // exact binary16 2^-9 .. 2^-6 with random mantissas: weights of order 1e-2 .. 1.
+            let blocks = n * k / 256;
+            let mut p: Vec<u8> = (0..blocks * 96).map(|_| byte(rng)).collect();
+            p.resize(align256(blocks * 96), 0);
+            for _ in 0..blocks {
+                let d = (6 + rng.next_u64() % 4) << 10 | (rng.next_u64() % 1024);
+                p.extend_from_slice(&(d as u16).to_le_bytes());
+            }
+            p
+        }
         q => {
             let rs = q.row_split().expect("row-split format");
             let codes = random_codes(rng, rs, n, k);
@@ -1780,6 +1792,13 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         layout: RopeLayout::Blocked,
     })?;
     s.stack(&ModelSpec::preset("tiny")?)?;
+    // Cases added later go last: the suite draws from one random stream, so inserting earlier
+    // would change every following case's data.
+    // IQ3_XXS dense MLP: decode, a verify window over an odd row view, and the tiled path.
+    s.linear(WeightFormat::Iq3Xxs, 96, 512, 0, 96, 1)?;
+    s.linear(WeightFormat::Iq3Xxs, 130, 768, 3, 100, 8)?;
+    s.linear(WeightFormat::Iq3Xxs, 200, 256, 17, 150, 33)?;
+    s.embed(WeightFormat::Iq3Xxs, 12, 512, &[11, 0, 5])?;
     Ok(s.results)
 }
 
@@ -1828,6 +1847,7 @@ mod tests {
             (WeightFormat::Fp8RowBf16, 96, 300),
             (WeightFormat::Nvfp4, 256, 128),
             (WeightFormat::Bf16, 3, 5),
+            (WeightFormat::Iq3Xxs, 5, 768),
         ] {
             assert_eq!(
                 random_weight(&mut rng, f, n, k).len(),

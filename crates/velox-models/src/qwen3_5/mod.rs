@@ -11,7 +11,7 @@ mod weights;
 
 use velox_core::backend::{
     AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, NormKind, RopeLayout,
-    RopePosShape, RopeShape,
+    RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{CopySpec, Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
@@ -25,7 +25,7 @@ pub use dflash::{
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use paging::{KvChunkSet, KvShare};
 pub use vision::{Qwen35Vision, VisionConfig};
-pub use weights::{DenseFfn, ExpertBank, Ffn, Layer, Mixer, MoeFfn, TextWeights, WDesc};
+pub use weights::{DenseFfn, ExpertBank, Ffn, Layer, Mixer, MoeFfn, Runs, TextWeights, WDesc};
 
 /// Per-sequence state: attention KV caches, GDN convolution and recurrent states, position.
 pub struct Session<B: Backend> {
@@ -54,6 +54,43 @@ pub struct Session<B: Backend> {
 /// Up to this many tokens (decode, verify) adjacent projections run as one fused linear; larger
 /// chunks keep them separate, where per-matrix GEMM tiles are faster than the split copy saves.
 const FUSE_MAX_TOKENS: usize = 16;
+
+/// `y[t, runs.rows()] = h . W^T` for a projection stored as `runs`. With several runs, each is
+/// computed into `scratch` (at least `t x` its rows) and copied to its columns of `y`.
+fn linear_runs<'w, B: Backend>(
+    b: &B,
+    view: impl Fn(&WDesc) -> WeightView<'w, B::Buffer>,
+    h: &B::Buffer,
+    runs: &Runs,
+    y: &mut B::Buffer,
+    scratch: &mut B::Buffer,
+    t: usize,
+) -> Result<()>
+where
+    B::Buffer: 'w,
+{
+    if let Some(d) = runs.single() {
+        return b.linear(h, &view(d), y, t);
+    }
+    let (total, mut col) = (runs.rows(), 0);
+    for d in &runs.0 {
+        b.linear(h, &view(d), scratch, t)?;
+        b.copy2d(
+            scratch,
+            y,
+            Copy2dShape {
+                rows: t,
+                cols: d.rows,
+                src_offset: 0,
+                src_stride: d.rows,
+                dst_offset: col,
+                dst_stride: total,
+            },
+        )?;
+        col += d.rows;
+    }
+    Ok(())
+}
 
 /// Most tokens one `verify` call may feed (the anchor plus drafts).
 pub const VERIFY_MAX: usize = 16;
@@ -877,17 +914,26 @@ impl<B: Backend> Qwen35Text<B> {
                                 t,
                                 f.rows,
                                 &mut [
-                                    (&mut *qkv_buf, qkv.row_begin - f.row_begin, qkv.rows),
+                                    (&mut *qkv_buf, qkv.0[0].row_begin - f.row_begin, qkv.rows()),
                                     (&mut ws.z, z.row_begin - f.row_begin, z.rows),
                                 ],
                             )?;
                         }
                         None => {
-                            b.linear(&ws.h, &w.view(qkv), qkv_buf, t)?;
+                            // conv_out ([t, gdn_qkv]) is only written after the projections.
+                            linear_runs(
+                                b,
+                                |d| w.view(d),
+                                &ws.h,
+                                qkv,
+                                qkv_buf,
+                                &mut ws.conv_out,
+                                t,
+                            )?;
                             b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
                         }
                     }
-                    b.linear(&ws.h, &w.view(ab), ab_buf, t)?;
+                    linear_runs(b, |d| w.view(d), &ws.h, ab, ab_buf, &mut ws.conv_out, t)?;
                     let mut row0 = 0;
                     for &end in &cuts {
                         let cs = ConvShape {
@@ -1885,17 +1931,30 @@ impl<B: Backend> Qwen35Text<B> {
                                     t,
                                     f.rows,
                                     &mut [
-                                        (&mut *qkv_buf, qkv.row_begin - f.row_begin, qkv.rows),
+                                        (
+                                            &mut *qkv_buf,
+                                            qkv.0[0].row_begin - f.row_begin,
+                                            qkv.rows(),
+                                        ),
                                         (&mut ws.z, z.row_begin - f.row_begin, z.rows),
                                     ],
                                 )?;
                             }
                             None => {
-                                b.linear(&ws.h, &w.view(qkv), qkv_buf, t)?;
+                                // conv_out ([t, gdn_qkv]) is only written after the projections.
+                                linear_runs(
+                                    b,
+                                    |d| w.view(d),
+                                    &ws.h,
+                                    qkv,
+                                    qkv_buf,
+                                    &mut ws.conv_out,
+                                    t,
+                                )?;
                                 b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
                             }
                         }
-                        b.linear(&ws.h, &w.view(ab), ab_buf, t)?;
+                        linear_runs(b, |d| w.view(d), &ws.h, ab, ab_buf, &mut ws.conv_out, t)?;
                     }
                     if let Some(p) = pre.as_deref_mut() {
                         if v > 0 {
@@ -2217,4 +2276,58 @@ pub fn shift_inserts<'a, Buf>(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velox_core::backend::ActPolicy;
+    use velox_core::format::WeightFormat;
+    use velox_cpu::CpuBackend;
+
+    #[test]
+    fn split_projection_matches_its_runs() -> Result<()> {
+        // Rows 1..5 of parent 0 ([6, k]) then rows 2..5 of parent 1 ([5, k]), as the IQ3_XXS
+        // artifact stores GDN q|k and v in two parents.
+        let (b, k, t) = (CpuBackend, 8, 3);
+        let p0: Vec<f32> = (0..6 * k).map(|i| (i as f32 * 0.37).sin()).collect();
+        let p1: Vec<f32> = (0..5 * k).map(|i| (i as f32 * 0.11).cos()).collect();
+        let x: Vec<f32> = (0..t * k).map(|i| i as f32 * 0.05 - 0.4).collect();
+        let parents = [b.upload(&p0)?, b.upload(&p1)?];
+        let h = b.upload(&x)?;
+        let d = |parent: usize, n, row_begin, rows| WDesc {
+            parent,
+            format: WeightFormat::F32,
+            n,
+            k,
+            row_begin,
+            rows,
+            act: ActPolicy::A16Only,
+        };
+        let runs = Runs(vec![d(0, 6, 1, 4), d(1, 5, 2, 3)]);
+        let view = |d: &WDesc| WeightView {
+            buf: &parents[d.parent],
+            format: d.format,
+            parent_rows: d.n,
+            k: d.k,
+            row_begin: d.row_begin,
+            rows: d.rows,
+            act: d.act,
+        };
+        let (mut y, mut scratch) = (b.alloc(t * 7)?, b.alloc(t * 4)?);
+        linear_runs(&b, view, &h, &runs, &mut y, &mut scratch, t)?;
+        let mut got = vec![0.0; t * 7];
+        b.download(&y, &mut got)?;
+        let rows: Vec<&[f32]> = (1..5)
+            .map(|r| &p0[r * k..(r + 1) * k])
+            .chain((2..5).map(|r| &p1[r * k..(r + 1) * k]))
+            .collect();
+        for i in 0..t {
+            for (j, w) in rows.iter().enumerate() {
+                let want: f32 = (0..k).map(|c| x[i * k + c] * w[c]).sum();
+                assert!((got[i * 7 + j] - want).abs() < 1e-5, "[{i},{j}]");
+            }
+        }
+        Ok(())
+    }
 }
