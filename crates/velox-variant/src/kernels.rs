@@ -284,9 +284,9 @@ fn iq3_direct(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
 /// Widest NVFP4 view the sliced-K kernel serves (see `linear`).
 const NVFP4_SLICED_MAX_ROWS: usize = 8192;
 
-/// IQ3_XXS decode and verify (1..=SKINNY_MAX_M tokens): the weight-streaming bf16 kernels.
+/// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
 fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
-    w.format == WeightFormat::Iq3Xxs && (1..=SKINNY_MAX_M).contains(&m)
+    w.format == WeightFormat::Iq3Xxs && m >= 1
 }
 
 pub struct Rtx5060Kernels;
@@ -521,6 +521,13 @@ impl CudaKernels for Rtx5060Kernels {
                 "rtx5060 linear a8",
             ),
             ActQuant::Bf16 => {
+                if skinny_iq3(w, m) && m > SKINNY16_MAX_M {
+                    // Prefill: the staged kernel tiles the tokens itself (64 per weight pass).
+                    return status(
+                        unsafe { velox_5060_linear_skinny_iq3(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr()) },
+                        "rtx5060 linear iq3 prefill",
+                    );
+                }
                 if skinny_iq3(w, m) {
                     let direct = iq3_direct(w, m);
                     // The kernel takes up to 16 rows; larger m runs in blocks.

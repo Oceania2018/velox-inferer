@@ -172,6 +172,13 @@ __device__ __forceinline__ void load_stage(Smem<NT>& s, const Args& p, int stage
 
 template <int NT>
 __global__ void __launch_bounds__(kThreads) skinny_iq3_kernel(Args p) {
+    // Prefill: blockIdx.y picks this block's tile of NT * 8 tokens (weights decoded once per tile).
+    {
+        const int t0 = blockIdx.y * NT * 8;
+        p.x += static_cast<long long>(t0) * p.k;
+        p.y += static_cast<long long>(t0) * p.rows;
+        p.m = min(NT * 8, p.m - t0);
+    }
     extern __shared__ __align__(128) uint8_t smem_raw[];
     Smem<NT>& s = *reinterpret_cast<Smem<NT>*>(smem_raw);
     const int n0 = blockIdx.x * (p.pair ? kBN / 2 : kBN);
@@ -362,14 +369,15 @@ int launch(Args p) {
     }
     const int rows_per_block = p.pair ? kBN / 2 : kBN;
     const long long blocks = (p.rows + rows_per_block - 1) / rows_per_block, stages = (p.blocks + kBlk - 1) / kBlk;
-    const int splits = p.pair ? 1 : pick_splits(blocks, stages, kSms * per_sm);
+    const int tiles = (p.m + NT * 8 - 1) / (NT * 8);
+    const int splits = p.pair || tiles > 1 ? 1 : pick_splits(blocks, stages, kSms * per_sm);
     p.kt_per_split = static_cast<int>((stages + splits - 1) / splits);
     float* y = p.y;
     if (splits > 1) {
         p.y = static_cast<float*>(g_part.get(static_cast<size_t>(splits) * p.m * p.rows * sizeof(float)));
         if (!p.y) return static_cast<int>(cudaErrorMemoryAllocation);
     }
-    skinny_iq3_kernel<NT><<<dim3(static_cast<unsigned>(blocks), 1, splits), kThreads, sizeof(Smem<NT>)>>>(p);
+    skinny_iq3_kernel<NT><<<dim3(static_cast<unsigned>(blocks), tiles, splits), kThreads, sizeof(Smem<NT>)>>>(p);
     if (splits > 1) {
         const long long n = static_cast<long long>(p.m) * p.rows;
         sum_splits<<<velox_grid_1d(n, 256), 256>>>(p.y, splits, n, y);
@@ -381,7 +389,7 @@ int launch(Args p) {
 
 namespace {
 int run(const float* x, Args p, int m, long long k) {
-    if (m < 1 || m > 16 || p.rows <= 0 || k % 256 != 0 || reinterpret_cast<uintptr_t>(p.w) % 16 != 0 ||
+    if (m < 1 || (p.pair && m > 16) || p.rows <= 0 || k % 256 != 0 || reinterpret_cast<uintptr_t>(p.w) % 16 != 0 ||
         reinterpret_cast<uintptr_t>(p.w2) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     p.blocks = k / 256;
@@ -393,12 +401,14 @@ int run(const float* x, Args p, int m, long long k) {
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16_perm<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, m, p.k, xb);
     p.x = xb;
-    return m <= 8 ? launch<1>(p) : launch<2>(p);
+    // Decode / verify: one tile of 8 or 16 tokens. Prefill: 64-token tiles.
+    if (m <= 8) return launch<1>(p);
+    return m <= 16 ? launch<2>(p) : launch<8>(p);
 }
 }  // namespace
 
-// y[m, rows] = bf16(x) . W[row_begin.., :]^T for an iq3_xxs_planar_v1 parent [parent_rows, k] and
-// 1 <= m <= 16. Returns VELOX_ERR_UNSUPPORTED for anything else.
+// y[m, rows] = bf16(x) . W[row_begin.., :]^T for an iq3_xxs_planar_v1 parent [parent_rows, k],
+// m >= 1 (more than 16 tokens run in 64-token tiles). Returns VELOX_ERR_UNSUPPORTED otherwise.
 VELOX_API int velox_5060_linear_skinny_iq3(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                            long long row_begin, int rows, float* y) {
     Args p{};
