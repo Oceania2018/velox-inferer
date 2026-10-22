@@ -133,7 +133,7 @@ struct Lanes<B: Backend> {
     clock: u64,
     /// Checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
     /// prefills snapshot into it instead of allocating, which would synchronize the device. Holds
-    /// the [`DEVICE_STATES`] device checkpoints not in a lane, and host ones up to its trim.
+    /// the device checkpoints (see [`DEVICE_SPARE`]) not in a lane, and host ones up to its trim.
     spare: Vec<Checkpoint<B>>,
     /// Published prefix chunks of the lanes' paged attention caches.
     share: KvShare<B>,
@@ -146,9 +146,9 @@ const DEVICE_SPARE: usize = 2;
 
 /// Device checkpoints (one recurrent state each, 157 MB for Qwen3.8-27B), created at startup
 /// inside the memory budget and never more: the lanes' kept heads ([`DEVICE_HEADS`]) plus
-/// [`DEVICE_SPARE`]. A prefill snapshot finding none free takes pinned host storage instead;
-/// allocating them per prefill took ~1.4 GB for seconds when six fresh prompts started together.
-const DEVICE_STATES: usize = DEVICE_HEADS + DEVICE_SPARE;
+/// [`DEVICE_SPARE`], each at most one per lane (`budget_memory`). A prefill snapshot finding none
+/// free takes pinned host storage instead; allocating them per prefill took ~1.4 GB for seconds
+/// when six fresh prompts started together.
 
 /// Lanes whose chain head stays in device memory (the most recently admitted); other heads move
 /// to the context store, from where their next request restores them (~5 ms over PCIe).
@@ -243,7 +243,7 @@ fn core(e: CoreError) -> ApiError {
 }
 
 /// Keeps at most `max` host checkpoints in `spare` and every device one: device checkpoints
-/// are a fixed set (see [`DEVICE_STATES`]), so dropping one would only shrink it.
+/// are a fixed set (see [`DEVICE_SPARE`]), so dropping one would only shrink it.
 fn trim_spare<B: Backend>(spare: &mut Vec<Checkpoint<B>>, max: usize) {
     let mut host = 0;
     spare.retain(|c| {
@@ -672,8 +672,11 @@ impl<B: Backend> Core<B> {
     fn budget_memory(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
         let cfg = &self.cfg;
         // The device checkpoints there will ever be, before the measurement below counts them.
+        // One lane needs its head and one more for the next prefill's deepest snapshot.
+        let lanes = st.lanes.len();
+        let states = DEVICE_HEADS.min(lanes) + DEVICE_SPARE.min(lanes);
         let device = st.spare.iter().filter(|c| !c.on_host()).count();
-        for _ in device..DEVICE_STATES {
+        for _ in device..states {
             st.spare
                 .push(st.lanes[0].session.blank_checkpoint(&self.b, 0)?);
         }
