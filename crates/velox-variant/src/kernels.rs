@@ -20,6 +20,20 @@ extern "C" {
         input_divisor: f32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5090_linear_swiglu_a4(
+        x: *const f32,
+        m: i32,
+        wg: *const u8,
+        parent_rows_g: i64,
+        row_begin_g: i64,
+        wu: *const u8,
+        parent_rows_u: i64,
+        row_begin_u: i64,
+        k: i64,
+        rows: i32,
+        input_divisor: f32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5090_attention_full(
         q: *const f32,
         k: *const f32,
@@ -107,6 +121,8 @@ const SMALL_M_MAX: usize = 8;
 /// (speculative verify, short chunks) the tensor-core GEMM with rounded activations takes over
 /// where the artifact allows: its 16-token tile with split-K streams the weights once.
 const GEMV_MAX_M: usize = 1;
+/// Fused SwiGLU from here (the CUDA side's prefill tiles start above kSmallMaxM = 32).
+const SWIGLU_MIN_M: usize = 33;
 
 /// From this many query tokens attention uses the tensor-core prefill kernel; below it the exact
 /// split-KV kernel, which is bound by reading the cache anyway.
@@ -313,6 +329,59 @@ impl CudaKernels for Rtx5090Kernels {
             }
             _ => ActQuant::Exact,
         }
+    }
+
+    fn linear_swiglu_act(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> Option<ActQuant> {
+        // Prefill widths of NVFP4 gate / up views the A4 tensor-core GEMM serves with one rounding.
+        let act = self.linear_act(gate, m);
+        let fused = m >= SWIGLU_MIN_M
+            && matches!(act, ActQuant::Nvfp4 { .. })
+            && self.linear_act(up, m) == act
+            && gate.rows == up.rows
+            && gate.k == up.k
+            && gate.rows % 64 == 0;
+        fused.then_some(act)
+    }
+
+    fn linear_swiglu(
+        &self,
+        x: &CudaBuffer,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        let ActQuant::Nvfp4 { divisor } = self.linear_swiglu_act(gate, up, m).ok_or_else(|| {
+            Error::Unsupported("rtx5090 fused linear_swiglu at this shape".into())
+        })?
+        else {
+            unreachable!("linear_swiglu_act reports NVFP4 only");
+        };
+        // SAFETY: extents validated by CudaBackend (check::linear for both views).
+        status(
+            unsafe {
+                velox_5090_linear_swiglu_a4(
+                    x.as_ptr(),
+                    to_i32("m", m)?,
+                    gate.buf.as_ptr().cast(),
+                    gate.parent_rows as i64,
+                    gate.row_begin as i64,
+                    up.buf.as_ptr().cast(),
+                    up.parent_rows as i64,
+                    up.row_begin as i64,
+                    gate.k as i64,
+                    to_i32("rows", gate.rows)?,
+                    divisor,
+                    out.as_mut_ptr(),
+                )
+            },
+            "rtx5090 linear_swiglu a4",
+        )
     }
 
     fn linear(&self, x: &CudaBuffer, w: &WeightView<'_, CudaBuffer>, y: &mut CudaBuffer, m: usize) -> Result<()> {
