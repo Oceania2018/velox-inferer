@@ -1869,21 +1869,21 @@ impl<B: Backend> Core<B> {
             .filter(|&p| p != tail)
             .max();
         let mut behind = None;
-        for mut cp in std::mem::take(&mut lane.checkpoints) {
+        for cp in std::mem::take(&mut lane.checkpoints) {
             if cp.pos == tail && store.enabled() {
                 // The prompt's end goes straight to system RAM: only an exact retry resumes there.
                 let drafter = self.drafter_context(lane);
-                let id = store.insert_taking(
+                let (id, back) = store.insert_owned(
                     &self.b,
                     &lane.session,
                     &lane.keys,
-                    &mut cp,
+                    cp,
                     false,
                     None,
                     drafter,
                 )?;
                 store.mark_tail(id, head.unwrap_or(0));
-                lane.spare.push(cp);
+                lane.spare.extend(back);
                 continue;
             }
             if store.enabled()
@@ -1895,18 +1895,18 @@ impl<B: Backend> Core<B> {
                 if Some(cp.pos) == head {
                     store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
                 } else {
-                    let pos = cp.pos;
-                    store.insert_taking(
+                    // Not the head and an anchor (never kept behind): the store owns it now.
+                    let (_, back) = store.insert_owned(
                         &self.b,
                         &lane.session,
                         &lane.keys,
-                        &mut cp,
+                        cp,
                         true,
                         None,
                         drafter,
                     )?;
-                    // The storage left behind is a blank spare: nothing below uses its state.
-                    cp.pos = pos;
+                    lane.spare.extend(back);
+                    continue;
                 }
             }
             if Some(cp.pos) == head {
