@@ -631,6 +631,52 @@ pub fn gated_delta_net(
     )
 }
 
+/// [`gated_delta_net`] from `state_in` writing only `out` (no state): the per-row kernel with a null
+/// state target, also through graph staging.
+pub fn gated_delta_net_out(
+    qkv: &CudaBuffer,
+    ab: &CudaBuffer,
+    a_log: &CudaBuffer,
+    dt_bias: &CudaBuffer,
+    state_in: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: GdnShape,
+) -> Result<()> {
+    check::gdn(
+        qkv.len(),
+        ab.len(),
+        a_log.len(),
+        dt_bias.len(),
+        state_in.len(),
+        out.len(),
+        &s,
+    )?;
+    let Some(pp) = graph_params(&[state_in.as_ptr() as i64, 0])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above; a null state is never written.
+    status(
+        unsafe {
+            velox_portable_gated_delta_net(
+                qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                ab.as_ptr().add(s.row0 * 2 * s.v_heads),
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                state_in.as_ptr(),
+                std::ptr::null_mut(),
+                out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
+                to_i32("tokens", s.tokens)?,
+                to_i32("k_heads", s.k_heads)?,
+                to_i32("v_heads", s.v_heads)?,
+                to_i32("k_dim", s.k_dim)?,
+                to_i32("v_dim", s.v_dim)?,
+                pp,
+            )
+        },
+        "portable gated_delta_net_out",
+    )
+}
+
 /// Shapes validated by the caller (`check::gdn_replay_layer` per layer).
 pub fn gdn_replay(
     layers: &mut [GdnReplayLayer<'_, CudaBuffer>],
