@@ -1,0 +1,2 @@
+# nvcc flags for this branch's kernels: RTX 5060 Ti (GB206) only.
+-gencode arch=compute_120a,code=sm_120a
