@@ -1346,17 +1346,17 @@ impl<B: Backend> Qwen35Text<B> {
     fn swiglu_ffn(&self, b: &B, ws: &mut Workspace<B>, d: &DenseFfn, t: usize) -> Result<()> {
         let w = &self.w;
         let width = d.gate.rows;
-        match d.gate_up.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
+        let (gate, up) = (w.view(&d.gate), w.view(&d.up));
+        if t > FUSE_MAX_TOKENS && b.fuses_swiglu(&gate, &up, t) {
+            // Prefill on a backend that fuses this width: no scratch is touched.
+            b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.mu)?;
+        } else if t <= FUSE_MAX_TOKENS && d.gate_up.is_some() {
             // Decode and verify: the fused projection (ws.gu is the composed op's scratch).
-            Some(_) => {
-                let (gate, up) = (w.view(&d.gate), w.view(&d.up));
-                b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.gu)?;
-            }
-            None => {
-                b.linear(&ws.h, &w.view(&d.gate), &mut ws.mg, t)?;
-                b.linear(&ws.h, &w.view(&d.up), &mut ws.mu, t)?;
-                b.silu_mul(&mut ws.mg, &ws.mu, t * width)?;
-            }
+            b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.gu)?;
+        } else {
+            b.linear(&ws.h, &gate, &mut ws.mg, t)?;
+            b.linear(&ws.h, &up, &mut ws.mu, t)?;
+            b.silu_mul(&mut ws.mg, &ws.mu, t * width)?;
         }
         b.linear(&ws.mg, &w.view(&d.down), &mut ws.y, t)
     }

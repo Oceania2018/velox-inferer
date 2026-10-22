@@ -1931,6 +1931,10 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear_swiglu_with(WeightFormat::Iq3Xxs, 512, 40, 0, 70, false, false, a8)?;
     s.linear_swiglu_with(WeightFormat::Iq3Xxs, 768, 24, 8, 33, false, true, a8)?;
     s.linear_swiglu_with(WeightFormat::Iq3Xxs, 256, 64, 0, 130, true, false, a8)?;
+    // Full prefill chunks (the widest token tiles).
+    s.linear_act(WeightFormat::Iq3Xxs, 160, 512, 16, 136, 1030, a8)?;
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 256, 72, 0, 1030, false, false, a8)?;
+    s.linear_act(WeightFormat::Q5G64, 128, 512, 0, 128, 1030, a8)?;
     Ok(s.results)
 }
 
