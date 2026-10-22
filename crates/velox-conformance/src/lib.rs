@@ -1967,7 +1967,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     // ragged columns, a view not starting on a tile, and a wide grid.
     s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 256, 192, 0, 130, false, true, a8)?;
     s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 320, 200, 17, 300, true, false, a8)?;
-    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 256, 4096, 0, 1030, false, true, a8)?;
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 128, 4096, 0, 1030, false, true, a8)?;
     Ok(s.results)
 }
 
