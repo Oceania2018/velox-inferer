@@ -77,6 +77,16 @@ extern "C" {
         format: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_linear_skinny_iq3(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_rowsplit(
         x: *const f32,
         m: i32,
@@ -152,18 +162,26 @@ fn a16_fp8(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
 const A16_FP8_MAX_M: usize = 96;
 const A16_FP8_BLOCK_M: usize = 64;
 
-/// `velox_5060_linear_skinny16`'s format code for a weight it serves at `m` tokens.
+/// `velox_5060_linear_skinny16`'s format code for a weight it serves at `m` tokens. Single tokens
+/// stay on main's GEMV except for q5, which has no fast GEMV there.
 fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     let max = if w.format.row_split().is_some() { ROWSPLIT_MIN_M - 1 } else { SKINNY_MAX_M };
-    if !(2..=max).contains(&m) {
+    let min = if w.format == WeightFormat::Q5G64 { 1 } else { 2 };
+    if !(min..=max).contains(&m) {
         return None;
     }
     match w.format {
         WeightFormat::Nvfp4 if w.k % 128 == 0 && w.row_begin % 64 == 0 => Some(0),
         WeightFormat::Q4G64 => Some(4),
+        WeightFormat::Q5G64 => Some(5),
         WeightFormat::Q8G32 => Some(8),
         _ => None,
     }
+}
+
+/// IQ3_XXS decode and verify (1..=SKINNY_MAX_M tokens): the weight-streaming bf16 kernel.
+fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    w.format == WeightFormat::Iq3Xxs && (1..=SKINNY_MAX_M).contains(&m)
 }
 
 pub struct Rtx5060Kernels;
@@ -291,6 +309,9 @@ impl CudaKernels for Rtx5060Kernels {
         if m >= ROWSPLIT_MIN_M && w.format.row_split().is_some() {
             return ActQuant::Bf16;
         }
+        if skinny_iq3(w, m) || (m == 1 && skinny16_format(w, m).is_some()) {
+            return ActQuant::Bf16;
+        }
         if m <= GEMV_MAX_M {
             return ActQuant::Exact;
         }
@@ -333,6 +354,19 @@ impl CudaKernels for Rtx5060Kernels {
                 "rtx5060 linear a8",
             ),
             ActQuant::Bf16 => {
+                if skinny_iq3(w, m) {
+                    // The kernel takes up to 16 rows; larger m runs in blocks.
+                    for r0 in (0..m).step_by(SKINNY16_MAX_M) {
+                        let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
+                        // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
+                        let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
+                        status(
+                            unsafe { velox_5060_linear_skinny_iq3(xp, mb, wp, pr, k, rb, rows, yp) },
+                            "rtx5060 linear skinny iq3",
+                        )?;
+                    }
+                    return Ok(());
+                }
                 if a16_fp8(w, m) {
                     // The kernel takes up to 64 rows; larger m runs in blocks (activations [m, k],
                     // outputs [m, rows]).

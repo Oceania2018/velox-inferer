@@ -1,9 +1,9 @@
-// RTX 5060 Ti (from rtx-5090-32g) skinny linear (2..16 tokens) for weights whose uses are A16Only: NVFP4, groupwise
-// q4_g64 / q8_g32 (row_split_k128_v1). Activations are rounded to bf16 (ActQuant::Bf16); the
+// RTX 5060 Ti (from rtx-5090-32g) skinny linear (1..16 tokens) for weights whose uses are A16Only: NVFP4, groupwise
+// q4_g64 / q5_g64 / q8_g32 (row_split_k128_v1). Activations are rounded to bf16 (ActQuant::Bf16); the
 // weights stay exact:
 //   NVFP4: E2M1 code x E4M3 group scale is bf16-exact, decoded per value; the tensor divisor is
 //          applied to the result.
-//   q4/q8: integer codes are bf16-exact; each group accumulates into its own register tile, which
+//   q4/q5/q8: integer codes are bf16-exact (q5: the nibble plus its bit from the high plane); each group accumulates into its own register tile, which
 //          is scaled by the group's FP16 scale before it is added.
 //
 // Speculative verify and draft steps are weight-streaming, so the block streams raw weight bytes
@@ -21,7 +21,7 @@
 
 namespace {
 
-enum Fmt { kNvfp4 = 0, kQ4 = 1, kQ8 = 2 };
+enum Fmt { kNvfp4 = 0, kQ4 = 1, kQ8 = 2, kQ5 = 3 };
 
 constexpr int kBN = 64, kKS = 128, kStages = 4, kThreads = 128, kTok = 16;
 // Activation tile rows: 128 bf16 + 8 pad (272 bytes) so ldmatrix rows fall in distinct banks.
@@ -32,7 +32,10 @@ struct Geo {
     // Weight bytes per row per stage, padded by 16 so the 8 rows a fragment reads hit 8 banks.
     static constexpr int kRowBytes = F == kQ8 ? kKS : kKS / 2;
     static constexpr int kStride = kRowBytes + 16;
-    static constexpr int kGroup = F == kQ8 ? 32 : F == kQ4 ? 64 : 16;
+    static constexpr int kGroup = F == kQ8 ? 32 : F == kNvfp4 ? 16 : 64;
+    // q5 high-plane bytes per row per stage: one bit per value, 8 bytes per 64-group.
+    static constexpr int kHighBytes = F == kQ5 ? kKS / 8 : 0;
+    static constexpr int kHighStride = F == kQ5 ? kHighBytes + 16 : 1;
     // Scale bytes per row per stage: FP16 per group (q4: 2, q8: 4); NVFP4 uses 512-byte tiles.
     static constexpr int kScaleHalves = kKS / (F == kQ8 ? 32 : 64);
 };
@@ -43,6 +46,7 @@ struct Smem {
     uint8_t b[kStages][kBN * Geo<F>::kStride];
     // q4/q8: [row][group] FP16 scales. NVFP4: the two 128x4 E4M3 tiles of the stage's k64 steps.
     uint8_t s[kStages][F == kNvfp4 ? 2 * 512 : kBN * Geo<F>::kScaleHalves * 2];
+    uint8_t h[kStages][F == kQ5 ? kBN * Geo<F>::kHighStride : 16];
 };
 
 struct Args {
@@ -51,7 +55,8 @@ struct Args {
     long long parent_rows, row_begin;
     int rows, m, kp;         // kp: K padded to the format's row length (multiple of 128)
     long long gpr;           // q4/q8: groups per row
-    long long scale_off;     // q4/q8: FP16 scale plane; NVFP4: E4M3 scale tile plane
+    long long scale_off;     // q4/q5/q8: FP16 scale plane; NVFP4: E4M3 scale tile plane
+    long long high_off;      // q5: high-bit plane
     float alpha;             // NVFP4: 1 / weight divisor; else 1
     int kt_per_split;
     float* y;                // [m, rows], or [splits, m, rows] partials
@@ -125,9 +130,10 @@ __device__ __forceinline__ float e4m3(uint8_t b) {
     return __half2float(__half(h));
 }
 
-// Two adjacent K values (k, k+1) of row `r` as a bf16x2 register.
+// Two adjacent K values (k, k+1) of row `r` as a bf16x2 register (k even; q5: `high` is the row's
+// high-plane bytes for the stage).
 template <int F>
-__device__ __forceinline__ uint32_t decode2(const uint8_t* row, int k, float nv_scale) {
+__device__ __forceinline__ uint32_t decode2(const uint8_t* row, const uint8_t* high, int k, float nv_scale) {
     if (F == kQ8) {
         const uint16_t v = *reinterpret_cast<const uint16_t*>(row + k);
         return pack_bf16(static_cast<float>(static_cast<int8_t>(v & 0xff)), static_cast<float>(static_cast<int8_t>(v >> 8)));
@@ -136,6 +142,13 @@ __device__ __forceinline__ uint32_t decode2(const uint8_t* row, int k, float nv_
         if (F == kQ4) {
             const int lo = static_cast<int>(v & 0xf), hi = static_cast<int>(v >> 4);
             return pack_bf16(static_cast<float>(lo >= 8 ? lo - 16 : lo), static_cast<float>(hi >= 8 ? hi - 16 : hi));
+        }
+        if (F == kQ5) {
+            // Bit t of a group's 8 high bytes is value t's bit 4 (k % 64 == t; k even, so both
+            // bits sit in one byte).
+            const uint32_t hb = high[k >> 3] >> (k & 7);
+            const int lo = static_cast<int>((v & 0xf) | ((hb & 1) << 4)), hi = static_cast<int>((v >> 4) | ((hb & 2) << 3));
+            return pack_bf16(static_cast<float>(lo >= 16 ? lo - 32 : lo), static_cast<float>(hi >= 16 ? hi - 32 : hi));
         }
         return pack_bf16(e2m1(v & 0xf) * nv_scale, e2m1(v >> 4) * nv_scale);
     }
@@ -169,7 +182,16 @@ __device__ __forceinline__ void load_stage(Smem<F>& s, const Args& p, int stage,
                        p.w + p.scale_off + (tile * (p.kp / 64) + kt * 2 + step) * 512 + off, true);
         }
     } else {
-        // FP16 scales of the stage's groups: q8 four (8 bytes), q4 two (4 bytes) per row.
+        if (F == kQ5) {
+            // High bits of the stage's two groups: 16 contiguous bytes per row.
+            for (int r = t; r < kBN; r += kThreads) {
+                const long long wrow = p.row_begin + n0 + r;
+                const bool ok = wrow < p.parent_rows;
+                cp_async16(&s.h[stage][r * Geo<F>::kHighStride],
+                           p.w + p.high_off + ((ok ? wrow : 0) * p.gpr + k0 / 64) * 8, ok);
+            }
+        }
+        // FP16 scales of the stage's groups: q8 four (8 bytes), q4/q5 two (4 bytes) per row.
         constexpr int kHalves = Geo<F>::kScaleHalves;
         const long long g0 = k0 / Geo<F>::kGroup;
         for (int r = t; r < kBN; r += kThreads) {
@@ -216,6 +238,7 @@ __global__ void __launch_bounds__(kThreads) skinny16_kernel(Args p) {
         cp_commit();
         const int st = i % kStages;
         const uint8_t* rowp[2] = {&s.b[st][br[0] * Geo<F>::kStride], &s.b[st][br[1] * Geo<F>::kStride]};
+        const uint8_t* highp[2] = {&s.h[st][br[0] * Geo<F>::kHighStride], &s.h[st][br[1] * Geo<F>::kHighStride]};
 
         if (F == kNvfp4) {
             // K is permuted within each 32-value chunk (activations were stored to match, see
@@ -263,7 +286,8 @@ __global__ void __launch_bounds__(kThreads) skinny16_kernel(Args p) {
 #pragma unroll
                     for (int nt = 0; nt < 2; ++nt) {
                         const int k = ks * 16 + q2;
-                        mma_bf16(part[nt], af, decode2<F>(rowp[nt], k, 0.0f), decode2<F>(rowp[nt], k + 8, 0.0f));
+                        mma_bf16(part[nt], af, decode2<F>(rowp[nt], highp[nt], k, 0.0f),
+                                 decode2<F>(rowp[nt], highp[nt], k + 8, 0.0f));
                     }
                 }
                 // C columns 2q, 2q+1 are rows g' = (lane & 3) * 2 (+1) of the n8 tile.
@@ -362,8 +386,8 @@ int launch(Args p, const float* x, int k) {
 
 }  // namespace
 
-// y[m, rows] = bf16(x) . W[row_begin.., :]^T for 2 <= m <= 16. format: 0 NVFP4 (needs k % 128 == 0
-// and row_begin % 64 == 0), 4 q4_g64 or 8 q8_g32 (row_split_k128_v1). Returns
+// y[m, rows] = bf16(x) . W[row_begin.., :]^T for 1 <= m <= 16. format: 0 NVFP4 (needs k % 128 == 0
+// and row_begin % 64 == 0), 4 q4_g64, 5 q5_g64 or 8 q8_g32 (row_split_k128_v1). Returns
 // VELOX_ERR_UNSUPPORTED for anything else.
 VELOX_API int velox_5060_linear_skinny16(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                          long long row_begin, int rows, int format, float* y) {
@@ -395,10 +419,14 @@ VELOX_API int velox_5060_linear_skinny16(const float* x, int m, const uint8_t* w
         p.alpha = 1.0f / it->second;
         return launch<kNvfp4>(p, x, static_cast<int>(k));
     }
-    if (format != 4 && format != 8) return VELOX_ERR_UNSUPPORTED;
+    if (format != 4 && format != 5 && format != 8) return VELOX_ERR_UNSUPPORTED;
     const int group = format == 8 ? 32 : 64;
     p.kp = static_cast<int>((k + 127) / 128 * 128);
     p.gpr = p.kp / group;
-    p.scale_off = align256(parent_rows * p.gpr * 32);  // no high plane for q4 / q8
+    // row_split_k128_v1 planes: base codes, high bits (q5: 8 bytes per group), FP16 scales.
+    const long long groups = parent_rows * p.gpr;
+    p.high_off = align256(groups * 32);
+    p.scale_off = p.high_off + (format == 5 ? align256(groups * 8) : 0);
+    if (format == 5) return launch<kQ5>(p, x, static_cast<int>(k));
     return format == 8 ? launch<kQ8>(p, x, static_cast<int>(k)) : launch<kQ4>(p, x, static_cast<int>(k));
 }
