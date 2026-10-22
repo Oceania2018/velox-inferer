@@ -117,22 +117,29 @@ __global__ void quant_fp8_kernel(const float* __restrict__ x, int m, int k, uint
 }
 
 // ---------------------------------------------------------------------------------------------
-// GEMM. Tile configurations: Cfg<WM, WN, MT> has WM x WN warps, each covering MT x 16 tokens and
-// 32 weight rows, so a block is BM = WM * MT * 16 tokens by BN = WN * 32 rows.
-//   Big<2,4,4>:   128 x 128, 256 threads (prefill)
-//   Small<1,4,1>:  16 x 128, 128 threads (speculative verify and short chunks), with split-K so
-//                  a handful of tokens still spreads the weight stream over every SM.
+// GEMM. Tile configurations: Cfg<WM, WN, MT, .., NT> has WM x WN warps, each covering MT x 16
+// tokens and NT x 8 weight rows, so a block is BM = WM * MT * 16 tokens by BN = WN * NT * 8 rows.
+//   Wide:  256 x 128, 256 threads, 64 x 64 per warp (prefill grids of at least kWideBlocks)
+//   Big:   128 x 128, 256 threads, 64 x 32 per warp (smaller prefill grids)
+//   Small:  16 x 64, 64 threads (speculative verify and short chunks), with split-K so a handful
+//          of tokens still spreads the weight stream over every SM.
 
 
 enum Kind { kFp4 = 0, kFp8 = 1 };
 
-template <int WM_, int WN_, int MT_, int ST_, int KS_>
+template <int WM_, int WN_, int MT_, int ST_, int KS_, int NT_ = 4>
 struct Cfg {
     // ST: cp.async pipeline stages. KS: MMA k-steps (32 code bytes each) per stage, so each weight
     // row is read in BK-byte contiguous pieces; longer pieces keep DRAM pages open for skinny m.
-    static constexpr int WM = WM_, WN = WN_, MT = MT_, ST = ST_, KS = KS_, BK = KS_ * 32;
-    static constexpr int BM = WM * MT * 16, BN = WN * 32, THREADS = WM * WN * 32;
+    // NT: n8 tiles per warp (each warp covers MT x 16 tokens by NT x 8 weight rows).
+    static constexpr int WM = WM_, WN = WN_, MT = MT_, ST = ST_, KS = KS_, BK = KS_ * 32, NT = NT_;
+    static constexpr int BM = WM * MT * 16, BN = WN * NT * 8, THREADS = WM * WN * 32;
 };
+// Prefill. Wide's 64 x 64 warp tiles issue 32 MMAs per k-step per warp (Big: 16) and reuse each
+// operand fragment more, but a quarter-size grid under-fills 170 SMs on narrow outputs. RTX 5090,
+// m = 512 / 2048 (us): NVFP4 [34816,5120] Big 340 / 1300, Wide 293 / 946; [5120,17408] Big
+// 114 / 468, Wide 201 / 485; FP8 [16384,5120] Big 247 / 733, Wide 221 / 725.
+using Wide = Cfg<4, 2, 4, 3, 2, 8>;
 using Big = Cfg<2, 4, 4, 3, 2>;
 // Skinny m (decode, verify, drafts) is weight-streaming: 64 rows per block, 128 contiguous bytes
 // per row per stage and four stages measured best on the RTX 5090 (m = 8: lm_head 1.05 -> 1.53
@@ -256,7 +263,7 @@ __device__ __forceinline__ void load_stage(Smem<C>& s, const GemmArgs& p, int st
 }
 
 template <class C, int KIND>
-__global__ void __launch_bounds__(C::THREADS) gemm_kernel(GemmArgs p) {
+__global__ void __launch_bounds__(C::THREADS, 1) gemm_kernel(GemmArgs p) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
     Smem<C>& s = *reinterpret_cast<Smem<C>*>(smem_raw);
     const int n0 = blockIdx.x * C::BN, m0 = blockIdx.y * C::BM;
@@ -274,11 +281,11 @@ __global__ void __launch_bounds__(C::THREADS) gemm_kernel(GemmArgs p) {
         cp_commit();
     }
 
-    float acc[C::MT][4][4];
+    float acc[C::MT][C::NT][4];
 #pragma unroll
     for (int i = 0; i < C::MT; ++i)
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < C::NT; ++j)
 #pragma unroll
             for (int v = 0; v < 4; ++v) acc[i][j][v] = 0.0f;
 
@@ -299,7 +306,7 @@ __global__ void __launch_bounds__(C::THREADS) gemm_kernel(GemmArgs p) {
         const int st = i % C::ST;
 #pragma unroll
         for (int ks = 0; ks < C::KS; ++ks) {
-            uint32_t af[C::MT][4], bf[4][2], sfa[C::MT], sfb[4];
+            uint32_t af[C::MT][4], bf[C::NT][2], sfa[C::MT], sfb[C::NT];
 #pragma unroll
             for (int mt = 0; mt < C::MT; ++mt) {
                 const int r = wm * WROWS + mt * 16 + a_row;
@@ -307,23 +314,23 @@ __global__ void __launch_bounds__(C::THREADS) gemm_kernel(GemmArgs p) {
                 if (KIND == kFp4) sfa[mt] = s.a_scale[st][wm * WROWS + mt * 16 + sfa_row][ks];
             }
 #pragma unroll
-            for (int nt = 0; nt < 4; nt += 2) {
-                const int r = wn * 32 + nt * 8 + b_row;
+            for (int nt = 0; nt < C::NT; nt += 2) {
+                const int r = wn * (C::NT * 8) + nt * 8 + b_row;
                 uint32_t t4[4];
                 ldmatrix_x4(t4, s.b[st] + swz<C::BK>(r, ks * 32 + b_byte));
                 bf[nt][0] = t4[0], bf[nt][1] = t4[1], bf[nt + 1][0] = t4[2], bf[nt + 1][1] = t4[3];
             }
             if (KIND == kFp4) {
 #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    const int r = static_cast<int>((p.row_begin + n0) & 127) + wn * 32 + nt * 8 + sfb_row;
+                for (int nt = 0; nt < C::NT; ++nt) {
+                    const int r = static_cast<int>((p.row_begin + n0) & 127) + wn * (C::NT * 8) + nt * 8 + sfb_row;
                     sfb[nt] = *reinterpret_cast<const uint32_t*>(&s.b_scale[st][ks][(r & 31) * 16 + (r >> 5) * 4]);
                 }
             }
 #pragma unroll
             for (int mt = 0; mt < C::MT; ++mt)
 #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
+                for (int nt = 0; nt < C::NT; ++nt) {
                     if (KIND == kFp4) mma_fp4(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1], sfa[mt], sfb[nt]);
                     else mma_fp8(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1]);
                 }
@@ -336,8 +343,8 @@ __global__ void __launch_bounds__(C::THREADS) gemm_kernel(GemmArgs p) {
     const int g = lane >> 2, q = lane & 3;
     const uint8_t* wscale = p.w + (p.parent_rows * p.kb + 255) / 256 * 256;  // FP8 BF16 row scales
 #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) {
-        const int n = n0 + wn * 32 + nt * 8 + 2 * q;
+    for (int nt = 0; nt < C::NT; ++nt) {
+        const int n = n0 + wn * (C::NT * 8) + nt * 8 + 2 * q;
         float f0 = p.alpha, f1 = p.alpha;
         if (KIND == kFp8) {
             const long long r0 = p.row_begin + n;
@@ -385,8 +392,18 @@ Scratch g_part;     // split-K partial sums
 constexpr int kSms = 170;
 constexpr int kSmallMaxM = 32;
 
+// Wide tiles when their grid fills the GPU about one and a half times over, and for at least two
+// tile rows of tokens (m = 128 padded to one Wide tile: [34816,5120] 110 -> 150 us).
+constexpr long long kWideBlocks = 256;
+constexpr int kWideMinM = 2 * Wide::BM;
+
+bool use_wide(int m, int rows) {
+    return m >= kWideMinM &&
+           static_cast<long long>((rows + Wide::BN - 1) / Wide::BN) * ((m + Wide::BM - 1) / Wide::BM) >= kWideBlocks;
+}
+
 // Token rows the quantizers pad to: the tile height of the configuration launch_gemm picks.
-int m_tile(int m) { return m <= kSmallMaxM ? Small::BM : Big::BM; }
+int m_tile(int m, int rows) { return m <= kSmallMaxM ? Small::BM : use_wide(m, rows) ? Wide::BM : Big::BM; }
 static_assert(Small::BM == Small64::BM, "small configurations share the activation tile height");
 
 template <class C, int KIND>
@@ -420,6 +437,7 @@ int launch_cfg(GemmArgs p) {
 
 template <int KIND>
 int launch_gemm(const GemmArgs& p) {
+    if (use_wide(p.m, p.rows)) return launch_cfg<Wide, KIND>(p);
     if (p.m > kSmallMaxM) return launch_cfg<Big, KIND>(p);
     return p.kb % Small::BK == 0 ? launch_cfg<Small, KIND>(p) : launch_cfg<Small64, KIND>(p);
 }
@@ -432,7 +450,7 @@ VELOX_API int velox_5090_linear_a4(const float* x, int m, const uint8_t* w, long
                                    long long row_begin, int rows, float input_divisor, float* y) {
     if (k % 128 != 0 || row_begin % 128 != 0 || m <= 0 || reinterpret_cast<uintptr_t>(x) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
-    const int mt = m_tile(m);
+    const int mt = m_tile(m, rows);
     const int m_pad = (m + mt - 1) / mt * mt;
     const size_t code_bytes = static_cast<size_t>(m_pad) * k / 2;
     uint8_t* buf = g_scratch.get(code_bytes + static_cast<size_t>(m_pad) * k / 16);
@@ -468,7 +486,7 @@ VELOX_API int velox_5090_linear_a4(const float* x, int m, const uint8_t* w, long
 VELOX_API int velox_5090_linear_a8(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                    long long row_begin, int rows, float* y) {
     if (k % 64 != 0 || m <= 0 || reinterpret_cast<uintptr_t>(x) % 16 != 0) return VELOX_ERR_UNSUPPORTED;
-    const int mt = m_tile(m);
+    const int mt = m_tile(m, rows);
     const int m_pad = (m + mt - 1) / mt * mt;
     const size_t code_bytes = static_cast<size_t>(m_pad) * k;
     uint8_t* buf = g_scratch.get(code_bytes + static_cast<size_t>(m_pad) * 4);
