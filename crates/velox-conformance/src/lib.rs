@@ -1952,6 +1952,28 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     // view starting mid-tile with ragged rows, and a full chunk.
     s.linear(WeightFormat::Nvfp4, 384, 512, 40, 300, 100)?;
     s.linear(WeightFormat::Nvfp4, 256, 448, 0, 256, 1030)?;
+    // Prefill grids of several hundred tiles (kernel sets may pick larger tiles for them): ragged
+    // tokens and rows, a view starting one scale tile into its parent.
+    let a4 = ActPolicy::AllowA4 { divisor: 600.0 };
+    s.linear_act(WeightFormat::Nvfp4, 8448, 256, 128, 8200, 1030, a4)?;
+    s.linear_act(WeightFormat::Fp8RowBf16, 8448, 256, 64, 8200, 1030, a8)?;
+    // Fused SwiGLU under A4 at prefill widths: both row orders, separate parents, a view one scale
+    // tile into its parent, and a grid of several hundred tiles.
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 512, 256, 0, 100, false, false, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 128, 128, 300, true, false, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 256, 0, 70, false, true, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 4096, 0, 1030, false, false, a4)?;
+    // ... and FP8 rows under A8 (the Qwen3.8 NVFP4 artifact's FP8 MLP layers): separate parents,
+    // ragged columns, a view not starting on a tile, and a wide grid.
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 256, 192, 0, 130, false, true, a8)?;
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 320, 200, 17, 300, true, false, a8)?;
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 128, 4096, 0, 1030, false, true, a8)?;
+    // IQ3_XXS at the dense MLP's own K (gate/up 5120, down 17408), which kernels specialize on,
+    // at decode and verify widths.
+    for m in [1, 8] {
+        s.linear_swiglu(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false)?;
+        s.linear(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m)?;
+    }
     Ok(s.results)
 }
 
