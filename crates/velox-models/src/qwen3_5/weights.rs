@@ -494,9 +494,77 @@ impl<'a, B: Backend> Loader<'a, B> {
         acc.ok_or_else(|| Error::Config("empty row list".into()))
     }
 
+    /// The named row views of a direct row-major format (bf16 / f32) in separate parents, copied
+    /// into one new device parent so the projection is a single view (e.g. GDN a and b, stored
+    /// as two small objects). `None` when any view is in another format, on the host list, or
+    /// the views already form one run. The source objects are not uploaded.
+    fn direct_concat(&mut self, names: &[&str]) -> Result<Option<WDesc>> {
+        let mut parts = Vec::with_capacity(names.len());
+        for name in names {
+            let (id, range) = self.binding(name)?;
+            if self.index.contains_key(&id) || self.host.iter().any(|h| h == name) {
+                return Ok(None);
+            }
+            let Some(ObjectKind::Tensor {
+                shape,
+                format,
+                layout,
+            }) = self.art.object(&id).map(|o| &o.kind)
+            else {
+                return Ok(None);
+            };
+            let fmt = WeightFormat::from_names(format, layout)?;
+            if shape.len() != 2 || !matches!(fmt, WeightFormat::Bf16 | WeightFormat::F32) {
+                return Ok(None);
+            }
+            let (n, k) = (shape[0] as usize, shape[1] as usize);
+            let (r0, rows) = match range {
+                None => (0, n),
+                Some((a, e)) if a % k as u64 == 0 && e % k as u64 == 0 => {
+                    ((a / k as u64) as usize, ((e - a) / k as u64) as usize)
+                }
+                Some(_) => return Ok(None),
+            };
+            parts.push((name, id, fmt, k, r0, rows));
+        }
+        let (fmt, k) = (parts[0].2, parts[0].3);
+        if parts.len() < 2
+            || parts.iter().any(|p| p.2 != fmt || p.3 != k)
+            || parts.windows(2).all(|w| w[0].1 == w[1].1)
+        {
+            return Ok(None);
+        }
+        let row_bytes = fmt.payload_bytes(1, k);
+        let mut bytes = Vec::new();
+        for (_, id, _, _, r0, rows) in &parts {
+            let obj = self.art.read_object(id).map_err(werr)?;
+            bytes.extend_from_slice(&obj[r0 * row_bytes..(r0 + rows) * row_bytes]);
+        }
+        let n: usize = parts.iter().map(|p| p.5).sum();
+        self.bytes += bytes.len() as u64;
+        self.parents.push(self.b.upload_bytes(&bytes)?);
+        let act = parts
+            .iter()
+            .map(|p| self.policy(p.0))
+            .reduce(ActPolicy::meet)
+            .unwrap_or(ActPolicy::A16Only);
+        Ok(Some(WDesc {
+            parent: self.parents.len() - 1,
+            format: fmt,
+            n,
+            k,
+            row_begin: 0,
+            rows: n,
+            act,
+        }))
+    }
+
     /// The named row views in order, merging each into the previous run when adjacent in one
-    /// parent.
+    /// parent. Direct-format views in separate parents are copied into one parent instead.
     pub(crate) fn runs_of(&mut self, names: &[&str]) -> Result<Runs> {
+        if let Some(d) = self.direct_concat(names)? {
+            return Ok(Runs(vec![d]));
+        }
         let mut runs: Vec<WDesc> = Vec::new();
         for name in names {
             let d = self.matrix(name)?;
