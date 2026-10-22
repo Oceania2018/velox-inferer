@@ -1254,10 +1254,10 @@ impl<B: Backend> Qwen35Text<B> {
         let w = &self.w;
         let width = d.gate.rows;
         match d.gate_up.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
-            Some(f) => {
-                b.linear(&ws.h, &w.view(f), &mut ws.gu, t)?;
-                let (g, u) = (d.gate.row_begin - f.row_begin, d.up.row_begin - f.row_begin);
-                b.swiglu(&ws.gu, t, f.rows, g, u, width, &mut ws.mg)?;
+            // Decode and verify: the fused projection (ws.gu is the composed op's scratch).
+            Some(_) => {
+                let (gate, up) = (w.view(&d.gate), w.view(&d.up));
+                b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.gu)?;
             }
             None => {
                 b.linear(&ws.h, &w.view(&d.gate), &mut ws.mg, t)?;

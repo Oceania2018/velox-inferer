@@ -286,6 +286,83 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `linear_swiglu` against the oracle: gate rows then up rows of one `[2 * width + extra, k]`
+    /// parent from row `begin` (`swap`: up first), or (`split`) separate parents.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu(
+        &mut self,
+        fmt: WeightFormat,
+        k: usize,
+        width: usize,
+        begin: usize,
+        m: usize,
+        swap: bool,
+        split: bool,
+    ) -> Result<()> {
+        let n = (begin + 2 * width + 16).div_ceil(128) * 128; // nvfp4 needs whole 128-row tiles
+        let bytes = random_weight(&mut self.rng, fmt, n, k);
+        let bytes2 = random_weight(&mut self.rng, fmt, n, k);
+        let x = self.rng.vec(m * k, 1.0);
+        let (gb, ub) = if swap {
+            (begin + width, begin)
+        } else {
+            (begin, begin + width)
+        };
+        let (wd, wd2) = (self.b.upload_bytes(&bytes)?, self.b.upload_bytes(&bytes2)?);
+        let gate = WeightView::full(&wd, fmt, n, k).rows(gb, width);
+        let up = WeightView::full(if split { &wd2 } else { &wd }, fmt, n, k).rows(ub, width);
+        let act = self.b.linear_swiglu_act(&gate, &up, m);
+        let mut xq = x.clone();
+        quantize_activations(&mut xq, k, act);
+        let (wc, wc2) = (
+            CpuBackend.upload_bytes(&bytes)?,
+            CpuBackend.upload_bytes(&bytes2)?,
+        );
+        let (mut g, mut u) = (vec![0.0; m * width], vec![0.0; m * width]);
+        CpuBackend.linear(
+            &xq,
+            &WeightView::full(&wc, fmt, n, k).rows(gb, width),
+            &mut g,
+            m,
+        )?;
+        let up_parent = if split { &wc2 } else { &wc };
+        CpuBackend.linear(
+            &xq,
+            &WeightView::full(up_parent, fmt, n, k).rows(ub, width),
+            &mut u,
+            m,
+        )?;
+        CpuBackend.silu_mul(&mut g, &u, m * width)?;
+        let xd = self.b.upload(&x)?;
+        let (mut od, mut sd) = (self.b.alloc(m * width)?, self.b.alloc(2 * m * width)?);
+        self.b.linear_swiglu(&xd, &gate, &up, &mut od, m, &mut sd)?;
+        let got = fetch(self.b, &od, m * width)?;
+        let tag = match act {
+            ActQuant::Exact => "",
+            ActQuant::Fp8Row => " a8",
+            ActQuant::Nvfp4 { .. } => " a4",
+            ActQuant::Bf16 => " bf16",
+        };
+        let layout = if split {
+            " split"
+        } else if swap {
+            " up|gate"
+        } else {
+            ""
+        };
+        self.record(
+            format!(
+                "linear_swiglu {} [{width}x2,{k}] from {begin} m={m}{layout}{tag}",
+                fmt.name()
+            ),
+            Some(Op::LinearSwiglu),
+            &got,
+            &g,
+            2e-4,
+        );
+        Ok(())
+    }
+
     /// Splits `[rows, sum(widths)]` into consecutive column blocks (5 parts: two launches).
     fn split_cols(&mut self, rows: usize, widths: &[usize]) -> Result<()> {
         let total: usize = widths.iter().sum();
@@ -1801,6 +1878,17 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.embed(WeightFormat::Iq3Xxs, 12, 512, &[11, 0, 5])?;
     // Greedy speculative verify: the argmax of each row of a verify window.
     s.top_k(8, 248_320, 248_077, 1)?;
+    // Fused SwiGLU projections at decode and verify widths: the dense MLP's formats, ragged
+    // widths, both row orders and separate parents.
+    for m in [1, 2, 8, 16] {
+        s.linear_swiglu(WeightFormat::Iq3Xxs, 512, 40, 0, m, false, false)?;
+    }
+    s.linear_swiglu(WeightFormat::Iq3Xxs, 768, 24, 8, 3, false, false)?;
+    s.linear_swiglu(WeightFormat::Iq3Xxs, 256, 16, 0, 8, true, false)?;
+    s.linear_swiglu(WeightFormat::Iq3Xxs, 512, 16, 0, 8, false, true)?;
+    s.linear_swiglu(WeightFormat::Q4G64, 320, 40, 3, 8, false, false)?;
+    s.linear_swiglu(WeightFormat::Nvfp4, 512, 128, 0, 8, false, false)?;
+    s.linear_swiglu(WeightFormat::Bf16, 96, 33, 1, 5, false, false)?;
     Ok(s.results)
 }
 

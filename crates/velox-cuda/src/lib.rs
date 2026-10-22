@@ -375,6 +375,30 @@ pub trait CudaKernels: Send + Sync {
         ActQuant::Exact
     }
 
+    /// A fused [`Backend::linear_swiglu`] (no scratch). The default reports `Unsupported`, and the
+    /// backend composes the op from `linear` and `swiglu`.
+    fn linear_swiglu(
+        &self,
+        _x: &CudaBuffer,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _out: &mut CudaBuffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("fused linear_swiglu".into()))
+    }
+
+    /// The activation rounding a fused `linear_swiglu` applies, `None` when it is not fused at
+    /// these rows (the backend then reports the composed op's).
+    fn linear_swiglu_act(
+        &self,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _m: usize,
+    ) -> Option<ActQuant> {
+        None
+    }
+
     fn embed(
         &self,
         ids: &[u32],
@@ -878,6 +902,43 @@ impl Backend for CudaBackend {
             self.kernels
                 .swiglu(src, rows, src_cols, gate, up, width, out)
         })
+    }
+
+    fn linear_swiglu(
+        &self,
+        x: &CudaBuffer,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        m: usize,
+        scratch: &mut CudaBuffer,
+    ) -> Result<()> {
+        check::linear(x.len, gate, gate.buf.len, out.len, m)?;
+        check::linear(x.len, up, up.buf.len, out.len, m)?;
+        if self.kernels.linear_swiglu_act(gate, up, m).is_some() {
+            let op = format!(
+                "linear_swiglu {} m={m} [{}x{}]",
+                gate.format.name(),
+                gate.rows,
+                gate.k
+            );
+            return self.timed(&op, || self.kernels.linear_swiglu(x, gate, up, out, m));
+        }
+        velox_core::backend::linear_swiglu_composed(self, x, gate, up, out, m, scratch)
+    }
+
+    fn linear_swiglu_act(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> ActQuant {
+        self.kernels
+            .linear_swiglu_act(gate, up, m)
+            .unwrap_or_else(|| match velox_core::backend::swiglu_pair(gate, up) {
+                Some((both, _, _)) => self.linear_act(&both, m),
+                None => self.linear_act(gate, m),
+            })
     }
 
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
