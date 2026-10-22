@@ -89,7 +89,30 @@ struct Args {
     int rows, m, k;
     int kt_per_split;  // stages per split-K slice
     float* y;          // [m, rows], or [splits, m, rows] partials
+    // Fused SwiGLU (pair != 0): rows are output rows; each warp's 16 tile rows are 8 gate rows
+    // (w from row_begin) and the matching 8 up rows (w2 from row_begin2), and
+    // y[t][r] = silu(gate . x_t) * (up . x_t). No split-K.
+    int pair;
+    const uint8_t* w2;
+    long long parent_rows2, row_begin2, scale_off2;
 };
+
+// Parent payload and row of shared tile row r (0..kBN) for block output rows from n0.
+struct TileRow {
+    const uint8_t* w;
+    long long row;
+    bool ok;
+    int second;
+};
+__device__ __forceinline__ TileRow tile_row(const Args& p, int n0, int r) {
+    if (!p.pair) {
+        const long long row = p.row_begin + n0 + r;
+        return {p.w, row, n0 + r < p.rows && row < p.parent_rows, 0};
+    }
+    const int e = (r & 15) >> 3, o = n0 + (r >> 4) * 8 + (r & 7);
+    const long long row = (e ? p.row_begin2 : p.row_begin) + o;
+    return {e ? p.w2 : p.w, row, o < p.rows && row < (e ? p.parent_rows2 : p.parent_rows), e};
+}
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -139,11 +162,11 @@ __device__ __forceinline__ void load_stage(Smem<NT>& s, const Args& p, int stage
     constexpr int kChunks = kRow / 16;
     for (int idx = t; idx < kBN * kChunks; idx += kThreads) {
         const int r = idx / kChunks, c = idx % kChunks;
-        const long long wrow = p.row_begin + n0 + r;
+        const TileRow tr = tile_row(p, n0, r);
         const long long blk = static_cast<long long>(kt) * kBlk + c / (kCode / 16);
-        const bool ok = wrow < p.parent_rows && blk < p.blocks;
+        const bool ok = tr.ok && blk < p.blocks;
         cp_async16(&s.b[stage][r * kStride + c * 16],
-                   p.w + (ok ? (wrow * p.blocks + kt * static_cast<long long>(kBlk)) * kCode + c * 16 : 0), ok);
+                   tr.w + (ok ? (tr.row * p.blocks + kt * static_cast<long long>(kBlk)) * kCode + c * 16 : 0), ok);
     }
 }
 
@@ -151,7 +174,7 @@ template <int NT>
 __global__ void __launch_bounds__(kThreads) skinny_iq3_kernel(Args p) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
     Smem<NT>& s = *reinterpret_cast<Smem<NT>*>(smem_raw);
-    const int n0 = blockIdx.x * kBN;
+    const int n0 = blockIdx.x * (p.pair ? kBN / 2 : kBN);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int stages = static_cast<int>((p.blocks + kBlk - 1) / kBlk);
     const int kt_begin = blockIdx.z * p.kt_per_split;
@@ -184,12 +207,13 @@ __global__ void __launch_bounds__(kThreads) skinny_iq3_kernel(Args p) {
     // A rows (and C rows) of this lane: g and g + 8 of the warp's 16.
     const int ar[2] = {warp * 16 + g, warp * 16 + 8 + g};
     long long drow[2];
+    const __half* dps[2];
 #pragma unroll
     for (int e = 0; e < 2; ++e) {
-        const long long wrow = p.row_begin + n0 + ar[e];
-        drow[e] = (wrow < p.parent_rows ? wrow : 0) * p.blocks;  // rows past the parent: output dropped
+        const TileRow tr = tile_row(p, n0, ar[e]);
+        drow[e] = (tr.ok ? tr.row : 0) * p.blocks;  // rows past the view: output dropped
+        dps[e] = reinterpret_cast<const __half*>(tr.w + (tr.second ? p.scale_off2 : p.scale_off));
     }
-    const __half* dp = reinterpret_cast<const __half*>(p.w + p.scale_off);
     // ldmatrix x4 over 8 token rows: matrix j covers K columns 8j..8j+7 of a 32-value chunk.
     const int b_row = lane & 7, b_col = (lane >> 3) * 8;
 
@@ -210,7 +234,7 @@ __global__ void __launch_bounds__(kThreads) skinny_iq3_kernel(Args p) {
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
                 sw[e] = *reinterpret_cast<const uint64_t*>(rowp[e] + 64 + 8 * q);
-                d[e] = __half2float(dp[drow[e] + blk0 + bk]);
+                d[e] = __half2float(dps[e][drow[e] + blk0 + bk]);
             }
 #pragma unroll
             for (int sb = 0; sb < 8; ++sb) {
@@ -258,6 +282,21 @@ __global__ void __launch_bounds__(kThreads) skinny_iq3_kernel(Args p) {
     }
     cp_wait<0>();
 
+    if (p.pair) {
+        // c0, c1: gate row, tokens 2q, 2q+1; c2, c3: the matching up row.
+        const int o = n0 + warp * 8 + g;
+        if (o < p.rows) {
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int t = nt * 8 + 2 * q + j;
+                    const float gv = acc[nt][j];
+                    if (t < p.m) y[static_cast<long long>(t) * p.rows + o] = gv / (1.0f + expf(-gv)) * acc[nt][2 + j];
+                }
+        }
+        return;
+    }
     // c0, c1: row g, tokens 2q, 2q+1; c2, c3: row g + 8.
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt)
@@ -321,8 +360,9 @@ int launch(Args p) {
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, skinny_iq3_kernel<NT>, kThreads, sizeof(Smem<NT>));
         per_sm = per_sm > 0 ? per_sm : 1;
     }
-    const long long blocks = (p.rows + kBN - 1) / kBN, stages = (p.blocks + kBlk - 1) / kBlk;
-    const int splits = pick_splits(blocks, stages, kSms * per_sm);
+    const int rows_per_block = p.pair ? kBN / 2 : kBN;
+    const long long blocks = (p.rows + rows_per_block - 1) / rows_per_block, stages = (p.blocks + kBlk - 1) / kBlk;
+    const int splits = p.pair ? 1 : pick_splits(blocks, stages, kSms * per_sm);
     p.kt_per_split = static_cast<int>((stages + splits - 1) / splits);
     float* y = p.y;
     if (splits > 1) {
@@ -339,25 +379,52 @@ int launch(Args p) {
 
 }  // namespace
 
-// y[m, rows] = bf16(x) . W[row_begin.., :]^T for an iq3_xxs_planar_v1 parent [parent_rows, k] and
-// 1 <= m <= 16. Returns VELOX_ERR_UNSUPPORTED for anything else.
-VELOX_API int velox_5060_linear_skinny_iq3(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
-                                           long long row_begin, int rows, float* y) {
-    if (m < 1 || m > 16 || rows <= 0 || k % 256 != 0 || reinterpret_cast<uintptr_t>(w) % 16 != 0)
+namespace {
+int run(const float* x, Args p, int m, long long k) {
+    if (m < 1 || m > 16 || p.rows <= 0 || k % 256 != 0 || reinterpret_cast<uintptr_t>(p.w) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(p.w2) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
-    Args p{};
-    p.w = w;
-    p.parent_rows = parent_rows;
-    p.row_begin = row_begin;
     p.blocks = k / 256;
-    p.scale_off = align256(parent_rows * p.blocks * kCode);
-    p.rows = rows;
+    p.scale_off = align256(p.parent_rows * p.blocks * kCode);
+    p.scale_off2 = align256(p.parent_rows2 * p.blocks * kCode);
     p.m = m;
     p.k = static_cast<int>(k);
-    p.y = y;
     auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * k * 2));
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16_perm<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, m, p.k, xb);
     p.x = xb;
     return m <= 8 ? launch<1>(p) : launch<2>(p);
+}
+}  // namespace
+
+// y[m, rows] = bf16(x) . W[row_begin.., :]^T for an iq3_xxs_planar_v1 parent [parent_rows, k] and
+// 1 <= m <= 16. Returns VELOX_ERR_UNSUPPORTED for anything else.
+VELOX_API int velox_5060_linear_skinny_iq3(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
+                                           long long row_begin, int rows, float* y) {
+    Args p{};
+    p.w = p.w2 = w;
+    p.parent_rows = p.parent_rows2 = parent_rows;
+    p.row_begin = p.row_begin2 = row_begin;
+    p.rows = rows;
+    p.y = y;
+    return run(x, p, m, k);
+}
+
+// out[m, rows] = silu(bf16(x) . G^T) * (bf16(x) . U^T) for `rows` gate rows of the parent at `w`
+// from `gate_begin` and as many up rows of the parent at `up_w` from `up_begin` (same k).
+VELOX_API int velox_5060_linear_swiglu_skinny_iq3(const float* x, int m, const uint8_t* w, long long parent_rows,
+                                                  long long gate_begin, const uint8_t* up_w,
+                                                  long long up_parent_rows, long long up_begin, long long k, int rows,
+                                                  float* out) {
+    Args p{};
+    p.pair = 1;
+    p.w = w;
+    p.parent_rows = parent_rows;
+    p.row_begin = gate_begin;
+    p.w2 = up_w;
+    p.parent_rows2 = up_parent_rows;
+    p.row_begin2 = up_begin;
+    p.rows = rows;
+    p.y = out;
+    return run(x, p, m, k);
 }

@@ -108,19 +108,28 @@ __device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
 // compiler unroll the block loop and issue loads further ahead; 0 reads it from k.
 // XT: the activations' type. f32 (converted to bf16 in registers) saves the conversion launch
 // and costs the same for 1..2 tokens; bf16 (pre-converted) is faster for more tokens.
-template <int W, int MT, int NT, int KB, typename XT>
+// PAIR: a fused SwiGLU projection. Each 16-row tile is 8 gate rows (from w) and the matching 8 up
+// rows (from up.w, possibly another parent); out[t][r] = silu(gate . x_t) * (up . x_t).
+struct Up {
+    const uint8_t* w;
+    long long parent_rows, row_begin;
+};
+
+template <int W, int MT, int NT, int KB, typename XT, bool PAIR>
 __global__ void __launch_bounds__(W * 32)
 iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows, int k_rt,
-                  long long row_begin, int rows, int m, float* __restrict__ y) {
+                  long long row_begin, int rows, int m, float* __restrict__ y, Up up) {
     const int k = KB ? KB * 256 : k_rt;
     __shared__ Tables tables;
     __shared__ float4 partial[W > 1 ? W * NT * 32 : 1];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int gid = lane >> 2, q = lane & 3;
     const int blocks = KB ? KB : k / 256;
-    const int r0 = blockIdx.x * 16 * MT;
-    const uint8_t* codes = w;
-    const __half* dplane = reinterpret_cast<const __half*>(w + (parent_rows * blocks * 96 + 255) / 256 * 256);
+    constexpr int kTileRows = PAIR ? 8 : 16;  // output rows per 16-row MMA tile
+    const int r0 = blockIdx.x * kTileRows * MT;
+    auto dplane_of = [&](const uint8_t* base, long long n) {
+        return reinterpret_cast<const __half*>(base + (n * blocks * 96 + 255) / 256 * 256);
+    };
 
     const uint8_t* row_codes[MT][2];
     const __half* row_d[MT][2];
@@ -128,10 +137,13 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
     for (int mi = 0; mi < MT; ++mi)
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
-            const int r = r0 + mi * 16 + gid + 8 * e;
-            const long long row = row_begin + (r < rows ? r : 0);  // rows past the view: output dropped
-            row_codes[mi][e] = codes + row * blocks * 96;
-            row_d[mi][e] = dplane + row * blocks;
+            const int r = PAIR ? r0 + mi * 8 + gid : r0 + mi * 16 + gid + 8 * e;
+            const int rr = r < rows ? r : 0;  // rows past the view: output dropped
+            const bool second = PAIR && e == 1;
+            const uint8_t* base = second ? up.w : w;
+            const long long row = (second ? up.row_begin : row_begin) + rr;
+            row_codes[mi][e] = base + row * blocks * 96;
+            row_d[mi][e] = dplane_of(base, second ? up.parent_rows : parent_rows) + row * blocks;
         }
     auto load = [&](int b, Raw (&raw)[MT][2]) {
 #pragma unroll
@@ -279,6 +291,21 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
 #pragma unroll
                 for (int j = 0; j < 4; ++j) c[ni][j] = acc[mi][ni][j];
         }
+        if (PAIR) {
+            // c0, c1: gate row, tokens 2q, 2q+1; c2, c3: the matching up row.
+            const int r = r0 + mi * 8 + gid;
+            if (r < rows) {
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni)
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        const int t = ni * 8 + 2 * q + j;
+                        const float g = c[ni][j];
+                        if (t < m) y[static_cast<long long>(t) * rows + r] = g / (1.0f + expf(-g)) * c[ni][2 + j];
+                    }
+            }
+            continue;
+        }
 #pragma unroll
         for (int ni = 0; ni < NT; ++ni)
 #pragma unroll
@@ -303,18 +330,43 @@ __global__ void to_bf16(const float* __restrict__ x, long long n, __nv_bfloat16*
 
 VeloxScratch g_x;
 
-template <int W, int MT, int NT, int KB, typename XT>
-int launch_kb(const XT* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y) {
-    const unsigned grid = static_cast<unsigned>((rows + 16 * MT - 1) / (16 * MT));
-    iq3_direct_kernel<W, MT, NT, KB, XT><<<grid, W * 32>>>(x, w, n, k, rb, rows, m, y);
+template <int W, int MT, int NT, int KB, typename XT, bool PAIR>
+int launch_kb(const XT* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y, Up up) {
+    constexpr int kTileRows = (PAIR ? 8 : 16) * MT;
+    const unsigned grid = static_cast<unsigned>((rows + kTileRows - 1) / kTileRows);
+    iq3_direct_kernel<W, MT, NT, KB, XT, PAIR><<<grid, W * 32>>>(x, w, n, k, rb, rows, m, y, up);
     return velox_launch_status();
 }
 
-template <int W, int MT, int NT, typename XT>
-int launch(const XT* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y) {
-    if (k == 5120) return launch_kb<W, MT, NT, 20>(x, w, n, k, rb, rows, m, y);
-    if (k == 17408) return launch_kb<W, MT, NT, 68>(x, w, n, k, rb, rows, m, y);
-    return launch_kb<W, MT, NT, 0>(x, w, n, k, rb, rows, m, y);
+template <int W, int MT, int NT, bool PAIR, typename XT>
+int launch(const XT* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y, Up up) {
+    if (k == 5120) return launch_kb<W, MT, NT, 20, XT, PAIR>(x, w, n, k, rb, rows, m, y, up);
+    if (k == 17408) return launch_kb<W, MT, NT, 68, XT, PAIR>(x, w, n, k, rb, rows, m, y, up);
+    return launch_kb<W, MT, NT, 0, XT, PAIR>(x, w, n, k, rb, rows, m, y, up);
+}
+
+template <bool PAIR>
+int run(const float* x, int m, const uint8_t* w, long long parent_rows, long long k, long long row_begin, int rows,
+        float* y, Up up) {
+    if (m < 1 || m > 16 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(w) % 16 != 0 || reinterpret_cast<uintptr_t>(up.w) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    const int ki = static_cast<int>(k);
+    const bool long_rows = k / 256 > IQ3_DIRECT_LONG_BLOCKS;
+    if (m <= 2) {
+        return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 1, PAIR>(x, w, parent_rows, ki, row_begin, rows, m, y, up)
+                         : launch<IQ3_DIRECT_W_SHORT, 1, 1, PAIR>(x, w, parent_rows, ki, row_begin, rows, m, y, up);
+    }
+    auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * k * 2));
+    if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
+    to_bf16<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, static_cast<long long>(m) * k, xb);
+    const __nv_bfloat16* x16 = xb;
+    if (m <= 8) {
+        return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 1, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up)
+                         : launch<IQ3_DIRECT_W_SHORT, 1, 1, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up);
+    }
+    return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 2, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up)
+                     : launch<IQ3_DIRECT_W_SHORT, 2, 2, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up);
 }
 
 }  // namespace
@@ -325,23 +377,14 @@ int launch(const XT* x, const uint8_t* w, long long n, int k, long long rb, int 
 // more are converted to bf16 first. Returns VELOX_ERR_UNSUPPORTED for anything else.
 VELOX_API int velox_5060_linear_iq3_direct(const float* x, int m, const uint8_t* w, long long parent_rows,
                                            long long k, long long row_begin, int rows, float* y) {
-    if (m < 1 || m > 16 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
-        reinterpret_cast<uintptr_t>(w) % 16 != 0)
-        return VELOX_ERR_UNSUPPORTED;
-    const int ki = static_cast<int>(k);
-    const bool long_rows = k / 256 > IQ3_DIRECT_LONG_BLOCKS;
-    if (m <= 2) {
-        return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 1>(x, w, parent_rows, ki, row_begin, rows, m, y)
-                         : launch<IQ3_DIRECT_W_SHORT, 1, 1>(x, w, parent_rows, ki, row_begin, rows, m, y);
-    }
-    auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * k * 2));
-    if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
-    to_bf16<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, static_cast<long long>(m) * k, xb);
-    const __nv_bfloat16* x16 = xb;
-    if (m <= 8) {
-        return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 1>(x16, w, parent_rows, ki, row_begin, rows, m, y)
-                         : launch<IQ3_DIRECT_W_SHORT, 1, 1>(x16, w, parent_rows, ki, row_begin, rows, m, y);
-    }
-    return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 2>(x16, w, parent_rows, ki, row_begin, rows, m, y)
-                     : launch<IQ3_DIRECT_W_SHORT, 2, 2>(x16, w, parent_rows, ki, row_begin, rows, m, y);
+    return run<false>(x, m, w, parent_rows, k, row_begin, rows, y, Up{w, parent_rows, row_begin});
+}
+
+// out[m, rows] = silu(bf16(x) . G^T) * (bf16(x) . U^T) for `rows` gate rows of the parent at `w`
+// from `gate_begin` and as many up rows of the parent at `up_w` from `up_begin` (same k).
+VELOX_API int velox_5060_linear_swiglu_iq3_direct(const float* x, int m, const uint8_t* w, long long parent_rows,
+                                                  long long gate_begin, const uint8_t* up_w,
+                                                  long long up_parent_rows, long long up_begin, long long k, int rows,
+                                                  float* out) {
+    return run<true>(x, m, w, parent_rows, k, gate_begin, rows, out, Up{up_w, up_parent_rows, up_begin});
 }

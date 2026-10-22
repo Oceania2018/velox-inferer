@@ -77,6 +77,32 @@ extern "C" {
         format: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_linear_swiglu_iq3_direct(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        gate_begin: i64,
+        up_w: *const u8,
+        up_parent_rows: i64,
+        up_begin: i64,
+        k: i64,
+        rows: i32,
+        out: *mut f32,
+    ) -> i32;
+    fn velox_5060_linear_swiglu_skinny_iq3(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        gate_begin: i64,
+        up_w: *const u8,
+        up_parent_rows: i64,
+        up_begin: i64,
+        k: i64,
+        rows: i32,
+        out: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_nvfp4_sliced(
         x: *const f32,
         m: i32,
@@ -274,7 +300,7 @@ fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<(
 
 impl CudaKernels for Rtx5060Kernels {
     fn native_ops(&self) -> &'static [Op] {
-        &[Op::MatMul, Op::Linear, Op::Attention, Op::AttentionFull]
+        &[Op::MatMul, Op::Linear, Op::Attention, Op::AttentionFull, Op::LinearSwiglu]
     }
 
     // Shapes were validated by CudaBackend before these are called.
@@ -416,6 +442,59 @@ impl CudaKernels for Rtx5060Kernels {
             }
             _ => ActQuant::Exact,
         }
+    }
+
+    fn linear_swiglu_act(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> Option<ActQuant> {
+        // IQ3_XXS gate / up (the dense MLP) at decode and verify widths: the IQ3 kernels with
+        // gate and up rows paired in each MMA tile and SwiGLU in the epilogue.
+        let fused = gate.format == WeightFormat::Iq3Xxs
+            && up.format == WeightFormat::Iq3Xxs
+            && gate.k == up.k
+            && gate.rows == up.rows
+            && (1..=SKINNY16_MAX_M).contains(&m);
+        fused.then_some(ActQuant::Bf16)
+    }
+
+    fn linear_swiglu(
+        &self,
+        x: &CudaBuffer,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if self.linear_swiglu_act(gate, up, m).is_none() {
+            return Err(Error::Unsupported("linear_swiglu shape".into()));
+        }
+        let launch = if iq3_direct(gate, m) {
+            velox_5060_linear_swiglu_iq3_direct
+        } else {
+            velox_5060_linear_swiglu_skinny_iq3
+        };
+        // SAFETY: both views and the output were validated by CudaBackend (check::linear).
+        status(
+            unsafe {
+                launch(
+                    x.as_ptr(),
+                    to_i32("m", m)?,
+                    gate.buf.as_ptr().cast(),
+                    gate.parent_rows as i64,
+                    gate.row_begin as i64,
+                    up.buf.as_ptr().cast(),
+                    up.parent_rows as i64,
+                    up.row_begin as i64,
+                    gate.k as i64,
+                    to_i32("rows", gate.rows)?,
+                    out.as_mut_ptr(),
+                )
+            },
+            "rtx5060 linear_swiglu iq3",
+        )
     }
 
     fn linear(&self, x: &CudaBuffer, w: &WeightView<'_, CudaBuffer>, y: &mut CudaBuffer, m: usize) -> Result<()> {
