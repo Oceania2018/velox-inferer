@@ -229,7 +229,10 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         const uint2 g = tables.grid[(pair >> (8 * h)) & 0xffu];
-                        const uint2 mk = tables.sign_mask[(s8 >> (4 * h)) & 15u];
+                        // bf16 sign bits of the nibble's four values, from ALU ops: the kernel is
+                        // bound by the shared-memory queue (MIO), not by issue.
+                        const uint32_t n = s8 >> (4 * h);
+                        const uint2 mk = make_uint2(((n & 1u) << 15) | ((n & 2u) << 30), ((n & 4u) << 13) | ((n & 8u) << 28));
                         f[mi][e][h] = make_uint2(g.x ^ mk.x, g.y ^ mk.y);
                     }
                 }

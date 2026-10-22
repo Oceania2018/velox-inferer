@@ -339,8 +339,8 @@ fn gemv_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
 
 /// Which IQ3_XXS kernel serves a 16-token block of `m` tokens: the register-direct one (codes
 /// straight to registers) or the shared-memory staged one. Measured (us, gate/up [34816,5120] /
-/// down [5120,17408]): m=1 205 / 100 direct vs 220 / 116 staged; m=8 247 / 108 vs 214 / 122;
-/// m=16 279 / 159 vs 228 / 136.
+/// down [5120,17408]): m=1 207 / 99 direct vs 215 / 118 staged; m=8 235 / 110 vs 213 / 120;
+/// m=16 238 / 151 vs 239 / 137.
 fn iq3_direct(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     let blocks = w.k / 256;
     m.min(SKINNY16_MAX_M) <= 2 || (blocks > 32 && m.min(SKINNY16_MAX_M) <= 8)
