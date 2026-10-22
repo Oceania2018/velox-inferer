@@ -130,6 +130,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
                 draft_len,
                 chunk,
                 &fe,
+                on_phase,
             )?;
             continue;
         }
@@ -148,6 +149,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
                 drafts,
                 chunk,
                 &fe,
+                on_phase,
             )?;
             continue;
         }
@@ -282,6 +284,7 @@ fn mtp_generate<B: Backend>(
     draft_len: usize,
     chunk: usize,
     fe: &Frontend,
+    on_phase: &mut dyn FnMut(&str),
 ) -> Result<()> {
     use velox_engine::spec::MtpDrafter;
     let limit = fe.public_vocab;
@@ -293,6 +296,7 @@ fn mtp_generate<B: Backend>(
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;
     let prefill = t0.elapsed().as_secs_f64();
+    on_phase("prefill");
     let t1 = Instant::now();
     let mut out = vec![c];
     let mut drafts = dr.draft(b, model, s, ws, 0, &[], c, limit)?;
@@ -327,6 +331,7 @@ fn mtp_generate<B: Backend>(
         drafts = dr.draft(b, model, s, ws, p, &window[1..keep], c, limit)?;
     }
     let decode = t1.elapsed().as_secs_f64();
+    on_phase("decode");
     if out.last().is_some_and(|&t| fe.is_eos(t)) {
         out.pop();
     }
@@ -357,6 +362,7 @@ fn dflash_generate<B: Backend>(
     drafts_per_block: usize,
     chunk: usize,
     fe: &Frontend,
+    on_phase: &mut dyn FnMut(&str),
 ) -> Result<()> {
     use velox_engine::spec::DFlashDrafter;
     use velox_models::qwen3_5::DFlashModel;
@@ -373,6 +379,7 @@ fn dflash_generate<B: Backend>(
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;
     let prefill = t0.elapsed().as_secs_f64();
+    on_phase("prefill");
     let t1 = Instant::now();
     let mut out = vec![c];
     let (mut rounds, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
@@ -428,6 +435,7 @@ fn dflash_generate<B: Backend>(
         (row, kept) = (p, keep);
     }
     let decode = t1.elapsed().as_secs_f64();
+    on_phase("decode");
     if out.last().is_some_and(|&t| fe.is_eos(t)) {
         out.pop();
     }
