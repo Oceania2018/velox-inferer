@@ -235,6 +235,12 @@ impl<B: Backend> Session<B> {
         })
     }
 
+    /// Backs rows `0..rows` (with the margin) now, from the pool when there is one.
+    pub fn reserve_kv(&mut self, b: &B, rows: usize) -> Result<()> {
+        let end = self.kv_sets_for(rows);
+        self.back_chunks(b, 0, end)
+    }
+
     /// Paged caches: (chunks in one set, rows one set covers).
     pub fn kv_set_shape(&self) -> Option<(usize, usize)> {
         self.paging

@@ -108,8 +108,9 @@ where
             None => None,
             Some(_) => Some(a.parse::<usize>("vram-budget-mib", 0)? << 20),
         },
-        // --graph-mib N (default 1024): device memory recorded CUDA graphs may hold.
-        graph_budget: a.parse::<usize>("graph-mib", 1024)? << 20,
+        // --graph-mib N (default 256): device memory recorded CUDA graphs may hold (a 6-way
+        // stress run of production sessions recorded 129 graphs in 0.15 GB).
+        graph_budget: a.parse::<usize>("graph-mib", 256)? << 20,
         // --ctx-lrfu-lambda F: LRFU decay per request of that store (0: LRU).
         lrfu_lambda: a.parse("ctx-lrfu-lambda", 0.1)?,
         // --disk-context-mib N (default 0: off) and --disk-context-dir DIR: NVMe tier below RAM.
