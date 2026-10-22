@@ -99,6 +99,13 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// A 16-byte read-only load the compiler keeps where it is issued (see the activation loads).
+__device__ __forceinline__ uint4 ld_nc4(const uint8_t* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
 __device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
     const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
     return *reinterpret_cast<const uint32_t*>(&v);
@@ -115,11 +122,19 @@ struct Up {
     long long parent_rows, row_begin;
 };
 
+// Short rows (gate/up, K = 5120: at most IQ3_DIRECT_LONG_BLOCKS K blocks) run with fewer warps, a
+// rolled K loop and table sign masks; long rows (down) with more warps, unrolled, ALU sign masks.
+__host__ __device__ constexpr bool short_rows(int kb) { return kb != 0 && kb <= IQ3_DIRECT_LONG_BLOCKS; }
+
+// Short rows declare one block per SM: ptxas then keeps the whole block's loads in flight (141
+// registers) instead of trimming to 72 for occupancy, which serialized them (gate/up pair m=8:
+// 202 -> 184 us). Long rows are fastest at the default.
 template <int W, int MT, int NT, int KB, typename XT, bool PAIR>
-__global__ void __launch_bounds__(W * 32)
+__global__ void __launch_bounds__(W * 32, short_rows(KB) ? 1 : 2)
 iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows, int k_rt,
                   long long row_begin, int rows, int m, float* __restrict__ y, Up up) {
     const int k = KB ? KB * 256 : k_rt;
+    constexpr bool kShort = short_rows(KB);
     __shared__ Tables tables;
     __shared__ float4 partial[W > 1 ? W * NT * 32 : 1];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -177,8 +192,8 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
 #pragma unroll
         for (int ni = 0; ni < NT; ++ni) acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
 
-#pragma unroll
-    for (int b = warp; b < blocks; b += W) {
+    // One K block of this warp: contract `cur`, prefetch the next into `next`.
+    auto step = [&](int b) {
         const bool more = b + W < blocks;
         if (more) load(b + W, next);
         // The quad's eight sub-block scales: lane j's top sign byte holds ls of 2j (low), 2j+1.
@@ -195,6 +210,18 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
                 scales[mi][e] = s;
                 signs[mi][e] = (static_cast<uint64_t>(cur[mi][e].signs.y) << 32) | cur[mi][e].signs.x;
             }
+        // The block's activations for all 8 sub-blocks, issued before any MMA: volatile loads, as
+        // whole-program compilation otherwise sinks each to its sub-block and the warp waits on 8
+        // L2 round trips per block (gate/up pair m=8: 208 -> 183 us).
+        constexpr int kXW = sizeof(XT) / 2;  // 16-byte chunks per lane per sub-block
+        uint4 xr[8][NT][kXW];
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni)
+#pragma unroll
+                for (int c = 0; c < kXW; ++c)
+                    if (valid[ni]) xr[s][ni][c] = ld_nc4(reinterpret_cast<const uint8_t*>(xrow[ni] + b * 256 + s * 32) + 16 * c);
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             // Activations: values 8q..8q+7 of sub-block s for each token tile, as bf16 pairs.
@@ -203,12 +230,12 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
             for (int ni = 0; ni < NT; ++ni) {
                 if (valid[ni]) {
                     if constexpr (sizeof(XT) == 4) {
-                        const float4* xp = reinterpret_cast<const float4*>(xrow[ni] + b * 256 + s * 32);
-                        const float4 a = __ldg(xp), c = __ldg(xp + 1);
+                        const float4 a = *reinterpret_cast<const float4*>(&xr[s][ni][0]);
+                        const float4 c = *reinterpret_cast<const float4*>(&xr[s][ni][1]);
                         xb[ni][0] = bf16x2(a.x, a.y), xb[ni][1] = bf16x2(a.z, a.w);
                         xb[ni][2] = bf16x2(c.x, c.y), xb[ni][3] = bf16x2(c.z, c.w);
                     } else {
-                        const uint4 v = __ldg(reinterpret_cast<const uint4*>(xrow[ni] + b * 256 + s * 32));
+                        const uint4 v = xr[s][ni][0];
                         xb[ni][0] = v.x, xb[ni][1] = v.y, xb[ni][2] = v.z, xb[ni][3] = v.w;
                     }
                 } else {
@@ -229,10 +256,17 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         const uint2 g = tables.grid[(pair >> (8 * h)) & 0xffu];
-                        // bf16 sign bits of the nibble's four values, from ALU ops: the kernel is
-                        // bound by the shared-memory queue (MIO), not by issue.
-                        const uint32_t n = s8 >> (4 * h);
-                        const uint2 mk = make_uint2(((n & 1u) << 15) | ((n & 2u) << 30), ((n & 4u) << 13) | ((n & 8u) << 28));
+                        // bf16 sign bits of the nibble's four values: a table lookup for short
+                        // rows, ALU ops for long ones (8 warps, unrolled: bound by the shared-memory
+                        // queue, not by issue). Measured (gate/up pair, down) at m=8: table 183 vs
+                        // ALU 195 us, ALU 85 vs table 107 us.
+                        uint2 mk;
+                        if constexpr (kShort) {
+                            mk = tables.sign_mask[(s8 >> (4 * h)) & 15u];
+                        } else {
+                            const uint32_t n = s8 >> (4 * h);
+                            mk = make_uint2(((n & 1u) << 15) | ((n & 2u) << 30), ((n & 4u) << 13) | ((n & 8u) << 28));
+                        }
                         f[mi][e][h] = make_uint2(g.x ^ mk.x, g.y ^ mk.y);
                     }
                 }
@@ -266,6 +300,15 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) cur[mi][0] = next[mi][0], cur[mi][1] = next[mi][1];
         }
+    };
+    // Long rows (down) run faster fully unrolled, gate/up (10 blocks per warp) rolled: gate/up
+    // pair m=8 183 vs 186 us, down m=8 104 vs 113 us.
+    if constexpr (kShort) {
+#pragma unroll 1
+        for (int b = warp; b < blocks; b += W) step(b);
+    } else {
+#pragma unroll
+        for (int b = warp; b < blocks; b += W) step(b);
     }
 
     // Cross-warp K reduction, then c0, c1: row gid, tokens 2q, 2q+1; c2, c3: row gid + 8.

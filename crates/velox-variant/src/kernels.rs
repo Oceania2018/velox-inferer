@@ -338,12 +338,11 @@ fn gemv_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
 }
 
 /// Which IQ3_XXS kernel serves a 16-token block of `m` tokens: the register-direct one (codes
-/// straight to registers) or the shared-memory staged one. Measured (us, gate/up [34816,5120] /
-/// down [5120,17408]): m=1 207 / 99 direct vs 215 / 118 staged; m=8 235 / 110 vs 213 / 120;
-/// m=16 238 / 151 vs 239 / 137.
-fn iq3_direct(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
-    let blocks = w.k / 256;
-    m.min(SKINNY16_MAX_M) <= 2 || (blocks > 32 && m.min(SKINNY16_MAX_M) <= 8)
+/// straight to registers) or the shared-memory staged one. Up to 8 tokens the direct one is faster
+/// in the model (verify m=8, nsys: gate/up pair 200 us staged; down 99 vs 120 us); at 16 the staged
+/// one (gate/up 239 vs 227, down 151 vs 137 us, bench-linear).
+fn iq3_direct(m: usize) -> bool {
+    m.min(SKINNY16_MAX_M) <= 8
 }
 
 /// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
@@ -616,7 +615,7 @@ impl CudaKernels for Rtx5060Kernels {
         let launch = match self.linear_swiglu_act(gate, up, m) {
             None => return Err(Error::Unsupported("linear_swiglu shape".into())),
             Some(ActQuant::Int8G256) => velox_5060_linear_swiglu_iq3_q8,
-            Some(_) if iq3_direct(gate, m) => velox_5060_linear_swiglu_iq3_direct,
+            Some(_) if iq3_direct(m) => velox_5060_linear_swiglu_iq3_direct,
             Some(_) => velox_5060_linear_swiglu_skinny_iq3,
         };
         // SAFETY: both views and the output were validated by CudaBackend (check::linear).
@@ -756,7 +755,7 @@ impl CudaKernels for Rtx5060Kernels {
                     );
                 }
                 if skinny_iq3(w, m) {
-                    let direct = iq3_direct(w, m);
+                    let direct = iq3_direct(m);
                     // The kernel takes up to 16 rows; larger m runs in blocks.
                     for r0 in (0..m).step_by(SKINNY16_MAX_M) {
                         let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
