@@ -23,7 +23,7 @@ pub use dflash::{
     DRAFT_PAGE_ROWS,
 };
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
-pub use paging::{KvChunkSet, KvShare};
+pub use paging::{KvChunkSet, KvPool, KvShare};
 pub use vision::{Qwen35Vision, VisionConfig};
 pub use weights::{DenseFfn, ExpertBank, Ffn, Layer, Mixer, MoeFfn, TextWeights, WDesc};
 
