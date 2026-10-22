@@ -193,6 +193,16 @@ extern "C" {
         bits: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_linear_nvfp4_mma(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_iq3_q8(
         x: *const f32,
         m: i32,
@@ -367,6 +377,16 @@ fn q8_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     }
 }
 
+/// NVFP4 views the FP4-activation path does not serve (A16-only, or not 128-row aligned) from
+/// this many tokens: the tiled bf16 tensor-core kernel (ninfer's prefill kernel and schedule).
+/// Below, the sliced-K kernel in 16-token blocks.
+const NVFP4_MMA_MIN_M: usize = 33;
+
+fn nvfp4_mma(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    let a4 = matches!(w.act, ActPolicy::AllowA4 { .. }) && w.row_begin % 128 == 0 && w.k % 128 == 0;
+    w.format == WeightFormat::Nvfp4 && w.k % 64 == 0 && m >= NVFP4_MMA_MIN_M && !a4
+}
+
 pub struct Rtx5060Kernels;
 
 fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -535,6 +555,9 @@ impl CudaKernels for Rtx5060Kernels {
         if gemv_format(w, m).is_some() {
             return ActQuant::Exact;
         }
+        if nvfp4_mma(w, m) {
+            return ActQuant::Bf16;
+        }
         if skinny_iq3(w, m) || (m == 1 && skinny16_format(w, m).is_some()) {
             return ActQuant::Bf16;
         }
@@ -700,6 +723,23 @@ impl CudaKernels for Rtx5060Kernels {
                 None => Err(Error::Unsupported("int8 linear shape".into())),
             },
             ActQuant::Bf16 => {
+                if nvfp4_mma(w, m) {
+                    return status(
+                        unsafe {
+                            velox_5060_linear_nvfp4_mma(
+                                x.as_ptr(),
+                                mi,
+                                wp,
+                                pr,
+                                k,
+                                rb,
+                                rows,
+                                y.as_mut_ptr(),
+                            )
+                        },
+                        "rtx5060 linear nvfp4 mma",
+                    );
+                }
                 if skinny_iq3(w, m) && m > SKINNY16_MAX_M {
                     // Prefill: the staged kernel tiles the tokens itself (64 per weight pass).
                     return status(

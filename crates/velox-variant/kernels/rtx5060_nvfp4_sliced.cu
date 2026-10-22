@@ -1,5 +1,5 @@
-// RTX 5060 Ti NVFP4 linear (block_scale_k16_m128x4_v1) for 1..16 tokens with bf16 activations:
-// sliced-K tensor-core kernel.
+// RTX 5060 Ti NVFP4 linear (block_scale_k16_m128x4_v1) with bf16 activations: a sliced-K
+// tensor-core kernel for 1..16 tokens and a tiled one for prefill.
 //
 // Adapted from ninfer's nvfp4_a16_sliced_k_mma_kernel (src/ops/linear/nvfp4/
 // nvfp4_a16_sliced_k_mma.cuh, Apache-2.0), with ninfer's launch shape for up to 16 tokens: a block
@@ -46,6 +46,11 @@ __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_grou
 template <int N>
 __device__ __forceinline__ void cp_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+__device__ __forceinline__ void ldsm_x4(uint32_t (&a)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(smem_u32(p)));
 }
 __device__ __forceinline__ void ldsm_x2(uint32_t& b0, uint32_t& b1, const void* p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(b0), "=r"(b1) : "r"(smem_u32(p)));
@@ -178,6 +183,125 @@ nvfp4_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restri
     }
 }
 
+// Prefill: adapted from ninfer's nvfp4_a16_mma_kernel (src/ops/linear/nvfp4/nvfp4_a16_mma.cuh,
+// Apache-2.0) with its schedule on this card (64 rows x 64 tokens x K 64 per block, warps of WR
+// rows x 16 tokens, two activation stages, four blocks per SM). Each K tile's codes and scales are
+// staged, widened once to exact bf16 weights in shared memory, then served to every warp through
+// ldmatrix + mma.m16n8k16; 8-value chunks are XOR-swizzled by row.
+constexpr int kMmaBM = 64, kMmaBN = 64, kMmaBK = 64, kMmaWT = 16;
+constexpr int kMmaSmem = kMmaBM * kMmaBK * 2 + 2 * kMmaBN * kMmaBK * 2 + kMmaBM * (kMmaBK / 2 + kMmaBK / 16);
+
+template <int WR>
+__global__ void __launch_bounds__((kMmaBM / WR) * (kMmaBN / kMmaWT) * 32, 4)
+nvfp4_mma_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows, int k,
+                 long long view_begin, int rows, int m, float alpha, float* __restrict__ y) {
+    constexpr int kWarpsT = kMmaBN / kMmaWT, kWarps = (kMmaBM / WR) * kWarpsT, kThr = kWarps * 32;
+    constexpr int MT = WR / 16, NT = kMmaWT / 8, KSUB = kMmaBK / 16;
+    extern __shared__ __align__(16) unsigned char smem[];
+    auto* ws = reinterpret_cast<__nv_bfloat16*>(smem);                // [BM][BK] widened weights
+    auto* xs = ws + kMmaBM * kMmaBK;                                   // [2][BN][BK] activations
+    auto* cs = reinterpret_cast<uint8_t*>(xs + 2 * kMmaBN * kMmaBK);  // [BM][BK / 2] codes
+    auto* ss = cs + kMmaBM * (kMmaBK / 2);                             // [BM][BK / 16] scales
+    const uint8_t* codes = w;
+    const uint8_t* scales = w + (parent_rows * k / 2 + 255) / 256 * 256;
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, lid = lane & 3;
+    const int wm = warp / kWarpsT, wn = warp % kWarpsT;
+    const int r0 = blockIdx.x * kMmaBM, t0 = blockIdx.y * kMmaBN;
+
+    auto stage_x = [&](int st, int kt) {
+        for (int item = tid; item < kMmaBN * (kMmaBK / 8); item += kThr) {
+            const int lt = item / (kMmaBK / 8), kk = (item % (kMmaBK / 8)) * 8, t = t0 + lt;
+            const bool ok = t < m;
+            cp_async<16>(&xs[st * kMmaBN * kMmaBK + lt * kMmaBK + swz(lt, kk)],
+                         x + (ok ? static_cast<long long>(t) * k + kt * kMmaBK + kk : 0), ok);
+        }
+    };
+    // Rows past the view read its first row; their outputs are dropped.
+    auto parent = [&](int r) { return view_begin + (r0 + r < rows ? r0 + r : 0); };
+    auto stage_w = [&](int kt) {
+        for (int item = tid; item < kMmaBM * (kMmaBK / 32); item += kThr) {
+            const int r = item / (kMmaBK / 32), c = item % (kMmaBK / 32);
+            cp_async<16>(cs + r * (kMmaBK / 2) + c * 16, codes + parent(r) * (k / 2) + kt * kMmaBK / 2 + c * 16, true);
+        }
+        for (int item = tid; item < kMmaBM * (kMmaBK / 64); item += kThr) {
+            const int r = item / (kMmaBK / 64), q = item % (kMmaBK / 64);
+            cp_async<4>(ss + r * (kMmaBK / 16) + q * 4, scales + scale_offset(parent(r), kt * kMmaBK / 16 + q * 4, k),
+                        true);
+        }
+    };
+    auto widen = [&]() {
+        const int half = lane >> 4, hl = lane & 15;
+        for (int pr = warp * 2; pr < kMmaBM; pr += kWarps * 2) {
+            const int r = pr + half;
+#pragma unroll
+            for (int c32 = 0; c32 < kMmaBK; c32 += 32) {
+                const int c = c32 + hl * 2;
+                *reinterpret_cast<uint32_t*>(&ws[r * kMmaBK + swz(r, c)]) =
+                    scaled_pair(cs[r * (kMmaBK / 2) + c / 2], ss[r * (kMmaBK / 16) + c / 16]);
+            }
+        }
+    };
+
+    float acc[MT][NT][4] = {};
+    const int am = lane >> 3, a_row = (lane & 7) + ((am & 1) << 3), a_col = (am >> 1) << 3;
+    const int b_row = lane & 7, b_col = ((lane >> 3) & 1) << 3;
+    stage_x(0, 0);
+    stage_w(0);
+    cp_commit();
+    const int tiles = k / kMmaBK;
+#pragma unroll 1
+    for (int kt = 0; kt < tiles; ++kt) {
+        const int st = kt & 1;
+        cp_wait<0>();
+        __syncthreads();
+        widen();
+        __syncthreads();
+        if (kt + 1 < tiles) {
+            stage_x(st ^ 1, kt + 1);
+            stage_w(kt + 1);
+            cp_commit();
+        }
+#pragma unroll
+        for (int ks = 0; ks < KSUB; ++ks) {
+            uint32_t a[MT][4], b[NT][2];
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                const int r = wm * WR + mi * 16 + a_row, c = ks * 16 + a_col;
+                ldsm_x4(a[mi], &ws[r * kMmaBK + swz(r, c)]);
+            }
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                const int r = wn * kMmaWT + ni * 8 + b_row, c = ks * 16 + b_col;
+                ldsm_x2(b[ni][0], b[ni][1], &xs[st * kMmaBN * kMmaBK + r * kMmaBK + swz(r, c)]);
+            }
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni)
+                    mma_bf16(acc[mi][ni], a[mi][0], a[mi][1], a[mi][2], a[mi][3], b[ni][0], b[ni][1]);
+        }
+    }
+    // c0, c1: row gid, tokens 2 lid, 2 lid + 1; c2, c3: row gid + 8.
+#pragma unroll
+    for (int mi = 0; mi < MT; ++mi) {
+        const int ra = r0 + wm * WR + mi * 16 + gid, rb = ra + 8;
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni) {
+            const int t = t0 + wn * kMmaWT + ni * 8 + 2 * lid;
+            const float* v = acc[mi][ni];
+            if (ra < rows) {
+                if (t < m) y[static_cast<long long>(t) * rows + ra] = v[0] * alpha;
+                if (t + 1 < m) y[static_cast<long long>(t + 1) * rows + ra] = v[1] * alpha;
+            }
+            if (rb < rows) {
+                if (t < m) y[static_cast<long long>(t) * rows + rb] = v[2] * alpha;
+                if (t + 1 < m) y[static_cast<long long>(t + 1) * rows + rb] = v[3] * alpha;
+            }
+        }
+    }
+}
+
 __global__ void to_bf16(const float* __restrict__ x, long long n, __nv_bfloat16* __restrict__ y) {
     for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
          i += static_cast<long long>(gridDim.x) * blockDim.x)
@@ -186,7 +310,55 @@ __global__ void to_bf16(const float* __restrict__ x, long long n, __nv_bfloat16*
 
 VeloxScratch g_x;
 
+// The tensor divisor is the FP32 word after the scale plane; read once per parent (a read per
+// call would synchronize).
+int divisor_of(const uint8_t* w, long long parent_rows, long long k, float& divisor) {
+    static std::mutex mu;
+    static std::unordered_map<const uint8_t*, float> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(w);
+    if (it == cache.end()) {
+        float d = 0.0f;
+        const long long off = (parent_rows * k / 2 + 255) / 256 * 256 + parent_rows * k / 16;
+        if (const cudaError_t e = cudaMemcpy(&d, w + off, 4, cudaMemcpyDeviceToHost)) return static_cast<int>(e);
+        it = cache.emplace(w, d).first;
+    }
+    divisor = it->second;
+    return 0;
+}
+
+template <int WR>
+int launch_mma(const __nv_bfloat16* xb, const uint8_t* w, long long parent_rows, int k, long long row_begin, int rows,
+               int m, float alpha, float* y) {
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(nvfp4_mma_kernel<WR>, cudaFuncAttributeMaxDynamicSharedMemorySize, kMmaSmem);
+        configured = true;
+    }
+    const dim3 grid((rows + kMmaBM - 1) / kMmaBM, (m + kMmaBN - 1) / kMmaBN);
+    nvfp4_mma_kernel<WR><<<grid, (kMmaBM / WR) * (kMmaBN / kMmaWT) * 32, kMmaSmem>>>(xb, w, parent_rows, k, row_begin,
+                                                                                    rows, m, alpha, y);
+    return velox_launch_status();
+}
+
 }  // namespace
+
+// y[m, rows] = bf16(x) . W[row_begin.., :]^T / divisor for an NVFP4 parent [parent_rows, k] with
+// k % 64 == 0 and any m (prefill). Returns VELOX_ERR_UNSUPPORTED for anything else.
+VELOX_API int velox_5060_linear_nvfp4_mma(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
+                                          long long row_begin, int rows, float* y) {
+    if (m < 1 || rows <= 0 || k % kMmaBK != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(w) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    float divisor;
+    if (const int e = divisor_of(w, parent_rows, k, divisor)) return e;
+    auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * k * 2));
+    if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
+    to_bf16<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, static_cast<long long>(m) * k, xb);
+    const int ki = static_cast<int>(k);
+    // ninfer on this card: 8 warps of 32 rows up to 192 tokens, then 4 warps of 64 rows.
+    return m <= 192 ? launch_mma<32>(xb, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y)
+                    : launch_mma<64>(xb, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
+}
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T / divisor for an NVFP4 parent [parent_rows, k],
 // 1 <= m <= 16, k % 512 == 0. Returns VELOX_ERR_UNSUPPORTED for anything else.
@@ -195,22 +367,8 @@ VELOX_API int velox_5060_linear_nvfp4_sliced(const float* x, int m, const uint8_
     if (m < 1 || m > 16 || rows <= 0 || k % kBlockK != 0 || k > (1ll << 30) ||
         reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
-    // The tensor divisor is the FP32 word after the scale plane; read once per parent (a read per
-    // call would synchronize).
-    static std::mutex mu;
-    static std::unordered_map<const uint8_t*, float> cache;
     float divisor;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        auto it = cache.find(w);
-        if (it == cache.end()) {
-            float d = 0.0f;
-            const long long off = (parent_rows * k / 2 + 255) / 256 * 256 + parent_rows * k / 16;
-            if (const cudaError_t e = cudaMemcpy(&d, w + off, 4, cudaMemcpyDeviceToHost)) return static_cast<int>(e);
-            it = cache.emplace(w, d).first;
-        }
-        divisor = it->second;
-    }
+    if (const int e = divisor_of(w, parent_rows, k, divisor)) return e;
     auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * k * 2));
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, static_cast<long long>(m) * k, xb);
