@@ -16,10 +16,10 @@ use crate::select::Selected;
 
 /// "; device in use X GiB" (every process, as nvidia-smi counts), when the backend can tell.
 fn in_use<B: Backend>(b: &B) -> String {
-    b.mem_info().map_or(String::new(), |(free, total)| {
+    b.device_in_use().map_or(String::new(), |used| {
         format!(
             "; device in use {:.2} GiB",
-            (total - free) as f64 / (1u64 << 30) as f64
+            used as f64 / (1u64 << 30) as f64
         )
     })
 }
