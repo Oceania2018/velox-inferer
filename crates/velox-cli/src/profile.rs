@@ -109,6 +109,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn mem_info(&self) -> Option<(usize, usize)> {
         self.inner.mem_info()
     }
+    fn device_in_use(&self) -> Option<usize> {
+        self.inner.device_in_use()
+    }
     fn upload_bytes_host(&self, data: &[u8]) -> Result<B::Buffer> {
         self.inner.upload_bytes_host(data)
     }

@@ -839,9 +839,15 @@ pub trait Backend {
     fn graph_stats(&self) -> (usize, usize, usize) {
         (0, 0, 0)
     }
-    /// (free, total) device memory in bytes, when the backend can tell.
+    /// (free, total) device memory in bytes, when the backend can tell: what can still be
+    /// allocated.
     fn mem_info(&self) -> Option<(usize, usize)> {
         None
+    }
+    /// Device memory in use by every process as monitoring tools (nvidia-smi) report it, the
+    /// figure budgets are set in; falls back to [`Self::mem_info`]'s total minus free.
+    fn device_in_use(&self) -> Option<usize> {
+        self.mem_info().map(|(free, total)| total - free)
     }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;

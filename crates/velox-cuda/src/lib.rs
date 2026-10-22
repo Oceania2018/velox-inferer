@@ -36,6 +36,7 @@ mod ffi {
         ) -> i32;
         pub fn velox_cuda_set_device(device: i32) -> i32;
         pub fn velox_cuda_mem_info(free: *mut usize, total: *mut usize) -> i32;
+        pub fn velox_nvml_used(used: *mut usize, total: *mut usize) -> i32;
         pub fn velox_cuda_profiler(on: i32) -> i32;
         pub fn velox_cuda_malloc_zeroed(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn velox_cuda_host_alloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
@@ -1099,6 +1100,15 @@ impl Backend for CudaBackend {
 
     fn mem_info(&self) -> Option<(usize, usize)> {
         mem_info().ok().map(|(f, t)| (f as usize, t as usize))
+    }
+
+    fn device_in_use(&self) -> Option<usize> {
+        let (mut used, mut total) = (0usize, 0usize);
+        // SAFETY: out-pointers to live locals.
+        match unsafe { ffi::velox_nvml_used(&mut used, &mut total) } {
+            0 => Some(used),
+            _ => self.mem_info().map(|(free, total)| total - free),
+        }
     }
 
     fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {
