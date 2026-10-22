@@ -77,6 +77,28 @@ extern "C" {
         format: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_gemv(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        format: i32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5060_linear_skinny_rs(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        format: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_skinny_iq3(
         x: *const f32,
         m: i32,
@@ -162,8 +184,9 @@ fn a16_fp8(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
 const A16_FP8_MAX_M: usize = 96;
 const A16_FP8_BLOCK_M: usize = 64;
 
-/// `velox_5060_linear_skinny16`'s format code for a weight it serves at `m` tokens. Single tokens
-/// stay on main's GEMV except for q5, which has no fast GEMV there.
+/// Format code of the skinny kernel serving a weight at `m` tokens: NVFP4 (0) runs
+/// `velox_5060_linear_skinny16`, groupwise q4/q5/q8 (4/5/8) `velox_5060_linear_skinny_rs`. Single
+/// tokens stay on main's GEMV except for q5, which has no fast GEMV there.
 fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     let max = if w.format.row_split().is_some() { ROWSPLIT_MIN_M - 1 } else { SKINNY_MAX_M };
     let min = if w.format == WeightFormat::Q5G64 { 1 } else { 2 };
@@ -175,6 +198,20 @@ fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
         WeightFormat::Q4G64 => Some(4),
         WeightFormat::Q5G64 => Some(5),
         WeightFormat::Q8G32 => Some(8),
+        _ => None,
+    }
+}
+
+/// Single-token decode for the formats main has no fast GEMV for, IQ3_XXS (3) and q5_g64 (5): the
+/// register-streaming f32 GEMV (exact activations). From two tokens the tensor-core kernels win
+/// (measured: q5 [12288,5120] m=1 112 us vs 179 us skinny; m=2 184 vs 183; iq3 even at m=1).
+fn gemv_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
+    if m != 1 {
+        return None;
+    }
+    match w.format {
+        WeightFormat::Iq3Xxs => Some(3),
+        WeightFormat::Q5G64 if w.k % 32 == 0 => Some(5),
         _ => None,
     }
 }
@@ -309,6 +346,9 @@ impl CudaKernels for Rtx5060Kernels {
         if m >= ROWSPLIT_MIN_M && w.format.row_split().is_some() {
             return ActQuant::Bf16;
         }
+        if gemv_format(w, m).is_some() {
+            return ActQuant::Exact;
+        }
         if skinny_iq3(w, m) || (m == 1 && skinny16_format(w, m).is_some()) {
             return ActQuant::Bf16;
         }
@@ -344,7 +384,13 @@ impl CudaKernels for Rtx5060Kernels {
         // fallback: falling back would change the rounding linear_act reported.
         // SAFETY: extents validated by CudaBackend (check::linear).
         match self.linear_act(w, m) {
-            ActQuant::Exact => portable::linear(x, w, y, m),
+            ActQuant::Exact => match gemv_format(w, m) {
+                Some(f) => status(
+                    unsafe { velox_5060_gemv(x.as_ptr(), mi, wp, pr, k, rb, rows, f, y.as_mut_ptr()) },
+                    "rtx5060 gemv",
+                ),
+                None => portable::linear(x, w, y, m),
+            },
             ActQuant::Nvfp4 { divisor } => status(
                 unsafe { velox_5060_linear_a4(x.as_ptr(), mi, wp, pr, k, rb, rows, divisor, y.as_mut_ptr()) },
                 "rtx5060 linear a4",
@@ -388,10 +434,17 @@ impl CudaKernels for Rtx5060Kernels {
                         let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
                         let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
-                        status(
-                            unsafe { velox_5060_linear_skinny16(xp, mb, wp, pr, k, rb, rows, f, yp) },
-                            "rtx5060 linear skinny16",
-                        )?;
+                        if f == 0 {
+                            status(
+                                unsafe { velox_5060_linear_skinny16(xp, mb, wp, pr, k, rb, rows, f, yp) },
+                                "rtx5060 linear skinny16",
+                            )?;
+                        } else {
+                            status(
+                                unsafe { velox_5060_linear_skinny_rs(xp, mb, wp, pr, k, rb, rows, f, yp) },
+                                "rtx5060 linear skinny rs",
+                            )?;
+                        }
                     }
                     return Ok(());
                 }
