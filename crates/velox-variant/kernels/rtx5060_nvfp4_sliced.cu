@@ -8,6 +8,7 @@
 // tile). E2M1 code times its E4M3 scale is exact in bf16, so weights are exact; the tensor
 // divisor is applied to the f32 result. Warps' partial sums meet in shared memory.
 #include <cuda_bf16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
 
@@ -42,6 +43,11 @@ __device__ __forceinline__ void cp_async(void* dst, const void* src, bool valid)
         asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_u32(dst)), "l"(src), "n"(N),
                      "r"(valid ? N : 0));
 }
+// 16 bytes through L1 (.ca): every block of a launch reads the same activation tile.
+__device__ __forceinline__ void cp_async_ca16(void* dst, const void* src, bool valid) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src),
+                 "r"(valid ? 16 : 0));
+}
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N>
 __device__ __forceinline__ void cp_wait() {
@@ -66,32 +72,32 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 // Activation tile [token][64] with 8-value chunks XOR-swizzled by token.
 __device__ __forceinline__ int swz(int row, int col) { return col ^ ((row & 7) << 3); }
 
-// E2M1 magnitude codes 0..7 are 0, 0.5, 1, 1.5, 2, 3, 4, 6; built from the bits.
-__device__ __forceinline__ float e2m1(uint32_t c) {
-    const uint32_t e = (c >> 1) & 3, f = c & 1;
-    const uint32_t mag = e ? ((e + 126u) << 23) | (f << 22) : f * (126u << 23);
-    return __uint_as_float(mag | ((c & 8u) << 28));
-}
-__device__ __forceinline__ float e4m3(uint8_t b) {
-    const __half_raw h = __nv_cvt_fp8_to_halfraw(b, __NV_E4M3);
-    return __half2float(__half(h));
-}
-// Values 2j, 2j+1 (one code byte) times their group scale, as bf16x2 (exact).
+// Values 2j, 2j+1 (one code byte) times their group scale, as bf16x2 (exact). The hardware
+// E2M1x2 / E4M3x2 conversions (as ninfer's nvfp4_scaled_pair_bf16): the kernels are bound by
+// instruction issue at decode widths, where per-value bit manipulation cost ~30%.
 __device__ __forceinline__ uint32_t scaled_pair(uint8_t code, uint8_t scale) {
-    const float s = e4m3(scale);
-    const __nv_bfloat162 v = __floats2bfloat162_rn(e2m1(code & 0xfu) * s, e2m1(code >> 4) * s);
-    return *reinterpret_cast<const uint32_t*>(&v);
+    __nv_fp4x2_e2m1 c;
+    c.__x = code;
+    const float2 v = static_cast<float2>(c);
+    __nv_fp8x2_e4m3 sc;
+    sc.__x = static_cast<__nv_fp8x2_storage_t>(scale | (static_cast<unsigned>(scale) << 8));
+    const float s = static_cast<float2>(sc).x;
+    const __nv_bfloat162 r = __floats2bfloat162_rn(v.x * s, v.y * s);
+    return *reinterpret_cast<const uint32_t*>(&r);
 }
 __device__ __forceinline__ long long scale_offset(long long row, long long group, long long k) {
     return ((row / 128) * (k / 64) + group / 4) * 512 + (row & 31) * 16 + ((row & 127) >> 5) * 4 + (group & 3);
 }
 
-template <int T>
+// KS: K as a compile-time constant (0: runtime k), so the tile loop unrolls (ninfer's measured
+// shape instances do the same).
+template <int T, int KS>
 __global__ void __launch_bounds__(kThreads, 2)
 nvfp4_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows,
-                    int k, long long view_begin, int rows, int m, float alpha, float* __restrict__ y) {
+                    int k_rt, long long view_begin, int rows, int m, float alpha, float* __restrict__ y) {
     constexpr int NT = T / 8;
     __shared__ Smem<T> sm;
+    const int k = KS ? KS : k_rt;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, lid = lane & 3;
     const int r0 = blockIdx.x * kRows;
     const int tiles = k / kBlockK;
@@ -118,8 +124,8 @@ nvfp4_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restri
         for (int item = lane; item < T * (kTileK / 8); item += 32) {
             const int t = item / (kTileK / 8), c8 = (item % (kTileK / 8)) * 8;
             const bool ok = t < m;
-            cp_async<16>(&sm.st.x[slot][warp][t * kTileK + swz(t, c8)],
-                         x + (ok ? static_cast<long long>(t) * k + k0 + warp * kTileK + c8 : 0), ok);
+            cp_async_ca16(&sm.st.x[slot][warp][t * kTileK + swz(t, c8)],
+                          x + (ok ? static_cast<long long>(t) * k + k0 + warp * kTileK + c8 : 0), ok);
         }
         cp_commit();
     };
@@ -131,6 +137,7 @@ nvfp4_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restri
     for (int s = 0; s < kStages; ++s)
         if (s < tiles) stage(s, s);
     const int b_row = lane & 7, b_k = ((lane >> 3) & 1) << 3, wk0 = warp * kTileK;
+#pragma unroll
     for (int tile = 0; tile < tiles; ++tile) {
         const int slot = tile % kStages;
         if (tile + kStages - 1 < tiles) cp_wait<kStages - 1>();
@@ -327,6 +334,24 @@ int divisor_of(const uint8_t* w, long long parent_rows, long long k, float& divi
     return 0;
 }
 
+template <int T, int KS>
+int launch_sliced(const __nv_bfloat16* xb, const uint8_t* w, long long parent_rows, int k, long long row_begin,
+                  int rows, int m, float alpha, float* y) {
+    const unsigned grid = static_cast<unsigned>((rows + kRows - 1) / kRows);
+    nvfp4_sliced_kernel<T, KS><<<grid, kThreads>>>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y);
+    return velox_launch_status();
+}
+
+// The model's input widths as compile-time constants.
+template <int T>
+int launch_sliced_k(const __nv_bfloat16* xb, const uint8_t* w, long long parent_rows, int k, long long row_begin,
+                    int rows, int m, float alpha, float* y) {
+    if (k == 5120) return launch_sliced<T, 5120>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y);
+    if (k == 6144) return launch_sliced<T, 6144>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y);
+    if (k == 17408) return launch_sliced<T, 17408>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y);
+    return launch_sliced<T, 0>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y);
+}
+
 template <int WR>
 int launch_mma(const __nv_bfloat16* xb, const uint8_t* w, long long parent_rows, int k, long long row_begin, int rows,
                int m, float alpha, float* y) {
@@ -372,11 +397,8 @@ VELOX_API int velox_5060_linear_nvfp4_sliced(const float* x, int m, const uint8_
     auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * k * 2));
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, static_cast<long long>(m) * k, xb);
-    const unsigned grid = static_cast<unsigned>((rows + kRows - 1) / kRows);
     const int ki = static_cast<int>(k);
-    if (m <= 8)
-        nvfp4_sliced_kernel<8><<<grid, kThreads>>>(xb, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
-    else
-        nvfp4_sliced_kernel<16><<<grid, kThreads>>>(xb, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
-    return velox_launch_status();
+    const float alpha = 1.0f / divisor;
+    if (m <= 8) return launch_sliced_k<8>(xb, w, parent_rows, ki, row_begin, rows, m, alpha, y);
+    return launch_sliced_k<16>(xb, w, parent_rows, ki, row_begin, rows, m, alpha, y);
 }

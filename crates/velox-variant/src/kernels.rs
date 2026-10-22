@@ -346,9 +346,6 @@ fn iq3_direct(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     m.min(SKINNY16_MAX_M) <= 2 || (blocks > 32 && m.min(SKINNY16_MAX_M) <= 8)
 }
 
-/// Widest NVFP4 view the sliced-K kernel serves (see `linear`).
-const NVFP4_SLICED_MAX_ROWS: usize = 8192;
-
 /// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
 fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     w.format == WeightFormat::Iq3Xxs && m >= 1
@@ -802,10 +799,10 @@ impl CudaKernels for Rtx5060Kernels {
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
                         let (xp, yp) =
                             unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
-                        if f == 0 && w.k % 512 == 0 && w.rows <= NVFP4_SLICED_MAX_ROWS {
-                            // NVFP4 with few rows and K in whole 512-value tiles: the sliced-K
-                            // kernel. Measured at m=8: [5120,17408] 199 vs 247 us, [5120,6144] 76
-                            // vs 90 us; wide views stay on skinny16 ([248320,5120] 2217 vs 2733 us).
+                        if f == 0 && w.k % 512 == 0 {
+                            // NVFP4 with K in whole 512-value tiles: the sliced-K kernel. Measured
+                            // at m=8: [5120,6144] 58 vs 90 us, [34816,5120] 293 vs 350 us,
+                            // [248320,5120] 2019 vs 2208 us (skinny16).
                             status(
                                 unsafe {
                                     velox_5060_linear_nvfp4_sliced(xp, mb, wp, pr, k, rb, rows, yp)
