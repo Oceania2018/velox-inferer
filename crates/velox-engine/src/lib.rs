@@ -36,7 +36,7 @@ use velox_frontend::image::{
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
     shift_inserts, BatchWorkspace, Checkpoint, DFlashModel, DFlashState, DFlashWorkspace,
-    EmbedInsert, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
+    EmbedInsert, KvPool, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
     DRAFT_PAGE_ROWS,
 };
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
@@ -86,6 +86,14 @@ pub struct EngineConfig {
     /// sequence grows instead of at full capacity, with identical prefix chunks (system prompt,
     /// task) mapped once for every lane that holds them.
     pub kv_paging: bool,
+    /// Paged caches: tokens of attention cache in the startup pool every lane draws from (`None`:
+    /// what device memory allows after everything else, minus `vram_headroom`).
+    pub kv_capacity: Option<usize>,
+    /// Device memory left unallocated at startup (paged caches; WDDM spills to system memory
+    /// when the card fills, slowing every step several times).
+    pub vram_headroom: usize,
+    /// Device memory recorded graphs may hold; past it the least recently run are released.
+    pub graph_budget: usize,
 }
 
 /// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
@@ -125,6 +133,8 @@ struct Lanes<B: Backend> {
     spare: Vec<Checkpoint<B>>,
     /// Published prefix chunks of the lanes' paged attention caches.
     share: KvShare<B>,
+    /// The chunk sets those caches draw from, created at startup (paged caches only).
+    pool: Option<Arc<KvPool<B>>>,
 }
 
 /// Device checkpoint storage kept for reuse across lanes.
@@ -175,6 +185,9 @@ const DISK_GAIN: usize = 1024;
 /// is returned. Without the trim every lane keeps its longest prompt ever backed, and on a 32 GB
 /// card six lanes near capacity push VRAM into WDDM's system-memory spill (decode 3x slower).
 const KV_TRIM_SLACK: usize = 4096;
+
+/// How often the engine logs device memory (free, attention pool, graphs).
+const MEM_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub struct QwenEngine<B: Backend> {
     core: Arc<Core<B>>,
@@ -552,6 +565,7 @@ where
             clock: 0,
             spare: Vec::new(),
             share: KvShare::default(),
+            pool: None,
         };
         let core = Arc::new(Core {
             b,
@@ -568,21 +582,7 @@ where
         for lane in &mut state.lanes {
             lane.session.trim_kv(&core.b, 0)?;
         }
-        eprintln!(
-            "attention caches: {} lanes, {:.2} GB backed ({})",
-            state.lanes.len(),
-            state
-                .lanes
-                .iter()
-                .map(|l| l.session.kv_bytes(&core.b))
-                .sum::<usize>() as f64
-                / 1e9,
-            if state.lanes.iter().any(|l| l.session.kv_paged()) {
-                "paged"
-            } else {
-                "whole"
-            }
-        );
+        core.budget_memory(&mut state)?;
         let queue = Arc::new(JobQueue {
             jobs: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -620,6 +620,120 @@ impl<B: Backend> Core<B> {
     /// under load: growing scratch keeps every smaller buffer (recorded graphs may hold them), and
     /// past the card's memory WDDM spills to system RAM and everything crawls. The lanes are reset
     /// afterwards.
+    /// Fixes device memory at startup, as ninfer does: recorded graphs get `graph_budget`, and the
+    /// paged caches' chunks are created now, as many as `kv_capacity` asks or the device has
+    /// left after everything else and `vram_headroom`. Requests then allocate no device memory
+    /// for caches, so VRAM stays flat instead of creeping into WDDM's system-memory spill.
+    fn budget_memory(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
+        let cfg = &self.cfg;
+        self.b.set_graph_budget(cfg.graph_budget);
+        let gb = |x: usize| x as f64 / 1e9;
+        let Some((per_set, rows_per_set)) = st.lanes[0].session.kv_set_shape() else {
+            eprintln!("attention caches: {} lanes, whole", st.lanes.len());
+            return Ok(());
+        };
+        let set_bytes = per_set * self.b.vm_chunk_len() * 4;
+        let full = st.lanes.len() * st.lanes[0].session.kv_sets_for(cfg.capacity);
+        let (graphs, graph_bytes, _) = self.b.graph_stats();
+        let free = self.b.mem_info().map(|(f, _)| f);
+        let sets = match (cfg.kv_capacity, free) {
+            (Some(tokens), _) => tokens.div_ceil(rows_per_set.max(1)),
+            (None, Some(free)) => {
+                let reserve = cfg.vram_headroom + cfg.graph_budget.saturating_sub(graph_bytes);
+                free.saturating_sub(reserve) / set_bytes.max(1)
+            }
+            // No way to measure: every lane's full capacity.
+            (None, None) => full,
+        }
+        .min(full);
+        let pool = KvPool::new(&self.b, sets, per_set)?;
+        for lane in &mut st.lanes {
+            lane.session.set_kv_pool(Arc::clone(&pool));
+        }
+        st.pool = Some(pool);
+        eprintln!(
+            "memory budget: attention pool {sets} sets of {rows_per_set} rows ({} tokens, {:.2} GB;              all lanes full: {full}), graphs up to {:.2} GB ({graphs} recorded, {:.2} GB),              headroom {:.2} GB; free now {}",
+            sets * rows_per_set,
+            gb(sets * set_bytes),
+            gb(cfg.graph_budget),
+            gb(graph_bytes),
+            gb(cfg.vram_headroom),
+            self.b
+                .mem_info()
+                .map_or("unknown".into(), |(f, _)| format!("{:.2} GB", gb(f)))
+        );
+        Ok(())
+    }
+
+    /// Room in the attention pool for a prompt of `len` tokens on lane `li` (with output room):
+    /// idle lanes, least recently used first, give their chunks back (their conversations resume
+    /// from the context store). False when that is not enough while other requests run: the
+    /// request waits for them. Alone, it runs anyway (the pool lends past its size).
+    fn kv_room(&self, st: &mut Lanes<B>, li: usize, len: usize, busy: &[usize]) -> bool {
+        let Some(pool) = st.pool.clone() else {
+            return true;
+        };
+        let need = st.lanes[li].session.kv_need(len + KV_TRIM_SLACK);
+        while pool.free_sets() < need {
+            let Some(j) = (0..st.lanes.len())
+                .filter(|&j| j != li && !busy.contains(&j))
+                .filter(|&j| st.lanes[j].session.kv_private_sets() > 1)
+                .min_by_key(|&j| st.lanes[j].last_used)
+            else {
+                return busy.is_empty();
+            };
+            if let Err(e) = self.release_lane(st, j) {
+                eprintln!("attention pool: releasing lane {j} failed: {e}");
+                return busy.is_empty();
+            }
+        }
+        true
+    }
+
+    fn log_memory(&self, st: &Lanes<B>) {
+        let gb = |x: usize| x as f64 / 1e9;
+        let (graphs, graph_bytes, released) = self.b.graph_stats();
+        let pool = st.pool.as_ref().map_or(String::new(), |p| {
+            format!(
+                ", attention pool {}/{} sets free ({} lent past it)",
+                p.free_sets(),
+                p.sets(),
+                p.overflow()
+            )
+        });
+        eprintln!(
+            "[mem] free {}{pool}, graphs {graphs} ({:.2} GB, {released} released)",
+            self.b
+                .mem_info()
+                .map_or("unknown".into(), |(f, _)| format!("{:.2} GB", gb(f))),
+            gb(graph_bytes)
+        );
+    }
+
+    /// Returns idle lane `j`'s attention chunks to the pool; its chain head goes to the context
+    /// store first, so its conversation resumes from there.
+    fn release_lane(&self, st: &mut Lanes<B>, j: usize) -> Result<(), CoreError> {
+        let Lanes {
+            lanes,
+            store,
+            spare,
+            ..
+        } = st;
+        let lane = &mut lanes[j];
+        if store.enabled() {
+            self.capture_head(lane, store, 0)?;
+        }
+        let n = lane.session.trim_kv(&self.b, 0)?;
+        lane.keys.clear();
+        lane.chain = None;
+        spare.append(&mut lane.checkpoints);
+        spare.truncate(DEVICE_SPARE);
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+            eprintln!("[kv] lane {j} released {n} chunks to the pool");
+        }
+        Ok(())
+    }
+
     fn warm_up(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
         use velox_models::qwen3_5::VERIFY_MAX;
         let (b, model) = (&self.b, &self.model);
@@ -717,6 +831,7 @@ impl<B: Backend> Core<B> {
         }
         let mut waiting: VecDeque<Job> = VecDeque::new();
         let mut active: Vec<Active<B>> = Vec::new();
+        let mut mem_logged = Instant::now();
         let draft = self.dflash.as_ref().map(|dm| {
             (
                 dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
@@ -724,6 +839,10 @@ impl<B: Backend> Core<B> {
             )
         });
         loop {
+            if mem_logged.elapsed() >= MEM_LOG_EVERY {
+                mem_logged = Instant::now();
+                self.log_memory(&st);
+            }
             st.store.feed(&self.b, &st.lanes[0].session, draft);
             // New requests; while idle, pin context-store storage between them.
             loop {
@@ -772,6 +891,9 @@ impl<B: Backend> Core<B> {
                 let Some(li) = Self::pick_lane(&st.lanes, &busy, &waiting[0].p.keys) else {
                     break;
                 };
+                if !self.kv_room(&mut st, li, waiting[0].p.keys.len(), &busy) {
+                    break;
+                }
                 let job = waiting.pop_front().expect("checked");
                 match self.begin(&mut st, li, job) {
                     Ok(a) => {

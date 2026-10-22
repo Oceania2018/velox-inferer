@@ -832,6 +832,17 @@ pub trait Backend {
     fn graph_break(&self) -> Result<()> {
         Ok(())
     }
+    /// Caps the device memory recorded graphs hold: past `bytes`, the least recently run steps'
+    /// graphs are released (they record again when next run). A no-op without graphs.
+    fn set_graph_budget(&self, _bytes: usize) {}
+    /// Recorded graphs: (steps held, device bytes they hold, steps released by the budget).
+    fn graph_stats(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+    /// (free, total) device memory in bytes, when the backend can tell.
+    fn mem_info(&self) -> Option<(usize, usize)> {
+        None
+    }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
     /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.

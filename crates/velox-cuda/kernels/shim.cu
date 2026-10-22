@@ -227,8 +227,10 @@ struct GraphSlot {
     unsigned char* dev = nullptr;
     cudaEvent_t done = nullptr;     // recorded after each launch
     bool launched = false;
+    size_t bytes = 0;               // device memory its executable graph took (measured)
 };
 std::vector<GraphSlot> g_slots(kGraphSlots);
+size_t g_graph_bytes = 0;  // sum of the slots' bytes
 int g_region = -1;  // slot whose region stage() fills, -1 outside graphs
 size_t g_region_off = 0;
 
@@ -406,11 +408,21 @@ VELOX_API int velox_cuda_graph_end_launch(int slot) {
         }
     }
     if (exec == nullptr) {
+        // Executable graphs take device memory the caller budgets (velox_cuda_graph_bytes): the
+        // free-memory drop across instantiation is this graph's share (driver pages, so coarse).
+        GraphSlot& s = g_slots[slot];
+        g_graph_bytes -= s.bytes;
+        s.bytes = 0;
+        size_t before = 0, after = 0, total = 0;
+        cudaMemGetInfo(&before, &total);
         if (cudaError_t e = cudaGraphInstantiate(&exec, g, 0)) {
             cudaGraphDestroy(g);
             exec = nullptr;
             return static_cast<int>(e);
         }
+        cudaMemGetInfo(&after, &total);
+        s.bytes = before > after ? before - after : 0;
+        g_graph_bytes += s.bytes;
     }
     cudaGraphDestroy(g);
     return launch_slot(slot);
@@ -422,6 +434,31 @@ VELOX_API int velox_cuda_graph_replay_launch(int slot) {
     std::lock_guard<std::mutex> lock(g_stage.mu);
     g_region = -1;
     return launch_slot(slot);
+}
+
+// Releases slot `slot`'s executable graph (after its last launch completes); its staging region
+// stays for the slot's next capture.
+VELOX_API int velox_cuda_graph_release(int slot) {
+    if (slot < 0 || slot >= kGraphSlots) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    GraphSlot& s = g_slots[slot];
+    if (s.launched) {
+        if (cudaError_t e = cudaEventSynchronize(s.done)) return static_cast<int>(e);
+        s.launched = false;
+    }
+    if (s.exec != nullptr) {
+        if (cudaError_t e = cudaGraphExecDestroy(s.exec)) return static_cast<int>(e);
+        s.exec = nullptr;
+    }
+    g_graph_bytes -= s.bytes;
+    s.bytes = 0;
+    return 0;
+}
+
+// Device bytes the slots' executable graphs hold.
+VELOX_API size_t velox_cuda_graph_bytes() {
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    return g_graph_bytes;
 }
 
 // Ends a capture or replay whose host code failed, discarding a capture.

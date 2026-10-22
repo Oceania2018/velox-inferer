@@ -82,6 +82,17 @@ where
         // --kv-paging on|off (default on): lanes' attention caches in virtual memory, backed as
         // they grow, with identical prefix chunks shared between lanes.
         kv_paging: a.get("kv-paging").is_none_or(|v| v != "off"),
+        // --kv-capacity N|auto (ninfer's name; default auto): tokens of attention cache in the pool
+        // the lanes share, created at startup; auto takes what device memory leaves after the
+        // weights, workspaces, graph budget and --vram-headroom-mib.
+        kv_capacity: match a.get("kv-capacity") {
+            None | Some("auto") => None,
+            Some(_) => Some(a.parse("kv-capacity", 0)?),
+        },
+        // --vram-headroom-mib N (default 1024, as ninfer): device memory left free at startup.
+        vram_headroom: a.parse::<usize>("vram-headroom-mib", 1024)? << 20,
+        // --graph-mib N (default 1024): device memory recorded CUDA graphs may hold.
+        graph_budget: a.parse::<usize>("graph-mib", 1024)? << 20,
         // --ctx-lrfu-lambda F: LRFU decay per request of that store (0: LRU).
         lrfu_lambda: a.parse("ctx-lrfu-lambda", 0.1)?,
         // --disk-context-mib N (default 0: off) and --disk-context-dir DIR: NVMe tier below RAM.
