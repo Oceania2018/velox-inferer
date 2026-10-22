@@ -94,6 +94,9 @@ pub struct EngineConfig {
     pub vram_headroom: usize,
     /// Device memory recorded graphs may hold; past it the least recently run are released.
     pub graph_budget: usize,
+    /// Device memory in use once started (every process, graph budget included): the attention
+    /// pool gets what is left. Takes precedence over `vram_headroom`.
+    pub vram_budget: Option<usize>,
 }
 
 /// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
@@ -577,6 +580,13 @@ where
             special,
         });
         let mut state = state;
+        if let Some((free, total)) = core.b.mem_info() {
+            eprintln!(
+                "memory: {:.2} GiB in use with {} lanes' states and the workspaces",
+                (total - free) as f64 / (1u64 << 30) as f64,
+                state.lanes.len()
+            );
+        }
         core.warm_up(&mut state)?;
         // Warm-up wrote near the end of the caches; paged lanes start empty.
         for lane in &mut state.lanes {
@@ -635,15 +645,38 @@ impl<B: Backend> Core<B> {
         let set_bytes = per_set * self.b.vm_chunk_len() * 4;
         let full = st.lanes.len() * st.lanes[0].session.kv_sets_for(cfg.capacity);
         let (graphs, graph_bytes, _) = self.b.graph_stats();
-        let free = self.b.mem_info().map(|(f, _)| f);
-        let sets = match (cfg.kv_capacity, free) {
-            (Some(tokens), _) => tokens.div_ceil(rows_per_set.max(1)),
-            (None, Some(free)) => {
-                let reserve = cfg.vram_headroom + cfg.graph_budget.saturating_sub(graph_bytes);
-                free.saturating_sub(reserve) / set_bytes.max(1)
+        let gib = |x: usize| x as f64 / (1u64 << 30) as f64;
+        let mem = self.b.mem_info();
+        if let Some((free, total)) = mem {
+            eprintln!(
+                "memory: {:.2} GiB in use after warm-up, before the attention pool",
+                gib(total - free)
+            );
+        }
+        let graphs_to_come = cfg.graph_budget.saturating_sub(graph_bytes);
+        let sets = match (cfg.kv_capacity, cfg.vram_budget, mem) {
+            (Some(tokens), _, _) => tokens.div_ceil(rows_per_set.max(1)),
+            (None, Some(budget), Some((free, total))) => {
+                let used = total - free;
+                let room = budget.saturating_sub(used + graphs_to_come) / set_bytes.max(1);
+                // One full-length request must always fit.
+                let floor = st.lanes[0].session.kv_sets_for(cfg.capacity);
+                if room < floor {
+                    eprintln!(
+                        "memory budget: {:.2} GiB in use and {:.2} GiB of graph budget leave \
+                         {room} attention sets under --vram-budget-mib; taking {floor} (one full \
+                         context) over it",
+                        gib(used),
+                        gib(graphs_to_come)
+                    );
+                }
+                room.max(floor)
+            }
+            (None, _, Some((free, _))) => {
+                free.saturating_sub(cfg.vram_headroom + graphs_to_come) / set_bytes.max(1)
             }
             // No way to measure: every lane's full capacity.
-            (None, None) => full,
+            (None, _, None) => full,
         }
         .min(full);
         let pool = KvPool::new(&self.b, sets, per_set)?;
@@ -652,7 +685,7 @@ impl<B: Backend> Core<B> {
         }
         st.pool = Some(pool);
         eprintln!(
-            "memory budget: attention pool {sets} sets of {rows_per_set} rows ({} tokens, {:.2} GB;              all lanes full: {full}), graphs up to {:.2} GB ({graphs} recorded, {:.2} GB),              headroom {:.2} GB; free now {}",
+            "memory budget: attention pool {sets} sets of {rows_per_set} rows ({} tokens, {:.2} GB;              all lanes full: {full}), graphs up to {:.2} GB ({graphs} recorded, {:.2} GB),              headroom {:.2} GB; in use now {}",
             sets * rows_per_set,
             gb(sets * set_bytes),
             gb(cfg.graph_budget),
@@ -660,7 +693,7 @@ impl<B: Backend> Core<B> {
             gb(cfg.vram_headroom),
             self.b
                 .mem_info()
-                .map_or("unknown".into(), |(f, _)| format!("{:.2} GB", gb(f)))
+                .map_or("unknown".into(), |(f, t)| format!("{:.2} GiB", gib(t - f)))
         );
         Ok(())
     }
@@ -702,10 +735,11 @@ impl<B: Backend> Core<B> {
             )
         });
         eprintln!(
-            "[mem] free {}{pool}, graphs {graphs} ({:.2} GB, {released} released)",
-            self.b
-                .mem_info()
-                .map_or("unknown".into(), |(f, _)| format!("{:.2} GB", gb(f))),
+            "[mem] device in use {}{pool}, graphs {graphs} ({:.2} GB, {released} released)",
+            self.b.mem_info().map_or("unknown".into(), |(f, t)| format!(
+                "{:.2} GiB",
+                (t - f) as f64 / (1u64 << 30) as f64
+            )),
             gb(graph_bytes)
         );
     }
