@@ -560,6 +560,21 @@ pub trait CudaKernels: Send + Sync {
         portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s)
     }
 
+    /// [`Backend::gated_delta_net_out`]: outputs from `state_in`, no state written.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_out(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+    ) -> Result<()> {
+        portable::gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, out, s)
+    }
+
     fn gdn_replay(
         &self,
         layers: &mut [GdnReplayLayer<'_, CudaBuffer>],
@@ -1766,6 +1781,23 @@ impl Backend for CudaBackend {
         self.staged("gated_delta_net verify", || {
             self.kernels
                 .gated_delta_net(qkv, ab, a_log, dt_bias, Some(state_in), state_out, out, s)
+        })
+    }
+
+    fn gated_delta_net_out(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: &CudaBuffer,
+        _scratch: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+    ) -> Result<()> {
+        self.staged("gated_delta_net verify", || {
+            self.kernels
+                .gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, out, s)
         })
     }
 

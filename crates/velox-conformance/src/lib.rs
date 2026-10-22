@@ -1096,6 +1096,19 @@ impl<B: Backend> Suite<'_, B> {
         );
         self.record(name, Some(Op::GatedDeltaNet), &got, &want_o, 1e-4);
 
+        // Outputs only (no state kept): same outputs, the input state untouched.
+        let mut od2 = self.b.alloc(out_len)?;
+        self.b
+            .gated_delta_net_out(&qd, &abd, &ad, &dd, &sd, &mut so, &mut od2, gs)?;
+        let mut got = fetch(self.b, &od2, out_len)?;
+        got.extend(fetch(self.b, &sd, state_len)?);
+        let mut want = want_o[..out_len].to_vec();
+        want.extend_from_slice(&s0);
+        let name = format!(
+            "gated_delta_net_out heads {k_heads}/{v_heads} d {dk} ({tokens} tokens) + state_in"
+        );
+        self.record(name, Some(Op::GatedDeltaNet), &got, &want, 1e-4);
+
         let (channels, width) = (gs.qkv_width(), 4);
         let cs = ConvShape {
             tokens,

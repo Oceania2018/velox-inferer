@@ -336,7 +336,8 @@ __device__ __forceinline__ void gdn_rows(const float* __restrict__ qkv, const fl
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(k_dim));
     const float neg_a = -expf(a_log[h]), bias = dt_bias[h];
     const size_t row_off = (static_cast<size_t>(h) * v_dim + i) * k_dim;
-    float* row_state = state + row_off;  // written at the end; read from state_in (may alias)
+    // Written at the end (unless state is null: outputs only); read from state_in (may alias).
+    float* row_state = state != nullptr ? state + row_off : nullptr;
     float s[PER];
 #pragma unroll
     for (int p = 0; p < PER; ++p) {
@@ -377,6 +378,7 @@ __device__ __forceinline__ void gdn_rows(const float* __restrict__ qkv, const fl
             if (lane == 0) out[(static_cast<size_t>(t) * v_heads + h) * v_dim + i] = o * inv_sqrt_dk;
         }
     }
+    if (row_state == nullptr) return;
 #pragma unroll
     for (int p = 0; p < PER; ++p) {
         const int d = lane + p * VELOX_WARP;
@@ -1236,14 +1238,15 @@ VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, const f
     return velox_launch_status();
 }
 
-// state_in: the state before the call; the updated state goes to `state` (may be the same buffer).
-// pp: null, or device [state_in, state_out] staged by a graph step; staged calls take the per-row
-// kernel, which reads the states through it.
+// state_in: the state before the call; the updated state goes to `state` (may be the same buffer;
+// null: outputs only, per-row kernel). pp: null, or device [state_in, state_out] staged by a graph
+// step; staged calls take the per-row kernel, which reads the states through it.
 VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, const float* a_log,
                                              const float* dt_bias, const float* state_in, float* state, float* out,
                                              int tokens, int k_heads, int v_heads, int k_dim, int v_dim,
                                              const long long* pp) {
-    if (pp == nullptr && tokens >= kGdnChunkMinTokens && (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
+    if (pp == nullptr && state != nullptr && tokens >= kGdnChunkMinTokens &&
+        (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
         if (state_in != state) {
             // The chunked kernel updates in place.
             const size_t n = static_cast<size_t>(v_heads) * v_dim * k_dim;
