@@ -29,6 +29,12 @@ use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 
+/// The state a new entry stores: copied, or taken over when it already lives in system RAM.
+enum Src<'a, B: Backend> {
+    Copy(&'a Checkpoint<B>),
+    Take(&'a mut Checkpoint<B>),
+}
+
 use velox_core::backend::HostAlloc;
 use velox_core::{Backend, Error as CoreError};
 use velox_models::qwen3_5::{
@@ -560,7 +566,41 @@ impl<B: Backend> ContextStore<B> {
         chain: Option<u64>,
         drafter: Option<(&DFlashModel<B>, &DFlashState<B>)>,
     ) -> Result<u64, CoreError> {
-        let pos = cp.pos;
+        self.insert_from(b, session, keys, Src::Copy(cp), root, chain, drafter)
+    }
+
+    /// [`Self::insert`] that takes `cp`'s storage when it is pinned instead of copying it (a
+    /// prefill snapshot written straight to system RAM), leaving `cp` with the storage the copy
+    /// would have filled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_taking(
+        &mut self,
+        b: &B,
+        session: &Session<B>,
+        keys: &[u32],
+        cp: &mut Checkpoint<B>,
+        root: bool,
+        chain: Option<u64>,
+        drafter: Option<(&DFlashModel<B>, &DFlashState<B>)>,
+    ) -> Result<u64, CoreError> {
+        self.insert_from(b, session, keys, Src::Take(cp), root, chain, drafter)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_from(
+        &mut self,
+        b: &B,
+        session: &Session<B>,
+        keys: &[u32],
+        cp: Src<'_, B>,
+        root: bool,
+        chain: Option<u64>,
+        drafter: Option<(&DFlashModel<B>, &DFlashState<B>)>,
+    ) -> Result<u64, CoreError> {
+        let pos = match &cp {
+            Src::Copy(c) => c.pos,
+            Src::Take(c) => c.pos,
+        };
         let keys = &keys[..pos];
         let (lambda, now) = (self.lambda, self.now);
         if let Some(e) = self.entries.iter_mut().find(|e| e.keys == keys) {
@@ -620,7 +660,11 @@ impl<B: Backend> ContextStore<B> {
             Some(s) => s,
             None => session.blank_checkpoint_in(b, pos, true)?,
         };
-        cp.copy_into(b, &mut state)?;
+        match cp {
+            Src::Take(c) if c.on_host() => std::mem::swap(c, &mut state),
+            Src::Take(c) => c.copy_into(b, &mut state)?,
+            Src::Copy(c) => c.copy_into(b, &mut state)?,
+        }
         let t_state = t0.elapsed();
         let id = self.next_id;
         self.next_id += 1;

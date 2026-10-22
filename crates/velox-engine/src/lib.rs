@@ -23,7 +23,7 @@ use store::{ContextStore, Pinner};
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -199,6 +199,12 @@ const KV_TRIM_SLACK: usize = 4096;
 /// Device memory a budget keeps back for kernel scratch that grows after warm-up (grow-only
 /// buffers sized by the largest call so far; a 6-way stress run went ~0.2 GB past warm-up).
 const SCRATCH_RESERVE: usize = 256 << 20;
+
+/// Prefill snapshots by storage: a device checkpoint, a pinned state the store had ready, or
+/// one pinned on the request path (logged with device memory).
+static SNAPS_DEVICE: AtomicUsize = AtomicUsize::new(0);
+static SNAPS_HOST: AtomicUsize = AtomicUsize::new(0);
+static SNAPS_PINNED: AtomicUsize = AtomicUsize::new(0);
 
 /// How often the engine logs device memory (free, attention pool, graphs).
 const MEM_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
@@ -771,6 +777,12 @@ impl<B: Backend> Core<B> {
                 p.overflow()
             )
         });
+        let snaps = format!(
+            ", snapshots {} device / {} host ({} pinned on demand)",
+            SNAPS_DEVICE.load(Ordering::Relaxed),
+            SNAPS_HOST.load(Ordering::Relaxed),
+            SNAPS_PINNED.load(Ordering::Relaxed)
+        );
         let allocs = self
             .b
             .device_allocs()
@@ -783,7 +795,8 @@ impl<B: Backend> Core<B> {
                 )
             });
         eprintln!(
-            "[mem] device in use {}{pool}{allocs}, graphs {graphs} ({:.2} GB, {released} released)",
+            "[mem] device in use {}{pool}{allocs}{snaps}, graphs {graphs} ({:.2} GB, {released} \
+             released)",
             self.b.device_in_use().map_or("unknown".into(), |u| format!(
                 "{:.2} GiB",
                 u as f64 / (1u64 << 30) as f64
@@ -1856,15 +1869,15 @@ impl<B: Backend> Core<B> {
             .filter(|&p| p != tail)
             .max();
         let mut behind = None;
-        for cp in std::mem::take(&mut lane.checkpoints) {
+        for mut cp in std::mem::take(&mut lane.checkpoints) {
             if cp.pos == tail && store.enabled() {
                 // The prompt's end goes straight to system RAM: only an exact retry resumes there.
                 let drafter = self.drafter_context(lane);
-                let id = store.insert(
+                let id = store.insert_taking(
                     &self.b,
                     &lane.session,
                     &lane.keys,
-                    &cp,
+                    &mut cp,
                     false,
                     None,
                     drafter,
@@ -1879,7 +1892,22 @@ impl<B: Backend> Core<B> {
                 && !store.holds(&lane.keys[..cp.pos])
             {
                 let drafter = self.drafter_context(lane);
-                store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
+                if Some(cp.pos) == head {
+                    store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
+                } else {
+                    let pos = cp.pos;
+                    store.insert_taking(
+                        &self.b,
+                        &lane.session,
+                        &lane.keys,
+                        &mut cp,
+                        true,
+                        None,
+                        drafter,
+                    )?;
+                    // The storage left behind is a blank spare: nothing below uses its state.
+                    cp.pos = pos;
+                }
             }
             if Some(cp.pos) == head {
                 lane.checkpoints.push(cp);
@@ -2106,20 +2134,41 @@ impl<B: Backend> Core<B> {
             if Some(pos) != deepest && pos != tail && !(anchor || !self.cfg.host_checkpoints) {
                 continue;
             }
-            // Storage: spare, else the lane's oldest checkpoint (its restore, if any, is queued
-            // before the snapshot), else new.
-            let mut cp = match lane.spare.pop() {
-                Some(cp) => cp,
-                None if !lane.checkpoints.is_empty() && self.cfg.host_checkpoints => {
-                    lane.checkpoints.sort_by_key(|c| c.pos);
-                    lane.checkpoints.remove(0)
-                }
-                // Every device state is taken: pinned storage, ready in the store or new.
-                None => match store.take_spare_state() {
+            // Storage. Only the deepest snapshot can become the lane's head (kept on the device);
+            // the others go to the context store, so they are written straight to pinned storage
+            // the store takes over (one copy over PCIe instead of a device copy then a download).
+            // Then: spare, else the lane's oldest checkpoint (its restore, if any, is queued before
+            // the snapshot), else pinned storage the store has ready or new.
+            let to_store = Some(pos) != deepest && store.enabled() && self.cfg.host_checkpoints;
+            let ready = if to_store {
+                store.take_spare_state()
+            } else {
+                None
+            };
+            let device = lane.spare.iter().position(|c| !c.on_host());
+            let mut cp = match (ready, device) {
+                (Some(cp), _) => cp,
+                (None, Some(i)) => lane.spare.swap_remove(i),
+                (None, None) => match lane.spare.pop() {
                     Some(cp) => cp,
-                    None => lane.session.blank_checkpoint_in(&self.b, pos, true)?,
+                    None if !lane.checkpoints.is_empty() && self.cfg.host_checkpoints => {
+                        lane.checkpoints.sort_by_key(|c| c.pos);
+                        lane.checkpoints.remove(0)
+                    }
+                    None => match store.take_spare_state() {
+                        Some(cp) => cp,
+                        None => {
+                            SNAPS_PINNED.fetch_add(1, Ordering::Relaxed);
+                            lane.session.blank_checkpoint_in(&self.b, pos, true)?
+                        }
+                    },
                 },
             };
+            if cp.on_host() {
+                SNAPS_HOST.fetch_add(1, Ordering::Relaxed);
+            } else {
+                SNAPS_DEVICE.fetch_add(1, Ordering::Relaxed);
+            }
             cp.pos = pos;
             cp.rope_delta = p.rope_delta;
             snaps.push(cp);
