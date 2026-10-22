@@ -367,6 +367,8 @@ impl CudaKernels for Rtx5090Kernels {
                     "rtx5090 linear rowsplit",
                 )
             }
+            // linear_act never reports it: this kernel set has no int8 path.
+            ActQuant::Int8G256 => Err(Error::Unsupported("rtx5090 linear int8".into())),
         }
     }
 }
