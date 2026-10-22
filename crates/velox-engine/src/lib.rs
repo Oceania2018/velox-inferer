@@ -171,6 +171,11 @@ const STORE_GAIN: usize = 128;
 /// Tokens a disk record must cover beyond every resident source to be read back.
 const DISK_GAIN: usize = 1024;
 
+/// Paged caches: rows past a new prompt a lane keeps backed (room for its output) before the rest
+/// is returned. Without the trim every lane keeps its longest prompt ever backed, and on a 32 GB
+/// card six lanes near capacity push VRAM into WDDM's system-memory spill (decode 3x slower).
+const KV_TRIM_SLACK: usize = 4096;
+
 pub struct QwenEngine<B: Backend> {
     core: Arc<Core<B>>,
     queue: Arc<JobQueue>,
@@ -929,6 +934,16 @@ impl<B: Backend> Core<B> {
             lane.checkpoints = keep;
             lane.spare.extend(stale);
             lane.keys = p.keys[..start].to_vec();
+            // No checkpoint left reaches past `start`, so rows past this prompt hold nothing.
+            let trimmed = lane
+                .session
+                .trim_kv(&self.b, p.keys.len() + KV_TRIM_SLACK)?;
+            if trimmed > 0 && debug {
+                eprintln!(
+                    "[kv] lane {li} returned {trimmed} chunks, {:.2} GB backed",
+                    lane.session.kv_bytes(&self.b) as f64 / 1e9
+                );
+            }
             let anchors: Vec<usize> = self
                 .checkpoint_positions(&p.ids, 0)
                 .into_iter()
