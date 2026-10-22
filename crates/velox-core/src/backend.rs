@@ -839,6 +839,11 @@ pub trait Backend {
     fn graph_stats(&self) -> (usize, usize, usize) {
         (0, 0, 0)
     }
+    /// This process's device allocations: (buffer bytes live, buffer bytes at their peak since
+    /// start, physical chunk bytes live), when the backend counts them.
+    fn device_allocs(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
     /// (free, total) device memory in bytes, when the backend can tell: what can still be
     /// allocated.
     fn mem_info(&self) -> Option<(usize, usize)> {

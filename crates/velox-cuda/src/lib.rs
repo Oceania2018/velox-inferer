@@ -244,12 +244,19 @@ impl Drop for CudaChunk {
     fn drop(&mut self) {
         // SAFETY: the handle came from cuMemCreate and is released exactly once.
         unsafe { ffi::velox_vmm_release(self.handle) };
+        CHUNK_BYTES.fetch_sub(vm_chunk_bytes(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 // SAFETY: a device pointer is a plain address; synchronisation is CUDA's stream ordering.
 unsafe impl Send for CudaBuffer {}
 unsafe impl Sync for CudaBuffer {}
+
+/// Bytes of device buffers (cudaMalloc) alive and at their peak, and of physical chunks alive:
+/// what the engine's memory log reports, to tell its own growth from the driver's.
+static BUFFER_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BUFFER_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CHUNK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl CudaBuffer {
     fn new(len: usize) -> Result<Self> {
@@ -263,6 +270,9 @@ impl CudaBuffer {
                 unsafe { ffi::velox_cuda_malloc_zeroed(&mut ptr, bytes) },
                 "cudaMalloc",
             )?;
+            use std::sync::atomic::Ordering::Relaxed;
+            let live = BUFFER_BYTES.fetch_add(bytes, Relaxed) + bytes;
+            BUFFER_PEAK.fetch_max(live, Relaxed);
         }
         Ok(CudaBuffer {
             ptr: ptr.cast(),
@@ -311,6 +321,7 @@ impl Drop for CudaBuffer {
                     ffi::velox_cuda_free_host(self.ptr.cast());
                 } else {
                     ffi::velox_cuda_free(self.ptr.cast());
+                    BUFFER_BYTES.fetch_sub(self.len * 4, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1102,6 +1113,15 @@ impl Backend for CudaBackend {
         mem_info().ok().map(|(f, t)| (f as usize, t as usize))
     }
 
+    fn device_allocs(&self) -> Option<(usize, usize, usize)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        Some((
+            BUFFER_BYTES.load(Relaxed),
+            BUFFER_PEAK.load(Relaxed),
+            CHUNK_BYTES.load(Relaxed),
+        ))
+    }
+
     fn device_in_use(&self) -> Option<usize> {
         let (mut used, mut total) = (0usize, 0usize);
         // SAFETY: out-pointers to live locals.
@@ -1229,6 +1249,7 @@ impl Backend for CudaBackend {
             unsafe { ffi::velox_vmm_create(&mut handle, chunk) },
             "cuMemCreate",
         )?;
+        CHUNK_BYTES.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
         Ok(CudaChunk { handle })
     }
 

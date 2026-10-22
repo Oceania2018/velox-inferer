@@ -189,6 +189,10 @@ const DISK_GAIN: usize = 1024;
 /// card six lanes near capacity push VRAM into WDDM's system-memory spill (decode 3x slower).
 const KV_TRIM_SLACK: usize = 4096;
 
+/// Device memory a budget keeps back for kernel scratch that grows after warm-up (grow-only
+/// buffers sized by the largest call so far; a 6-way stress run went ~0.2 GB past warm-up).
+const SCRATCH_RESERVE: usize = 256 << 20;
+
 /// How often the engine logs device memory (free, attention pool, graphs).
 const MEM_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -663,7 +667,8 @@ impl<B: Backend> Core<B> {
         let sets = match (cfg.kv_capacity, cfg.vram_budget, used, self.b.mem_info()) {
             (Some(tokens), ..) => tokens.div_ceil(rows_per_set.max(1)),
             (None, Some(budget), Some(used), _) => {
-                let room = budget.saturating_sub(used + graphs_to_come) / set_bytes.max(1);
+                let room = budget.saturating_sub(used + graphs_to_come + SCRATCH_RESERVE)
+                    / set_bytes.max(1);
                 // One full-length request must always fit.
                 let floor = st.lanes[0].session.kv_sets_for(cfg.capacity);
                 if room < floor {
@@ -740,8 +745,19 @@ impl<B: Backend> Core<B> {
                 p.overflow()
             )
         });
+        let allocs = self
+            .b
+            .device_allocs()
+            .map_or(String::new(), |(live, peak, chunks)| {
+                format!(
+                    ", buffers {:.2} GiB (peak {:.2}), chunks {:.2} GiB",
+                    live as f64 / (1u64 << 30) as f64,
+                    peak as f64 / (1u64 << 30) as f64,
+                    chunks as f64 / (1u64 << 30) as f64
+                )
+            });
         eprintln!(
-            "[mem] device in use {}{pool}, graphs {graphs} ({:.2} GB, {released} released)",
+            "[mem] device in use {}{pool}{allocs}, graphs {graphs} ({:.2} GB, {released} released)",
             self.b.device_in_use().map_or("unknown".into(), |u| format!(
                 "{:.2} GiB",
                 u as f64 / (1u64 << 30) as f64
@@ -1100,6 +1116,9 @@ impl<B: Backend> Core<B> {
             let trimmed = lane
                 .session
                 .trim_kv(&self.b, p.keys.len() + KV_TRIM_SLACK)?;
+            // The prompt's rows are backed now rather than as its chunks run, so the next
+            // admission's room check (`kv_room`) sees this request's share of the pool taken.
+            lane.session.reserve_kv(&self.b, p.keys.len())?;
             if trimmed > 0 && debug {
                 eprintln!(
                     "[kv] lane {li} returned {trimmed} chunks, {:.2} GB backed",
