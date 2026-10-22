@@ -64,7 +64,8 @@ COMMANDS:
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
       [--max-tokens 64] [--chunk 256] [--capacity 4096] [--mtp N | --dflash N] (speculative)
       [--kv-format f32|bf16|fp8|nvfp4] (attention KV cache storage, default f32)
-  serve                   OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
+      [--host-weights <list>|none] (matrices kept in system RAM, default text/token_embedding)
+  serve                  OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
       --model-id <id>       default: artifact metadata name
