@@ -82,6 +82,49 @@ __global__ void __launch_bounds__(1024) top_k_merge(const float* __restrict__ ca
     block_top_k<1024, kMergePer>(sv, si, n, k, out_v + static_cast<long long>(row) * k, out_i + static_cast<long long>(row) * k);
 }
 
+// k = 1 (greedy argmax, e.g. speculative verify): a reduction instead of sorting each slice.
+// Same order as `before`: value desc, then index asc; NaN ranks lowest; index -1 is padding.
+__device__ __forceinline__ void keep_best(float& v, int& i, float ov, int oi) {
+    if (before(ov, oi, v, i)) v = ov, i = oi;
+}
+
+template <int THREADS>
+__device__ void block_argmax(float v, int i, float* out_v, int* out_i) {
+    __shared__ float wv[THREADS / 32];
+    __shared__ int wi[THREADS / 32];
+    for (int o = 16; o > 0; o >>= 1) keep_best(v, i, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, i, o));
+    if ((threadIdx.x & 31) == 0) wv[threadIdx.x / 32] = v, wi[threadIdx.x / 32] = i;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        v = threadIdx.x < THREADS / 32 ? wv[threadIdx.x] : -INFINITY;
+        i = threadIdx.x < THREADS / 32 ? wi[threadIdx.x] : -1;
+        for (int o = 16; o > 0; o >>= 1) keep_best(v, i, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, i, o));
+        if (threadIdx.x == 0) *out_v = v, *out_i = i;
+    }
+}
+
+__global__ void __launch_bounds__(256) argmax_slices(const float* __restrict__ x, long long row_len, int limit,
+                                                     float* __restrict__ cand_v, int* __restrict__ cand_i) {
+    const int row = blockIdx.y, slice = blockIdx.x;
+    const int lo = slice * kSlice, n = min(kSlice, limit - lo);
+    const float* xr = x + row * row_len + lo;
+    float v = -INFINITY;
+    int i = -1;
+    for (int j = threadIdx.x; j < n; j += 256) keep_best(v, i, rank_key(xr[j]), lo + j);
+    const long long out = static_cast<long long>(row) * gridDim.x + slice;
+    block_argmax<256>(v, i, cand_v + out, cand_i + out);
+}
+
+__global__ void __launch_bounds__(256) argmax_merge(const float* __restrict__ cand_v, const int* __restrict__ cand_i,
+                                                    int n, float* __restrict__ out_v, int* __restrict__ out_i) {
+    const int row = blockIdx.x;
+    float v = -INFINITY;
+    int i = -1;
+    for (int j = threadIdx.x; j < n; j += 256)
+        keep_best(v, i, cand_v[static_cast<long long>(row) * n + j], cand_i[static_cast<long long>(row) * n + j]);
+    block_argmax<256>(v, i, out_v + row, out_i + row);
+}
+
 struct Scratch {
     std::mutex mu;
     uint8_t* ptr = nullptr;
@@ -115,8 +158,13 @@ VELOX_API int velox_portable_top_k(const float* x, int rows, long long row_len, 
     int* cand_i = reinterpret_cast<int*>(base + cand * 4);
     float* out_v = reinterpret_cast<float*>(base + cand * 8);
     int* out_i = reinterpret_cast<int*>(base + cand * 8 + outn * 4);
-    top_k_slices<<<dim3(slices, rows), 256>>>(x, row_len, limit, k, cand_v, cand_i);
-    top_k_merge<<<rows, 1024>>>(cand_v, cand_i, slices * k, k, out_v, out_i);
+    if (k == 1) {
+        argmax_slices<<<dim3(slices, rows), 256>>>(x, row_len, limit, cand_v, cand_i);
+        argmax_merge<<<rows, 256>>>(cand_v, cand_i, slices, out_v, out_i);
+    } else {
+        top_k_slices<<<dim3(slices, rows), 256>>>(x, row_len, limit, k, cand_v, cand_i);
+        top_k_merge<<<rows, 1024>>>(cand_v, cand_i, slices * k, k, out_v, out_i);
+    }
     if (const int e = velox_launch_status()) return e;
     if (cudaError_t e = cudaMemcpy(host_idx, out_i, outn * 4, cudaMemcpyDeviceToHost)) return static_cast<int>(e);
     return static_cast<int>(cudaMemcpy(host_val, out_v, outn * 4, cudaMemcpyDeviceToHost));

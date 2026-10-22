@@ -1799,6 +1799,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Iq3Xxs, 130, 768, 3, 100, 8)?;
     s.linear(WeightFormat::Iq3Xxs, 200, 256, 17, 150, 33)?;
     s.embed(WeightFormat::Iq3Xxs, 12, 512, &[11, 0, 5])?;
+    // Greedy speculative verify: the argmax of each row of a verify window.
+    s.top_k(8, 248_320, 248_077, 1)?;
     Ok(s.results)
 }
 
