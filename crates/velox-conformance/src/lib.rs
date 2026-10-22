@@ -1935,6 +1935,10 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear_act(WeightFormat::Iq3Xxs, 160, 512, 16, 136, 1030, a8)?;
     s.linear_swiglu_with(WeightFormat::Iq3Xxs, 256, 72, 0, 1030, false, false, a8)?;
     s.linear_act(WeightFormat::Q5G64, 128, 512, 0, 128, 1030, a8)?;
+    // A16-only NVFP4 at prefill widths (output projections of the IQ3_XXS DFlash2 artifact): a
+    // view starting mid-tile with ragged rows, and a full chunk.
+    s.linear(WeightFormat::Nvfp4, 384, 512, 40, 300, 100)?;
+    s.linear(WeightFormat::Nvfp4, 256, 448, 0, 256, 1030)?;
     Ok(s.results)
 }
 
