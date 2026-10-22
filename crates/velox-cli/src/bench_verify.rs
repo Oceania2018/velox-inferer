@@ -55,7 +55,7 @@ fn bench<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
         s.pos = context;
         sessions.push(s);
     }
-    let mut bw = model.batch_workspace(b, n.max(2))?;
+    let mut bw = model.batch_workspace(b, n.max(2), m)?;
     let window: Vec<u32> = (1..=m as u32).collect();
     let limit = model.cfg.vocab;
 

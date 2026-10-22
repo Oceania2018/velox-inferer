@@ -42,11 +42,9 @@ pub struct Session<B: Backend> {
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
     /// Speculative-verify state, allocated on first `verify`.
-    spec: Option<Spec<B>>,
+    spec: Option<Spec>,
     /// Distinguishes this session's graph recordings from other sessions' (they bind its buffers).
     id: u64,
-    /// Flips whenever a committed verify swaps the recurrent state with the speculative buffers.
-    parity: bool,
     /// Virtual-memory backing of the caches (see `paging`); `None`: allocated whole.
     paging: Option<paging::KvPaging<B>>,
 }
@@ -76,7 +74,7 @@ const STATIC_MAX_TOKENS: usize = 15;
 const GRAPH_SEGMENT_STARTS: [usize; 5] = [1, 4, 16, 32, 48];
 
 fn graph_key(kind: u64, shape: u64, s: &Session<impl Backend>, kv_len: Option<usize>) -> u64 {
-    let mut key = kind | shape | u64::from(s.parity) << 15 | (s.id & 0xffff) << 40;
+    let mut key = kind | shape | (s.id & 0xffff) << 40;
     if let Some(kv) = kv_len {
         key |= GRAPH_STATIC | (kv.div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
     }
@@ -89,9 +87,7 @@ static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// the window, and per GDN layer the raw projections each token fed to the convolution and the
 /// recurrence. Replaying a prefix runs the same kernels on the same inputs, so the committed
 /// state is bit-identical to the verify trajectory at that point.
-struct Spec<B: Backend> {
-    conv: Vec<B::Buffer>,
-    ssm: Vec<B::Buffer>,
+struct Spec {
     pos0: usize,
     tokens: usize,
     recording: bool,
@@ -109,11 +105,13 @@ struct SpecRows<B: Backend> {
     ab: Vec<B::Buffer>,
 }
 
-/// Buffers for [`Qwen35Text::verify_batch`]: several sequences' windows (at most
-/// [`VERIFY_MAX`] rows each) share one forward pass, so every weight is read once per round.
+/// Buffers for [`Qwen35Text::verify_batch`]: several sequences' windows (at most `window`
+/// rows each) share one forward pass, so every weight is read once per round.
 pub struct BatchWorkspace<B: Backend> {
     max_seqs: usize,
-    /// Per GDN layer, `[max_seqs * VERIFY_MAX, *]` rows: what each sequence's commit replays.
+    /// Rows of one sequence's window, at most (the drafter's drafts plus the pending token).
+    window: usize,
+    /// Per GDN layer, `[max_seqs * window, *]` rows: what each sequence's commit replays.
     qkv: Vec<B::Buffer>,
     conv_out: Vec<B::Buffer>,
     ab: Vec<B::Buffer>,
@@ -165,6 +163,11 @@ impl<B: Backend> BatchWorkspace<B> {
     /// Most sequences one batch takes.
     pub fn max_seqs(&self) -> usize {
         self.max_seqs
+    }
+
+    /// Rows of one sequence's window, at most.
+    pub fn window(&self) -> usize {
+        self.window
     }
 }
 
@@ -499,9 +502,69 @@ pub struct Workspace<B: Backend> {
     kv_f32: Option<(B::Buffer, B::Buffer)>,
     /// Verify replay rows (allocated with the first verify).
     spec_rows: Option<SpecRows<B>>,
+    /// Where verify's recurrences write their final state: one GDN layer's conv and SSM state,
+    /// shared by every layer and session and never read (commit replays the kept rows from the
+    /// recorded inputs instead, as ninfer's ReplaySSM). Saves a full state copy per lane.
+    spec_state: Option<(B::Buffer, B::Buffer)>,
     /// `emb` / `rows_hidden` hold `max_tokens` rows (MTP drafting reads them); without, they are
     /// placeholders and `keep_rows` does not fill them.
     rows: bool,
+    /// Physical memory the per-phase buffers share (see [`overlay`]); empty without virtual
+    /// memory. Declared last, so the buffers mapping it drop first.
+    _overlay: Vec<B::Chunk>,
+}
+
+/// Allocates `groups` of buffers (f32 lengths) whose groups share physical memory: each group's
+/// buffers are disjoint, and every group starts at the same physical chunk. For buffers of
+/// phases that are never live together (a layer's GDN mixer, attention mixer and MLP scratch),
+/// this takes the largest group instead of the sum. `None` without virtual memory (or with
+/// `VELOX_NO_OVERLAY`): the caller allocates them separately. Contents start zeroed.
+fn overlay<B: Backend>(
+    b: &B,
+    groups: &[&[usize]],
+) -> Result<Option<(Vec<Vec<B::Buffer>>, Vec<B::Chunk>)>> {
+    let chunk = b.vm_chunk_len();
+    if chunk == 0 || std::env::var_os("VELOX_NO_OVERLAY").is_some() {
+        return Ok(None);
+    }
+    let span = |len: usize| len.max(1).div_ceil(chunk);
+    let need = groups
+        .iter()
+        .map(|g| g.iter().map(|&l| span(l)).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let chunks = (0..need)
+        .map(|_| b.alloc_chunk())
+        .collect::<Result<Vec<_>>>()?;
+    let zero = b.alloc(chunk)?;
+    let mut out = Vec::with_capacity(groups.len());
+    for g in groups {
+        let mut at = 0;
+        let mut bufs = Vec::with_capacity(g.len());
+        for &len in g.iter() {
+            let mut buf = b.alloc_virtual(len)?;
+            for j in 0..span(len) {
+                b.map_chunk(&mut buf, j, &chunks[at + j])?;
+            }
+            at += span(len);
+            bufs.push(buf);
+        }
+        out.push(bufs);
+    }
+    // Chunk contents are undefined; the first group's buffers cover every chunk (it is not
+    // necessarily the largest, so zero through each group).
+    for bufs in &mut out {
+        for buf in bufs.iter_mut() {
+            let len = b.len(buf);
+            let mut off = 0;
+            while off < len {
+                let n = chunk.min(len - off);
+                b.copy(&zero, 0, buf, off, n)?;
+                off += n;
+            }
+        }
+    }
+    Ok(Some((out, chunks)))
 }
 
 pub struct Qwen35Text<B: Backend> {
@@ -574,7 +637,6 @@ impl<B: Backend> Qwen35Text<B> {
             ssm,
             spec: None,
             id: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            parity: false,
             paging: paged.then(|| {
                 let chunk = b.vm_chunk_len();
                 paging::KvPaging::new(chunk, kv_len.div_ceil(chunk))
@@ -594,27 +656,60 @@ impl<B: Backend> Qwen35Text<B> {
         // Fused projections and the fused MLP gate|up only run up to FUSE_MAX_TOKENS rows.
         let tf = t.min(FUSE_MAX_TOKENS);
         let tr = if rows { t } else { 1 };
+        // Scratch of a layer's three phases: the GDN mixer, the attention mixer and the MLP (the
+        // dense SwiGLU, a MoE block's shared expert; routed experts will need their own scratch
+        // once the MoE ops land). Each phase finishes into `y` before the next starts, so with
+        // virtual memory the phases overlay one another.
+        let gdn = [
+            t * c.gdn_qkv(),
+            t * c.gdn_qkv(),
+            t * c.gdn_v(),
+            t * 2 * c.gdn_v_heads,
+            t * c.gdn_v(),
+        ];
+        let attn = [
+            t * c.q_dim(),
+            t * c.q_dim(),
+            t * c.kv_dim(),
+            t * c.kv_dim(),
+            t * c.q_dim(),
+            t * c.kv_dim(),
+            t * c.q_dim(),
+        ];
+        let mlp = [t * c.mlp_width(), t * c.mlp_width()];
+        let (bufs, backing) = match overlay(b, &[&gdn, &attn, &mlp])? {
+            Some(o) => o,
+            None => (
+                [&gdn[..], &attn[..], &mlp[..]]
+                    .iter()
+                    .map(|g| g.iter().map(|&l| b.alloc(l)).collect::<Result<Vec<_>>>())
+                    .collect::<Result<Vec<_>>>()?,
+                Vec::new(),
+            ),
+        };
+        let mut bufs = bufs.into_iter();
+        let mut next = || bufs.next().expect("three groups").into_iter();
+        let (mut g_gdn, mut g_attn, mut g_mlp) = (next(), next(), next());
+        let take = |g: &mut std::vec::IntoIter<B::Buffer>| g.next().expect("group sized above");
         Ok(Workspace {
             max_tokens,
             x: b.alloc(t * c.hidden)?,
             h: b.alloc(t * c.hidden)?,
             y: b.alloc(t * c.hidden)?,
-            qkv: b.alloc(t * c.gdn_qkv())?,
-            conv_out: b.alloc(t * c.gdn_qkv())?,
-            z: b.alloc(t * c.gdn_v())?,
-            ab: b.alloc(t * 2 * c.gdn_v_heads)?,
-            o: b.alloc(t * c.gdn_v())?,
-            q: b.alloc(t * c.q_dim())?,
-            g: b.alloc(t * c.q_dim())?,
-            k: b.alloc(t * c.kv_dim())?,
-            v: b.alloc(t * c.kv_dim())?,
-            qn: b.alloc(t * c.q_dim())?,
-            kn: b.alloc(t * c.kv_dim())?,
-            attn: b.alloc(t * c.q_dim())?,
-            // The dense SwiGLU (a MoE block's shared expert); routed experts will need their own
-            // scratch once the MoE ops land.
-            mg: b.alloc(t * c.mlp_width())?,
-            mu: b.alloc(t * c.mlp_width())?,
+            qkv: take(&mut g_gdn),
+            conv_out: take(&mut g_gdn),
+            z: take(&mut g_gdn),
+            ab: take(&mut g_gdn),
+            o: take(&mut g_gdn),
+            q: take(&mut g_attn),
+            g: take(&mut g_attn),
+            k: take(&mut g_attn),
+            v: take(&mut g_attn),
+            qn: take(&mut g_attn),
+            kn: take(&mut g_attn),
+            attn: take(&mut g_attn),
+            mg: take(&mut g_mlp),
+            mu: take(&mut g_mlp),
             fused: b.alloc(tf * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
             gu: b.alloc(tf * 2 * c.mlp_width())?,
             last: b.alloc(c.hidden)?,
@@ -630,7 +725,9 @@ impl<B: Backend> Qwen35Text<B> {
             kv_f32: None,
             features: None,
             spec_rows: None,
+            spec_state: None,
             rows,
+            _overlay: backing,
         })
     }
 
@@ -842,7 +939,7 @@ impl<B: Backend> Qwen35Text<B> {
                 } => {
                     // While a verify window is recorded, its qkv and a/b rows land directly in the
                     // spec buffers commit replays from, and the recurrent state advances into the
-                    // spec state, so the session keeps the state to roll back to (no copies).
+                    // shared scratch state, so the session keeps the state to roll back to.
                     let Session {
                         spec,
                         conv: s_conv,
@@ -850,23 +947,19 @@ impl<B: Backend> Qwen35Text<B> {
                         ..
                     } = &mut *s;
                     let (qkv_buf, ab_buf, mut state_out) = match (
-                        spec.as_mut().filter(|sp| sp.recording),
+                        spec.as_ref().filter(|sp| sp.recording),
                         ws.spec_rows.as_mut(),
+                        ws.spec_state.as_mut(),
                     ) {
                         (
-                            Some(Spec {
-                                conv: sc, ssm: ss, ..
-                            }),
+                            Some(_),
                             Some(SpecRows {
                                 qkv: sq,
                                 conv_out: so,
                                 ab: sa,
                             }),
-                        ) => (
-                            &mut sq[gi],
-                            &mut sa[gi],
-                            Some((&mut sc[gi], &mut ss[gi], &mut so[gi])),
-                        ),
+                            Some((sc, ss)),
+                        ) => (&mut sq[gi], &mut sa[gi], Some((sc, ss, &mut so[gi]))),
                         _ => (&mut ws.qkv, &mut ws.ab, None),
                     };
                     match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
@@ -1275,7 +1368,7 @@ impl<B: Backend> Qwen35Text<B> {
                 VERIFY_MAX.min(ws.max_tokens)
             )));
         }
-        self.ensure_spec(b, s)?;
+        self.ensure_spec(s)?;
         self.ensure_spec_rows(b, ws)?;
         if s.pos + t > s.capacity {
             return Err(Error::Config(format!(
@@ -1338,7 +1431,6 @@ impl<B: Backend> Qwen35Text<B> {
             conv,
             ssm,
             pos,
-            parity,
             ..
         } = &mut *s;
         let sp = spec
@@ -1355,15 +1447,10 @@ impl<B: Backend> Qwen35Text<B> {
                 sp.tokens
             )));
         }
-        if keep == sp.tokens {
-            // The whole window stays: verify left its state in the spec buffers, which become
-            // the session's (graph keys carry the parity, as recordings bind buffers).
-            std::mem::swap(conv, &mut sp.conv);
-            std::mem::swap(ssm, &mut sp.ssm);
-            *parity = !*parity;
-        } else {
-            // The session still holds the state before the window: advance it over the kept
-            // prefix from the recorded inputs, every GDN layer in one step per kept length.
+        {
+            // The session still holds the state before the window (verify wrote its own to
+            // scratch): advance it over the kept prefix from the recorded inputs, every GDN layer
+            // in one step per kept length.
             let rows = ws
                 .spec_rows
                 .as_ref()
@@ -1414,16 +1501,11 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
-    fn ensure_spec(&self, b: &B, s: &mut Session<B>) -> Result<()> {
+    fn ensure_spec(&self, s: &mut Session<B>) -> Result<()> {
         if s.spec.is_some() {
             return Ok(());
         }
-        let like = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
-            bufs.iter().map(|x| b.alloc(b.len(x))).collect()
-        };
         s.spec = Some(Spec {
-            conv: like(&s.conv)?,
-            ssm: like(&s.ssm)?,
             pos0: 0,
             tokens: 0,
             recording: false,
@@ -1432,7 +1514,19 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
+    fn ensure_spec_state(&self, b: &B, ws: &mut Workspace<B>) -> Result<()> {
+        if ws.spec_state.is_none() {
+            let c = &self.cfg;
+            ws.spec_state = Some((
+                b.alloc((c.conv_width - 1) * c.gdn_qkv())?,
+                b.alloc(c.gdn_v_heads * c.gdn_v_dim * c.gdn_k_dim)?,
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_spec_rows(&self, b: &B, ws: &mut Workspace<B>) -> Result<()> {
+        self.ensure_spec_state(b, ws)?;
         if ws.spec_rows.is_some() {
             return Ok(());
         }
@@ -1452,19 +1546,28 @@ impl<B: Backend> Qwen35Text<B> {
     /// Allocates what speculative verify needs for `s` and `ws` now rather than at the first
     /// verify, so a server's memory is committed at startup.
     pub fn reserve_verify(&self, b: &B, s: &mut Session<B>, ws: &mut Workspace<B>) -> Result<()> {
-        self.ensure_spec(b, s)?;
+        self.ensure_spec(s)?;
         self.ensure_spec_rows(b, ws)
     }
 
-    /// Buffers for batches of up to `max_seqs` sequences (see [`Self::verify_batch`]).
-    pub fn batch_workspace(&self, b: &B, max_seqs: usize) -> Result<BatchWorkspace<B>> {
+    /// Buffers for batches of up to `max_seqs` sequences of up to `window` tokens each (at most
+    /// [`VERIFY_MAX`]; see [`Self::verify_batch`]). Every buffer scales with `max_seqs * window`, so
+    /// the window should be what the drafter proposes (drafts + 1), not the limit.
+    pub fn batch_workspace(
+        &self,
+        b: &B,
+        max_seqs: usize,
+        window: usize,
+    ) -> Result<BatchWorkspace<B>> {
         let c = &self.cfg;
-        let rows = max_seqs * VERIFY_MAX;
+        let window = window.clamp(1, VERIFY_MAX);
+        let rows = max_seqs * window;
         let gdn = c.layers.iter().filter(|l| **l == LayerKind::Gdn).count();
         let per_layer =
             |w: usize| -> Result<Vec<B::Buffer>> { (0..gdn).map(|_| b.alloc(rows * w)).collect() };
         Ok(BatchWorkspace {
             max_seqs,
+            window,
             qkv: per_layer(c.gdn_qkv())?,
             conv_out: per_layer(c.gdn_qkv())?,
             ab: per_layer(2 * c.gdn_v_heads)?,
@@ -1506,9 +1609,10 @@ impl<B: Backend> Qwen35Text<B> {
         let mut rows = Vec::with_capacity(n);
         let mut ids = Vec::new();
         for (s, w) in sessions.iter_mut().zip(windows) {
-            if w.is_empty() || w.len() > VERIFY_MAX {
+            if w.is_empty() || w.len() > bw.window {
                 return Err(Error::Shape(format!(
-                    "verify takes 1..={VERIFY_MAX} tokens per sequence"
+                    "batched verify takes 1..={} tokens per sequence",
+                    bw.window
                 )));
             }
             if s.pos + w.len() > s.capacity {
@@ -1516,7 +1620,8 @@ impl<B: Backend> Qwen35Text<B> {
                     "verify window exceeds session capacity".into(),
                 ));
             }
-            self.ensure_spec(b, s)?;
+            self.ensure_spec(s)?;
+            self.ensure_spec_state(b, ws)?;
             s.prepare_kv(b, s.pos, s.pos + w.len())?;
             rows.push((ids.len(), w.len()));
             ids.extend_from_slice(w);
@@ -1589,7 +1694,6 @@ impl<B: Backend> Qwen35Text<B> {
             conv,
             ssm,
             pos,
-            parity,
             ..
         } = &mut *s;
         let sp = spec
@@ -1605,11 +1709,7 @@ impl<B: Backend> Qwen35Text<B> {
                 sp.tokens
             )));
         }
-        if keep == sp.tokens {
-            std::mem::swap(conv, &mut sp.conv);
-            std::mem::swap(ssm, &mut sp.ssm);
-            *parity = !*parity;
-        } else if keep > 0 {
+        if keep > 0 {
             let gdn_params = self.w.layers.iter().filter_map(|l| match &l.mixer {
                 Mixer::Gdn { a_log, dt_bias, .. } => Some((*a_log, *dt_bias)),
                 _ => None,
@@ -1691,9 +1791,10 @@ impl<B: Backend> Qwen35Text<B> {
         let mut ids = prefill.ids.to_vec();
         let mut rows = Vec::with_capacity(n);
         for (s, win) in sessions.iter_mut().zip(windows) {
-            if win.is_empty() || win.len() > VERIFY_MAX {
+            if win.is_empty() || win.len() > bw.window {
                 return Err(Error::Shape(format!(
-                    "verify takes 1..={VERIFY_MAX} tokens per sequence"
+                    "batched verify takes 1..={} tokens per sequence",
+                    bw.window
                 )));
             }
             if s.pos + win.len() > s.capacity {
@@ -1701,7 +1802,8 @@ impl<B: Backend> Qwen35Text<B> {
                     "verify window exceeds session capacity".into(),
                 ));
             }
-            self.ensure_spec(b, s)?;
+            self.ensure_spec(s)?;
+            self.ensure_spec_state(b, ws)?;
             s.prepare_kv(b, s.pos, s.pos + win.len())?;
             rows.push((ids.len() - tp, win.len()));
             ids.extend_from_slice(win);
@@ -1944,12 +2046,11 @@ impl<B: Backend> Qwen35Text<B> {
                     }
                     for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
                         let Session {
-                            spec,
                             conv: s_conv,
                             ssm: s_ssm,
                             ..
                         } = &mut **s;
-                        let sp = spec.as_mut().expect("ensure_spec ran");
+                        let (sc, ss) = ws.spec_state.as_mut().expect("ensure_spec_state ran");
                         let cs = ConvShape {
                             tokens: m,
                             channels: c.gdn_qkv(),
@@ -1968,7 +2069,7 @@ impl<B: Backend> Qwen35Text<B> {
                             &bw.qkv[gi],
                             cw,
                             &s_conv[gi],
-                            &mut sp.conv[gi],
+                            sc,
                             &mut bw.conv_out[gi],
                             cs,
                         )?;
@@ -1980,7 +2081,7 @@ impl<B: Backend> Qwen35Text<B> {
                             al,
                             dt,
                             &s_ssm[gi],
-                            &mut sp.ssm[gi],
+                            ss,
                             o,
                             gs,
                         )?;
