@@ -131,8 +131,9 @@ struct Lanes<B: Backend> {
     /// Batched-verify buffers, with more than one lane.
     bw: Option<BatchWorkspace<B>>,
     clock: u64,
-    /// Device checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
-    /// prefills snapshot into it instead of allocating, which would synchronize the device.
+    /// Checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
+    /// prefills snapshot into it instead of allocating, which would synchronize the device. Holds
+    /// the [`DEVICE_STATES`] device checkpoints not in a lane, and host ones up to its trim.
     spare: Vec<Checkpoint<B>>,
     /// Published prefix chunks of the lanes' paged attention caches.
     share: KvShare<B>,
@@ -142,6 +143,12 @@ struct Lanes<B: Backend> {
 
 /// Device checkpoint storage kept for reuse across lanes.
 const DEVICE_SPARE: usize = 2;
+
+/// Device checkpoints (one recurrent state each, 157 MB for Qwen3.8-27B), created at startup
+/// inside the memory budget and never more: the lanes' kept heads ([`DEVICE_HEADS`]) plus
+/// [`DEVICE_SPARE`]. A prefill snapshot finding none free takes pinned host storage instead;
+/// allocating them per prefill took ~1.4 GB for seconds when six fresh prompts started together.
+const DEVICE_STATES: usize = DEVICE_HEADS + DEVICE_SPARE;
 
 /// Lanes whose chain head stays in device memory (the most recently admitted); other heads move
 /// to the context store, from where their next request restores them (~5 ms over PCIe).
@@ -227,6 +234,19 @@ fn core(e: CoreError) -> ApiError {
         code: "engine_error",
         message: e.to_string(),
     }
+}
+
+/// Keeps at most `max` host checkpoints in `spare` and every device one: device checkpoints
+/// are a fixed set (see [`DEVICE_STATES`]), so dropping one would only shrink it.
+fn trim_spare<B: Backend>(spare: &mut Vec<Checkpoint<B>>, max: usize) {
+    let mut host = 0;
+    spare.retain(|c| {
+        if !c.on_host() {
+            return true;
+        }
+        host += 1;
+        host <= max
+    });
 }
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
@@ -645,6 +665,12 @@ impl<B: Backend> Core<B> {
     /// for caches, so VRAM stays flat instead of creeping into WDDM's system-memory spill.
     fn budget_memory(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
         let cfg = &self.cfg;
+        // The device checkpoints there will ever be, before the measurement below counts them.
+        let device = st.spare.iter().filter(|c| !c.on_host()).count();
+        for _ in device..DEVICE_STATES {
+            st.spare
+                .push(st.lanes[0].session.blank_checkpoint(&self.b, 0)?);
+        }
         self.b.set_graph_budget(cfg.graph_budget);
         let Some((per_set, rows_per_set)) = st.lanes[0].session.kv_set_shape() else {
             eprintln!("attention caches: {} lanes, whole", st.lanes.len());
@@ -783,7 +809,7 @@ impl<B: Backend> Core<B> {
         lane.keys.clear();
         lane.chain = None;
         spare.append(&mut lane.checkpoints);
-        spare.truncate(DEVICE_SPARE);
+        trim_spare(spare, DEVICE_SPARE);
         if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
             eprintln!("[kv] lane {j} released {n} chunks to the pool");
         }
@@ -1030,7 +1056,7 @@ impl<B: Backend> Core<B> {
                 spare.push(cp);
             }
         }
-        spare.truncate(DEVICE_SPARE);
+        trim_spare(spare, DEVICE_SPARE);
         Ok(())
     }
 
@@ -1132,7 +1158,7 @@ impl<B: Backend> Core<B> {
                 .collect();
             self.begin_prefill(lane, store, p, &job.images, start, anchors, t0)
         })();
-        lane.spare.truncate(DEVICE_SPARE);
+        trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
         match r {
             Ok(pre) => Ok(Active {
@@ -1192,7 +1218,7 @@ impl<B: Backend> Core<B> {
             );
             Ok(())
         };
-        lane.spare.truncate(DEVICE_SPARE);
+        trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
         placed?;
         a.prompt_ms = pre.t0.elapsed().as_secs_f64() * 1e3;
@@ -1806,7 +1832,7 @@ impl<B: Backend> Core<B> {
                 .unwrap_or(0);
             spare.push(checkpoints.remove(drop));
         }
-        spare.truncate(MAX_SPARE);
+        trim_spare(spare, MAX_SPARE);
     }
 
     /// Host checkpoint mode, after a prefill: checkpoints at `anchors` (system prompt and task:
@@ -2037,7 +2063,7 @@ impl<B: Backend> Core<B> {
     fn begin_prefill(
         &self,
         lane: &mut Lane<B>,
-        store: &ContextStore<B>,
+        store: &mut ContextStore<B>,
         p: &Prompt,
         images: &[ImagePatches],
         start: usize,
@@ -2088,7 +2114,11 @@ impl<B: Backend> Core<B> {
                     lane.checkpoints.sort_by_key(|c| c.pos);
                     lane.checkpoints.remove(0)
                 }
-                None => lane.session.blank_checkpoint(&self.b, pos)?,
+                // Every device state is taken: pinned storage, ready in the store or new.
+                None => match store.take_spare_state() {
+                    Some(cp) => cp,
+                    None => lane.session.blank_checkpoint_in(&self.b, pos, true)?,
+                },
             };
             cp.pos = pos;
             cp.rope_delta = p.rope_delta;
