@@ -435,49 +435,61 @@ __device__ __forceinline__ void gdn_head_prep(const float* __restrict__ qkv, con
     }
 }
 
-// `gdn_rows` over a window of at most kGdnRowsMaxT tokens whose head values are in `hd`.
+// Lanes per state row of `gdn_rows_shared`: a warp updates 8 rows, and a row's dot products
+// reduce over 4 lanes (2 shuffles) instead of a whole warp (5).
+constexpr int kGdnRowLanes = 4;
+constexpr int kGdnRowsPerBlock = kGdnRowsWarps * (VELOX_WARP / kGdnRowLanes);
+
+// `gdn_rows` over a window of at most kGdnRowsMaxT tokens whose head values are in `hd`, for row
+// i with kGdnRowLanes lanes; lane j of the row holds elements j, j + 4, ... (conflict-free
+// shared reads: the row's lanes hit distinct banks, the warp's 8 rows broadcast).
 template <int PER>
 __device__ __forceinline__ void gdn_rows_shared(const float* __restrict__ qkv, const float* state_in, float* state,
                                                 float* __restrict__ out, int tokens, int k_heads, int v_heads,
-                                                int k_dim, int v_dim, int h, int i, int lane,
+                                                int k_dim, int v_dim, int h, int i, int j,
                                                 const GdnHead<PER>& hd) {
+    constexpr int V = PER * VELOX_WARP / kGdnRowLanes;  // values per lane
     const int width = 2 * k_heads * k_dim + v_heads * v_dim;
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(k_dim));
-    const size_t row_off = (static_cast<size_t>(h) * v_dim + i) * k_dim;
-    // Written at the end (unless state is null: outputs only); read from state_in (may alias).
-    float* row_state = state != nullptr ? state + row_off : nullptr;
-    float s[PER];
+    const bool live = i < v_dim;  // dead lanes still join the shuffles
+    const size_t row_off = (static_cast<size_t>(h) * v_dim + (live ? i : 0)) * k_dim;
+    float s[V];
 #pragma unroll
-    for (int p = 0; p < PER; ++p) {
-        const int d = lane + p * VELOX_WARP;
-        s[p] = d < k_dim ? state_in[row_off + d] : 0.0f;
+    for (int p = 0; p < V; ++p) {
+        const int d = j + p * kGdnRowLanes;
+        s[p] = live && d < k_dim ? state_in[row_off + d] : 0.0f;
     }
+    auto row_sum = [](float x) {
+        x += __shfl_xor_sync(0xffffffffu, x, 1);
+        return x + __shfl_xor_sync(0xffffffffu, x, 2);
+    };
     for (int t = 0; t < tokens; ++t) {
-        const float v = qkv[static_cast<size_t>(t) * width + 2 * k_heads * k_dim + h * v_dim + i];
+        const float v = live ? qkv[static_cast<size_t>(t) * width + 2 * k_heads * k_dim + h * v_dim + i] : 0.0f;
         const float alpha = hd.alpha[t];
         float sk = 0.0f;
 #pragma unroll
-        for (int p = 0; p < PER; ++p) {
+        for (int p = 0; p < V; ++p) {
             s[p] *= alpha;
-            sk += s[p] * hd.k[t][lane + p * VELOX_WARP];
+            sk += s[p] * hd.k[t][j + p * kGdnRowLanes];
         }
-        const float delta = hd.beta[t] * (v - velox_warp_sum(sk));
+        const float delta = hd.beta[t] * (v - row_sum(sk));
         float o = 0.0f;
 #pragma unroll
-        for (int p = 0; p < PER; ++p) {
-            s[p] += delta * hd.k[t][lane + p * VELOX_WARP];
-            o += s[p] * hd.q[t][lane + p * VELOX_WARP];
+        for (int p = 0; p < V; ++p) {
+            s[p] += delta * hd.k[t][j + p * kGdnRowLanes];
+            o += s[p] * hd.q[t][j + p * kGdnRowLanes];
         }
         if (out != nullptr) {
-            o = velox_warp_sum(o);
-            if (lane == 0) out[(static_cast<size_t>(t) * v_heads + h) * v_dim + i] = o * inv_sqrt_dk;
+            o = row_sum(o);
+            if (live && j == 0) out[(static_cast<size_t>(t) * v_heads + h) * v_dim + i] = o * inv_sqrt_dk;
         }
     }
-    if (row_state == nullptr) return;
+    // Written at the end (unless state is null: outputs only); read from state_in (may alias).
+    if (state == nullptr || !live) return;
 #pragma unroll
-    for (int p = 0; p < PER; ++p) {
-        const int d = lane + p * VELOX_WARP;
-        if (d < k_dim) row_state[d] = s[p];
+    for (int p = 0; p < V; ++p) {
+        const int d = j + p * kGdnRowLanes;
+        if (d < k_dim) state[row_off + d] = s[p];
     }
 }
 
@@ -495,11 +507,13 @@ __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const
     const int warps = blockDim.x / VELOX_WARP;
     const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
     if (tokens <= kGdnRowsMaxT) {
+        // Grid y counts blocks of kGdnRowsPerBlock rows here (see the launch).
         __shared__ GdnHead<PER> hd;
         gdn_head_prep<PER>(qkv, ab, a_log, dt_bias, tokens, k_heads, v_heads, k_dim, v_dim, h, hd);
         __syncthreads();
-        if (i < v_dim)
-            gdn_rows_shared<PER>(qkv, state_in, state, out, tokens, k_heads, v_heads, k_dim, v_dim, h, i, lane, hd);
+        const int row = blockIdx.y * kGdnRowsPerBlock + threadIdx.x / kGdnRowLanes;
+        gdn_rows_shared<PER>(qkv, state_in, state, out, tokens, k_heads, v_heads, k_dim, v_dim, h, row,
+                             threadIdx.x % kGdnRowLanes, hd);
         return;
     }
     if (i >= v_dim) return;
@@ -530,9 +544,9 @@ __global__ void gdn_replay_rows_kernel(const __grid_constant__ GdnReplayTable t,
         gdn_head_prep<PER>(t.conv_out[l], t.ab[l], t.a_log[l], t.dt_bias[l], tokens, k_heads, v_heads, k_dim, v_dim, h,
                            hd);
         __syncthreads();
-        if (i < v_dim)
-            gdn_rows_shared<PER>(t.conv_out[l], t.ssm[l], t.ssm[l], nullptr, tokens, k_heads, v_heads, k_dim, v_dim, h,
-                                 i, lane, hd);
+        const int row = blockIdx.y * kGdnRowsPerBlock + threadIdx.x / kGdnRowLanes;
+        gdn_rows_shared<PER>(t.conv_out[l], t.ssm[l], t.ssm[l], nullptr, tokens, k_heads, v_heads, k_dim, v_dim, h,
+                             row, threadIdx.x % kGdnRowLanes, hd);
         return;
     }
     if (i >= v_dim) return;
@@ -1386,7 +1400,9 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
         return velox_launch_status();
     }
     constexpr int kWarps = kGdnRowsWarps;
-    const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps), block(kWarps * VELOX_WARP);
+    // Short windows: kGdnRowsPerBlock rows per block (4 lanes each); longer: a warp per row.
+    const int rows_per_block = tokens <= kGdnRowsMaxT ? kGdnRowsPerBlock : kWarps;
+    const dim3 grid(v_heads, (v_dim + rows_per_block - 1) / rows_per_block), block(kWarps * VELOX_WARP);
 #define VELOX_GDN(PER)                                                                                     \
     gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state_in, state, out, tokens, k_heads, \
                                                       v_heads, k_dim, v_dim, pp)
@@ -1419,7 +1435,8 @@ VELOX_API int velox_portable_gdn_replay(const float* const* qkv, const float* co
     const GdnReplayTable& t = host;
     gdn_replay_conv_kernel<<<dim3((channels + 255) / 256, layers), 256>>>(t, tokens, channels, width);
     constexpr int kWarps = kGdnRowsWarps;
-    const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps, layers), block(kWarps * VELOX_WARP);
+    const int rows_per_block = tokens <= kGdnRowsMaxT ? kGdnRowsPerBlock : kWarps;
+    const dim3 grid(v_heads, (v_dim + rows_per_block - 1) / rows_per_block, layers), block(kWarps * VELOX_WARP);
 #define VELOX_GDN_REPLAY(PER) \
     gdn_replay_rows_kernel<PER><<<grid, block>>>(t, tokens, k_heads, v_heads, k_dim, v_dim)
     if (k_dim <= 32) VELOX_GDN_REPLAY(1);
