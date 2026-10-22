@@ -109,11 +109,13 @@ struct SpecRows<B: Backend> {
     ab: Vec<B::Buffer>,
 }
 
-/// Buffers for [`Qwen35Text::verify_batch`]: several sequences' windows (at most
-/// [`VERIFY_MAX`] rows each) share one forward pass, so every weight is read once per round.
+/// Buffers for [`Qwen35Text::verify_batch`]: several sequences' windows (at most `window`
+/// rows each) share one forward pass, so every weight is read once per round.
 pub struct BatchWorkspace<B: Backend> {
     max_seqs: usize,
-    /// Per GDN layer, `[max_seqs * VERIFY_MAX, *]` rows: what each sequence's commit replays.
+    /// Rows of one sequence's window, at most (the drafter's drafts plus the pending token).
+    window: usize,
+    /// Per GDN layer, `[max_seqs * window, *]` rows: what each sequence's commit replays.
     qkv: Vec<B::Buffer>,
     conv_out: Vec<B::Buffer>,
     ab: Vec<B::Buffer>,
@@ -165,6 +167,11 @@ impl<B: Backend> BatchWorkspace<B> {
     /// Most sequences one batch takes.
     pub fn max_seqs(&self) -> usize {
         self.max_seqs
+    }
+
+    /// Rows of one sequence's window, at most.
+    pub fn window(&self) -> usize {
+        self.window
     }
 }
 
@@ -502,6 +509,62 @@ pub struct Workspace<B: Backend> {
     /// `emb` / `rows_hidden` hold `max_tokens` rows (MTP drafting reads them); without, they are
     /// placeholders and `keep_rows` does not fill them.
     rows: bool,
+    /// Physical memory the per-phase buffers share (see [`overlay`]); empty without virtual
+    /// memory. Declared last, so the buffers mapping it drop first.
+    _overlay: Vec<B::Chunk>,
+}
+
+/// Allocates `groups` of buffers (f32 lengths) whose groups share physical memory: each group's
+/// buffers are disjoint, and every group starts at the same physical chunk. For buffers of
+/// phases that are never live together (a layer's GDN mixer, attention mixer and MLP scratch),
+/// this takes the largest group instead of the sum. `None` without virtual memory (or with
+/// `VELOX_NO_OVERLAY`): the caller allocates them separately. Contents start zeroed.
+fn overlay<B: Backend>(
+    b: &B,
+    groups: &[&[usize]],
+) -> Result<Option<(Vec<Vec<B::Buffer>>, Vec<B::Chunk>)>> {
+    let chunk = b.vm_chunk_len();
+    if chunk == 0 || std::env::var_os("VELOX_NO_OVERLAY").is_some() {
+        return Ok(None);
+    }
+    let span = |len: usize| len.max(1).div_ceil(chunk);
+    let need = groups
+        .iter()
+        .map(|g| g.iter().map(|&l| span(l)).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let chunks = (0..need)
+        .map(|_| b.alloc_chunk())
+        .collect::<Result<Vec<_>>>()?;
+    let zero = b.alloc(chunk)?;
+    let mut out = Vec::with_capacity(groups.len());
+    for g in groups {
+        let mut at = 0;
+        let mut bufs = Vec::with_capacity(g.len());
+        for &len in g.iter() {
+            let mut buf = b.alloc_virtual(len)?;
+            for j in 0..span(len) {
+                b.map_chunk(&mut buf, j, &chunks[at + j])?;
+            }
+            at += span(len);
+            bufs.push(buf);
+        }
+        out.push(bufs);
+    }
+    // Chunk contents are undefined; the first group's buffers cover every chunk (it is not
+    // necessarily the largest, so zero through each group).
+    for bufs in &mut out {
+        for buf in bufs.iter_mut() {
+            let len = b.len(buf);
+            let mut off = 0;
+            while off < len {
+                let n = chunk.min(len - off);
+                b.copy(&zero, 0, buf, off, n)?;
+                off += n;
+            }
+        }
+    }
+    Ok(Some((out, chunks)))
 }
 
 pub struct Qwen35Text<B: Backend> {
@@ -594,27 +657,60 @@ impl<B: Backend> Qwen35Text<B> {
         // Fused projections and the fused MLP gate|up only run up to FUSE_MAX_TOKENS rows.
         let tf = t.min(FUSE_MAX_TOKENS);
         let tr = if rows { t } else { 1 };
+        // Scratch of a layer's three phases: the GDN mixer, the attention mixer and the MLP (the
+        // dense SwiGLU, a MoE block's shared expert; routed experts will need their own scratch
+        // once the MoE ops land). Each phase finishes into `y` before the next starts, so with
+        // virtual memory the phases overlay one another.
+        let gdn = [
+            t * c.gdn_qkv(),
+            t * c.gdn_qkv(),
+            t * c.gdn_v(),
+            t * 2 * c.gdn_v_heads,
+            t * c.gdn_v(),
+        ];
+        let attn = [
+            t * c.q_dim(),
+            t * c.q_dim(),
+            t * c.kv_dim(),
+            t * c.kv_dim(),
+            t * c.q_dim(),
+            t * c.kv_dim(),
+            t * c.q_dim(),
+        ];
+        let mlp = [t * c.mlp_width(), t * c.mlp_width()];
+        let (bufs, backing) = match overlay(b, &[&gdn, &attn, &mlp])? {
+            Some(o) => o,
+            None => (
+                [&gdn[..], &attn[..], &mlp[..]]
+                    .iter()
+                    .map(|g| g.iter().map(|&l| b.alloc(l)).collect::<Result<Vec<_>>>())
+                    .collect::<Result<Vec<_>>>()?,
+                Vec::new(),
+            ),
+        };
+        let mut bufs = bufs.into_iter();
+        let mut next = || bufs.next().expect("three groups").into_iter();
+        let (mut g_gdn, mut g_attn, mut g_mlp) = (next(), next(), next());
+        let take = |g: &mut std::vec::IntoIter<B::Buffer>| g.next().expect("group sized above");
         Ok(Workspace {
             max_tokens,
             x: b.alloc(t * c.hidden)?,
             h: b.alloc(t * c.hidden)?,
             y: b.alloc(t * c.hidden)?,
-            qkv: b.alloc(t * c.gdn_qkv())?,
-            conv_out: b.alloc(t * c.gdn_qkv())?,
-            z: b.alloc(t * c.gdn_v())?,
-            ab: b.alloc(t * 2 * c.gdn_v_heads)?,
-            o: b.alloc(t * c.gdn_v())?,
-            q: b.alloc(t * c.q_dim())?,
-            g: b.alloc(t * c.q_dim())?,
-            k: b.alloc(t * c.kv_dim())?,
-            v: b.alloc(t * c.kv_dim())?,
-            qn: b.alloc(t * c.q_dim())?,
-            kn: b.alloc(t * c.kv_dim())?,
-            attn: b.alloc(t * c.q_dim())?,
-            // The dense SwiGLU (a MoE block's shared expert); routed experts will need their own
-            // scratch once the MoE ops land.
-            mg: b.alloc(t * c.mlp_width())?,
-            mu: b.alloc(t * c.mlp_width())?,
+            qkv: take(&mut g_gdn),
+            conv_out: take(&mut g_gdn),
+            z: take(&mut g_gdn),
+            ab: take(&mut g_gdn),
+            o: take(&mut g_gdn),
+            q: take(&mut g_attn),
+            g: take(&mut g_attn),
+            k: take(&mut g_attn),
+            v: take(&mut g_attn),
+            qn: take(&mut g_attn),
+            kn: take(&mut g_attn),
+            attn: take(&mut g_attn),
+            mg: take(&mut g_mlp),
+            mu: take(&mut g_mlp),
             fused: b.alloc(tf * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
             gu: b.alloc(tf * 2 * c.mlp_width())?,
             last: b.alloc(c.hidden)?,
@@ -631,6 +727,7 @@ impl<B: Backend> Qwen35Text<B> {
             features: None,
             spec_rows: None,
             rows,
+            _overlay: backing,
         })
     }
 
@@ -1456,15 +1553,24 @@ impl<B: Backend> Qwen35Text<B> {
         self.ensure_spec_rows(b, ws)
     }
 
-    /// Buffers for batches of up to `max_seqs` sequences (see [`Self::verify_batch`]).
-    pub fn batch_workspace(&self, b: &B, max_seqs: usize) -> Result<BatchWorkspace<B>> {
+    /// Buffers for batches of up to `max_seqs` sequences of up to `window` tokens each (at most
+    /// [`VERIFY_MAX`]; see [`Self::verify_batch`]). Every buffer scales with `max_seqs * window`, so
+    /// the window should be what the drafter proposes (drafts + 1), not the limit.
+    pub fn batch_workspace(
+        &self,
+        b: &B,
+        max_seqs: usize,
+        window: usize,
+    ) -> Result<BatchWorkspace<B>> {
         let c = &self.cfg;
-        let rows = max_seqs * VERIFY_MAX;
+        let window = window.clamp(1, VERIFY_MAX);
+        let rows = max_seqs * window;
         let gdn = c.layers.iter().filter(|l| **l == LayerKind::Gdn).count();
         let per_layer =
             |w: usize| -> Result<Vec<B::Buffer>> { (0..gdn).map(|_| b.alloc(rows * w)).collect() };
         Ok(BatchWorkspace {
             max_seqs,
+            window,
             qkv: per_layer(c.gdn_qkv())?,
             conv_out: per_layer(c.gdn_qkv())?,
             ab: per_layer(2 * c.gdn_v_heads)?,
@@ -1506,9 +1612,10 @@ impl<B: Backend> Qwen35Text<B> {
         let mut rows = Vec::with_capacity(n);
         let mut ids = Vec::new();
         for (s, w) in sessions.iter_mut().zip(windows) {
-            if w.is_empty() || w.len() > VERIFY_MAX {
+            if w.is_empty() || w.len() > bw.window {
                 return Err(Error::Shape(format!(
-                    "verify takes 1..={VERIFY_MAX} tokens per sequence"
+                    "batched verify takes 1..={} tokens per sequence",
+                    bw.window
                 )));
             }
             if s.pos + w.len() > s.capacity {
@@ -1691,9 +1798,10 @@ impl<B: Backend> Qwen35Text<B> {
         let mut ids = prefill.ids.to_vec();
         let mut rows = Vec::with_capacity(n);
         for (s, win) in sessions.iter_mut().zip(windows) {
-            if win.is_empty() || win.len() > VERIFY_MAX {
+            if win.is_empty() || win.len() > bw.window {
                 return Err(Error::Shape(format!(
-                    "verify takes 1..={VERIFY_MAX} tokens per sequence"
+                    "batched verify takes 1..={} tokens per sequence",
+                    bw.window
                 )));
             }
             if s.pos + win.len() > s.capacity {

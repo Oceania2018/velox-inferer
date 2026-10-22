@@ -532,7 +532,12 @@ where
             None => None,
         };
         let bw = match &dflash {
-            Some(_) if n_lanes > 1 => Some(model.batch_workspace(&b, n_lanes)?),
+            // Windows are the pending token plus the drafts (see `DFlashDrafter::workspace`).
+            Some(_) if n_lanes > 1 => Some(model.batch_workspace(
+                &b,
+                n_lanes,
+                DFlashDrafter::<B>::max_drafts(cfg.dflash_drafts) + 1,
+            )?),
             _ => None,
         };
         let special = SpecialTokens {
@@ -810,7 +815,7 @@ impl<B: Backend> Core<B> {
             }
         }
         if let Some(bw) = bw.as_mut() {
-            let m = 8usize;
+            let m = bw.window();
             let mut sessions: Vec<&mut Session<B>> =
                 lanes.iter_mut().map(|l| &mut l.session).collect();
             for s in sessions.iter_mut() {
