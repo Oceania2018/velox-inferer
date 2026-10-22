@@ -1,14 +1,30 @@
 //! RTX 5060 Ti kernel set (ported from rtx-5090-32g). Each override tries the tuned kernel and falls back to the portable one
 //! when the kernel reports the shape as unsupported.
 
-use velox_core::backend::{ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, WeightView};
+use velox_core::backend::{
+    ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, WeightView,
+};
 use velox_core::check::to_i32;
 use velox_core::{Error, KvFormat, Op, Result, WeightFormat};
 use velox_cuda::{portable, status, CudaBuffer, CudaKernels};
 
 extern "C" {
-    fn velox_5060_matmul_small_m(x: *const f32, w: *const f32, y: *mut f32, m: i32, n: i32, k: i32) -> i32;
-    fn velox_5060_matmul_tiled(x: *const f32, w: *const f32, y: *mut f32, m: i32, n: i32, k: i32) -> i32;
+    fn velox_5060_matmul_small_m(
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> i32;
+    fn velox_5060_matmul_tiled(
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> i32;
     fn velox_5060_linear_a4(
         x: *const f32,
         m: i32,
@@ -201,15 +217,12 @@ const GEMV_MAX_M: usize = 1;
 /// split-KV kernel, which is bound by reading the cache anyway.
 const FLASH_MIN_TOKENS: usize = 16;
 
-/// Most query rows (tokens x heads per KV head) the tensor-core NVFP4 verify kernel takes.
-const VERIFY_MAX_ROWS: usize = 96;
-
-/// Decode and verify windows over an NVFP4 cache: f16 tensor-core flash-decoding.
+/// Decode, verify and prefill over an NVFP4 cache: f16 tensor-core flash attention that decodes
+/// the cache tiles in shared memory (the f32-cache prefill kernel does not read packed caches).
 fn verify_nvfp4(s: &AttnShape) -> bool {
     s.kv == KvFormat::Nvfp4
         && s.head_dim == 256
         && s.heads % s.kv_heads == 0
-        && s.tokens * (s.heads / s.kv_heads) <= VERIFY_MAX_ROWS
         && s.kv_len() <= i32::MAX as usize
 }
 
@@ -245,8 +258,16 @@ const A16_FP8_BLOCK_M: usize = 64;
 /// `velox_5060_linear_skinny16`, groupwise q4/q5/q8 (4/5/8) `velox_5060_linear_skinny_rs`. Single
 /// tokens stay on main's GEMV except for q5, which has no fast GEMV there.
 fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
-    let max = if w.format.row_split().is_some() { ROWSPLIT_MIN_M - 1 } else { SKINNY_MAX_M };
-    let min = if w.format == WeightFormat::Q5G64 { 1 } else { 2 };
+    let max = if w.format.row_split().is_some() {
+        ROWSPLIT_MIN_M - 1
+    } else {
+        SKINNY_MAX_M
+    };
+    let min = if w.format == WeightFormat::Q5G64 {
+        1
+    } else {
+        2
+    };
     if !(min..=max).contains(&m) {
         return None;
     }
@@ -300,15 +321,36 @@ fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<(
 
 impl CudaKernels for Rtx5060Kernels {
     fn native_ops(&self) -> &'static [Op] {
-        &[Op::MatMul, Op::Linear, Op::Attention, Op::AttentionFull, Op::LinearSwiglu]
+        &[
+            Op::MatMul,
+            Op::Linear,
+            Op::Attention,
+            Op::AttentionFull,
+            Op::LinearSwiglu,
+        ]
     }
 
     // Shapes were validated by CudaBackend before these are called.
-    fn matmul(&self, x: &CudaBuffer, w: &CudaBuffer, y: &mut CudaBuffer, m: usize, n: usize, k: usize) -> Result<()> {
+    fn matmul(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        y: &mut CudaBuffer,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
         let (mi, ni, ki) = (to_i32("m", m)?, to_i32("n", n)?, to_i32("k", k)?);
-        let launch = if m <= SMALL_M_MAX { velox_5060_matmul_small_m } else { velox_5060_matmul_tiled };
+        let launch = if m <= SMALL_M_MAX {
+            velox_5060_matmul_small_m
+        } else {
+            velox_5060_matmul_tiled
+        };
         // SAFETY: extents validated by CudaBackend; kernels guard their own edges.
-        let r = status(unsafe { launch(x.as_ptr(), w.as_ptr(), y.as_mut_ptr(), mi, ni, ki) }, "rtx5060 matmul");
+        let r = status(
+            unsafe { launch(x.as_ptr(), w.as_ptr(), y.as_mut_ptr(), mi, ni, ki) },
+            "rtx5060 matmul",
+        );
         or_fallback(r, || portable::matmul(x, w, y, m, n, k))
     }
 
@@ -329,11 +371,20 @@ impl CudaKernels for Rtx5060Kernels {
         }
     }
 
-    fn attention(&self, q: &CudaBuffer, k: &CudaBuffer, v: &CudaBuffer, out: &mut CudaBuffer, s: AttnShape) -> Result<()> {
+    fn attention(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: AttnShape,
+    ) -> Result<()> {
         if verify_nvfp4(&s) {
             velox_core::check::attention(q.len(), k.len(), v.len(), out.len(), &s)?;
             // Graph steps stage the caches too: a recording serves any sequence.
-            let Some(params) = portable::graph_params(&[s.pos0 as i64, k.as_ptr() as i64, v.as_ptr() as i64])? else {
+            let Some(params) =
+                portable::graph_params(&[s.pos0 as i64, k.as_ptr() as i64, v.as_ptr() as i64])?
+            else {
                 return Ok(()); // graph replay: the recorded launch reads the staged values
             };
             // SAFETY: extents validated above (caches sized for the format).
@@ -389,7 +440,14 @@ impl CudaKernels for Rtx5060Kernels {
         }
     }
 
-    fn attention_full(&self, q: &CudaBuffer, k: &CudaBuffer, v: &CudaBuffer, out: &mut CudaBuffer, s: FullAttnShape) -> Result<()> {
+    fn attention_full(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: FullAttnShape,
+    ) -> Result<()> {
         if self.attention_full_precision(s) == AttnPrecision::Exact {
             return portable::attention_full(q, k, v, out, s);
         }
@@ -434,10 +492,14 @@ impl CudaKernels for Rtx5060Kernels {
             }
         }
         match (w.format, w.act) {
-            (WeightFormat::Nvfp4, ActPolicy::AllowA4 { divisor }) if w.k % 128 == 0 && w.row_begin % 128 == 0 => {
+            (WeightFormat::Nvfp4, ActPolicy::AllowA4 { divisor })
+                if w.k % 128 == 0 && w.row_begin % 128 == 0 =>
+            {
                 ActQuant::Nvfp4 { divisor }
             }
-            (WeightFormat::Fp8RowBf16, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. }) if w.k % 64 == 0 => {
+            (WeightFormat::Fp8RowBf16, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. })
+                if w.k % 64 == 0 =>
+            {
                 ActQuant::Fp8Row
             }
             _ => ActQuant::Exact,
@@ -497,7 +559,13 @@ impl CudaKernels for Rtx5060Kernels {
         )
     }
 
-    fn linear(&self, x: &CudaBuffer, w: &WeightView<'_, CudaBuffer>, y: &mut CudaBuffer, m: usize) -> Result<()> {
+    fn linear(
+        &self,
+        x: &CudaBuffer,
+        w: &WeightView<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
         let (mi, rows) = (to_i32("m", m)?, to_i32("rows", w.rows)?);
         let (pr, k, rb) = (w.parent_rows as i64, w.k as i64, w.row_begin as i64);
         let wp = w.buf.as_ptr().cast::<u8>();
@@ -507,24 +575,51 @@ impl CudaKernels for Rtx5060Kernels {
         match self.linear_act(w, m) {
             ActQuant::Exact => match gemv_format(w, m) {
                 Some(f) => status(
-                    unsafe { velox_5060_gemv(x.as_ptr(), mi, wp, pr, k, rb, rows, f, y.as_mut_ptr()) },
+                    unsafe {
+                        velox_5060_gemv(x.as_ptr(), mi, wp, pr, k, rb, rows, f, y.as_mut_ptr())
+                    },
                     "rtx5060 gemv",
                 ),
                 None => portable::linear(x, w, y, m),
             },
             ActQuant::Nvfp4 { divisor } => status(
-                unsafe { velox_5060_linear_a4(x.as_ptr(), mi, wp, pr, k, rb, rows, divisor, y.as_mut_ptr()) },
+                unsafe {
+                    velox_5060_linear_a4(
+                        x.as_ptr(),
+                        mi,
+                        wp,
+                        pr,
+                        k,
+                        rb,
+                        rows,
+                        divisor,
+                        y.as_mut_ptr(),
+                    )
+                },
                 "rtx5060 linear a4",
             ),
             ActQuant::Fp8Row => status(
-                unsafe { velox_5060_linear_a8(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr()) },
+                unsafe {
+                    velox_5060_linear_a8(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr())
+                },
                 "rtx5060 linear a8",
             ),
             ActQuant::Bf16 => {
                 if skinny_iq3(w, m) && m > SKINNY16_MAX_M {
                     // Prefill: the staged kernel tiles the tokens itself (64 per weight pass).
                     return status(
-                        unsafe { velox_5060_linear_skinny_iq3(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr()) },
+                        unsafe {
+                            velox_5060_linear_skinny_iq3(
+                                x.as_ptr(),
+                                mi,
+                                wp,
+                                pr,
+                                k,
+                                rb,
+                                rows,
+                                y.as_mut_ptr(),
+                            )
+                        },
                         "rtx5060 linear iq3 prefill",
                     );
                 }
@@ -534,7 +629,8 @@ impl CudaKernels for Rtx5060Kernels {
                     for r0 in (0..m).step_by(SKINNY16_MAX_M) {
                         let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
-                        let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
+                        let (xp, yp) =
+                            unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
                         status(
                             unsafe {
                                 if direct {
@@ -554,7 +650,8 @@ impl CudaKernels for Rtx5060Kernels {
                     for r0 in (0..m).step_by(A16_FP8_BLOCK_M) {
                         let mb = to_i32("m", (m - r0).min(A16_FP8_BLOCK_M))?;
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
-                        let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
+                        let (xp, yp) =
+                            unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
                         status(
                             unsafe { velox_5060_linear_a16_fp8(xp, mb, wp, pr, k, rb, rows, yp) },
                             "rtx5060 linear a16 fp8",
@@ -568,18 +665,23 @@ impl CudaKernels for Rtx5060Kernels {
                     for r0 in (0..m).step_by(SKINNY16_MAX_M) {
                         let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
-                        let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
+                        let (xp, yp) =
+                            unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
                         if f == 0 && w.k % 512 == 0 && w.rows <= NVFP4_SLICED_MAX_ROWS {
                             // NVFP4 with few rows and K in whole 512-value tiles: the sliced-K
                             // kernel. Measured at m=8: [5120,17408] 199 vs 247 us, [5120,6144] 76
                             // vs 90 us; wide views stay on skinny16 ([248320,5120] 2217 vs 2733 us).
                             status(
-                                unsafe { velox_5060_linear_nvfp4_sliced(xp, mb, wp, pr, k, rb, rows, yp) },
+                                unsafe {
+                                    velox_5060_linear_nvfp4_sliced(xp, mb, wp, pr, k, rb, rows, yp)
+                                },
                                 "rtx5060 linear nvfp4 sliced",
                             )?;
                         } else if f == 0 {
                             status(
-                                unsafe { velox_5060_linear_skinny16(xp, mb, wp, pr, k, rb, rows, f, yp) },
+                                unsafe {
+                                    velox_5060_linear_skinny16(xp, mb, wp, pr, k, rb, rows, f, yp)
+                                },
                                 "rtx5060 linear skinny16",
                             )?;
                         } else {
@@ -589,9 +691,13 @@ impl CudaKernels for Rtx5060Kernels {
                             status(
                                 unsafe {
                                     if f == 8 {
-                                        velox_5060_linear_skinny_rs(xp, mb, wp, pr, k, rb, rows, f, yp)
+                                        velox_5060_linear_skinny_rs(
+                                            xp, mb, wp, pr, k, rb, rows, f, yp,
+                                        )
                                     } else {
-                                        velox_5060_linear_rs_sliced(xp, mb, wp, pr, k, rb, rows, f, yp)
+                                        velox_5060_linear_rs_sliced(
+                                            xp, mb, wp, pr, k, rb, rows, f, yp,
+                                        )
                                     }
                                 },
                                 "rtx5060 linear rs",
@@ -602,7 +708,19 @@ impl CudaKernels for Rtx5060Kernels {
                 }
                 let bits = w.format.row_split().map_or(0, |r| r.bits as i32);
                 status(
-                    unsafe { velox_5060_linear_rowsplit(x.as_ptr(), mi, wp, pr, k, rb, rows, bits, y.as_mut_ptr()) },
+                    unsafe {
+                        velox_5060_linear_rowsplit(
+                            x.as_ptr(),
+                            mi,
+                            wp,
+                            pr,
+                            k,
+                            rb,
+                            rows,
+                            bits,
+                            y.as_mut_ptr(),
+                        )
+                    },
                     "rtx5060 linear rowsplit",
                 )
             }

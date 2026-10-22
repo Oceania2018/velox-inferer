@@ -18,7 +18,8 @@ mod kernels;
 pub static INFO: VariantInfo = VariantInfo {
     id: "rtx-5060-ti",
     branch: "rtx-5060-ti",
-    description: "RTX 5060 Ti 16 GB (GB206, 36 SMs): NVFP4/FP8 tensor-core linear, skinny verify kernels",
+    description:
+        "RTX 5060 Ti 16 GB (GB206, 36 SMs): NVFP4/FP8 tensor-core linear, skinny verify kernels",
     profiles: &["rtx-5060-ti-16g"],
     archs: &[GpuArch::Cuda {
         major: 12,

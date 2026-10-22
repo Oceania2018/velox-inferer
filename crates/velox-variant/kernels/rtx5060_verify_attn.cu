@@ -1,11 +1,13 @@
-// RTX 5060 Ti (from rtx-5090-32g) decode / verify attention over an NVFP4 KV cache (head_dim 256, few query tokens, GQA).
+// RTX 5060 Ti (from rtx-5090-32g) attention over an NVFP4 KV cache (head_dim 256, GQA): decode, verify and
+// prefill.
 //
 // Precision (velox_core::AttnPrecision::F16): the query is rotated (the cache's Hadamard basis),
 // scaled and rounded to f16; cached K/V values (E2M1 x E4M3) are exact in f16; the softmax weights
 // are rounded to f16 for the value product; accumulation is f32.
 //
-// Block: one KV head x one key split, eight warps; warp w < 6 owns query rows [16w, 16w + 16) of the
-// group's tokens x heads rows (row r = token * group + head-in-group). Key tiles of 32 rows are
+// Block: one KV head x one key split x one block of 128 query rows, eight warps; warp w owns rows
+// [16w, 16w + 16) of the block (row r = token * group + head-in-group). Keys past the block's last
+// token are never read (causal). Key tiles of 32 rows are
 // fetched as packed bytes two tiles ahead into registers, decoded by every thread (native
 // E2M1/E4M3 conversions) into f16 shared memory once and served to the row warps through
 // ldmatrix + mma.sync m16n8k16. Each split writes an unnormalized partial
@@ -132,6 +134,8 @@ struct VerifyArgs {
     int tokens, heads, kv_heads, pos0, splits, split_keys;
 };
 
+constexpr int kBlockRows = 128;  // query rows per block (eight warps of 16)
+
 constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * 32;
 constexpr int kItems = 2 * kTK * kChunks;  // (K|V, key, chunk) per tile
@@ -147,7 +151,8 @@ struct Raw {
 // tiles ahead into registers.
 __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
     extern __shared__ __align__(128) __half smem[];
-    const int group = p.heads / p.kv_heads, rows = p.tokens * group, mt = (rows + 15) / 16;
+    const int group = p.heads / p.kv_heads, row0 = blockIdx.z * kBlockRows;
+    const int rows = min(kBlockRows, p.tokens * group - row0), mt = (rows + 15) / 16;
     __half* ks = smem;           // [kTK][256]
     __half* vs = ks + kTK * kD;  // [kTK][256]
     __half* qs = vs + kTK * kD;  // [mt * 16][256]
@@ -158,7 +163,7 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
     const int sp = blockIdx.x, kvh = blockIdx.y;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, q4 = lane & 3;
-    const int j0 = sp * p.split_keys, j1 = min(j0 + p.split_keys, pos0 + p.tokens);
+    const int j0 = sp * p.split_keys, j1 = min(j0 + p.split_keys, pos0 + (row0 + rows - 1) / group + 1);
 
     auto fetch = [&](Raw& r, int base) {
 #pragma unroll
@@ -201,7 +206,7 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
     if (j0 + kTK < j1) fetch(rb, j0 + kTK);
 
     // Query tile (16-byte chunks, swizzled like K/V).
-    const __half* qsrc = p.q16 + static_cast<size_t>(kvh) * rows * kD;
+    const __half* qsrc = p.q16 + (static_cast<size_t>(kvh) * p.tokens * group + row0) * kD;
     for (int i = threadIdx.x; i < mt * 16 * (kD / 8); i += kThreads) {
         const int r = i / (kD / 8), c = i % (kD / 8);
         const uint4 x = r < rows ? *reinterpret_cast<const uint4*>(qsrc + static_cast<size_t>(r) * kD + c * 8)
@@ -211,9 +216,10 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
 
     const bool active = warp < mt;
     const int r0 = warp * 16 + g, r1 = r0 + 8;
-    const int last0 = r0 < rows ? pos0 + r0 / group : -1, last1 = r1 < rows ? pos0 + r1 / group : -1;
+    const int last0 = r0 < rows ? pos0 + (row0 + r0) / group : -1;
+    const int last1 = r1 < rows ? pos0 + (row0 + r1) / group : -1;
     // Last key any row of this warp sees (warp-uniform; -1 for helper warps).
-    const int wlast = active ? pos0 + min(rows - 1, warp * 16 + 15) / group : -1;
+    const int wlast = active ? pos0 + (row0 + min(rows - 1, warp * 16 + 15)) / group : -1;
     float o[32][4];
 #pragma unroll
     for (int i = 0; i < 32; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
@@ -313,7 +319,7 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
     for (int half = 0; half < 2; ++half) {
         const int r = half ? r1 : r0;
         if (r >= rows) continue;
-        const int t = r / group, h = kvh * group + r % group;
+        const int t = (row0 + r) / group, h = kvh * group + (row0 + r) % group;
         const size_t idx = (static_cast<size_t>(t) * p.heads + h) * p.splits + sp;
         float* dst = p.part_acc + idx * kD;
 #pragma unroll
@@ -394,18 +400,17 @@ int sm_count() {
     return sms;
 }
 
-constexpr int kMaxRows = 96;
 
 size_t verify_smem(int mt) { return static_cast<size_t>(2 * kTK + mt * 16) * kD * sizeof(__half); }
 
 // Resident verify blocks per SM for `mt` row tiles (cached per mt).
 int verify_occupancy(int mt) {
-    static int occ[kMaxRows / 16 + 1] = {};
+    static int occ[kBlockRows / 16 + 1] = {};
     if (occ[mt] == 0) {
         static bool configured = false;
         if (!configured) {
             cudaFuncSetAttribute(verify_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(verify_smem(kMaxRows / 16)));
+                                 static_cast<int>(verify_smem(kBlockRows / 16)));
             cudaFuncSetAttribute(verify_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                  static_cast<int>(cudaSharedmemCarveoutMaxShared));
             configured = true;
@@ -424,18 +429,19 @@ size_t align_up(size_t x) { return (x + 255) / 256 * 256; }
 
 }  // namespace
 
-// Rows (tokens x heads / kv_heads) up to 96. params: null, or device [pos0, k_cache, v_cache] staged by a graph step,
+// Any number of tokens. params: null, or device [pos0, k_cache, v_cache] staged by a graph step,
 // with kv_grid >= pos0 + tokens sizing the grid (the grid never depends on the staged value).
 VELOX_API int velox_5060_attention_verify_nvfp4(const float* q, const unsigned char* k, const unsigned char* v,
                                                 float* out, int tokens, int heads, int kv_heads, int head_dim,
                                                 int pos0, float scale, float norm, const long long* params,
                                                 int kv_grid) {
     if (head_dim != kD || tokens <= 0 || kv_heads <= 0 || heads % kv_heads != 0) return VELOX_ERR_UNSUPPORTED;
-    const int rows = tokens * (heads / kv_heads), mt = (rows + 15) / 16;
-    if (rows > kMaxRows) return VELOX_ERR_UNSUPPORTED;
+    const long long rows = static_cast<long long>(tokens) * (heads / kv_heads);
+    const int row_blocks = static_cast<int>((rows + kBlockRows - 1) / kBlockRows);
+    const int mt = static_cast<int>(rows < kBlockRows ? (rows + 15) / 16 : kBlockRows / 16);
     const int kv = kv_grid >= pos0 + tokens ? kv_grid : pos0 + tokens;
     // One wave of resident blocks, whole tiles per split, at least two tiles.
-    const int want = (verify_occupancy(mt) * sm_count() + kv_heads - 1) / kv_heads;
+    const int want = (verify_occupancy(mt) * sm_count() + kv_heads * row_blocks - 1) / (kv_heads * row_blocks);
     int split_keys = (kv + want - 1) / want;
     split_keys = (split_keys + kTK - 1) / kTK * kTK;
     if (split_keys < 2 * kTK) split_keys = 2 * kTK;
@@ -450,7 +456,7 @@ VELOX_API int velox_5060_attention_verify_nvfp4(const float* q, const unsigned c
     prep_query<<<static_cast<unsigned>((n_rows + kPrepWarps - 1) / kPrepWarps), kPrepWarps * 32>>>(
         q, q16, tokens, heads, kv_heads, scale * kLog2e, norm);
     VerifyArgs a{q16, k, v, part_acc, part_ml, params, tokens, heads, kv_heads, pos0, splits, split_keys};
-    verify_kernel<<<dim3(splits, kv_heads), kThreads, verify_smem(mt)>>>(a);
+    verify_kernel<<<dim3(splits, kv_heads, row_blocks), kThreads, verify_smem(mt)>>>(a);
     combine_kernel<<<static_cast<unsigned>(n_rows), kCombineWarps * 32>>>(part_acc, part_ml, out, splits, norm);
     return velox_launch_status();
 }
