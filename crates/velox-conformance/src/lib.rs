@@ -1968,6 +1968,17 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 256, 192, 0, 130, false, true, a8)?;
     s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 320, 200, 17, 300, true, false, a8)?;
     s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 128, 4096, 0, 1030, false, true, a8)?;
+    // IQ3_XXS at the dense MLP's own K (gate/up 5120, down 17408), which kernels specialize on,
+    // at decode and verify widths.
+    for m in [1, 8] {
+        s.linear_swiglu(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false)?;
+        s.linear(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m)?;
+    }
+    // A4 at batched-verify widths (several lanes' windows: 17..64 tokens), wide and narrow K
+    // stages, row views starting one scale tile in.
+    s.linear_act(WeightFormat::Nvfp4, 512, 2048, 128, 384, 24, a4)?;
+    s.linear_act(WeightFormat::Nvfp4, 384, 640, 128, 256, 48, a4)?;
+    s.linear_act(WeightFormat::Nvfp4, 256, 1024, 0, 256, 64, a4)?;
     Ok(s.results)
 }
 
