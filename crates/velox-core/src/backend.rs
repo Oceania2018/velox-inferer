@@ -303,7 +303,7 @@ pub enum ActPolicy {
     /// Activations stay exact (f32 here, BF16 in the source model).
     #[default]
     A16Only,
-    /// Per-token E4M3 activations are allowed.
+    /// 8-bit activations are allowed: per-token E4M3 or per-256-value int8.
     AllowA8,
     /// NVFP4 activations are allowed with this static input divisor.
     AllowA4 { divisor: f32 },
@@ -336,6 +336,10 @@ pub enum ActQuant {
     Nvfp4 {
         divisor: f32,
     },
+    /// Rounded to bf16, then per row and 256-value group: `scale = amax / 127`, codes
+    /// `rint(x * (127 / amax))` as int8 (the int8 tensor-core prefill paths). Needs `k % 256 == 0`;
+    /// an 8-bit activation, so [`ActPolicy::AllowA8`] permits it.
+    Int8G256,
 }
 
 /// The operand precision of an attention kernel (`attention`, `attention_full`). Like
