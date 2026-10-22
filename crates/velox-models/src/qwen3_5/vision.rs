@@ -100,6 +100,9 @@ pub struct Qwen35Vision<B: Backend> {
 
 struct VisionWs<B: Backend> {
     grid: (usize, usize),
+    /// Patches the buffers hold: the largest grid seen (the engine's warm-up encodes the largest
+    /// its pixel budget allows), so smaller images reuse them and nothing is reallocated.
+    cap: usize,
     /// Interpolated position embeddings of the grid.
     pos: B::Buffer,
     x: B::Buffer,
@@ -299,11 +302,22 @@ impl<B: Backend> Qwen35Vision<B> {
             .ws
             .lock()
             .map_err(|_| Error::Backend("vision workspace poisoned".into()))?;
-        if guard.as_ref().is_none_or(|w| w.grid != (gh, gw)) {
-            *guard = None; // free the old grid's buffers first
+        if guard
+            .as_ref()
+            .is_some_and(|w| w.grid != (gh, gw) && w.cap >= n)
+        {
+            // Same buffers, this grid's position embeddings (the old ones freed first).
+            let ws = guard.as_mut().expect("checked");
+            ws.grid = (gh, gw);
+            ws.pos = b.alloc(1)?;
+            ws.pos = b.upload(&self.position_embeddings(&coords, gh, gw))?;
+        }
+        if guard.as_ref().is_none_or(|w| w.cap < n) {
+            *guard = None; // free the smaller buffers first
             let inter = c.intermediate.max(self.merger_fc1.0.rows);
             *guard = Some(VisionWs {
                 grid: (gh, gw),
+                cap: n,
                 pos: b.upload(&self.position_embeddings(&coords, gh, gw))?,
                 x: b.alloc(n * h)?,
                 h: b.alloc(n * h)?,

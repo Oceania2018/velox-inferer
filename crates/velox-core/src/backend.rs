@@ -862,6 +862,28 @@ pub trait Backend {
     fn graph_break(&self) -> Result<()> {
         Ok(())
     }
+    /// Caps the device memory recorded graphs hold: past `bytes`, the least recently run steps'
+    /// graphs are released (they record again when next run). A no-op without graphs.
+    fn set_graph_budget(&self, _bytes: usize) {}
+    /// Recorded graphs: (steps held, device bytes they hold, steps released by the budget).
+    fn graph_stats(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+    /// This process's device allocations: (buffer bytes live, buffer bytes at their peak since
+    /// start, physical chunk bytes live), when the backend counts them.
+    fn device_allocs(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+    /// (free, total) device memory in bytes, when the backend can tell: what can still be
+    /// allocated.
+    fn mem_info(&self) -> Option<(usize, usize)> {
+        None
+    }
+    /// Device memory in use by every process as monitoring tools (nvidia-smi) report it, the
+    /// figure budgets are set in; falls back to [`Self::mem_info`]'s total minus free.
+    fn device_in_use(&self) -> Option<usize> {
+        self.mem_info().map(|(free, total)| total - free)
+    }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
     /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.

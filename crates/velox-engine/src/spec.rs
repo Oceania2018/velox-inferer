@@ -268,7 +268,7 @@ impl<B: Backend> DFlashDrafter<B> {
         })
     }
 
-    fn max_drafts(drafts: usize) -> usize {
+    pub(crate) fn max_drafts(drafts: usize) -> usize {
         drafts.clamp(1, velox_models::qwen3_5::VERIFY_MAX - 1)
     }
 

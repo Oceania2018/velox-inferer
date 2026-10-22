@@ -7,11 +7,14 @@
 //! only on the tokens up to its last row, so sessions holding the same prefix can map the same
 //! set ([`KvShare`]). Shared sets are read-only: a write below a shared set's end first copies it
 //! (copy on write). Addresses never move, so kernels and recorded graphs are unchanged.
+//!
+//! With a [`KvPool`] the physical chunks are created once, at startup, and sets go back to the
+//! pool when their last holder unmaps them: requests allocate no device memory for their caches.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use velox_core::{Backend, CopySpec, Error, Result};
 
@@ -27,6 +30,70 @@ pub struct KvChunkSet<B: Backend> {
     /// The key it is published under in a [`KvShare`] (0: unpublished). Cleared when its only
     /// holder writes into it.
     key: AtomicU64,
+    /// Where its chunks go back when the last holder drops it (every holder unmaps first).
+    pool: Option<Arc<KvPool<B>>>,
+}
+
+impl<B: Backend> Drop for KvChunkSet<B> {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.pool {
+            pool.give(std::mem::take(&mut self.chunks));
+        }
+    }
+}
+
+/// Chunk sets for the paged caches of every session, created at startup and sized from the
+/// device memory left after weights, workspaces and the graph budget (see the engine). A set is
+/// one chunk per cache (2 x attention layers); sessions take and return whole sets.
+pub struct KvPool<B: Backend> {
+    free: Mutex<Vec<Vec<B::Chunk>>>,
+    sets: usize,
+    /// Sets created outside the pool because it was empty (freed, not pooled, when dropped).
+    overflow: AtomicUsize,
+}
+
+impl<B: Backend> KvPool<B> {
+    /// Creates `sets` sets of `per_set` chunks.
+    pub fn new(b: &B, sets: usize, per_set: usize) -> Result<Arc<Self>> {
+        let mut free = Vec::with_capacity(sets);
+        for _ in 0..sets {
+            free.push(
+                (0..per_set)
+                    .map(|_| b.alloc_chunk())
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(Arc::new(KvPool {
+            free: Mutex::new(free),
+            sets,
+            overflow: AtomicUsize::new(0),
+        }))
+    }
+
+    /// Sets in the pool.
+    pub fn sets(&self) -> usize {
+        self.sets
+    }
+
+    /// Sets not held by any session.
+    pub fn free_sets(&self) -> usize {
+        self.free.lock().map_or(0, |f| f.len())
+    }
+
+    /// Sets ever created outside the pool because it was empty.
+    pub fn overflow(&self) -> usize {
+        self.overflow.load(Ordering::Relaxed)
+    }
+
+    fn take(&self) -> Option<Vec<B::Chunk>> {
+        self.free.lock().ok()?.pop()
+    }
+
+    fn give(&self, chunks: Vec<B::Chunk>) {
+        if let Ok(mut f) = self.free.lock() {
+            f.push(chunks);
+        }
+    }
 }
 
 /// Paging state of a session whose caches are virtual.
@@ -37,6 +104,8 @@ pub(super) struct KvPaging<B: Backend> {
     sets: Vec<Option<Arc<KvChunkSet<B>>>>,
     /// One chunk per cache of address space, for copy on write (allocated on first use).
     scratch: Option<B::Buffer>,
+    /// Where new sets come from (none: created and freed on demand).
+    pool: Option<Arc<KvPool<B>>>,
 }
 
 impl<B: Backend> KvPaging<B> {
@@ -45,7 +114,32 @@ impl<B: Backend> KvPaging<B> {
             chunk,
             sets: (0..chunks).map(|_| None).collect(),
             scratch: None,
+            pool: None,
         }
+    }
+}
+
+impl<B: Backend> KvPaging<B> {
+    /// A private, unpublished set of `n` chunks: from the pool, or created when there is none
+    /// (or it is empty, which [`KvPool::overflow`] counts).
+    fn new_set(&self, b: &B, n: usize) -> Result<Arc<KvChunkSet<B>>> {
+        let (chunks, pool) = match self.pool.as_ref().map(|p| (p.take(), p)) {
+            Some((Some(c), p)) => (c, Some(p.clone())),
+            other => {
+                if let Some((_, p)) = other {
+                    p.overflow.fetch_add(1, Ordering::Relaxed);
+                }
+                let c = (0..n)
+                    .map(|_| b.alloc_chunk())
+                    .collect::<Result<Vec<_>>>()?;
+                (c, None)
+            }
+        };
+        Ok(Arc::new(KvChunkSet {
+            chunks,
+            key: AtomicU64::new(0),
+            pool,
+        }))
     }
 }
 
@@ -102,6 +196,58 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    /// Takes new chunk sets from `pool` from now on.
+    pub fn set_kv_pool(&mut self, pool: Arc<KvPool<B>>) {
+        if let Some(pg) = self.paging.as_mut() {
+            pg.pool = Some(pool);
+        }
+    }
+
+    /// Chunk sets this session alone holds (what trimming it returns to the pool).
+    pub fn kv_private_sets(&self) -> usize {
+        self.paging.as_ref().map_or(0, |pg| {
+            pg.sets
+                .iter()
+                .flatten()
+                .filter(|s| Arc::strong_count(s) == 1)
+                .count()
+        })
+    }
+
+    /// Chunk indices covering rows `0..rows` (with the margin).
+    pub fn kv_sets_for(&self, rows: usize) -> usize {
+        self.paging.as_ref().map_or(0, |pg| {
+            ((rows + BACK_MARGIN_ROWS).min(self.capacity) * self.kv_row)
+                .div_ceil(pg.chunk)
+                .min(pg.sets.len())
+        })
+    }
+
+    /// New sets backing rows `0..rows` may take: unbacked indices, plus shared ones a write may
+    /// copy (an upper bound).
+    pub fn kv_need(&self, rows: usize) -> usize {
+        let end = self.kv_sets_for(rows);
+        self.paging.as_ref().map_or(0, |pg| {
+            pg.sets[..end]
+                .iter()
+                .filter(|s| s.as_ref().is_none_or(|s| Arc::strong_count(s) > 1))
+                .count()
+        })
+    }
+
+    /// Backs rows `0..rows` (with the margin) now, from the pool when there is one.
+    pub fn reserve_kv(&mut self, b: &B, rows: usize) -> Result<()> {
+        let end = self.kv_sets_for(rows);
+        self.back_chunks(b, 0, end)
+    }
+
+    /// Paged caches: (chunks in one set, rows one set covers).
+    pub fn kv_set_shape(&self) -> Option<(usize, usize)> {
+        self.paging
+            .as_ref()
+            .map(|pg| (2 * self.kv.len(), pg.chunk / self.kv_row))
+    }
+
     /// Chunk indices backed by a set other sessions also map.
     pub fn kv_shared_chunks(&self) -> usize {
         self.paging.as_ref().map_or(0, |pg| {
@@ -154,13 +300,7 @@ impl<B: Backend> Session<B> {
             if pg.sets[i].is_some() {
                 continue;
             }
-            let chunks = (0..n)
-                .map(|_| b.alloc_chunk())
-                .collect::<Result<Vec<_>>>()?;
-            let set = Arc::new(KvChunkSet {
-                chunks,
-                key: AtomicU64::new(0),
-            });
+            let set = pg.new_set(b, n)?;
             for (c, (k, v)) in self.kv.iter_mut().enumerate() {
                 b.map_chunk(k, i, &set.chunks[2 * c])?;
                 b.map_chunk(v, i, &set.chunks[2 * c + 1])?;
@@ -183,12 +323,7 @@ impl<B: Backend> Session<B> {
             pg.scratch = Some(b.alloc_virtual(n * chunk)?);
         }
         for &i in indices {
-            let set = Arc::new(KvChunkSet {
-                chunks: (0..n)
-                    .map(|_| b.alloc_chunk())
-                    .collect::<Result<Vec<_>>>()?,
-                key: AtomicU64::new(0),
-            });
+            let set = pg.new_set(b, n)?;
             let scratch = pg.scratch.as_mut().expect("allocated above");
             for (j, ch) in set.chunks.iter().enumerate() {
                 b.map_chunk(scratch, j, ch)?;

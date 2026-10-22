@@ -36,6 +36,7 @@ mod ffi {
         ) -> i32;
         pub fn velox_cuda_set_device(device: i32) -> i32;
         pub fn velox_cuda_mem_info(free: *mut usize, total: *mut usize) -> i32;
+        pub fn velox_nvml_used(used: *mut usize, total: *mut usize) -> i32;
         pub fn velox_cuda_profiler(on: i32) -> i32;
         pub fn velox_cuda_malloc_zeroed(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn velox_cuda_host_alloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
@@ -71,6 +72,8 @@ mod ffi {
         pub fn velox_cuda_graph_replay_begin(slot: i32) -> i32;
         pub fn velox_cuda_graph_replay_launch(slot: i32) -> i32;
         pub fn velox_cuda_graph_abort() -> i32;
+        pub fn velox_cuda_graph_release(slot: i32) -> i32;
+        pub fn velox_cuda_graph_bytes() -> usize;
     }
 }
 
@@ -241,12 +244,19 @@ impl Drop for CudaChunk {
     fn drop(&mut self) {
         // SAFETY: the handle came from cuMemCreate and is released exactly once.
         unsafe { ffi::velox_vmm_release(self.handle) };
+        CHUNK_BYTES.fetch_sub(vm_chunk_bytes(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 // SAFETY: a device pointer is a plain address; synchronisation is CUDA's stream ordering.
 unsafe impl Send for CudaBuffer {}
 unsafe impl Sync for CudaBuffer {}
+
+/// Bytes of device buffers (cudaMalloc) alive and at their peak, and of physical chunks alive:
+/// what the engine's memory log reports, to tell its own growth from the driver's.
+static BUFFER_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BUFFER_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CHUNK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl CudaBuffer {
     fn new(len: usize) -> Result<Self> {
@@ -260,6 +270,9 @@ impl CudaBuffer {
                 unsafe { ffi::velox_cuda_malloc_zeroed(&mut ptr, bytes) },
                 "cudaMalloc",
             )?;
+            use std::sync::atomic::Ordering::Relaxed;
+            let live = BUFFER_BYTES.fetch_add(bytes, Relaxed) + bytes;
+            BUFFER_PEAK.fetch_max(live, Relaxed);
         }
         Ok(CudaBuffer {
             ptr: ptr.cast(),
@@ -308,6 +321,7 @@ impl Drop for CudaBuffer {
                     ffi::velox_cuda_free_host(self.ptr.cast());
                 } else {
                     ffi::velox_cuda_free(self.ptr.cast());
+                    BUFFER_BYTES.fetch_sub(self.len * 4, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -697,10 +711,98 @@ pub struct CudaBackend {
 
 #[derive(Default)]
 struct GraphKeys {
+    /// Slot of each segment key (a step's key, then `key | segment << 56`).
     slots: HashMap<u64, i32>,
     seen: HashSet<u64>,
     /// Static keys recorded at least once: later runs replay.
     recorded: HashSet<u64>,
+    /// Each step's segment slots and when it last ran: a budget releases whole steps, so a
+    /// replay never meets a missing segment.
+    steps: HashMap<u64, GraphStep>,
+    /// Released slots, reused before new ones.
+    free: Vec<i32>,
+    next: i32,
+    clock: u64,
+    /// Device bytes recorded graphs may hold (0: unbounded).
+    budget: usize,
+    released: usize,
+}
+
+#[derive(Default)]
+struct GraphStep {
+    segs: Vec<i32>,
+    used: u64,
+}
+
+impl GraphKeys {
+    /// The slot of segment `seg_key` of step `step`, taking a free one (releasing the least
+    /// recently run other step when all are taken). `None`: no slot.
+    fn slot_for(&mut self, seg_key: u64, step: u64) -> Option<i32> {
+        if let Some(&s) = self.slots.get(&seg_key) {
+            return Some(s);
+        }
+        let s = match self.free.pop() {
+            Some(s) => s,
+            None if self.next < GRAPH_SLOTS => {
+                self.next += 1;
+                self.next - 1
+            }
+            None => {
+                let victim = self.lru(step)?;
+                self.release(victim).ok()?;
+                self.free.pop()?
+            }
+        };
+        self.slots.insert(seg_key, s);
+        self.steps.entry(step).or_default().segs.push(s);
+        Some(s)
+    }
+
+    fn touch(&mut self, step: u64) {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(st) = self.steps.get_mut(&step) {
+            st.used = clock;
+        }
+    }
+
+    /// The least recently run step other than `keep`.
+    fn lru(&self, keep: u64) -> Option<u64> {
+        self.steps
+            .iter()
+            .filter(|(&k, _)| k != keep)
+            .min_by_key(|(_, st)| st.used)
+            .map(|(&k, _)| k)
+    }
+
+    /// Releases every segment graph of `step`; its next run records again.
+    fn release(&mut self, step: u64) -> Result<()> {
+        let Some(st) = self.steps.remove(&step) else {
+            return Ok(());
+        };
+        self.slots.retain(|_, s| !st.segs.contains(s));
+        self.recorded.remove(&step);
+        for s in st.segs {
+            // SAFETY: `s` is a slot this map handed out (in the shim's range).
+            status(unsafe { ffi::velox_cuda_graph_release(s) }, "graph release")?;
+            self.free.push(s);
+        }
+        self.released += 1;
+        Ok(())
+    }
+
+    /// Releases least recently run steps other than `keep` while graphs hold over the budget.
+    fn enforce(&mut self, keep: u64) -> Result<()> {
+        if self.budget == 0 {
+            return Ok(());
+        }
+        // SAFETY: plain query.
+        while unsafe { ffi::velox_cuda_graph_bytes() } > self.budget {
+            let Some(victim) = self.lru(keep) else { break };
+            self.release(victim)?;
+        }
+        Ok(())
+    }
 }
 
 /// Graph slots the shim keeps (`kGraphSlots`).
@@ -957,15 +1059,12 @@ impl Backend for CudaBackend {
             if g.seen.insert(key) {
                 (None, false)
             } else {
-                let next = g.slots.len() as i32;
-                let slot = *g.slots.entry(key).or_insert(next);
-                (
-                    Some(slot),
-                    key & GRAPH_STATIC != 0 && g.recorded.contains(&key),
-                )
+                let slot = g.slot_for(key, key);
+                g.touch(key);
+                (slot, key & GRAPH_STATIC != 0 && g.recorded.contains(&key))
             }
         };
-        let Some(slot) = slot.filter(|&s| s < GRAPH_SLOTS) else {
+        let Some(slot) = slot else {
             return f();
         };
         let mode = if replay {
@@ -1008,12 +1107,14 @@ impl Backend for CudaBackend {
             }
         };
         status(launched, "graph launch")?;
-        if !replay && key & GRAPH_STATIC != 0 {
-            graphs
+        if !replay {
+            let mut g = graphs
                 .lock()
-                .map_err(|_| Error::Backend("graph keys poisoned".into()))?
-                .recorded
-                .insert(key);
+                .map_err(|_| Error::Backend("graph keys poisoned".into()))?;
+            if key & GRAPH_STATIC != 0 {
+                g.recorded.insert(key);
+            }
+            g.enforce(key)?;
         }
         Ok(())
     }
@@ -1026,17 +1127,17 @@ impl Backend for CudaBackend {
             return Ok(());
         }
         let (key, seg, slot) = GRAPH_SEG.with(std::cell::Cell::get);
-        let next_key = key | (seg + 1) << 56;
-        let next = {
-            let mut g = graphs
-                .lock()
-                .map_err(|_| Error::Backend("graph keys poisoned".into()))?;
-            let n = g.slots.len() as i32;
-            *g.slots.entry(next_key).or_insert(n)
-        };
-        if next >= GRAPH_SLOTS || seg + 1 >= 128 {
-            return Ok(()); // out of slots: the step stays one graph
+        if seg + 1 >= 128 {
+            return Ok(()); // the step stays one graph from here
         }
+        let next_key = key | (seg + 1) << 56;
+        let next = graphs
+            .lock()
+            .map_err(|_| Error::Backend("graph keys poisoned".into()))?
+            .slot_for(next_key, key);
+        let Some(next) = next else {
+            return Ok(()); // out of slots: the step stays one graph
+        };
         // SAFETY: both slots are in the shim's range; the current one was begun by `graph`.
         let r = unsafe {
             if mode == GraphMode::Replay {
@@ -1049,6 +1150,46 @@ impl Backend for CudaBackend {
         };
         GRAPH_SEG.with(|c| c.set((key, seg + 1, next)));
         r
+    }
+
+    fn set_graph_budget(&self, bytes: usize) {
+        if let Some(Ok(mut g)) = self.graphs.as_ref().map(Mutex::lock) {
+            g.budget = bytes;
+        }
+    }
+
+    fn graph_stats(&self) -> (usize, usize, usize) {
+        match self.graphs.as_ref().map(Mutex::lock) {
+            // SAFETY: plain query.
+            Some(Ok(g)) => (
+                g.steps.len(),
+                unsafe { ffi::velox_cuda_graph_bytes() },
+                g.released,
+            ),
+            _ => (0, 0, 0),
+        }
+    }
+
+    fn mem_info(&self) -> Option<(usize, usize)> {
+        mem_info().ok().map(|(f, t)| (f as usize, t as usize))
+    }
+
+    fn device_allocs(&self) -> Option<(usize, usize, usize)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        Some((
+            BUFFER_BYTES.load(Relaxed),
+            BUFFER_PEAK.load(Relaxed),
+            CHUNK_BYTES.load(Relaxed),
+        ))
+    }
+
+    fn device_in_use(&self) -> Option<usize> {
+        let (mut used, mut total) = (0usize, 0usize);
+        // SAFETY: out-pointers to live locals.
+        match unsafe { ffi::velox_nvml_used(&mut used, &mut total) } {
+            0 => Some(used),
+            _ => self.mem_info().map(|(free, total)| total - free),
+        }
     }
 
     fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {
@@ -1169,6 +1310,7 @@ impl Backend for CudaBackend {
             unsafe { ffi::velox_vmm_create(&mut handle, chunk) },
             "cuMemCreate",
         )?;
+        CHUNK_BYTES.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
         Ok(CudaChunk { handle })
     }
 
