@@ -1957,6 +1957,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     let a4 = ActPolicy::AllowA4 { divisor: 600.0 };
     s.linear_act(WeightFormat::Nvfp4, 8448, 256, 128, 8200, 1030, a4)?;
     s.linear_act(WeightFormat::Fp8RowBf16, 8448, 256, 64, 8200, 1030, a8)?;
+    // Fused SwiGLU under A4 at prefill widths: both row orders, separate parents, a view one scale
+    // tile into its parent, and a grid of several hundred tiles.
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 512, 256, 0, 100, false, false, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 128, 128, 300, true, false, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 256, 0, 70, false, true, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 4096, 0, 1030, false, false, a4)?;
     Ok(s.results)
 }
 
