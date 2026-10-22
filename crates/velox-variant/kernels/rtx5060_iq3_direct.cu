@@ -106,9 +106,11 @@ __device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
 
 // KB: IQ3 blocks per row as a compile-time constant (the model's K = 5120 and 17408), which lets the
 // compiler unroll the block loop and issue loads further ahead; 0 reads it from k.
-template <int W, int MT, int NT, int KB>
+// XT: the activations' type. f32 (converted to bf16 in registers) saves the conversion launch
+// and costs the same for 1..2 tokens; bf16 (pre-converted) is faster for more tokens.
+template <int W, int MT, int NT, int KB, typename XT>
 __global__ void __launch_bounds__(W * 32)
-iq3_direct_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows, int k_rt,
+iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows, int k_rt,
                   long long row_begin, int rows, int m, float* __restrict__ y) {
     const int k = KB ? KB * 256 : k_rt;
     __shared__ Tables tables;
@@ -143,7 +145,7 @@ iq3_direct_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict
             }
     };
     // This lane's token rows (one per token tile) and whether they are real.
-    const __nv_bfloat16* xrow[NT];
+    const XT* xrow[NT];
     bool valid[NT];
 #pragma unroll
     for (int ni = 0; ni < NT; ++ni) {
@@ -188,8 +190,15 @@ iq3_direct_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 if (valid[ni]) {
-                    const uint4 v = __ldg(reinterpret_cast<const uint4*>(xrow[ni] + b * 256 + s * 32));
-                    xb[ni][0] = v.x, xb[ni][1] = v.y, xb[ni][2] = v.z, xb[ni][3] = v.w;
+                    if constexpr (sizeof(XT) == 4) {
+                        const float4* xp = reinterpret_cast<const float4*>(xrow[ni] + b * 256 + s * 32);
+                        const float4 a = __ldg(xp), c = __ldg(xp + 1);
+                        xb[ni][0] = bf16x2(a.x, a.y), xb[ni][1] = bf16x2(a.z, a.w);
+                        xb[ni][2] = bf16x2(c.x, c.y), xb[ni][3] = bf16x2(c.z, c.w);
+                    } else {
+                        const uint4 v = __ldg(reinterpret_cast<const uint4*>(xrow[ni] + b * 256 + s * 32));
+                        xb[ni][0] = v.x, xb[ni][1] = v.y, xb[ni][2] = v.z, xb[ni][3] = v.w;
+                    }
                 } else {
                     xb[ni][0] = xb[ni][1] = xb[ni][2] = xb[ni][3] = 0u;
                 }
@@ -294,15 +303,15 @@ __global__ void to_bf16(const float* __restrict__ x, long long n, __nv_bfloat16*
 
 VeloxScratch g_x;
 
-template <int W, int MT, int NT, int KB>
-int launch_kb(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y) {
+template <int W, int MT, int NT, int KB, typename XT>
+int launch_kb(const XT* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y) {
     const unsigned grid = static_cast<unsigned>((rows + 16 * MT - 1) / (16 * MT));
-    iq3_direct_kernel<W, MT, NT, KB><<<grid, W * 32>>>(x, w, n, k, rb, rows, m, y);
+    iq3_direct_kernel<W, MT, NT, KB, XT><<<grid, W * 32>>>(x, w, n, k, rb, rows, m, y);
     return velox_launch_status();
 }
 
-template <int W, int MT, int NT>
-int launch(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y) {
+template <int W, int MT, int NT, typename XT>
+int launch(const XT* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y) {
     if (k == 5120) return launch_kb<W, MT, NT, 20>(x, w, n, k, rb, rows, m, y);
     if (k == 17408) return launch_kb<W, MT, NT, 68>(x, w, n, k, rb, rows, m, y);
     return launch_kb<W, MT, NT, 0>(x, w, n, k, rb, rows, m, y);
@@ -312,19 +321,23 @@ int launch(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, long lo
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T for an iq3_xxs_planar_v1 parent [parent_rows, k],
 // 1 <= m <= 16; x must be 16-byte aligned. Warps split K: 2 for few blocks per row (gate/up,
-// K = 5120), 8 for long rows (down, K = 17408). Returns
-// VELOX_ERR_UNSUPPORTED for anything else.
+// K = 5120), 8 for long rows (down, K = 17408). Up to 2 tokens read the f32 activations directly;
+// more are converted to bf16 first. Returns VELOX_ERR_UNSUPPORTED for anything else.
 VELOX_API int velox_5060_linear_iq3_direct(const float* x, int m, const uint8_t* w, long long parent_rows,
                                            long long k, long long row_begin, int rows, float* y) {
     if (m < 1 || m > 16 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
         reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const int ki = static_cast<int>(k);
+    const bool long_rows = k / 256 > IQ3_DIRECT_LONG_BLOCKS;
+    if (m <= 2) {
+        return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 1>(x, w, parent_rows, ki, row_begin, rows, m, y)
+                         : launch<IQ3_DIRECT_W_SHORT, 1, 1>(x, w, parent_rows, ki, row_begin, rows, m, y);
+    }
     auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * k * 2));
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, static_cast<long long>(m) * k, xb);
     const __nv_bfloat16* x16 = xb;
-    const bool long_rows = k / 256 > IQ3_DIRECT_LONG_BLOCKS;
     if (m <= 8) {
         return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 1>(x16, w, parent_rows, ki, row_begin, rows, m, y)
                          : launch<IQ3_DIRECT_W_SHORT, 1, 1>(x16, w, parent_rows, ki, row_begin, rows, m, y);
