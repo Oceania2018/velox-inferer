@@ -381,21 +381,34 @@ __global__ void __launch_bounds__(C::THREADS, 1) gemm_kernel(GemmArgs p) {
     // accumulator, so split-K partials can be scaled before they are summed.
     const int g = lane >> 2, q = lane & 3;
     if (SW) {
-        // out = silu(gate) * up, as the portable swiglu kernel computes it from the scaled sums.
+        // out = silu(gate) * up, as the portable swiglu kernel computes it from the sums scaled as
+        // the plain epilogue below scales them (FP4: alpha; FP8: weight row scale, then token's).
+        const uint16_t* gs = reinterpret_cast<const uint16_t*>(p.w + (p.parent_rows * p.kb + 255) / 256 * 256);
+        const uint16_t* us = reinterpret_cast<const uint16_t*>(p.w2 + (p.parent_rows2 * p.kb + 255) / 256 * 256);
 #pragma unroll
         for (int nt = 0; nt < C::NT / 2; ++nt) {
             const int n = n0 + wn * (C::NT * 4) + nt * 8 + 2 * q;
+            float fg[2] = {p.alpha, p.alpha}, fu[2] = {p.alpha2, p.alpha2};
+            if (KIND == kFp8) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const bool in = n + e < p.rows;
+                    fg[e] = in ? __uint_as_float(static_cast<uint32_t>(gs[p.row_begin + n + e]) << 16) : 0.0f;
+                    fu[e] = in ? __uint_as_float(static_cast<uint32_t>(us[p.row_begin2 + n + e]) << 16) : 0.0f;
+                }
+            }
 #pragma unroll
             for (int mt = 0; mt < C::MT; ++mt) {
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     const int t = m0 + wm * WROWS + mt * 16 + g + h * 8;
                     if (t >= p.m) continue;
+                    const float xs = KIND == kFp8 ? p.a_row[t] : 1.0f;
                     float v[2];
 #pragma unroll
                     for (int e = 0; e < 2; ++e) {
-                        const float gv = acc[mt][nt][2 * h + e] * p.alpha;
-                        const float uv = acc[mt][nt + C::NT / 2][2 * h + e] * p.alpha2;
+                        const float gv = acc[mt][nt][2 * h + e] * fg[e] * xs;
+                        const float uv = acc[mt][nt + C::NT / 2][2 * h + e] * fu[e] * xs;
                         v[e] = gv / (1.0f + expf(-gv)) * uv;
                     }
                     float* out = y + static_cast<long long>(t) * p.rows + n;
@@ -569,12 +582,12 @@ VELOX_API int velox_5090_linear_a4(const float* x, int m, const uint8_t* w, long
 // (possibly of one parent), prefill widths only (m > 32). Each product is exactly what
 // velox_5090_linear_a4 computes for that view, and the epilogue applies the portable swiglu's
 // arithmetic, so the result matches linear_a4 + swiglu bit for bit without the [m, 2 * rows]
-// intermediate. Requires k % 128 == 0, row_begin % 128 == 0 for both views, rows % 64 == 0.
+// intermediate. Requires k % 128 == 0 and row_begin % 128 == 0 for both views.
 VELOX_API int velox_5090_linear_swiglu_a4(const float* x, int m, const uint8_t* wg, long long parent_rows_g,
                                           long long row_begin_g, const uint8_t* wu, long long parent_rows_u,
                                           long long row_begin_u, long long k, int rows, float input_divisor,
                                           float* y) {
-    if (k % 128 != 0 || row_begin_g % 128 != 0 || row_begin_u % 128 != 0 || rows % 64 != 0 || m <= kSmallMaxM ||
+    if (k % 128 != 0 || row_begin_g % 128 != 0 || row_begin_u % 128 != 0 || m <= kSmallMaxM ||
         reinterpret_cast<uintptr_t>(x) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     // The tile the composed path would pick for the fused [2 * rows] view.
@@ -608,4 +621,25 @@ VELOX_API int velox_5090_linear_a8(const float* x, int m, const uint8_t* w, long
     GemmArgs p{buf, nullptr, row_scale, w, parent_rows, row_begin, rows, m, static_cast<int>(k),
                static_cast<int>(k), 1.0f, 0, y};
     return launch_gemm<kFp8>(p);
+}
+
+// y[m, rows] = silu(e4m3(x) . G^T) * (e4m3(x) . U^T) for FP8 row-scaled gate / up views of `rows`
+// rows (possibly of one parent), prefill widths only (m > 32); equals linear_a8 + swiglu (see
+// velox_5090_linear_swiglu_a4). Requires k % 64 == 0.
+VELOX_API int velox_5090_linear_swiglu_a8(const float* x, int m, const uint8_t* wg, long long parent_rows_g,
+                                          long long row_begin_g, const uint8_t* wu, long long parent_rows_u,
+                                          long long row_begin_u, long long k, int rows, float* y) {
+    if (k % 64 != 0 || m <= kSmallMaxM || reinterpret_cast<uintptr_t>(x) % 16 != 0) return VELOX_ERR_UNSUPPORTED;
+    const bool wide = use_wide(m, 2 * rows);
+    const int mt = wide ? Wide::BM : Big::BM;
+    const int m_pad = (m + mt - 1) / mt * mt;
+    const size_t code_bytes = static_cast<size_t>(m_pad) * k;
+    uint8_t* buf = g_scratch.get(code_bytes + static_cast<size_t>(m_pad) * 4);
+    if (!buf) return static_cast<int>(cudaErrorMemoryAllocation);
+    float* row_scale = reinterpret_cast<float*>(buf + code_bytes);
+    quant_fp8_kernel<<<m_pad, 256>>>(x, m, static_cast<int>(k), buf, row_scale);
+    if (const int e = velox_launch_status()) return e;
+    GemmArgs p{buf, nullptr, row_scale, wg, parent_rows_g, row_begin_g, rows, m, static_cast<int>(k),
+               static_cast<int>(k), 1.0f, 0, y, wu, parent_rows_u, row_begin_u, 1.0f};
+    return wide ? launch_cfg<Wide, kFp8, true>(p) : launch_cfg<Big, kFp8, true>(p);
 }

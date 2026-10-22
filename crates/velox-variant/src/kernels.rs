@@ -34,6 +34,19 @@ extern "C" {
         input_divisor: f32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5090_linear_swiglu_a8(
+        x: *const f32,
+        m: i32,
+        wg: *const u8,
+        parent_rows_g: i64,
+        row_begin_g: i64,
+        wu: *const u8,
+        parent_rows_u: i64,
+        row_begin_u: i64,
+        k: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5090_attention_full(
         q: *const f32,
         k: *const f32,
@@ -337,14 +350,15 @@ impl CudaKernels for Rtx5090Kernels {
         up: &WeightView<'_, CudaBuffer>,
         m: usize,
     ) -> Option<ActQuant> {
-        // Prefill widths of NVFP4 gate / up views the A4 tensor-core GEMM serves with one rounding.
+        // Prefill widths of NVFP4 / FP8 gate / up views the A4 / A8 tensor-core GEMM serves with one
+        // rounding.
         let act = self.linear_act(gate, m);
         let fused = m >= SWIGLU_MIN_M
-            && matches!(act, ActQuant::Nvfp4 { .. })
+            && matches!(act, ActQuant::Nvfp4 { .. } | ActQuant::Fp8Row)
             && self.linear_act(up, m) == act
+            && gate.format == up.format
             && gate.rows == up.rows
-            && gate.k == up.k
-            && gate.rows % 64 == 0;
+            && gate.k == up.k;
         fused.then_some(act)
     }
 
@@ -356,32 +370,30 @@ impl CudaKernels for Rtx5090Kernels {
         out: &mut CudaBuffer,
         m: usize,
     ) -> Result<()> {
-        let ActQuant::Nvfp4 { divisor } = self.linear_swiglu_act(gate, up, m).ok_or_else(|| {
-            Error::Unsupported("rtx5090 fused linear_swiglu at this shape".into())
-        })?
-        else {
-            unreachable!("linear_swiglu_act reports NVFP4 only");
-        };
+        let act = self
+            .linear_swiglu_act(gate, up, m)
+            .ok_or_else(|| Error::Unsupported("rtx5090 fused linear_swiglu at this shape".into()))?;
+        let (mi, rows, k) = (to_i32("m", m)?, to_i32("rows", gate.rows)?, gate.k as i64);
+        let (wg, pg, bg) = (gate.buf.as_ptr().cast::<u8>(), gate.parent_rows as i64, gate.row_begin as i64);
+        let (wu, pu, bu) = (up.buf.as_ptr().cast::<u8>(), up.parent_rows as i64, up.row_begin as i64);
         // SAFETY: extents validated by CudaBackend (check::linear for both views).
-        status(
-            unsafe {
-                velox_5090_linear_swiglu_a4(
-                    x.as_ptr(),
-                    to_i32("m", m)?,
-                    gate.buf.as_ptr().cast(),
-                    gate.parent_rows as i64,
-                    gate.row_begin as i64,
-                    up.buf.as_ptr().cast(),
-                    up.parent_rows as i64,
-                    up.row_begin as i64,
-                    gate.k as i64,
-                    to_i32("rows", gate.rows)?,
-                    divisor,
-                    out.as_mut_ptr(),
-                )
-            },
-            "rtx5090 linear_swiglu a4",
-        )
+        match act {
+            ActQuant::Nvfp4 { divisor } => status(
+                unsafe {
+                    velox_5090_linear_swiglu_a4(
+                        x.as_ptr(), mi, wg, pg, bg, wu, pu, bu, k, rows, divisor, out.as_mut_ptr(),
+                    )
+                },
+                "rtx5090 linear_swiglu a4",
+            ),
+            ActQuant::Fp8Row => status(
+                unsafe {
+                    velox_5090_linear_swiglu_a8(x.as_ptr(), mi, wg, pg, bg, wu, pu, bu, k, rows, out.as_mut_ptr())
+                },
+                "rtx5090 linear_swiglu a8",
+            ),
+            _ => unreachable!("linear_swiglu_act reports NVFP4 or FP8 rows only"),
+        }
     }
 
     fn linear(&self, x: &CudaBuffer, w: &WeightView<'_, CudaBuffer>, y: &mut CudaBuffer, m: usize) -> Result<()> {
