@@ -541,7 +541,8 @@ pub struct Workspace<B: Backend> {
     spec_rows: Option<SpecRows<B>>,
     /// Where verify's recurrences write their final state: one GDN layer's conv and SSM state,
     /// shared by every layer and session and never read (commit replays the kept rows from the
-    /// recorded inputs instead, as ninfer's ReplaySSM). Saves a full state copy per lane.
+    /// recorded inputs instead, as ninfer's ReplaySSM). Saves a full state copy per lane. The SSM
+    /// part is only `gated_delta_net_out`'s working state (backends may skip writing it).
     spec_state: Option<(B::Buffer, B::Buffer)>,
     /// `emb` / `rows_hidden` hold `max_tokens` rows (MTP drafting reads them); without, they are
     /// placeholders and `keep_rows` does not fill them.
@@ -1047,7 +1048,7 @@ impl<B: Backend> Qwen35Text<B> {
                         match &mut state_out {
                             Some((sc, ss, so)) => {
                                 b.conv1d_silu_from(qkv_buf, cw, &s_conv[gi], sc, so, cs)?;
-                                b.gated_delta_net_from(
+                                b.gated_delta_net_out(
                                     so, ab_buf, al, dt, &s_ssm[gi], ss, &mut ws.o, gs,
                                 )?;
                             }
@@ -2134,7 +2135,7 @@ impl<B: Backend> Qwen35Text<B> {
                         )?;
                         // Window outputs go to the workspace's rows after the prefill.
                         let o = if tp > 0 { &mut bw.o } else { &mut ws.o };
-                        b.gated_delta_net_from(
+                        b.gated_delta_net_out(
                             &bw.conv_out[gi],
                             &bw.ab[gi],
                             al,

@@ -635,6 +635,24 @@ pub trait Backend {
         self.copy(state_in, 0, state_out, 0, self.len(state_in))?;
         self.gated_delta_net(qkv, ab, a_log, dt_bias, state_out, out, shape)
     }
+    /// [`Self::gated_delta_net_from`] when only `out` is needed (a speculative window that commit
+    /// replays from its recorded inputs): the state after the window is not kept. `scratch`
+    /// (state-sized) is the default's working state; a backend may leave it untouched and skip
+    /// writing a state at all.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_out(
+        &self,
+        qkv: &Self::Buffer,
+        ab: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        state_in: &Self::Buffer,
+        scratch: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: GdnShape,
+    ) -> Result<()> {
+        self.gated_delta_net_from(qkv, ab, a_log, dt_bias, state_in, scratch, out, shape)
+    }
     /// Advances several GDN layers over the first `gdn.tokens` rows of a window whose conv outputs
     /// are known (a speculative window replayed after a partial accept): each layer's conv state
     /// as [`Self::conv1d_silu`] and its recurrent state as [`Self::gated_delta_net`] would leave
