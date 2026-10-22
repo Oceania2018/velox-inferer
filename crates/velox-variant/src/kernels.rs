@@ -134,8 +134,8 @@ const SMALL_M_MAX: usize = 8;
 /// (speculative verify, short chunks) the tensor-core GEMM with rounded activations takes over
 /// where the artifact allows: its 16-token tile with split-K streams the weights once.
 const GEMV_MAX_M: usize = 1;
-/// Fused SwiGLU from here (the CUDA side's prefill tiles start above kSmallMaxM = 32).
-const SWIGLU_MIN_M: usize = 33;
+/// Fused SwiGLU from here (the CUDA side's prefill tiles start above kSmallMaxM = 64).
+const SWIGLU_MIN_M: usize = 65;
 
 /// From this many query tokens attention uses the tensor-core prefill kernel; below it the exact
 /// split-KV kernel, which is bound by reading the cache anyway.

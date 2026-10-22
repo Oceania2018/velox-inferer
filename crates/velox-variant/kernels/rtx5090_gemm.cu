@@ -121,8 +121,8 @@ __global__ void quant_fp8_kernel(const float* __restrict__ x, int m, int k, uint
 // tokens and NT x 8 weight rows, so a block is BM = WM * MT * 16 tokens by BN = WN * NT * 8 rows.
 //   Wide:  256 x 128, 256 threads, 64 x 64 per warp (prefill grids of at least kWideBlocks)
 //   Big:   128 x 128, 256 threads, 64 x 32 per warp (smaller prefill grids)
-//   Small:  16 x 64, 64 threads (speculative verify and short chunks), with split-K so a handful
-//          of tokens still spreads the weight stream over every SM.
+//   Small:  16 / 32 / 64 x 64, 64 threads (verify, drafts, short chunks: m <= 64), with split-K so a
+//           handful of tokens still spreads the weight stream over every SM.
 
 
 enum Kind { kFp4 = 0, kFp8 = 1 };
@@ -144,8 +144,13 @@ using Big = Cfg<2, 4, 4, 3, 2>;
 // Skinny m (decode, verify, drafts) is weight-streaming: 64 rows per block, 128 contiguous bytes
 // per row per stage and four stages measured best on the RTX 5090 (m = 8: lm_head 1.05 -> 1.53
 // TB/s, MLP gate|up 0.96 -> 1.29 TB/s).
-using Small = Cfg<1, 2, 1, 4, 4>;
-using Small64 = Cfg<1, 2, 1, 3, 2>;  // K whose code bytes are not a multiple of Small::BK
+// The tile is as tall as the batch (16 / 32 / 64 tokens), so a batched verify of several lanes
+// still streams the weights once (16-row tiles took two or four passes at m = 17..64).
+template <int MT>
+using SmallT = Cfg<1, 2, MT, 4, 4>;
+template <int MT>
+using Small64T = Cfg<1, 2, MT, 3, 2>;  // K whose code bytes are not a multiple of SmallT::BK
+using Small = SmallT<1>;
 
 template <class C, bool SW>
 struct Smem {
@@ -472,7 +477,7 @@ Scratch g_scratch;  // quantized activations
 Scratch g_part;     // split-K partial sums
 
 constexpr int kSms = 170;
-constexpr int kSmallMaxM = 32;
+constexpr int kSmallMaxM = 64;  // skinny tiles up to here; prefill tiles (and fused SwiGLU) above
 
 // Wide tiles when their grid fills the GPU about one and a half times over, and for at least two
 // tile rows of tokens (m = 128 padded to one Wide tile: [34816,5120] 110 -> 150 us).
@@ -485,8 +490,10 @@ bool use_wide(int m, int rows) {
 }
 
 // Token rows the quantizers pad to: the tile height of the configuration launch_gemm picks.
-int m_tile(int m, int rows) { return m <= kSmallMaxM ? Small::BM : use_wide(m, rows) ? Wide::BM : Big::BM; }
-static_assert(Small::BM == Small64::BM, "small configurations share the activation tile height");
+int m_tile(int m, int rows) {
+    if (m <= kSmallMaxM) return m <= 16 ? 16 : m <= 32 ? 32 : 64;
+    return use_wide(m, rows) ? Wide::BM : Big::BM;
+}
 
 template <class C, int KIND, bool SW = false>
 int launch_cfg(GemmArgs p) {
@@ -504,7 +511,7 @@ int launch_cfg(GemmArgs p) {
     // The small tile always may split; the large one only when its grid is badly under-filled,
     // since the partial pass costs more than it saves on prefill-sized grids. SwiGLU never splits
     // (its epilogue needs the whole sums).
-    while (!SW && (C::BM == Small::BM || blocks < 64) && blocks * splits < 2 * kSms && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
+    while (!SW && (C::WM == 1 || blocks < 64) && blocks * splits < 2 * kSms && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
     p.kt_per_split = (kt_total + splits - 1) / splits;
     float* y = p.y;
     if (splits > 1) {
@@ -524,7 +531,12 @@ template <int KIND>
 int launch_gemm(const GemmArgs& p) {
     if (use_wide(p.m, p.rows)) return launch_cfg<Wide, KIND>(p);
     if (p.m > kSmallMaxM) return launch_cfg<Big, KIND>(p);
-    return p.kb % Small::BK == 0 ? launch_cfg<Small, KIND>(p) : launch_cfg<Small64, KIND>(p);
+    if (p.kb % Small::BK != 0) {
+        if (p.m <= 16) return launch_cfg<Small64T<1>, KIND>(p);
+        return p.m <= 32 ? launch_cfg<Small64T<2>, KIND>(p) : launch_cfg<Small64T<4>, KIND>(p);
+    }
+    if (p.m <= 16) return launch_cfg<SmallT<1>, KIND>(p);
+    return p.m <= 32 ? launch_cfg<SmallT<2>, KIND>(p) : launch_cfg<SmallT<4>, KIND>(p);
 }
 
 // Quantizes x to NVFP4 codes and scales padded to the tile height mt; returns the codes (scales
