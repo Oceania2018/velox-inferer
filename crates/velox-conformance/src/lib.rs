@@ -1963,6 +1963,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 128, 128, 300, true, false, a4)?;
     s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 256, 0, 70, false, true, a4)?;
     s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 4096, 0, 1030, false, false, a4)?;
+    // ... and FP8 rows under A8 (the Qwen3.8 NVFP4 artifact's FP8 MLP layers): separate parents,
+    // ragged columns, a view not starting on a tile, and a wide grid.
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 256, 192, 0, 130, false, true, a8)?;
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 320, 200, 17, 300, true, false, a8)?;
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 256, 4096, 0, 1030, false, true, a8)?;
     Ok(s.results)
 }
 
