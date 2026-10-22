@@ -77,6 +77,16 @@ extern "C" {
         format: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_linear_nvfp4_sliced(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_rs_sliced(
         x: *const f32,
         m: i32,
@@ -244,6 +254,9 @@ fn iq3_direct(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     let blocks = w.k / 256;
     m.min(SKINNY16_MAX_M) <= 2 || (blocks > 32 && m.min(SKINNY16_MAX_M) <= 8)
 }
+
+/// Widest NVFP4 view the sliced-K kernel serves (see `linear`).
+const NVFP4_SLICED_MAX_ROWS: usize = 8192;
 
 /// IQ3_XXS decode and verify (1..=SKINNY_MAX_M tokens): the weight-streaming bf16 kernels.
 fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
@@ -470,7 +483,15 @@ impl CudaKernels for Rtx5060Kernels {
                         let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
                         let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
-                        if f == 0 {
+                        if f == 0 && w.k % 512 == 0 && w.rows <= NVFP4_SLICED_MAX_ROWS {
+                            // NVFP4 with few rows and K in whole 512-value tiles: the sliced-K
+                            // kernel. Measured at m=8: [5120,17408] 199 vs 247 us, [5120,6144] 76
+                            // vs 90 us; wide views stay on skinny16 ([248320,5120] 2217 vs 2733 us).
+                            status(
+                                unsafe { velox_5060_linear_nvfp4_sliced(xp, mb, wp, pr, k, rb, rows, yp) },
+                                "rtx5060 linear nvfp4 sliced",
+                            )?;
+                        } else if f == 0 {
                             status(
                                 unsafe { velox_5060_linear_skinny16(xp, mb, wp, pr, k, rb, rows, f, yp) },
                                 "rtx5060 linear skinny16",
