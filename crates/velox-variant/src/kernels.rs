@@ -77,6 +77,17 @@ extern "C" {
         format: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_linear_rs_sliced(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        format: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_iq3_direct(
         x: *const f32,
         m: i32,
@@ -465,9 +476,18 @@ impl CudaKernels for Rtx5060Kernels {
                                 "rtx5060 linear skinny16",
                             )?;
                         } else {
+                            // q4 / q5: the sliced-K kernel (16 rows per block, 4 warps over each
+                            // 256-value K tile); q8: the staged 128-row kernel. Measured at m=8: q5
+                            // [12288,5120] 123 vs 186 us, q4 [8192,5120] 84 vs 90 us.
                             status(
-                                unsafe { velox_5060_linear_skinny_rs(xp, mb, wp, pr, k, rb, rows, f, yp) },
-                                "rtx5060 linear skinny rs",
+                                unsafe {
+                                    if f == 8 {
+                                        velox_5060_linear_skinny_rs(xp, mb, wp, pr, k, rb, rows, f, yp)
+                                    } else {
+                                        velox_5060_linear_rs_sliced(xp, mb, wp, pr, k, rb, rows, f, yp)
+                                    }
+                                },
+                                "rtx5060 linear rs",
                             )?;
                         }
                     }
