@@ -52,6 +52,18 @@ pub fn max_err(got: &[f32], want: &[f32]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Whether a weight's activation policy permits the input rounding a kernel reports.
+fn permitted(act: ActQuant, policy: ActPolicy) -> bool {
+    match (act, policy) {
+        (ActQuant::Exact | ActQuant::Bf16, _) => true,
+        (ActQuant::Fp8Row | ActQuant::Int8G256, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. }) => {
+            true
+        }
+        (ActQuant::Nvfp4 { divisor: a }, ActPolicy::AllowA4 { divisor: b }) => a == b,
+        _ => false,
+    }
+}
+
 fn fetch<B: Backend>(b: &B, buf: &B::Buffer, len: usize) -> Result<Vec<f32>> {
     let mut out = vec![0.0; len];
     b.synchronize()?;
@@ -246,12 +258,7 @@ impl<B: Backend> Suite<'_, B> {
             .rows(begin, rows)
             .with_act(policy);
         let act = self.b.linear_act(&view, m);
-        let permitted = match (act, policy) {
-            (ActQuant::Exact | ActQuant::Bf16, _) => true,
-            (ActQuant::Fp8Row, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. }) => true,
-            (ActQuant::Nvfp4 { divisor: a }, ActPolicy::AllowA4 { divisor: b }) => a == b,
-            _ => false,
-        };
+        let permitted = permitted(act, policy);
         let mut xq = x.clone();
         quantize_activations(&mut xq, k, act);
         let wc = CpuBackend.upload_bytes(&bytes)?;
@@ -271,6 +278,7 @@ impl<B: Backend> Suite<'_, B> {
             ActQuant::Fp8Row => " a8",
             ActQuant::Nvfp4 { .. } => " a4",
             ActQuant::Bf16 => " bf16",
+            ActQuant::Int8G256 => " i8",
         };
         let name = format!(
             "linear {} [{n},{k}] rows {begin}+{rows} m={m}{tag}",
@@ -299,6 +307,22 @@ impl<B: Backend> Suite<'_, B> {
         swap: bool,
         split: bool,
     ) -> Result<()> {
+        self.linear_swiglu_with(fmt, k, width, begin, m, swap, split, ActPolicy::A16Only)
+    }
+
+    /// [`Self::linear_swiglu`] with both views under an activation policy.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_with(
+        &mut self,
+        fmt: WeightFormat,
+        k: usize,
+        width: usize,
+        begin: usize,
+        m: usize,
+        swap: bool,
+        split: bool,
+        policy: ActPolicy,
+    ) -> Result<()> {
         let n = (begin + 2 * width + 16).div_ceil(128) * 128; // nvfp4 needs whole 128-row tiles
         let bytes = random_weight(&mut self.rng, fmt, n, k);
         let bytes2 = random_weight(&mut self.rng, fmt, n, k);
@@ -309,8 +333,12 @@ impl<B: Backend> Suite<'_, B> {
             (begin, begin + width)
         };
         let (wd, wd2) = (self.b.upload_bytes(&bytes)?, self.b.upload_bytes(&bytes2)?);
-        let gate = WeightView::full(&wd, fmt, n, k).rows(gb, width);
-        let up = WeightView::full(if split { &wd2 } else { &wd }, fmt, n, k).rows(ub, width);
+        let gate = WeightView::full(&wd, fmt, n, k)
+            .rows(gb, width)
+            .with_act(policy);
+        let up = WeightView::full(if split { &wd2 } else { &wd }, fmt, n, k)
+            .rows(ub, width)
+            .with_act(policy);
         let act = self.b.linear_swiglu_act(&gate, &up, m);
         let mut xq = x.clone();
         quantize_activations(&mut xq, k, act);
@@ -342,6 +370,7 @@ impl<B: Backend> Suite<'_, B> {
             ActQuant::Fp8Row => " a8",
             ActQuant::Nvfp4 { .. } => " a4",
             ActQuant::Bf16 => " bf16",
+            ActQuant::Int8G256 => " i8",
         };
         let layout = if split {
             " split"
@@ -350,16 +379,16 @@ impl<B: Backend> Suite<'_, B> {
         } else {
             ""
         };
-        self.record(
-            format!(
-                "linear_swiglu {} [{width}x2,{k}] from {begin} m={m}{layout}{tag}",
-                fmt.name()
-            ),
-            Some(Op::LinearSwiglu),
-            &got,
-            &g,
-            2e-4,
+        let name = format!(
+            "linear_swiglu {} [{width}x2,{k}] from {begin} m={m}{layout}{tag}",
+            fmt.name()
         );
+        if permitted(act, policy) {
+            self.record(name, Some(Op::LinearSwiglu), &got, &g, 2e-4);
+        } else {
+            let name = name + " (rounding not permitted)";
+            self.record(name, Some(Op::LinearSwiglu), &[f32::NAN], &[0.0], 0.0);
+        }
         Ok(())
     }
 
@@ -1889,6 +1918,19 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear_swiglu(WeightFormat::Q4G64, 320, 40, 3, 8, false, false)?;
     s.linear_swiglu(WeightFormat::Nvfp4, 512, 128, 0, 8, false, false)?;
     s.linear_swiglu(WeightFormat::Bf16, 96, 33, 1, 5, false, false)?;
+    // Prefill widths under AllowA8 (int8 tensor-core paths): ragged token tiles, row views that
+    // start mid-tile, ragged row counts, and a fused SwiGLU over separate parents.
+    let a8 = ActPolicy::AllowA8;
+    for m in [33, 64, 100] {
+        s.linear_act(WeightFormat::Iq3Xxs, 160, 768, 16, 128, m, a8)?;
+        s.linear_act(WeightFormat::Q5G64, 200, 512, 8, 136, m, a8)?;
+    }
+    s.linear_act(WeightFormat::Iq3Xxs, 100, 512, 3, 90, 47, a8)?;
+    s.linear_act(WeightFormat::Q4G64, 128, 1024, 0, 128, 70, a8)?;
+    s.linear_act(WeightFormat::Q8G32, 96, 512, 0, 96, 70, a8)?;
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 512, 40, 0, 70, false, false, a8)?;
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 768, 24, 8, 33, false, true, a8)?;
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 256, 64, 0, 130, true, false, a8)?;
     Ok(s.results)
 }
 
