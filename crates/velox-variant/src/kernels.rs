@@ -77,6 +77,16 @@ extern "C" {
         format: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_linear_iq3_direct(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_gemv(
         x: *const f32,
         m: i32,
@@ -202,21 +212,29 @@ fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     }
 }
 
-/// Single-token decode for the formats main has no fast GEMV for, IQ3_XXS (3) and q5_g64 (5): the
-/// register-streaming f32 GEMV (exact activations). From two tokens the tensor-core kernels win
-/// (measured: q5 [12288,5120] m=1 112 us vs 179 us skinny; m=2 184 vs 183; iq3 even at m=1).
+/// Single-token q5_g64 decode: the register-streaming f32 GEMV (exact activations). From two tokens
+/// the tensor-core kernels win (measured: q5 [12288,5120] m=1 112 us vs 179 us skinny; m=2 184 vs
+/// 183). IQ3_XXS decodes faster on its direct tensor-core kernel (m=1 205 vs 217 us GEMV).
 fn gemv_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     if m != 1 {
         return None;
     }
     match w.format {
-        WeightFormat::Iq3Xxs => Some(3),
         WeightFormat::Q5G64 if w.k % 32 == 0 => Some(5),
         _ => None,
     }
 }
 
-/// IQ3_XXS decode and verify (1..=SKINNY_MAX_M tokens): the weight-streaming bf16 kernel.
+/// Which IQ3_XXS kernel serves a 16-token block of `m` tokens: the register-direct one (codes
+/// straight to registers) or the shared-memory staged one. Measured (us, gate/up [34816,5120] /
+/// down [5120,17408]): m=1 205 / 100 direct vs 220 / 116 staged; m=8 247 / 108 vs 214 / 122;
+/// m=16 279 / 159 vs 228 / 136.
+fn iq3_direct(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    let blocks = w.k / 256;
+    m.min(SKINNY16_MAX_M) <= 2 || (blocks > 32 && m.min(SKINNY16_MAX_M) <= 8)
+}
+
+/// IQ3_XXS decode and verify (1..=SKINNY_MAX_M tokens): the weight-streaming bf16 kernels.
 fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     w.format == WeightFormat::Iq3Xxs && (1..=SKINNY_MAX_M).contains(&m)
 }
@@ -401,14 +419,21 @@ impl CudaKernels for Rtx5060Kernels {
             ),
             ActQuant::Bf16 => {
                 if skinny_iq3(w, m) {
+                    let direct = iq3_direct(w, m);
                     // The kernel takes up to 16 rows; larger m runs in blocks.
                     for r0 in (0..m).step_by(SKINNY16_MAX_M) {
                         let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
                         let (xp, yp) = unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
                         status(
-                            unsafe { velox_5060_linear_skinny_iq3(xp, mb, wp, pr, k, rb, rows, yp) },
-                            "rtx5060 linear skinny iq3",
+                            unsafe {
+                                if direct {
+                                    velox_5060_linear_iq3_direct(xp, mb, wp, pr, k, rb, rows, yp)
+                                } else {
+                                    velox_5060_linear_skinny_iq3(xp, mb, wp, pr, k, rb, rows, yp)
+                                }
+                            },
+                            "rtx5060 linear iq3",
                         )?;
                     }
                     return Ok(());
