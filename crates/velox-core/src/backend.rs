@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::format::WeightFormat;
 use crate::kv::KvFormat;
 use crate::op::Op;
@@ -303,7 +303,7 @@ pub enum ActPolicy {
     /// Activations stay exact (f32 here, BF16 in the source model).
     #[default]
     A16Only,
-    /// Per-token E4M3 activations are allowed.
+    /// 8-bit activations are allowed: per-token E4M3 or per-256-value int8.
     AllowA8,
     /// NVFP4 activations are allowed with this static input divisor.
     AllowA4 { divisor: f32 },
@@ -336,6 +336,10 @@ pub enum ActQuant {
     Nvfp4 {
         divisor: f32,
     },
+    /// Rounded to bf16, then per row and 256-value group: `scale = amax / 127`, codes
+    /// `rint(x * (127 / amax))` as int8 (the int8 tensor-core prefill paths). Needs `k % 256 == 0`;
+    /// an 8-bit activation, so [`ActPolicy::AllowA8`] permits it.
+    Int8G256,
 }
 
 /// The operand precision of an attention kernel (`attention`, `attention_full`). Like
@@ -439,6 +443,46 @@ pub trait Backend {
     /// that `w.act` permits.
     fn linear_act(&self, _w: &WeightView<'_, Self::Buffer>, _m: usize) -> ActQuant {
         ActQuant::Exact
+    }
+    /// A SwiGLU FFN's projections: `out[r][i] = silu((x_r . gate_i)) * (x_r . up_i)` for `m` rows
+    /// of `x`, where `gate` and `up` are views of the same width, format and K. Backends fuse it
+    /// where they can; the default ([`linear_swiglu_composed`]) runs one GEMM into `scratch`
+    /// (`[m, 2 * width]`) when the views are adjacent rows of one parent, else two, then
+    /// `swiglu` / `silu_mul`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu(
+        &self,
+        x: &Self::Buffer,
+        gate: &WeightView<'_, Self::Buffer>,
+        up: &WeightView<'_, Self::Buffer>,
+        out: &mut Self::Buffer,
+        m: usize,
+        scratch: &mut Self::Buffer,
+    ) -> Result<()> {
+        linear_swiglu_composed(self, x, gate, up, out, m, scratch)
+    }
+    /// Whether `linear_swiglu` at `m` rows runs fused (no `scratch`, no intermediate): callers
+    /// then use it at widths their scratch was not sized for.
+    fn fuses_swiglu(
+        &self,
+        _gate: &WeightView<'_, Self::Buffer>,
+        _up: &WeightView<'_, Self::Buffer>,
+        _m: usize,
+    ) -> bool {
+        false
+    }
+    /// The activation rounding `linear_swiglu` applies at `m` rows (that of the projection the
+    /// default runs).
+    fn linear_swiglu_act(
+        &self,
+        gate: &WeightView<'_, Self::Buffer>,
+        up: &WeightView<'_, Self::Buffer>,
+        m: usize,
+    ) -> ActQuant {
+        match swiglu_pair(gate, up) {
+            Some((both, _, _)) => self.linear_act(&both, m),
+            None => self.linear_act(gate, m),
+        }
     }
     /// Embedding lookup: `out[t, :] = W[ids[t], :]` decoded, for a `[vocab, k]` table view.
     fn embed(
@@ -881,6 +925,75 @@ pub trait Backend {
 
 /// Host reference for [`Backend::top_k`] on one row: the `k` largest of `row`, descending, ties to
 /// the lower index, NaN below every number and reported as -inf.
+/// The gate and up views as one view of adjacent rows of one parent, with the gate and up column
+/// offsets of its output, when they are.
+pub fn swiglu_pair<'a, Buf>(
+    gate: &WeightView<'a, Buf>,
+    up: &WeightView<'a, Buf>,
+) -> Option<(WeightView<'a, Buf>, usize, usize)> {
+    let w = gate.rows;
+    let same = std::ptr::eq(gate.buf, up.buf)
+        && gate.format == up.format
+        && gate.parent_rows == up.parent_rows
+        && gate.k == up.k
+        && up.rows == w;
+    let act = gate.act.meet(up.act);
+    if same && up.row_begin == gate.row_begin + w {
+        Some((
+            WeightView {
+                rows: 2 * w,
+                act,
+                ..*gate
+            },
+            0,
+            w,
+        ))
+    } else if same && gate.row_begin == up.row_begin + w {
+        Some((
+            WeightView {
+                rows: 2 * w,
+                act,
+                ..*up
+            },
+            w,
+            0,
+        ))
+    } else {
+        None
+    }
+}
+
+/// [`Backend::linear_swiglu`] from `linear` and `swiglu` / `silu_mul`.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_swiglu_composed<B: Backend + ?Sized>(
+    b: &B,
+    x: &B::Buffer,
+    gate: &WeightView<'_, B::Buffer>,
+    up: &WeightView<'_, B::Buffer>,
+    out: &mut B::Buffer,
+    m: usize,
+    scratch: &mut B::Buffer,
+) -> Result<()> {
+    let w = gate.rows;
+    if up.rows != w || up.k != gate.k {
+        return Err(Error::Shape(format!(
+            "linear_swiglu: gate [{w},{}] and up [{},{}] differ",
+            gate.k, up.rows, up.k
+        )));
+    }
+    match swiglu_pair(gate, up) {
+        Some((both, g, u)) => {
+            b.linear(x, &both, scratch, m)?;
+            b.swiglu(scratch, m, 2 * w, g, u, w, out)
+        }
+        None => {
+            b.linear(x, gate, out, m)?;
+            b.linear(x, up, scratch, m)?;
+            b.silu_mul(out, scratch, m * w)
+        }
+    }
+}
+
 pub fn top_k_row(row: &[f32], k: usize) -> Vec<(u32, f32)> {
     let key = |v: f32| if v.is_nan() { f32::NEG_INFINITY } else { v };
     let mut idx: Vec<u32> = (0..row.len() as u32).collect();

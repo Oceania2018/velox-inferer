@@ -165,6 +165,40 @@ impl<B: Backend> Backend for Profiled<B> {
     fn linear_act(&self, w: &WeightView<'_, B::Buffer>, m: usize) -> ActQuant {
         self.inner.linear_act(w, m)
     }
+    fn linear_swiglu(
+        &self,
+        x: &B::Buffer,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        out: &mut B::Buffer,
+        m: usize,
+        scratch: &mut B::Buffer,
+    ) -> Result<()> {
+        let name = format!(
+            "linear_swiglu {} {}",
+            gate.format.name(),
+            if m == 1 { "m=1" } else { "m>1" }
+        );
+        self.time(&name, || {
+            self.inner.linear_swiglu(x, gate, up, out, m, scratch)
+        })
+    }
+    fn linear_swiglu_act(
+        &self,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        m: usize,
+    ) -> ActQuant {
+        self.inner.linear_swiglu_act(gate, up, m)
+    }
+    fn fuses_swiglu(
+        &self,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        m: usize,
+    ) -> bool {
+        self.inner.fuses_swiglu(gate, up, m)
+    }
     fn embed(
         &self,
         ids: &[u32],

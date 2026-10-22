@@ -92,10 +92,20 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
     let cfg = TextConfig::from_json(&art.components()["text"]["config"])?;
     eprintln!("backend {}", b.describe());
     let t0 = Instant::now();
-    let w = TextWeights::load(b, &art, &cfg, |line| eprint!("\rloading {line}   "))?;
+    // As `velox serve`: matrices in --host-weights stay in system RAM (default the token
+    // embedding; `none` keeps everything on the device), and DFlash2 runs skip the MTP weights.
+    let host: Vec<String> = match a.get("host-weights").unwrap_or("text/token_embedding") {
+        "none" | "" => Vec::new(),
+        list => list.split(',').map(|s| s.trim().to_string()).collect(),
+    };
+    let mtp = a.get("dflash").is_none();
+    let w = TextWeights::load_opts(b, &art, &cfg, mtp, &host, |line| {
+        eprint!("\rloading {line}   ")
+    })?;
     eprintln!(
-        "\nloaded {:.2} GB in {:.1}s",
+        "\nloaded {:.2} GB to the device and {:.2} GB to system RAM in {:.1}s",
         w.bytes as f64 / 1e9,
+        w.host_bytes as f64 / 1e9,
         t0.elapsed().as_secs_f64()
     );
     let model = Qwen35Text::new(cfg, w);
@@ -130,6 +140,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
                 draft_len,
                 chunk,
                 &fe,
+                on_phase,
             )?;
             continue;
         }
@@ -148,6 +159,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
                 drafts,
                 chunk,
                 &fe,
+                on_phase,
             )?;
             continue;
         }
@@ -282,6 +294,7 @@ fn mtp_generate<B: Backend>(
     draft_len: usize,
     chunk: usize,
     fe: &Frontend,
+    on_phase: &mut dyn FnMut(&str),
 ) -> Result<()> {
     use velox_engine::spec::MtpDrafter;
     let limit = fe.public_vocab;
@@ -293,6 +306,7 @@ fn mtp_generate<B: Backend>(
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;
     let prefill = t0.elapsed().as_secs_f64();
+    on_phase("prefill");
     let t1 = Instant::now();
     let mut out = vec![c];
     let mut drafts = dr.draft(b, model, s, ws, 0, &[], c, limit)?;
@@ -327,6 +341,7 @@ fn mtp_generate<B: Backend>(
         drafts = dr.draft(b, model, s, ws, p, &window[1..keep], c, limit)?;
     }
     let decode = t1.elapsed().as_secs_f64();
+    on_phase("decode");
     if out.last().is_some_and(|&t| fe.is_eos(t)) {
         out.pop();
     }
@@ -357,6 +372,7 @@ fn dflash_generate<B: Backend>(
     drafts_per_block: usize,
     chunk: usize,
     fe: &Frontend,
+    on_phase: &mut dyn FnMut(&str),
 ) -> Result<()> {
     use velox_engine::spec::DFlashDrafter;
     use velox_models::qwen3_5::DFlashModel;
@@ -373,6 +389,7 @@ fn dflash_generate<B: Backend>(
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;
     let prefill = t0.elapsed().as_secs_f64();
+    on_phase("prefill");
     let t1 = Instant::now();
     let mut out = vec![c];
     let (mut rounds, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
@@ -428,6 +445,7 @@ fn dflash_generate<B: Backend>(
         (row, kept) = (p, keep);
     }
     let decode = t1.elapsed().as_secs_f64();
+    on_phase("decode");
     if out.last().is_some_and(|&t| fe.is_eos(t)) {
         out.pop();
     }
