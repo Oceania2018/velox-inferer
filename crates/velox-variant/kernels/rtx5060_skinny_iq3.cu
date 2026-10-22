@@ -4,12 +4,14 @@
 // sub-block accumulates into its own register tile, scaled by d * (0.25 + 0.5 ls) before it is
 // added.
 //
-// Decode and verify are weight-streaming: the block streams one 256-value IQ3 block per row per
-// stage (96 code bytes) through a cp.async pipeline and decodes B fragments from shared memory for
-// mma.m16n8k16 (bf16, f32 accumulate). Activations are stored in nvfp4_k_perm order within each
-// 32-value chunk, so the four lanes q of an MMA quad read exactly the values ninfer's layout gives
-// them: grid entries 2q, 2q+1 of each sub-block (index bytes 16q + 2s + {0,1}) and sign group q
-// (lane word q).
+// Decode and verify are bound by streaming the weights (and on this card by warps in flight:
+// 8 warps x 2 stages measured best). Weights are the A operand of
+// mma.m16n8k16 (each warp owns 16 rows) and tokens the B operand (8 per n-tile), so up to 8 tokens
+// cost one MMA per k16 step. Each cp.async stage reads kBlk consecutive IQ3 blocks (kBlk * 96
+// contiguous bytes) of each of the block's 64 rows. Activations are stored in k_perm order within
+// each 32-value chunk, so the four lanes q of an MMA quad read exactly the values ninfer's layout
+// gives them: grid entries 2q, 2q+1 of each sub-block (index bytes 16q + 2s + {0,1}) and sign
+// group q (lane word q); A and B fragments cover the same K positions.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -18,10 +20,23 @@
 
 namespace {
 
-constexpr int kBN = 64, kKS = 256, kStages = 4, kThreads = 128, kTok = 16;
-constexpr int kCode = 96;                  // code bytes per row per stage (one IQ3_XXS block)
-constexpr int kStride = kCode + 16;        // padded so the 8 rows a fragment reads spread over banks
-constexpr int kSA = kKS + 8;               // activation row: 256 bf16 + 8 pad
+#ifndef IQ3_BLK
+#define IQ3_BLK 1
+#endif
+#ifndef IQ3_STAGES
+#define IQ3_STAGES 2
+#endif
+constexpr int kBlk = IQ3_BLK;       // IQ3 blocks per row per stage
+constexpr int kStages = IQ3_STAGES;
+#ifndef IQ3_WARPS
+#define IQ3_WARPS 8
+#endif
+// Each warp owns 16 weight rows.
+constexpr int kWarps = IQ3_WARPS, kBN = 16 * kWarps, kThreads = 32 * kWarps, kCode = 96;
+constexpr int kKS = kBlk * 256;     // K values per stage
+constexpr int kRow = kBlk * kCode;  // code bytes per row per stage
+constexpr int kStride = kRow + 16;  // padded so the 8 rows a fragment reads spread over banks
+constexpr int kSA = kKS + 8;        // activation row: kKS bf16 + 8 pad
 
 __constant__ uint32_t kGrid[256] = {
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
@@ -58,21 +73,22 @@ __constant__ uint32_t kGrid[256] = {
     0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
 };
 
+template <int NT>
 struct Smem {
-    __nv_bfloat16 a[kStages][kTok * kSA];
+    __nv_bfloat16 a[kStages][NT * 8 * kSA];
     uint8_t b[kStages][kBN * kStride];
     // Grid entries as bf16 pairs: .x = magnitudes (0, 1), .y = (2, 3).
     uint2 grid[256];
 };
 
 struct Args {
-    const __nv_bfloat16* x;  // [16, k] bf16 in nvfp4_k_perm order, zero padded rows
-    const uint8_t* w;        // parent payload
+    const __nv_bfloat16* x;                    // [m, k] bf16 in k_perm order
+    const uint8_t* w;                          // parent payload
     long long parent_rows, row_begin, blocks;  // blocks: IQ3 blocks per row (k / 256)
-    long long scale_off;     // binary16 d plane
+    long long scale_off;                       // binary16 d plane
     int rows, m, k;
-    int kt_per_split;
-    float* y;                // [m, rows], or [splits, m, rows] partials
+    int kt_per_split;  // stages per split-K slice
+    float* y;          // [m, rows], or [splits, m, rows] partials
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -110,29 +126,36 @@ __device__ __forceinline__ uint32_t sign_mask(uint32_t bits) {
     return ((bits & 1u) << 15) | ((bits & 2u) << 30);
 }
 
-__device__ __forceinline__ void load_stage(Smem& s, const Args& p, int stage, int kt, int n0) {
+template <int NT>
+__device__ __forceinline__ void load_stage(Smem<NT>& s, const Args& p, int stage, int kt, int n0) {
     const int t = threadIdx.x;
-    const int k0 = kt * kKS;
-    for (int idx = t; idx < kTok * (kKS / 8); idx += kThreads) {
+    const long long k0 = static_cast<long long>(kt) * kKS;
+    // Only the m real token rows (padding rows were zeroed once); a partial last stage zero-fills.
+    for (int idx = t; idx < p.m * (kKS / 8); idx += kThreads) {
         const int r = idx / (kKS / 8), c = idx % (kKS / 8);
-        cp_async16(&s.a[stage][r * kSA + c * 8], p.x + static_cast<long long>(r) * p.k + k0 + c * 8, true);
+        const bool ok = k0 + c * 8 < p.k;
+        cp_async16(&s.a[stage][r * kSA + c * 8], p.x + static_cast<long long>(r) * p.k + (ok ? k0 + c * 8 : 0), ok);
     }
-    constexpr int kChunks = kCode / 16;
+    constexpr int kChunks = kRow / 16;
     for (int idx = t; idx < kBN * kChunks; idx += kThreads) {
         const int r = idx / kChunks, c = idx % kChunks;
         const long long wrow = p.row_begin + n0 + r;
-        const bool ok = wrow < p.parent_rows;
-        cp_async16(&s.b[stage][r * kStride + c * 16], p.w + ((ok ? wrow : 0) * p.blocks + kt) * kCode + c * 16, ok);
+        const long long blk = static_cast<long long>(kt) * kBlk + c / (kCode / 16);
+        const bool ok = wrow < p.parent_rows && blk < p.blocks;
+        cp_async16(&s.b[stage][r * kStride + c * 16],
+                   p.w + (ok ? (wrow * p.blocks + kt * static_cast<long long>(kBlk)) * kCode + c * 16 : 0), ok);
     }
 }
 
+template <int NT>
 __global__ void __launch_bounds__(kThreads) skinny_iq3_kernel(Args p) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
-    Smem& s = *reinterpret_cast<Smem*>(smem_raw);
+    Smem<NT>& s = *reinterpret_cast<Smem<NT>*>(smem_raw);
     const int n0 = blockIdx.x * kBN;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int stages = static_cast<int>((p.blocks + kBlk - 1) / kBlk);
     const int kt_begin = blockIdx.z * p.kt_per_split;
-    const int kt_end = min(static_cast<int>(p.blocks), kt_begin + p.kt_per_split);
+    const int kt_end = min(stages, kt_begin + p.kt_per_split);
     const int kt_count = kt_end - kt_begin;
     float* y = p.y + static_cast<long long>(blockIdx.z) * p.m * p.rows;
 
@@ -143,103 +166,120 @@ __global__ void __launch_bounds__(kThreads) skinny_iq3_kernel(Args p) {
         for (int j = 0; j < 4; ++j) b[j] = __float_as_uint(static_cast<float>((g >> (8 * j)) & 0xffu)) >> 16;
         s.grid[i] = make_uint2(b[0] | (b[1] << 16), b[2] | (b[3] << 16));
     }
+    for (int i = p.m * kSA + threadIdx.x; i < NT * 8 * kSA; i += kThreads)
+#pragma unroll
+        for (int st = 0; st < kStages; ++st) s.a[st][i] = __float2bfloat16_rn(0.0f);
 
 #pragma unroll
     for (int st = 0; st < kStages - 1; ++st) {
-        if (st < kt_count) load_stage(s, p, st, kt_begin + st, n0);
+        if (st < kt_count) load_stage<NT>(s, p, st, kt_begin + st, n0);
         cp_commit();
     }
 
-    float acc[2][4];
+    float acc[NT][4];
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+    for (int nt = 0; nt < NT; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
 
-    const int a_row = (lane & 7) + (((lane >> 3) & 1) << 3), a_col = (lane >> 4) << 3;
-    const int g = lane >> 2, q = lane & 3, q2 = q * 2;
-    // B rows this thread decodes (one per n8 tile), and the C rows (2q, 2q+1 of each tile) it scales.
-    const int br[2] = {warp * 16 + g, warp * 16 + 8 + g};
-    const int cr[2] = {warp * 16 + q2, warp * 16 + 8 + q2};
+    const int g = lane >> 2, q = lane & 3;
+    // A rows (and C rows) of this lane: g and g + 8 of the warp's 16.
+    const int ar[2] = {warp * 16 + g, warp * 16 + 8 + g};
+    long long drow[2];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+        const long long wrow = p.row_begin + n0 + ar[e];
+        drow[e] = (wrow < p.parent_rows ? wrow : 0) * p.blocks;  // rows past the parent: output dropped
+    }
     const __half* dp = reinterpret_cast<const __half*>(p.w + p.scale_off);
+    // ldmatrix x4 over 8 token rows: matrix j covers K columns 8j..8j+7 of a 32-value chunk.
+    const int b_row = lane & 7, b_col = (lane >> 3) * 8;
 
     for (int i = 0; i < kt_count; ++i) {
         cp_wait<kStages - 2>();
         __syncthreads();
         const int next = i + kStages - 1;
-        if (next < kt_count) load_stage(s, p, next % kStages, kt_begin + next, n0);
+        if (next < kt_count) load_stage<NT>(s, p, next % kStages, kt_begin + next, n0);
         cp_commit();
-        const int st = i % kStages, kt = kt_begin + i;
-        const uint8_t* rowp[2] = {&s.b[st][br[0] * kStride], &s.b[st][br[1] * kStride]};
-        // This lane's sign words (lane word q of each B row).
-        uint64_t sw[2];
+        const int st = i % kStages;
+        const long long blk0 = static_cast<long long>(kt_begin + i) * kBlk;
 #pragma unroll
-        for (int nt = 0; nt < 2; ++nt) sw[nt] = *reinterpret_cast<const uint64_t*>(rowp[nt] + 64 + 8 * q);
-        // Block scales d of the four C rows; rows past the parent read row 0 (their output is dropped).
-        float d[2][2];
-#pragma unroll
-        for (int nt = 0; nt < 2; ++nt)
+        for (int bk = 0; bk < kBlk; ++bk) {
+            if (blk0 + bk >= p.blocks) break;  // partial last stage
+            const uint8_t* rowp[2] = {&s.b[st][ar[0] * kStride + bk * kCode], &s.b[st][ar[1] * kStride + bk * kCode]};
+            uint64_t sw[2];
+            float d[2];
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
-                const long long wrow = p.row_begin + n0 + cr[nt] + e;
-                d[nt][e] = __half2float(dp[(wrow < p.parent_rows ? wrow : 0) * p.blocks + kt]);
+                sw[e] = *reinterpret_cast<const uint64_t*>(rowp[e] + 64 + 8 * q);
+                d[e] = __half2float(dp[drow[e] + blk0 + bk]);
             }
 #pragma unroll
-        for (int sb = 0; sb < 8; ++sb) {
-            uint32_t af[2][4];
-            ldsm_x4(af[0], &s.a[st][a_row * kSA + sb * 32 + a_col]);
-            ldsm_x4(af[1], &s.a[st][a_row * kSA + sb * 32 + 16 + a_col]);
-            float part[2][4];
+            for (int sb = 0; sb < 8; ++sb) {
+                const int kc = bk * 256 + sb * 32;  // stage column of this 32-value chunk
+                uint32_t bf[NT][4];
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
-                part[nt][0] = part[nt][1] = part[nt][2] = part[nt][3] = 0.0f;
-                // Two index bytes (entries 2q, 2q+1), the 7-bit sign index and its parity bit.
-                const uint16_t idx = *reinterpret_cast<const uint16_t*>(rowp[nt] + 16 * q + 2 * sb);
-                const uint32_t s7 = static_cast<uint32_t>(sw[nt] >> (7 * sb)) & 127u;
-                const uint32_t s8 = s7 | ((__popc(s7) & 1u) << 7);
+                for (int nt = 0; nt < NT; ++nt) ldsm_x4(bf[nt], &s.a[st][(nt * 8 + b_row) * kSA + kc + b_col]);
+                // A fragment per k16 step: {row g h=0, row g+8 h=0, row g h=1, row g+8 h=1}.
+                uint32_t af[2][4];
 #pragma unroll
-                for (int st2 = 0; st2 < 2; ++st2) {
-                    const uint2 m = s.grid[(idx >> (8 * st2)) & 0xff];
-                    const uint32_t bits = s8 >> (4 * st2);
-                    mma_bf16(part[nt], af[st2], m.x | sign_mask(bits), m.y | sign_mask(bits >> 2));
+                for (int e = 0; e < 2; ++e) {
+                    const uint16_t idx = *reinterpret_cast<const uint16_t*>(rowp[e] + 16 * q + 2 * sb);
+                    const uint32_t s7 = static_cast<uint32_t>(sw[e] >> (7 * sb)) & 127u;
+                    const uint32_t s8 = s7 | ((__popc(s7) & 1u) << 7);
+#pragma unroll
+                    for (int st2 = 0; st2 < 2; ++st2) {
+                        const uint2 mg = s.grid[(idx >> (8 * st2)) & 0xff];
+                        const uint32_t bits = s8 >> (4 * st2);
+                        af[st2][e] = mg.x | sign_mask(bits);
+                        af[st2][2 + e] = mg.y | sign_mask(bits >> 2);
+                    }
                 }
-            }
-            // Sub-block scales of the C rows: d (0.25 + 0.5 ls), ls in bits 56 + 4 (sb & 1) of
-            // lane word sb / 2 (byte 7 of that word).
+                float part[NT][4];
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
-                const uint8_t* r0 = &s.b[st][cr[nt] * kStride + 64 + 8 * (sb >> 1) + 7];
-                const float s0 = d[nt][0] * (0.25f + 0.5f * static_cast<float>((r0[0] >> (4 * (sb & 1))) & 15));
-                const float s1 = d[nt][1] * (0.25f + 0.5f * static_cast<float>((r0[kStride] >> (4 * (sb & 1))) & 15));
-                acc[nt][0] += part[nt][0] * s0;
-                acc[nt][1] += part[nt][1] * s1;
-                acc[nt][2] += part[nt][2] * s0;
-                acc[nt][3] += part[nt][3] * s1;
+                for (int nt = 0; nt < NT; ++nt) {
+                    part[nt][0] = part[nt][1] = part[nt][2] = part[nt][3] = 0.0f;
+                    mma_bf16(part[nt], af[0], bf[nt][0], bf[nt][1]);
+                    mma_bf16(part[nt], af[1], bf[nt][2], bf[nt][3]);
+                }
+                // Sub-block scales d (0.25 + 0.5 ls), ls in byte 7 of lane word sb / 2.
+                float sc[2];
+#pragma unroll
+                for (int e = 0; e < 2; ++e)
+                    sc[e] = d[e] *
+                            (0.25f + 0.5f * static_cast<float>((rowp[e][64 + 8 * (sb >> 1) + 7] >> (4 * (sb & 1))) & 15));
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    acc[nt][0] += part[nt][0] * sc[0];
+                    acc[nt][1] += part[nt][1] * sc[0];
+                    acc[nt][2] += part[nt][2] * sc[1];
+                    acc[nt][3] += part[nt][3] * sc[1];
+                }
             }
         }
     }
     cp_wait<0>();
 
-    // c0, c1: token g, rows 2q, 2q+1; c2, c3: token g + 8.
+    // c0, c1: row g, tokens 2q, 2q+1; c2, c3: row g + 8.
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
-        const int n = n0 + cr[nt];
+    for (int nt = 0; nt < NT; ++nt)
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int t = g + 8 * h;
-            if (t >= p.m) continue;
-            float* out = y + static_cast<long long>(t) * p.rows + n;
-            if (n < p.rows) out[0] = acc[nt][2 * h];
-            if (n + 1 < p.rows) out[1] = acc[nt][2 * h + 1];
+        for (int e = 0; e < 2; ++e) {
+            const int n = n0 + ar[e];
+            if (n >= p.rows) continue;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int t = nt * 8 + 2 * q + j;
+                if (t < p.m) y[static_cast<long long>(t) * p.rows + n] = acc[nt][2 * e + j];
+            }
         }
-    }
 }
 
-// x [m, k] f32 -> [16, k] bf16 (RNE) in k_perm order, zero padded rows.
+// x [m, k] f32 -> [m, k] bf16 (RNE) in k_perm order.
 __global__ void to_bf16_perm(const float* __restrict__ x, int m, int k, __nv_bfloat16* __restrict__ y) {
-    const long long n = static_cast<long long>(kTok) * k;
+    const long long n = static_cast<long long>(m) * k;
     for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
          i += static_cast<long long>(gridDim.x) * blockDim.x) {
-        const int r = static_cast<int>(i / k), l = static_cast<int>(i % k);
-        y[i] = __float2bfloat16_rn(r < m ? x[static_cast<long long>(r) * k + k_perm(l)] : 0.0f);
+        const long long r = i / k;
+        y[i] = __float2bfloat16_rn(x[r * k + k_perm(static_cast<int>(i % k))]);
     }
 }
 
@@ -259,19 +299,52 @@ constexpr int kSms = 36;
 
 long long align256(long long x) { return (x + 255) / 256 * 256; }
 
+// Split-K factor (power of two, at least 4 stages per slice) whose grid best fills whole waves of
+// `slots` resident blocks; the smallest split within 5% of the best wins (fewer partials to sum).
+int pick_splits(long long blocks, long long stages, int slots) {
+    auto fill = [&](int sp) {
+        const long long n = blocks * sp, waves = (n + slots - 1) / slots;
+        return static_cast<double>(n) / static_cast<double>(waves * slots);
+    };
+    double best = 0.0;
+    for (int sp = 1; sp <= 16 && stages / sp >= 4; sp *= 2) best = fill(sp) > best ? fill(sp) : best;
+    for (int sp = 1; sp <= 16 && stages / sp >= 4; sp *= 2)
+        if (fill(sp) >= 0.95 * best) return sp;
+    return 1;
+}
+
+template <int NT>
+int launch(Args p) {
+    static int per_sm = 0;
+    if (per_sm == 0) {
+        cudaFuncSetAttribute(skinny_iq3_kernel<NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem<NT>));
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, skinny_iq3_kernel<NT>, kThreads, sizeof(Smem<NT>));
+        per_sm = per_sm > 0 ? per_sm : 1;
+    }
+    const long long blocks = (p.rows + kBN - 1) / kBN, stages = (p.blocks + kBlk - 1) / kBlk;
+    const int splits = pick_splits(blocks, stages, kSms * per_sm);
+    p.kt_per_split = static_cast<int>((stages + splits - 1) / splits);
+    float* y = p.y;
+    if (splits > 1) {
+        p.y = static_cast<float*>(g_part.get(static_cast<size_t>(splits) * p.m * p.rows * sizeof(float)));
+        if (!p.y) return static_cast<int>(cudaErrorMemoryAllocation);
+    }
+    skinny_iq3_kernel<NT><<<dim3(static_cast<unsigned>(blocks), 1, splits), kThreads, sizeof(Smem<NT>)>>>(p);
+    if (splits > 1) {
+        const long long n = static_cast<long long>(p.m) * p.rows;
+        sum_splits<<<velox_grid_1d(n, 256), 256>>>(p.y, splits, n, y);
+    }
+    return velox_launch_status();
+}
+
 }  // namespace
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T for an iq3_xxs_planar_v1 parent [parent_rows, k] and
 // 1 <= m <= 16. Returns VELOX_ERR_UNSUPPORTED for anything else.
 VELOX_API int velox_5060_linear_skinny_iq3(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                            long long row_begin, int rows, float* y) {
-    if (m < 1 || m > kTok || rows <= 0 || k % 256 != 0 || reinterpret_cast<uintptr_t>(w) % 16 != 0)
+    if (m < 1 || m > 16 || rows <= 0 || k % 256 != 0 || reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
-    static bool configured = false;
-    if (!configured) {
-        cudaFuncSetAttribute(skinny_iq3_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem));
-        configured = true;
-    }
     Args p{};
     p.w = w;
     p.parent_rows = parent_rows;
@@ -281,24 +354,10 @@ VELOX_API int velox_5060_linear_skinny_iq3(const float* x, int m, const uint8_t*
     p.rows = rows;
     p.m = m;
     p.k = static_cast<int>(k);
-    auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(kTok) * k * 2));
-    if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
-    to_bf16_perm<<<velox_grid_1d(static_cast<long long>(kTok) * k, 256), 256>>>(x, m, p.k, xb);
-    p.x = xb;
-    const long long blocks = (rows + kBN - 1) / kBN;
-    // Split K until the grid covers the GPU twice, keeping at least 2 stages per slice.
-    int splits = 1;
-    while (blocks * splits < 2 * kSms && p.blocks / (splits * 2) >= 2) splits *= 2;
-    p.kt_per_split = static_cast<int>((p.blocks + splits - 1) / splits);
     p.y = y;
-    if (splits > 1) {
-        p.y = static_cast<float*>(g_part.get(static_cast<size_t>(splits) * m * rows * sizeof(float)));
-        if (!p.y) return static_cast<int>(cudaErrorMemoryAllocation);
-    }
-    skinny_iq3_kernel<<<dim3(static_cast<unsigned>(blocks), 1, splits), kThreads, sizeof(Smem)>>>(p);
-    if (splits > 1) {
-        const long long n = static_cast<long long>(m) * rows;
-        sum_splits<<<velox_grid_1d(n, 256), 256>>>(p.y, splits, n, y);
-    }
-    return velox_launch_status();
+    auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * k * 2));
+    if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
+    to_bf16_perm<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, m, p.k, xb);
+    p.x = xb;
+    return m <= 8 ? launch<1>(p) : launch<2>(p);
 }
