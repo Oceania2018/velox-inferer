@@ -256,9 +256,11 @@ VELOX_API int velox_5090_linear_a16_fp8(const float* x, int m, const uint8_t* w,
         return VELOX_ERR_UNSUPPORTED;
     const A16Args a{x, w, parent_rows, row_begin, rows, m, static_cast<int>(k), y};
     // Shapes measured on RTX 5090 (bench-linear --format fp8): 16 warps over two row groups and eight
-    // K slices up to 16 tokens; wider batches trade K slices for row groups so stages fit.
+    // K slices up to 16 tokens; wider batches trade K slices for row groups so stages fit. From 17
+    // tokens, eight row groups (128 rows a block) halve the activations each weight row costs in
+    // L2 traffic: m = 48 (us) [16384,5120] 106 -> 98, [5120,6144] 47.9 -> 43.0, [5120,17408] 103 -> 90.5.
     if (m <= 8) return launch_tile<8, 2, 8, 3>(a);
     if (m <= 16) return launch_tile<16, 2, 8, 3>(a);
-    if (m <= 32) return launch_tile<32, 4, 4, 3>(a);
-    return launch_tile<64, 4, 2, 3>(a);
+    if (m <= 32) return launch_tile<32, 8, 2, 3>(a);
+    return launch_tile<64, 8, 2, 3>(a);
 }
