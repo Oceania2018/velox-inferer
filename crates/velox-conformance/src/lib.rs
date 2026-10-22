@@ -1952,6 +1952,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     // view starting mid-tile with ragged rows, and a full chunk.
     s.linear(WeightFormat::Nvfp4, 384, 512, 40, 300, 100)?;
     s.linear(WeightFormat::Nvfp4, 256, 448, 0, 256, 1030)?;
+    // Prefill grids of several hundred tiles (kernel sets may pick larger tiles for them): ragged
+    // tokens and rows, a view starting one scale tile into its parent.
+    let a4 = ActPolicy::AllowA4 { divisor: 600.0 };
+    s.linear_act(WeightFormat::Nvfp4, 8448, 256, 128, 8200, 1030, a4)?;
+    s.linear_act(WeightFormat::Fp8RowBf16, 8448, 256, 64, 8200, 1030, a8)?;
     Ok(s.results)
 }
 
