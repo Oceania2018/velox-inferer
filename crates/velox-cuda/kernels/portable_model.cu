@@ -234,6 +234,43 @@ linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, i
     }
 }
 
+// Row-split (q4/q5/q6/q8) rows gathered a group per warp: a group's codes, high bits and scale are
+// three independent loads per lane, so a row costs a few memory round trips rather than several
+// per element (the table is often host-mapped, where every trip crosses PCIe).
+__global__ void embed_rs_kernel(const uint32_t* __restrict__ ids, WDesc d, long long row_begin, float* __restrict__ out) {
+    const int bits = d.format == VELOX_FMT_Q4 ? 4 : d.format == VELOX_FMT_Q5 ? 5 : d.format == VELOX_FMT_Q6 ? 6 : 8;
+    const int group = bits == 8 ? 32 : 64, epl = group / VELOX_WARP;  // elements per lane
+    const int hb = bits == 5 ? 1 : bits == 6 ? 2 : 0;                  // high-plane bits per element
+    const int high = hb * group / 8;                                   // high-plane bytes per group
+    const long long gpr = (d.k + 127) / 128 * 128 / group;
+    const long long groups = d.n * gpr;
+    const long long high_off = align256(groups * 32), scale_off = high_off + align256(groups * high);
+    const long long row = row_begin + ids[blockIdx.x];
+    const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP, warps = blockDim.x / VELOX_WARP;
+    const int row_groups = static_cast<int>((d.k + group - 1) / group);
+    float* o = out + static_cast<long long>(blockIdx.x) * d.k;
+#pragma unroll 4
+    for (int g = warp; g < row_groups; g += warps) {
+        const long long gi = row * gpr + g;
+        const uint8_t code = d.base[gi * 32 + lane];
+        const uint8_t hi = hb > 0 ? d.base[high_off + gi * high + (lane * epl * hb) / 8] : 0;
+        const uint8_t* sp = d.base + scale_off + 2 * gi;
+        const float scale = __half2float(__ushort_as_half(static_cast<unsigned short>(sp[0] | (sp[1] << 8))));
+        for (int j = 0; j < epl; ++j) {
+            const int e = lane * epl + j;
+            const long long col = static_cast<long long>(g) * group + e;
+            if (col >= d.k) break;
+            uint32_t u = bits == 8 ? code : (j & 1) ? (code >> 4) : (code & 0xf);
+            for (int b = 0; b < hb; ++b) {
+                const int t = e * hb + b;  // bit index in the group's high plane
+                u |= static_cast<uint32_t>((hi >> (t % 8)) & 1) << (4 + b);
+            }
+            const int q = u >= (1u << (bits - 1)) ? static_cast<int>(u) - (1 << bits) : static_cast<int>(u);
+            o[col] = scale * static_cast<float>(q);
+        }
+    }
+}
+
 // Block (token, column slice): a few tokens still spread over the whole GPU.
 __global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long long row_begin, float* __restrict__ out) {
     const long long row = row_begin + ids[blockIdx.x];
@@ -1391,6 +1428,11 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
 
 VELOX_API int velox_portable_embed(const uint32_t* ids, int count, const uint8_t* w, int format, long long n,
                                    long long k, long long row_begin, float* out) {
+    if (count <= 0) return 0;
+    if (format == VELOX_FMT_Q4 || format == VELOX_FMT_Q5 || format == VELOX_FMT_Q6 || format == VELOX_FMT_Q8) {
+        embed_rs_kernel<<<count, 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+        return velox_launch_status();
+    }
     const unsigned slices = static_cast<unsigned>((k + 255) / 256 < 65535 ? (k + 255) / 256 : 65535);
     embed_kernel<<<dim3(count, slices), 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
     return velox_launch_status();

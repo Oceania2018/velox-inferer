@@ -1753,6 +1753,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 16)?;
     // Verify and draft sizes with K a multiple of 128 (GDN gate projection, a row view).
     s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 8)?;
+    // A block of tokens over many bf16 rows (the DFlash conv kernel projections).
+    s.linear(WeightFormat::Bf16, 1280, 5120, 0, 1280, 8)?;
     s.linear(WeightFormat::Bf16, 130, 1024, 3, 98, 3)?;
     s.linear(WeightFormat::Bf16, 40, 256, 0, 40, 2)?;
     s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 12)?;
@@ -1936,6 +1938,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.embed(WeightFormat::Bf16, 10, 130, &[9, 1])?;
     s.embed(WeightFormat::Nvfp4, 128, 64, &[127, 0, 64])?;
     s.embed(WeightFormat::Q5G64, 20, 200, &[19, 0])?;
+    s.embed(WeightFormat::Q4G64, 30, 256, &[29, 0, 7, 7])?;
+    s.embed(WeightFormat::Q8G32, 10, 96, &[9, 3])?;
     s.add_rms_norm(8, 5120, NormKind::Offset)?;
     s.rms_norm_gated(8 * 48, 128, NormKind::Plain)?;
     s.rms_norm_gated(5, 96, NormKind::Offset)?;
