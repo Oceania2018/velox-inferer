@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde_json::json;
 use velox_core::{Backend, Error, KvFormat, Result};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{argmax, Qwen35Text, TextConfig, TextWeights};
+use velox_models::qwen3_5::{Qwen35Text, TextConfig, TextWeights};
 use velox_weights::Artifact;
 
 use crate::args::Args;
@@ -175,14 +175,16 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             )?;
             continue;
         }
+        // Greedy: the best id is selected on the device (one pair crosses to the host per step,
+        // not the vocabulary's logits).
         let t1 = Instant::now();
-        let mut logits = model.forward(b, &mut session, &mut ws, &ids)?;
+        model.advance(b, &mut session, &mut ws, &ids, None, &[])?;
+        let mut next = model.candidates(b, &mut ws, 1, fe.public_vocab)?[0].0;
         let prefill = t1.elapsed().as_secs_f64();
         on_phase("prefill");
         let mut out = Vec::new();
         let t2 = Instant::now();
         loop {
-            let next = argmax(&logits, fe.public_vocab);
             if fe.is_eos(next) {
                 break;
             }
@@ -190,7 +192,8 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             if out.len() >= max_tokens {
                 break;
             }
-            logits = model.forward(b, &mut session, &mut ws, &[next])?;
+            model.advance(b, &mut session, &mut ws, &[next], None, &[])?;
+            next = model.candidates(b, &mut ws, 1, fe.public_vocab)?[0].0;
         }
         let decode = t2.elapsed().as_secs_f64();
         on_phase("decode");
