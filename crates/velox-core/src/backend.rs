@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::format::WeightFormat;
 use crate::kv::KvFormat;
 use crate::op::Op;
@@ -303,7 +303,7 @@ pub enum ActPolicy {
     /// Activations stay exact (f32 here, BF16 in the source model).
     #[default]
     A16Only,
-    /// Per-token E4M3 activations are allowed.
+    /// 8-bit activations are allowed: per-token E4M3 or per-256-value int8.
     AllowA8,
     /// NVFP4 activations are allowed with this static input divisor.
     AllowA4 { divisor: f32 },
@@ -336,6 +336,10 @@ pub enum ActQuant {
     Nvfp4 {
         divisor: f32,
     },
+    /// Rounded to bf16, then per row and 256-value group: `scale = amax / 127`, codes
+    /// `rint(x * (127 / amax))` as int8 (the int8 tensor-core prefill paths). Needs `k % 256 == 0`;
+    /// an 8-bit activation, so [`ActPolicy::AllowA8`] permits it.
+    Int8G256,
 }
 
 /// The operand precision of an attention kernel (`attention`, `attention_full`). Like
@@ -370,6 +374,28 @@ impl<Buf> Clone for WeightView<'_, Buf> {
 }
 
 impl<Buf> Copy for WeightView<'_, Buf> {}
+
+/// One weight view of [`Backend::linears`], written to columns `col .. col + w.rows` of its
+/// destination.
+pub struct LinearPart<'w, Buf> {
+    pub w: WeightView<'w, Buf>,
+    pub col: usize,
+}
+
+impl<Buf> Clone for LinearPart<'_, Buf> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Buf> Copy for LinearPart<'_, Buf> {}
+
+/// A destination of [`Backend::linears`]: `m` rows of `ld` values whose columns `parts` fill.
+pub struct LinearDst<'y, 'p, 'w, Buf> {
+    pub y: &'y mut Buf,
+    pub ld: usize,
+    pub parts: &'p [LinearPart<'w, Buf>],
+}
 
 impl<'a, Buf> WeightView<'a, Buf> {
     /// The whole parent matrix.
@@ -439,6 +465,155 @@ pub trait Backend {
     /// that `w.act` permits.
     fn linear_act(&self, _w: &WeightView<'_, Self::Buffer>, _m: usize) -> ActQuant {
         ActQuant::Exact
+    }
+    /// Several projections of the same `m` rows of `x`, each part into a column range of its
+    /// destination and rounded as `linear` rounds it (`linear_act`). Backends share work between
+    /// parts (one activation quantization) and write column ranges in place; the default
+    /// ([`linears_composed`]) runs `linear` per part, through `scratch` (`[m, w.rows]` of the
+    /// widest part that is not a whole destination) for column ranges.
+    ///
+    /// `xb`: `x`'s bf16 twin (see [`Self::bf16_twins`]) when the caller has one; backends may
+    /// read it for parts they round to bf16.
+    fn linears(
+        &self,
+        x: &Self::Buffer,
+        xb: Option<&Self::Buffer>,
+        dsts: &mut [LinearDst<'_, '_, '_, Self::Buffer>],
+        scratch: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        let _ = xb;
+        linears_composed(self, x, dsts, scratch, m)
+    }
+
+    /// Whether the `_twin` producer ops are available: [`Self::add_rms_norm_twin`],
+    /// [`Self::rms_norm_gated_twin`], [`Self::sigmoid_mul_twin`]. A twin is a buffer holding the
+    /// same values rounded to bf16 (RNE) in the backend's layout (allocate it with `alloc(n)`), for
+    /// linears that round their activations to bf16 anyway: [`Self::linear_bf16`],
+    /// [`Self::linear_swiglu_twin`] and `linears` read it instead of converting `x` themselves.
+    fn bf16_twins(&self) -> bool {
+        false
+    }
+    /// [`Self::add_rms_norm`] that also writes `y`'s bf16 twin into `yb`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_twin(
+        &self,
+        _acc: &mut Self::Buffer,
+        _x: &Self::Buffer,
+        _weight: &Self::Buffer,
+        _y: &mut Self::Buffer,
+        _yb: &mut Self::Buffer,
+        _rows: usize,
+        _dim: usize,
+        _eps: f32,
+        _kind: NormKind,
+    ) -> Result<()> {
+        Err(Error::Unsupported("add_rms_norm_twin".into()))
+    }
+    /// [`Self::rms_norm_gated`] that also writes the result's bf16 twin into `gb`.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_gated_twin(
+        &self,
+        _x: &Self::Buffer,
+        _weight: &Self::Buffer,
+        _gate: &mut Self::Buffer,
+        _gb: &mut Self::Buffer,
+        _rows: usize,
+        _dim: usize,
+        _eps: f32,
+        _kind: NormKind,
+    ) -> Result<()> {
+        Err(Error::Unsupported("rms_norm_gated_twin".into()))
+    }
+    /// [`Self::sigmoid_mul`] that also writes the result's bf16 twin into `xb`.
+    fn sigmoid_mul_twin(
+        &self,
+        _x: &mut Self::Buffer,
+        _gate: &Self::Buffer,
+        _xb: &mut Self::Buffer,
+        _len: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("sigmoid_mul_twin".into()))
+    }
+    /// Whether [`Self::linear_bf16`] serves this view at `m` rows: `linear` rounds its activations
+    /// to bf16 there (`linear_act` is `ActQuant::Bf16`) and can take them already rounded.
+    fn takes_bf16(&self, _w: &WeightView<'_, Self::Buffer>, _m: usize) -> bool {
+        false
+    }
+    /// `linear` from `x`'s bf16 twin `xb`: the same result as `linear` on `x`, for views
+    /// [`Self::takes_bf16`] accepts.
+    fn linear_bf16(
+        &self,
+        _xb: &Self::Buffer,
+        _w: &WeightView<'_, Self::Buffer>,
+        _y: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_bf16".into()))
+    }
+    /// Whether [`Self::linear_swiglu_twin`] serves these views at `m` rows (a fused
+    /// `linear_swiglu` that rounds its input to bf16).
+    fn swiglu_twin(
+        &self,
+        _gate: &WeightView<'_, Self::Buffer>,
+        _up: &WeightView<'_, Self::Buffer>,
+        _m: usize,
+    ) -> bool {
+        false
+    }
+    /// Fused `linear_swiglu` from `x`'s bf16 twin `xb`, also writing `out`'s bf16 twin into
+    /// `outb`: the same `out` as `linear_swiglu` on `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_twin(
+        &self,
+        _xb: &Self::Buffer,
+        _gate: &WeightView<'_, Self::Buffer>,
+        _up: &WeightView<'_, Self::Buffer>,
+        _out: &mut Self::Buffer,
+        _outb: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_swiglu_twin".into()))
+    }
+    /// A SwiGLU FFN's projections: `out[r][i] = silu((x_r . gate_i)) * (x_r . up_i)` for `m` rows
+    /// of `x`, where `gate` and `up` are views of the same width, format and K. Backends fuse it
+    /// where they can; the default ([`linear_swiglu_composed`]) runs one GEMM into `scratch`
+    /// (`[m, 2 * width]`) when the views are adjacent rows of one parent, else two, then
+    /// `swiglu` / `silu_mul`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu(
+        &self,
+        x: &Self::Buffer,
+        gate: &WeightView<'_, Self::Buffer>,
+        up: &WeightView<'_, Self::Buffer>,
+        out: &mut Self::Buffer,
+        m: usize,
+        scratch: &mut Self::Buffer,
+    ) -> Result<()> {
+        linear_swiglu_composed(self, x, gate, up, out, m, scratch)
+    }
+    /// Whether `linear_swiglu` at `m` rows runs fused (no `scratch`, no intermediate): callers
+    /// then use it at widths their scratch was not sized for.
+    fn fuses_swiglu(
+        &self,
+        _gate: &WeightView<'_, Self::Buffer>,
+        _up: &WeightView<'_, Self::Buffer>,
+        _m: usize,
+    ) -> bool {
+        false
+    }
+    /// The activation rounding `linear_swiglu` applies at `m` rows (that of the projection the
+    /// default runs).
+    fn linear_swiglu_act(
+        &self,
+        gate: &WeightView<'_, Self::Buffer>,
+        up: &WeightView<'_, Self::Buffer>,
+        m: usize,
+    ) -> ActQuant {
+        match swiglu_pair(gate, up) {
+            Some((both, _, _)) => self.linear_act(&both, m),
+            None => self.linear_act(gate, m),
+        }
     }
     /// Embedding lookup: `out[t, :] = W[ids[t], :]` decoded, for a `[vocab, k]` table view.
     fn embed(
@@ -590,6 +765,24 @@ pub trait Backend {
     ) -> Result<()> {
         self.copy(state_in, 0, state_out, 0, self.len(state_in))?;
         self.gated_delta_net(qkv, ab, a_log, dt_bias, state_out, out, shape)
+    }
+    /// [`Self::gated_delta_net_from`] when only `out` is needed (a speculative window that commit
+    /// replays from its recorded inputs): the state after the window is not kept. `scratch`
+    /// (state-sized) is the default's working state; a backend may leave it untouched and skip
+    /// writing a state at all.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_out(
+        &self,
+        qkv: &Self::Buffer,
+        ab: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        state_in: &Self::Buffer,
+        scratch: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: GdnShape,
+    ) -> Result<()> {
+        self.gated_delta_net_from(qkv, ab, a_log, dt_bias, state_in, scratch, out, shape)
     }
     /// Advances several GDN layers over the first `gdn.tokens` rows of a window whose conv outputs
     /// are known (a speculative window replayed after a partial accept): each layer's conv state
@@ -832,6 +1025,28 @@ pub trait Backend {
     fn graph_break(&self) -> Result<()> {
         Ok(())
     }
+    /// Caps the device memory recorded graphs hold: past `bytes`, the least recently run steps'
+    /// graphs are released (they record again when next run). A no-op without graphs.
+    fn set_graph_budget(&self, _bytes: usize) {}
+    /// Recorded graphs: (steps held, device bytes they hold, steps released by the budget).
+    fn graph_stats(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+    /// This process's device allocations: (buffer bytes live, buffer bytes at their peak since
+    /// start, physical chunk bytes live), when the backend counts them.
+    fn device_allocs(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+    /// (free, total) device memory in bytes, when the backend can tell: what can still be
+    /// allocated.
+    fn mem_info(&self) -> Option<(usize, usize)> {
+        None
+    }
+    /// Device memory in use by every process as monitoring tools (nvidia-smi) report it, the
+    /// figure budgets are set in; falls back to [`Self::mem_info`]'s total minus free.
+    fn device_in_use(&self) -> Option<usize> {
+        self.mem_info().map(|(free, total)| total - free)
+    }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
     /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.
@@ -859,6 +1074,120 @@ pub trait Backend {
 
 /// Host reference for [`Backend::top_k`] on one row: the `k` largest of `row`, descending, ties to
 /// the lower index, NaN below every number and reported as -inf.
+/// The gate and up views as one view of adjacent rows of one parent, with the gate and up column
+/// offsets of its output, when they are.
+pub fn swiglu_pair<'a, Buf>(
+    gate: &WeightView<'a, Buf>,
+    up: &WeightView<'a, Buf>,
+) -> Option<(WeightView<'a, Buf>, usize, usize)> {
+    let w = gate.rows;
+    let same = std::ptr::eq(gate.buf, up.buf)
+        && gate.format == up.format
+        && gate.parent_rows == up.parent_rows
+        && gate.k == up.k
+        && up.rows == w;
+    let act = gate.act.meet(up.act);
+    if same && up.row_begin == gate.row_begin + w {
+        Some((
+            WeightView {
+                rows: 2 * w,
+                act,
+                ..*gate
+            },
+            0,
+            w,
+        ))
+    } else if same && gate.row_begin == up.row_begin + w {
+        Some((
+            WeightView {
+                rows: 2 * w,
+                act,
+                ..*up
+            },
+            w,
+            0,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Whether a part covers its whole destination (`linear` writes it directly).
+pub fn linear_part_whole<Buf>(part: &LinearPart<'_, Buf>, ld: usize) -> bool {
+    part.col == 0 && part.w.rows == ld
+}
+
+/// [`Backend::linears`] from `linear` and `copy2d`.
+pub fn linears_composed<B: Backend + ?Sized>(
+    b: &B,
+    x: &B::Buffer,
+    dsts: &mut [LinearDst<'_, '_, '_, B::Buffer>],
+    scratch: &mut B::Buffer,
+    m: usize,
+) -> Result<()> {
+    for d in dsts.iter_mut() {
+        for p in d.parts {
+            if p.col + p.w.rows > d.ld {
+                return Err(Error::Shape(format!(
+                    "linears: columns {}..{} past the destination's {}",
+                    p.col,
+                    p.col + p.w.rows,
+                    d.ld
+                )));
+            }
+            if linear_part_whole(p, d.ld) {
+                b.linear(x, &p.w, d.y, m)?;
+                continue;
+            }
+            b.linear(x, &p.w, scratch, m)?;
+            b.copy2d(
+                scratch,
+                d.y,
+                Copy2dShape {
+                    rows: m,
+                    cols: p.w.rows,
+                    src_offset: 0,
+                    src_stride: p.w.rows,
+                    dst_offset: p.col,
+                    dst_stride: d.ld,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// [`Backend::linear_swiglu`] from `linear` and `swiglu` / `silu_mul`.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_swiglu_composed<B: Backend + ?Sized>(
+    b: &B,
+    x: &B::Buffer,
+    gate: &WeightView<'_, B::Buffer>,
+    up: &WeightView<'_, B::Buffer>,
+    out: &mut B::Buffer,
+    m: usize,
+    scratch: &mut B::Buffer,
+) -> Result<()> {
+    let w = gate.rows;
+    if up.rows != w || up.k != gate.k {
+        return Err(Error::Shape(format!(
+            "linear_swiglu: gate [{w},{}] and up [{},{}] differ",
+            gate.k, up.rows, up.k
+        )));
+    }
+    match swiglu_pair(gate, up) {
+        Some((both, g, u)) => {
+            b.linear(x, &both, scratch, m)?;
+            b.swiglu(scratch, m, 2 * w, g, u, w, out)
+        }
+        None => {
+            b.linear(x, gate, out, m)?;
+            b.linear(x, up, scratch, m)?;
+            b.silu_mul(out, scratch, m * w)
+        }
+    }
+}
+
 pub fn top_k_row(row: &[f32], k: usize) -> Vec<(u32, f32)> {
     let key = |v: f32| if v.is_nan() { f32::NEG_INFINITY } else { v };
     let mut idx: Vec<u32> = (0..row.len() as u32).collect();

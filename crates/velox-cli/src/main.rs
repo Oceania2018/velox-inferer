@@ -43,7 +43,7 @@ COMMANDS:
       --prefill <n>         prefill chunk to time (default 128)
       --iters <n>           timed iterations (default 20)
   bench-linear            Time one linear at a model shape with random stored weights
-      --format <name>       nvfp4 | fp8 | bf16 | q4 | q8 ... (default nvfp4)
+      --format <name>       nvfp4 | fp8 | bf16 | q4 | q8 | iq3 ... (default nvfp4)
       --n <rows> --k <cols> default 17408 x 5120 (Qwen3.8 MLP gate)
       --m <list>            token counts, comma separated (default 1,4,16,128,512)
       --act <a16|a8|a4>     activation policy (default a16); --divisor <f> for a4 (default 500)
@@ -53,9 +53,11 @@ COMMANDS:
       --tokens <list>       token counts, comma separated (default 1,8,64,512)
       --iters <n>           timed iterations (default 50)
   bench-attn              Time causal attention over a KV cache in each storage format
-  bench-verify            Time batched speculative verify rounds against one sequence at a time
       --heads <n> --kv-heads <n> --head-dim <n>  default 24/4, 256 (Qwen3.8)
       --pos0 <n> (16384) --tokens <list> (1,8,16) --kv-format <list> (f32,bf16,fp8,nvfp4) --iters <n> (50)
+  bench-verify            Time batched speculative verify rounds against one sequence at a time
+      --artifact <path> --batch <n> (3) --window <n> (12) --context <n> (13000) --rounds <n> (40)
+      [--keep <n>] [--kv-format nvfp4] [--prefill <n>] (mixed rounds) [--only batched]
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
@@ -64,12 +66,14 @@ COMMANDS:
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
       [--max-tokens 64] [--chunk 256] [--capacity 4096] [--mtp N | --dflash N] (speculative)
       [--kv-format f32|bf16|fp8|nvfp4] (attention KV cache storage, default f32)
-  serve                   OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
+      [--host-weights <list>|none] (matrices kept in system RAM, default text/token_embedding)
+  serve                  OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
       --model-id <id>       default: artifact metadata name
       --chat-template <file> --max-context <n> (32768) --prefill-chunk <n> (512)
       --ctx-checkpoints <n> (8) --enable-thinking true|false (false)
+      --force-tool-call on|off (off)  requests offering tools answer with a tool call only
       --kv-format <fmt>     attention KV cache storage: f32 | bf16 | fp8 | nvfp4 (f32)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
       --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
@@ -317,6 +321,7 @@ fn bench_linear(a: &Args) -> Result<ExitCode> {
         "q5" => WeightFormat::Q5G64,
         "q6" => WeightFormat::Q6G64,
         "q8" => WeightFormat::Q8G32,
+        "iq3" => WeightFormat::Iq3Xxs,
         other => return Err(Error::Config(format!("unknown --format {other}"))),
     };
     let act = match a.get("act").unwrap_or("a16") {

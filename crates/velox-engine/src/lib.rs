@@ -23,7 +23,7 @@ use store::{ContextStore, Pinner};
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -36,7 +36,7 @@ use velox_frontend::image::{
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
     shift_inserts, BatchWorkspace, Checkpoint, DFlashModel, DFlashState, DFlashWorkspace,
-    EmbedInsert, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
+    EmbedInsert, KvPool, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
     DRAFT_PAGE_ROWS,
 };
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
@@ -53,6 +53,10 @@ pub struct EngineConfig {
     pub default_max_tokens: usize,
     /// Default for `chat_template_kwargs.enable_thinking` (ninfer `--no-thinking` = false).
     pub enable_thinking: bool,
+    /// A request that offers tools answers with a tool call only: the prompt ends in the opening
+    /// `<tool_call>` tag, so the model skips the sentence it would otherwise write first (ninfer's
+    /// tool-call grammar constraint has the same effect; the agent reads the call's own `why`).
+    pub force_tool_call: bool,
     /// Recurrent-state checkpoints kept per lane for prefix reuse (device checkpoints).
     pub max_checkpoints: usize,
     /// Superseded history points the context store keeps per request chain for retries and
@@ -86,6 +90,17 @@ pub struct EngineConfig {
     /// sequence grows instead of at full capacity, with identical prefix chunks (system prompt,
     /// task) mapped once for every lane that holds them.
     pub kv_paging: bool,
+    /// Paged caches: tokens of attention cache in the startup pool every lane draws from (`None`:
+    /// what device memory allows after everything else, minus `vram_headroom`).
+    pub kv_capacity: Option<usize>,
+    /// Device memory left unallocated at startup (paged caches; WDDM spills to system memory
+    /// when the card fills, slowing every step several times).
+    pub vram_headroom: usize,
+    /// Device memory recorded graphs may hold; past it the least recently run are released.
+    pub graph_budget: usize,
+    /// Device memory in use once started (every process, graph budget included): the attention
+    /// pool gets what is left. Takes precedence over `vram_headroom`.
+    pub vram_budget: Option<usize>,
 }
 
 /// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
@@ -120,15 +135,28 @@ struct Lanes<B: Backend> {
     /// Batched-verify buffers, with more than one lane.
     bw: Option<BatchWorkspace<B>>,
     clock: u64,
-    /// Device checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
-    /// prefills snapshot into it instead of allocating, which would synchronize the device.
+    /// Checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
+    /// prefills snapshot into it instead of allocating, which would synchronize the device. Holds
+    /// the device checkpoints (see [`DEVICE_SPARE`]) not in a lane, and host ones up to its trim.
     spare: Vec<Checkpoint<B>>,
     /// Published prefix chunks of the lanes' paged attention caches.
     share: KvShare<B>,
+    /// The chunk sets those caches draw from, created at startup (paged caches only).
+    pool: Option<Arc<KvPool<B>>>,
 }
 
 /// Device checkpoint storage kept for reuse across lanes.
 const DEVICE_SPARE: usize = 2;
+
+/// Device checkpoints (one recurrent state each, 157 MB for Qwen3.8-27B), created at startup
+/// inside the memory budget and never more: the lanes' kept heads ([`DEVICE_HEADS`]) plus
+/// [`DEVICE_SPARE`], each at most one per lane (`budget_memory`). A prefill snapshot finding none
+/// free takes pinned host storage instead; allocating them per prefill took ~1.4 GB for seconds
+/// when six fresh prompts started together.
+
+/// Opening tag of a Qwen tool call, as the chat template writes it (see
+/// `EngineConfig::force_tool_call`).
+const TOOL_CALL_OPEN: &str = "<tool_call>\n";
 
 /// Lanes whose chain head stays in device memory (the most recently admitted); other heads move
 /// to the context store, from where their next request restores them (~5 ms over PCIe).
@@ -171,6 +199,24 @@ const STORE_GAIN: usize = 128;
 /// Tokens a disk record must cover beyond every resident source to be read back.
 const DISK_GAIN: usize = 1024;
 
+/// Paged caches: rows past a new prompt a lane keeps backed (room for its output) before the rest
+/// is returned. Without the trim every lane keeps its longest prompt ever backed, and on a 32 GB
+/// card six lanes near capacity push VRAM into WDDM's system-memory spill (decode 3x slower).
+const KV_TRIM_SLACK: usize = 4096;
+
+/// Device memory a budget keeps back for kernel scratch that grows after warm-up (grow-only
+/// buffers sized by the largest call so far; a 6-way stress run went ~0.2 GB past warm-up).
+const SCRATCH_RESERVE: usize = 256 << 20;
+
+/// Prefill snapshots by storage: a device checkpoint, a pinned state the store had ready, or
+/// one pinned on the request path (logged with device memory).
+static SNAPS_DEVICE: AtomicUsize = AtomicUsize::new(0);
+static SNAPS_HOST: AtomicUsize = AtomicUsize::new(0);
+static SNAPS_PINNED: AtomicUsize = AtomicUsize::new(0);
+
+/// How often the engine logs device memory (free, attention pool, graphs).
+const MEM_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub struct QwenEngine<B: Backend> {
     core: Arc<Core<B>>,
     queue: Arc<JobQueue>,
@@ -202,6 +248,19 @@ fn core(e: CoreError) -> ApiError {
         code: "engine_error",
         message: e.to_string(),
     }
+}
+
+/// Keeps at most `max` host checkpoints in `spare` and every device one: device checkpoints
+/// are a fixed set (see [`DEVICE_SPARE`]), so dropping one would only shrink it.
+fn trim_spare<B: Backend>(spare: &mut Vec<Checkpoint<B>>, max: usize) {
+    let mut host = 0;
+    spare.retain(|c| {
+        if !c.on_host() {
+            return true;
+        }
+        host += 1;
+        host <= max
+    });
 }
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
@@ -511,7 +570,12 @@ where
             None => None,
         };
         let bw = match &dflash {
-            Some(_) if n_lanes > 1 => Some(model.batch_workspace(&b, n_lanes)?),
+            // Windows are the pending token plus the drafts (see `DFlashDrafter::workspace`).
+            Some(_) if n_lanes > 1 => Some(model.batch_workspace(
+                &b,
+                n_lanes,
+                DFlashDrafter::<B>::max_drafts(cfg.dflash_drafts) + 1,
+            )?),
             _ => None,
         };
         let special = SpecialTokens {
@@ -547,6 +611,7 @@ where
             clock: 0,
             spare: Vec::new(),
             share: KvShare::default(),
+            pool: None,
         };
         let core = Arc::new(Core {
             b,
@@ -558,26 +623,19 @@ where
             special,
         });
         let mut state = state;
+        if let Some(used) = core.b.device_in_use() {
+            eprintln!(
+                "memory: {:.2} GiB in use with {} lanes' states and the workspaces",
+                used as f64 / (1u64 << 30) as f64,
+                state.lanes.len()
+            );
+        }
         core.warm_up(&mut state)?;
         // Warm-up wrote near the end of the caches; paged lanes start empty.
         for lane in &mut state.lanes {
             lane.session.trim_kv(&core.b, 0)?;
         }
-        eprintln!(
-            "attention caches: {} lanes, {:.2} GB backed ({})",
-            state.lanes.len(),
-            state
-                .lanes
-                .iter()
-                .map(|l| l.session.kv_bytes(&core.b))
-                .sum::<usize>() as f64
-                / 1e9,
-            if state.lanes.iter().any(|l| l.session.kv_paged()) {
-                "paged"
-            } else {
-                "whole"
-            }
-        );
+        core.budget_memory(&mut state)?;
         let queue = Arc::new(JobQueue {
             jobs: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -615,6 +673,173 @@ impl<B: Backend> Core<B> {
     /// under load: growing scratch keeps every smaller buffer (recorded graphs may hold them), and
     /// past the card's memory WDDM spills to system RAM and everything crawls. The lanes are reset
     /// afterwards.
+    /// Fixes device memory at startup, as ninfer does: recorded graphs get `graph_budget`, and the
+    /// paged caches' chunks are created now, as many as `kv_capacity` asks or the device has
+    /// left after everything else and `vram_headroom`. Requests then allocate no device memory
+    /// for caches, so VRAM stays flat instead of creeping into WDDM's system-memory spill.
+    fn budget_memory(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
+        let cfg = &self.cfg;
+        // The device checkpoints there will ever be, before the measurement below counts them.
+        // One lane needs its head and one more for the next prefill's deepest snapshot.
+        let lanes = st.lanes.len();
+        let states = DEVICE_HEADS.min(lanes) + DEVICE_SPARE.min(lanes);
+        let device = st.spare.iter().filter(|c| !c.on_host()).count();
+        for _ in device..states {
+            st.spare
+                .push(st.lanes[0].session.blank_checkpoint(&self.b, 0)?);
+        }
+        self.b.set_graph_budget(cfg.graph_budget);
+        let Some((per_set, rows_per_set)) = st.lanes[0].session.kv_set_shape() else {
+            eprintln!("attention caches: {} lanes, whole", st.lanes.len());
+            return Ok(());
+        };
+        let set_bytes = per_set * self.b.vm_chunk_len() * 4;
+        let full = st.lanes.len() * st.lanes[0].session.kv_sets_for(cfg.capacity);
+        let (graphs, graph_bytes, _) = self.b.graph_stats();
+        let gib = |x: usize| x as f64 / (1u64 << 30) as f64;
+        let used = self.b.device_in_use();
+        if let Some(used) = used {
+            eprintln!(
+                "memory: {:.2} GiB in use after warm-up, before the attention pool",
+                gib(used)
+            );
+        }
+        let graphs_to_come = cfg.graph_budget.saturating_sub(graph_bytes);
+        // The budget is in nvidia-smi's terms (device_in_use); the headroom is kept from what
+        // CUDA says it can still allocate (mem_info), the stricter figure under WDDM.
+        let sets = match (cfg.kv_capacity, cfg.vram_budget, used, self.b.mem_info()) {
+            (Some(tokens), ..) => tokens.div_ceil(rows_per_set.max(1)),
+            (None, Some(budget), Some(used), _) => {
+                let room = budget.saturating_sub(used + graphs_to_come + SCRATCH_RESERVE)
+                    / set_bytes.max(1);
+                // One full-length request must always fit.
+                let floor = st.lanes[0].session.kv_sets_for(cfg.capacity);
+                if room < floor {
+                    eprintln!(
+                        "memory budget: {:.2} GiB in use and {:.2} GiB of graph budget leave \
+                         {room} attention sets under --vram-budget-mib; taking {floor} (one full \
+                         context) over it",
+                        gib(used),
+                        gib(graphs_to_come)
+                    );
+                }
+                room.max(floor)
+            }
+            (None, _, _, Some((free, _))) => {
+                free.saturating_sub(cfg.vram_headroom + graphs_to_come) / set_bytes.max(1)
+            }
+            // No way to measure: every lane's full capacity.
+            _ => full,
+        }
+        .min(full);
+        let pool = KvPool::new(&self.b, sets, per_set)?;
+        for lane in &mut st.lanes {
+            lane.session.set_kv_pool(Arc::clone(&pool));
+        }
+        st.pool = Some(pool);
+        eprintln!(
+            "memory budget: attention pool {sets} sets of {rows_per_set} rows ({} tokens, {:.2} GiB; \
+             all lanes full: {full}), graphs up to {:.2} GiB ({graphs} recorded, {:.2} GiB); \
+             in use now {}",
+            sets * rows_per_set,
+            gib(sets * set_bytes),
+            gib(cfg.graph_budget),
+            gib(graph_bytes),
+            self.b
+                .device_in_use()
+                .map_or("unknown".into(), |u| format!("{:.2} GiB", gib(u)))
+        );
+        Ok(())
+    }
+
+    /// Room in the attention pool for a prompt of `len` tokens on lane `li` (with output room):
+    /// idle lanes, least recently used first, give their chunks back (their conversations resume
+    /// from the context store). False when that is not enough while other requests run: the
+    /// request waits for them. Alone, it runs anyway (the pool lends past its size).
+    fn kv_room(&self, st: &mut Lanes<B>, li: usize, len: usize, busy: &[usize]) -> bool {
+        let Some(pool) = st.pool.clone() else {
+            return true;
+        };
+        let need = st.lanes[li].session.kv_need(len + KV_TRIM_SLACK);
+        while pool.free_sets() < need {
+            let Some(j) = (0..st.lanes.len())
+                .filter(|&j| j != li && !busy.contains(&j))
+                .filter(|&j| st.lanes[j].session.kv_private_sets() > 1)
+                .min_by_key(|&j| st.lanes[j].last_used)
+            else {
+                return busy.is_empty();
+            };
+            if let Err(e) = self.release_lane(st, j) {
+                eprintln!("attention pool: releasing lane {j} failed: {e}");
+                return busy.is_empty();
+            }
+        }
+        true
+    }
+
+    fn log_memory(&self, st: &Lanes<B>) {
+        let gb = |x: usize| x as f64 / 1e9;
+        let (graphs, graph_bytes, released) = self.b.graph_stats();
+        let pool = st.pool.as_ref().map_or(String::new(), |p| {
+            format!(
+                ", attention pool {}/{} sets free ({} lent past it)",
+                p.free_sets(),
+                p.sets(),
+                p.overflow()
+            )
+        });
+        let snaps = format!(
+            ", snapshots {} device / {} host ({} pinned on demand)",
+            SNAPS_DEVICE.load(Ordering::Relaxed),
+            SNAPS_HOST.load(Ordering::Relaxed),
+            SNAPS_PINNED.load(Ordering::Relaxed)
+        );
+        let allocs = self
+            .b
+            .device_allocs()
+            .map_or(String::new(), |(live, peak, chunks)| {
+                format!(
+                    ", buffers {:.2} GiB (peak {:.2}), chunks {:.2} GiB",
+                    live as f64 / (1u64 << 30) as f64,
+                    peak as f64 / (1u64 << 30) as f64,
+                    chunks as f64 / (1u64 << 30) as f64
+                )
+            });
+        eprintln!(
+            "[mem] device in use {}{pool}{allocs}{snaps}, graphs {graphs} ({:.2} GB, {released} \
+             released)",
+            self.b.device_in_use().map_or("unknown".into(), |u| format!(
+                "{:.2} GiB",
+                u as f64 / (1u64 << 30) as f64
+            )),
+            gb(graph_bytes)
+        );
+    }
+
+    /// Returns idle lane `j`'s attention chunks to the pool; its chain head goes to the context
+    /// store first, so its conversation resumes from there.
+    fn release_lane(&self, st: &mut Lanes<B>, j: usize) -> Result<(), CoreError> {
+        let Lanes {
+            lanes,
+            store,
+            spare,
+            ..
+        } = st;
+        let lane = &mut lanes[j];
+        if store.enabled() {
+            self.capture_head(lane, store, 0)?;
+        }
+        let n = lane.session.trim_kv(&self.b, 0)?;
+        lane.keys.clear();
+        lane.chain = None;
+        spare.append(&mut lane.checkpoints);
+        trim_spare(spare, DEVICE_SPARE);
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+            eprintln!("[kv] lane {j} released {n} chunks to the pool");
+        }
+        Ok(())
+    }
+
     fn warm_up(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
         use velox_models::qwen3_5::VERIFY_MAX;
         let (b, model) = (&self.b, &self.model);
@@ -653,11 +878,23 @@ impl<B: Backend> Core<B> {
                 (lane.drafter.as_mut(), self.dflash.as_ref(), dw.as_mut())
             {
                 d.drafts = d.long_block();
-                d.draft(b, dm, dw, model, ws, 0, 0, lane.session.pos, 0, limit, 0.0)?;
+                d.draft(
+                    b,
+                    dm,
+                    dw,
+                    model,
+                    ws,
+                    0,
+                    0,
+                    lane.session.pos,
+                    0,
+                    limit,
+                    &Sampler::greedy(),
+                )?;
             }
         }
         if let Some(bw) = bw.as_mut() {
-            let m = 8usize;
+            let m = bw.window();
             let mut sessions: Vec<&mut Session<B>> =
                 lanes.iter_mut().map(|l| &mut l.session).collect();
             for s in sessions.iter_mut() {
@@ -712,6 +949,7 @@ impl<B: Backend> Core<B> {
         }
         let mut waiting: VecDeque<Job> = VecDeque::new();
         let mut active: Vec<Active<B>> = Vec::new();
+        let mut mem_logged = Instant::now();
         let draft = self.dflash.as_ref().map(|dm| {
             (
                 dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
@@ -719,6 +957,10 @@ impl<B: Backend> Core<B> {
             )
         });
         loop {
+            if mem_logged.elapsed() >= MEM_LOG_EVERY {
+                mem_logged = Instant::now();
+                self.log_memory(&st);
+            }
             st.store.feed(&self.b, &st.lanes[0].session, draft);
             // New requests; while idle, pin context-store storage between them.
             loop {
@@ -767,6 +1009,9 @@ impl<B: Backend> Core<B> {
                 let Some(li) = Self::pick_lane(&st.lanes, &busy, &waiting[0].p.keys) else {
                     break;
                 };
+                if !self.kv_room(&mut st, li, waiting[0].p.keys.len(), &busy) {
+                    break;
+                }
                 let job = waiting.pop_front().expect("checked");
                 match self.begin(&mut st, li, job) {
                     Ok(a) => {
@@ -847,7 +1092,7 @@ impl<B: Backend> Core<B> {
                 spare.push(cp);
             }
         }
-        spare.truncate(DEVICE_SPARE);
+        trim_spare(spare, DEVICE_SPARE);
         Ok(())
     }
 
@@ -929,6 +1174,19 @@ impl<B: Backend> Core<B> {
             lane.checkpoints = keep;
             lane.spare.extend(stale);
             lane.keys = p.keys[..start].to_vec();
+            // No checkpoint left reaches past `start`, so rows past this prompt hold nothing.
+            let trimmed = lane
+                .session
+                .trim_kv(&self.b, p.keys.len() + KV_TRIM_SLACK)?;
+            // The prompt's rows are backed now rather than as its chunks run, so the next
+            // admission's room check (`kv_room`) sees this request's share of the pool taken.
+            lane.session.reserve_kv(&self.b, p.keys.len())?;
+            if trimmed > 0 && debug {
+                eprintln!(
+                    "[kv] lane {li} returned {trimmed} chunks, {:.2} GB backed",
+                    lane.session.kv_bytes(&self.b) as f64 / 1e9
+                );
+            }
             let anchors: Vec<usize> = self
                 .checkpoint_positions(&p.ids, 0)
                 .into_iter()
@@ -936,8 +1194,20 @@ impl<B: Backend> Core<B> {
                 .collect();
             self.begin_prefill(lane, store, p, &job.images, start, anchors, t0)
         })();
-        lane.spare.truncate(DEVICE_SPARE);
+        trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
+        if debug {
+            // Admission runs on the engine thread between rounds; with VELOX_DEBUG_BATCH its GPU
+            // work (state restore, vision encode) is waited for so the time is the whole cost.
+            if std::env::var_os("VELOX_DEBUG_BATCH").is_some() {
+                let _ = self.b.synchronize();
+            }
+            eprintln!(
+                "[admit] lane {li} from {} in {:.1} ms",
+                r.as_ref().map_or(0, |pre| pre.start),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         match r {
             Ok(pre) => Ok(Active {
                 job,
@@ -996,7 +1266,7 @@ impl<B: Backend> Core<B> {
             );
             Ok(())
         };
-        lane.spare.truncate(DEVICE_SPARE);
+        trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
         placed?;
         a.prompt_ms = pre.t0.elapsed().as_secs_f64() * 1e3;
@@ -1225,7 +1495,7 @@ impl<B: Backend> Core<B> {
                 lane.session.pos,
                 a.c,
                 self.fe.public_vocab,
-                a.job.sampler.temperature(),
+                &a.job.sampler,
             )
             .map_err(core)?;
         // `whole`: keep drafts past the request's budget (acceptance stops at the budget anyway),
@@ -1382,7 +1652,7 @@ impl<B: Backend> Core<B> {
                     let Some(Drafter::DFlash(d)) = lanes[a.lane].drafter.as_mut() else {
                         unreachable!("caller checked");
                     };
-                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, a.job.sampler.temperature());
+                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, &a.job.sampler);
                     let budget = if room {
                         picked.len()
                     } else {
@@ -1610,7 +1880,7 @@ impl<B: Backend> Core<B> {
                 .unwrap_or(0);
             spare.push(checkpoints.remove(drop));
         }
-        spare.truncate(MAX_SPARE);
+        trim_spare(spare, MAX_SPARE);
     }
 
     /// Host checkpoint mode, after a prefill: checkpoints at `anchors` (system prompt and task:
@@ -1638,17 +1908,17 @@ impl<B: Backend> Core<B> {
             if cp.pos == tail && store.enabled() {
                 // The prompt's end goes straight to system RAM: only an exact retry resumes there.
                 let drafter = self.drafter_context(lane);
-                let id = store.insert(
+                let (id, back) = store.insert_owned(
                     &self.b,
                     &lane.session,
                     &lane.keys,
-                    &cp,
+                    cp,
                     false,
                     None,
                     drafter,
                 )?;
                 store.mark_tail(id, head.unwrap_or(0));
-                lane.spare.push(cp);
+                lane.spare.extend(back);
                 continue;
             }
             if store.enabled()
@@ -1657,7 +1927,22 @@ impl<B: Backend> Core<B> {
                 && !store.holds(&lane.keys[..cp.pos])
             {
                 let drafter = self.drafter_context(lane);
-                store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
+                if Some(cp.pos) == head {
+                    store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
+                } else {
+                    // Not the head and an anchor (never kept behind): the store owns it now.
+                    let (_, back) = store.insert_owned(
+                        &self.b,
+                        &lane.session,
+                        &lane.keys,
+                        cp,
+                        true,
+                        None,
+                        drafter,
+                    )?;
+                    lane.spare.extend(back);
+                    continue;
+                }
             }
             if Some(cp.pos) == head {
                 lane.checkpoints.push(cp);
@@ -1841,7 +2126,7 @@ impl<B: Backend> Core<B> {
     fn begin_prefill(
         &self,
         lane: &mut Lane<B>,
-        store: &ContextStore<B>,
+        store: &mut ContextStore<B>,
         p: &Prompt,
         images: &[ImagePatches],
         start: usize,
@@ -1884,16 +2169,41 @@ impl<B: Backend> Core<B> {
             if Some(pos) != deepest && pos != tail && !(anchor || !self.cfg.host_checkpoints) {
                 continue;
             }
-            // Storage: spare, else the lane's oldest checkpoint (its restore, if any, is queued
-            // before the snapshot), else new.
-            let mut cp = match lane.spare.pop() {
-                Some(cp) => cp,
-                None if !lane.checkpoints.is_empty() && self.cfg.host_checkpoints => {
-                    lane.checkpoints.sort_by_key(|c| c.pos);
-                    lane.checkpoints.remove(0)
-                }
-                None => lane.session.blank_checkpoint(&self.b, pos)?,
+            // Storage. Only the deepest snapshot can become the lane's head (kept on the device);
+            // the others go to the context store, so they are written straight to pinned storage
+            // the store takes over (one copy over PCIe instead of a device copy then a download).
+            // Then: spare, else the lane's oldest checkpoint (its restore, if any, is queued before
+            // the snapshot), else pinned storage the store has ready or new.
+            let to_store = Some(pos) != deepest && store.enabled() && self.cfg.host_checkpoints;
+            let ready = if to_store {
+                store.take_spare_state()
+            } else {
+                None
             };
+            let device = lane.spare.iter().position(|c| !c.on_host());
+            let mut cp = match (ready, device) {
+                (Some(cp), _) => cp,
+                (None, Some(i)) => lane.spare.swap_remove(i),
+                (None, None) => match lane.spare.pop() {
+                    Some(cp) => cp,
+                    None if !lane.checkpoints.is_empty() && self.cfg.host_checkpoints => {
+                        lane.checkpoints.sort_by_key(|c| c.pos);
+                        lane.checkpoints.remove(0)
+                    }
+                    None => match store.take_spare_state() {
+                        Some(cp) => cp,
+                        None => {
+                            SNAPS_PINNED.fetch_add(1, Ordering::Relaxed);
+                            lane.session.blank_checkpoint_in(&self.b, pos, true)?
+                        }
+                    },
+                },
+            };
+            if cp.on_host() {
+                SNAPS_HOST.fetch_add(1, Ordering::Relaxed);
+            } else {
+                SNAPS_DEVICE.fetch_add(1, Ordering::Relaxed);
+            }
             cp.pos = pos;
             cp.rope_delta = p.rope_delta;
             snaps.push(cp);
@@ -1914,7 +2224,17 @@ impl<B: Backend> Core<B> {
     fn prepare(
         &self,
         req: &Value,
-    ) -> Result<(Prompt, Vec<ImagePatches>, Sampler, usize, Option<Value>), ApiError> {
+    ) -> Result<
+        (
+            Prompt,
+            Vec<ImagePatches>,
+            Sampler,
+            usize,
+            Option<Value>,
+            bool,
+        ),
+        ApiError,
+    > {
         let t_req = Instant::now();
         let Normalized {
             messages,
@@ -1925,11 +2245,21 @@ impl<B: Backend> Core<B> {
             .pointer("/chat_template_kwargs/enable_thinking")
             .and_then(Value::as_bool)
             .unwrap_or(self.cfg.enable_thinking);
-        let text = self
+        let mut text = self
             .fe
             .template
             .render(&messages, tools.as_ref(), thinking, true)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
+        // Forced tool call: the prompt ends in the opening tag, so the model continues inside
+        // the call (`generate` puts the tag back before parsing the output).
+        let forced = self.cfg.force_tool_call
+            && tools
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|t| !t.is_empty());
+        if forced {
+            text.push_str(TOOL_CALL_OPEN);
+        }
         let t_tpl = t_req.elapsed();
         let ids = self.fe.encode(&text).map_err(core)?;
         let t_tok = t_req.elapsed();
@@ -1971,7 +2301,7 @@ impl<B: Backend> Core<B> {
             });
         }
         let sampler = Sampler::from_request(req, thinking);
-        Ok((p, images, sampler, max_tokens, tools))
+        Ok((p, images, sampler, max_tokens, tools, forced))
     }
 }
 
@@ -1987,7 +2317,7 @@ where
 
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
         let core_ = &self.core;
-        let (p, images, sampler, max_tokens, tools) = core_.prepare(req)?;
+        let (p, images, sampler, max_tokens, tools, forced) = core_.prepare(req)?;
         let prompt_tokens = p.ids.len() as u64;
         let (tx, rx) = mpsc::channel();
         {
@@ -2008,7 +2338,10 @@ where
         let done = rx
             .recv()
             .map_err(|_| core(CoreError::Backend("engine worker stopped".into())))??;
-        let text = core_.fe.decode(&done.out).map_err(core)?;
+        let mut text = core_.fe.decode(&done.out).map_err(core)?;
+        if forced {
+            text.insert_str(0, TOOL_CALL_OPEN);
+        }
         let parsed = parse_output(&text, tools.as_ref());
         if !parsed.content.is_empty() {
             emit(Delta::Content(parsed.content));

@@ -7,6 +7,7 @@
 //! over the kept rows with the target's hidden states (repairing the KV rows that recursive
 //! drafting filled with draft states) and drafts the next round from the last of them.
 
+use crate::sampling::Sampler;
 use velox_core::backend::Backend;
 use velox_core::rng::Rng;
 use velox_core::Result;
@@ -268,7 +269,7 @@ impl<B: Backend> DFlashDrafter<B> {
         })
     }
 
-    fn max_drafts(drafts: usize) -> usize {
+    pub(crate) fn max_drafts(drafts: usize) -> usize {
         drafts.clamp(1, velox_models::qwen3_5::VERIFY_MAX - 1)
     }
 
@@ -300,17 +301,23 @@ impl<B: Backend> DFlashDrafter<B> {
     }
 
     /// Picks the drafts from a proposal made for this drafter's context (see
-    /// [`DFlashModel::propose_batch`]).
+    /// [`DFlashModel::propose_batch`]), drawing each from the request `sampler`'s proposal
+    /// distribution over the candidates.
     #[allow(clippy::type_complexity)]
     pub fn pick(
         &mut self,
         dm: &DFlashModel<B>,
         bc: &velox_models::qwen3_5::BlockCandidates,
         anchor: u32,
-        temperature: f32,
+        sampler: &Sampler,
     ) -> (Vec<u32>, Vec<Vec<(u32, f32)>>) {
         let rng = &mut self.rng;
-        dm.select(bc, anchor, temperature, &mut || rng.uniform() * 0.5 + 0.5)
+        dm.select(
+            bc,
+            anchor,
+            &mut |scored, drafts| sampler.proposal(scored, drafts),
+            &mut || rng.uniform() * 0.5 + 0.5,
+        )
     }
 
     /// The context rings (for saving them with a context-store entry).
@@ -412,7 +419,7 @@ impl<B: Backend> DFlashDrafter<B> {
         frontier: usize,
         anchor: u32,
         limit: usize,
-        temperature: f32,
+        sampler: &Sampler,
     ) -> Result<(Vec<u32>, Vec<Vec<(u32, f32)>>)> {
         if kept > 0 {
             dm.materialize(b, &mut self.state, dw, ws, 0, row0, kept)?;
@@ -427,7 +434,12 @@ impl<B: Backend> DFlashDrafter<B> {
         }
         let bc = dm.propose(b, target, st, dw, anchor, self.drafts, limit)?;
         let rng = &mut self.rng;
-        Ok(dm.select(&bc, anchor, temperature, &mut || rng.uniform() * 0.5 + 0.5))
+        Ok(dm.select(
+            &bc,
+            anchor,
+            &mut |scored, drafts| sampler.proposal(scored, drafts),
+            &mut || rng.uniform() * 0.5 + 0.5,
+        ))
     }
 }
 

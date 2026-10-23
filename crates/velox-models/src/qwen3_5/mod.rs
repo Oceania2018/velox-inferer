@@ -10,8 +10,8 @@ mod vision;
 mod weights;
 
 use velox_core::backend::{
-    AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, NormKind, RopeLayout,
-    RopePosShape, RopeShape,
+    AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, LinearDst, LinearPart,
+    NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{CopySpec, Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
@@ -23,9 +23,9 @@ pub use dflash::{
     DRAFT_PAGE_ROWS,
 };
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
-pub use paging::{KvChunkSet, KvShare};
+pub use paging::{KvChunkSet, KvPool, KvShare};
 pub use vision::{Qwen35Vision, VisionConfig};
-pub use weights::{DenseFfn, ExpertBank, Ffn, Layer, Mixer, MoeFfn, TextWeights, WDesc};
+pub use weights::{DenseFfn, ExpertBank, Ffn, Layer, Mixer, MoeFfn, Runs, TextWeights, WDesc};
 
 /// Per-sequence state: attention KV caches, GDN convolution and recurrent states, position.
 pub struct Session<B: Backend> {
@@ -42,11 +42,9 @@ pub struct Session<B: Backend> {
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
     /// Speculative-verify state, allocated on first `verify`.
-    spec: Option<Spec<B>>,
+    spec: Option<Spec>,
     /// Distinguishes this session's graph recordings from other sessions' (they bind its buffers).
     id: u64,
-    /// Flips whenever a committed verify swaps the recurrent state with the speculative buffers.
-    parity: bool,
     /// Virtual-memory backing of the caches (see `paging`); `None`: allocated whole.
     paging: Option<paging::KvPaging<B>>,
 }
@@ -54,6 +52,137 @@ pub struct Session<B: Backend> {
 /// Up to this many tokens (decode, verify) adjacent projections run as one fused linear; larger
 /// chunks keep them separate, where per-matrix GEMM tiles are faster than the split copy saves.
 const FUSE_MAX_TOKENS: usize = 16;
+
+/// The views of a projection's runs, at their columns of the concatenated output.
+fn run_parts<'w, Buf>(
+    view: &impl Fn(&WDesc) -> WeightView<'w, Buf>,
+    runs: &Runs,
+) -> Vec<LinearPart<'w, Buf>> {
+    let mut col = 0;
+    runs.0
+        .iter()
+        .map(|d| {
+            let part = LinearPart { w: view(d), col };
+            col += d.rows;
+            part
+        })
+        .collect()
+}
+
+/// `y = h . W^T` for a projection stored as runs: each run lands in its columns of `y`
+/// ([`Backend::linears`]; `scratch` holds `[t, rows]` of a run when the backend copies).
+fn linear_runs<'w, B: Backend>(
+    b: &B,
+    view: impl Fn(&WDesc) -> WeightView<'w, B::Buffer>,
+    h: &B::Buffer,
+    runs: &Runs,
+    y: &mut B::Buffer,
+    scratch: &mut B::Buffer,
+    t: usize,
+) -> Result<()>
+where
+    B::Buffer: 'w,
+{
+    let parts = run_parts(&view, runs);
+    let ld = runs.rows();
+    b.linears(
+        h,
+        None,
+        &mut [LinearDst {
+            y,
+            ld,
+            parts: &parts,
+        }],
+        scratch,
+        t,
+    )
+}
+
+/// The GDN input projections of `h` as one [`Backend::linears`] call (backends quantize `h`
+/// once; `hb`: its bf16 twin when there is one): q | k | v into `qkv_y`, z into `z_y` and a | b
+/// into `ab_y`.
+#[allow(clippy::too_many_arguments)]
+fn gdn_projections<'w, B: Backend>(
+    b: &B,
+    view: impl Fn(&WDesc) -> WeightView<'w, B::Buffer>,
+    h: &B::Buffer,
+    hb: Option<&B::Buffer>,
+    (qkv, qkv_y): (&Runs, &mut B::Buffer),
+    (z, z_y): (&WDesc, &mut B::Buffer),
+    (ab, ab_y): (&Runs, &mut B::Buffer),
+    scratch: &mut B::Buffer,
+    t: usize,
+) -> Result<()>
+where
+    B::Buffer: 'w,
+{
+    let (qkv_parts, ab_parts) = (run_parts(&view, qkv), run_parts(&view, ab));
+    let z_parts = [LinearPart { w: view(z), col: 0 }];
+    let (qkv_ld, ab_ld) = (qkv.rows(), ab.rows());
+    b.linears(
+        h,
+        hb,
+        &mut [
+            LinearDst {
+                y: qkv_y,
+                ld: qkv_ld,
+                parts: &qkv_parts,
+            },
+            LinearDst {
+                y: z_y,
+                ld: z.rows,
+                parts: &z_parts,
+            },
+            LinearDst {
+                y: ab_y,
+                ld: ab_ld,
+                parts: &ab_parts,
+            },
+        ],
+        scratch,
+        t,
+    )
+}
+
+/// `x += y; h = norm(x)` (the residual add fused with the next norm), also into `h`'s bf16 twin
+/// when `twin` and the workspace has twins. Returns whether the twin now mirrors `h`.
+#[allow(clippy::too_many_arguments)]
+fn add_norm_h<B: Backend>(
+    b: &B,
+    ws: &mut Workspace<B>,
+    weight: &B::Buffer,
+    t: usize,
+    hd: usize,
+    eps: f32,
+    twin: bool,
+) -> Result<bool> {
+    let Workspace { x, y, h, twins, .. } = ws;
+    match twins.as_mut().filter(|_| twin) {
+        Some(tw) => {
+            b.add_rms_norm_twin(x, y, weight, h, &mut tw.h, t, hd, eps, NormKind::Offset)?;
+            Ok(true)
+        }
+        None => {
+            b.add_rms_norm(x, y, weight, h, t, hd, eps, NormKind::Offset)?;
+            Ok(false)
+        }
+    }
+}
+
+/// `y = x . W^T` from `x`'s bf16 twin when the caller has it and the backend takes it.
+fn linear_from<B: Backend>(
+    b: &B,
+    x: &B::Buffer,
+    xb: Option<&B::Buffer>,
+    w: &WeightView<'_, B::Buffer>,
+    y: &mut B::Buffer,
+    t: usize,
+) -> Result<()> {
+    match xb.filter(|_| b.takes_bf16(w, t)) {
+        Some(xb) => b.linear_bf16(xb, w, y, t),
+        None => b.linear(x, w, y, t),
+    }
+}
 
 /// Most tokens one `verify` call may feed (the anchor plus drafts).
 pub const VERIFY_MAX: usize = 16;
@@ -72,11 +201,13 @@ const STATIC_MAX_TOKENS: usize = 15;
 
 /// Layers where a recorded step starts a new graph segment (see [`Backend::graph_break`]).
 /// Submission time grows with a segment's size and the GPU waits for the first one, so it holds
-/// one layer; each later segment is submitted while the GPU runs the ones before it.
-const GRAPH_SEGMENT_STARTS: [usize; 5] = [1, 4, 16, 32, 48];
+/// one layer; each later segment is submitted while the GPU runs the ones before it. Every
+/// boundary also idles the GPU between segments (~30 us under WSL2), so after the first few
+/// layers the rest is one segment: 12 layers of GPU time cover its submission.
+const GRAPH_SEGMENT_STARTS: [usize; 3] = [1, 4, 16];
 
 fn graph_key(kind: u64, shape: u64, s: &Session<impl Backend>, kv_len: Option<usize>) -> u64 {
-    let mut key = kind | shape | u64::from(s.parity) << 15 | (s.id & 0xffff) << 40;
+    let mut key = kind | shape | (s.id & 0xffff) << 40;
     if let Some(kv) = kv_len {
         key |= GRAPH_STATIC | (kv.div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
     }
@@ -89,9 +220,7 @@ static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// the window, and per GDN layer the raw projections each token fed to the convolution and the
 /// recurrence. Replaying a prefix runs the same kernels on the same inputs, so the committed
 /// state is bit-identical to the verify trajectory at that point.
-struct Spec<B: Backend> {
-    conv: Vec<B::Buffer>,
-    ssm: Vec<B::Buffer>,
+struct Spec {
     pos0: usize,
     tokens: usize,
     recording: bool,
@@ -109,11 +238,13 @@ struct SpecRows<B: Backend> {
     ab: Vec<B::Buffer>,
 }
 
-/// Buffers for [`Qwen35Text::verify_batch`]: several sequences' windows (at most
-/// [`VERIFY_MAX`] rows each) share one forward pass, so every weight is read once per round.
+/// Buffers for [`Qwen35Text::verify_batch`]: several sequences' windows (at most `window`
+/// rows each) share one forward pass, so every weight is read once per round.
 pub struct BatchWorkspace<B: Backend> {
     max_seqs: usize,
-    /// Per GDN layer, `[max_seqs * VERIFY_MAX, *]` rows: what each sequence's commit replays.
+    /// Rows of one sequence's window, at most (the drafter's drafts plus the pending token).
+    window: usize,
+    /// Per GDN layer, `[max_seqs * window, *]` rows: what each sequence's commit replays.
     qkv: Vec<B::Buffer>,
     conv_out: Vec<B::Buffer>,
     ab: Vec<B::Buffer>,
@@ -165,6 +296,11 @@ impl<B: Backend> BatchWorkspace<B> {
     /// Most sequences one batch takes.
     pub fn max_seqs(&self) -> usize {
         self.max_seqs
+    }
+
+    /// Rows of one sequence's window, at most.
+    pub fn window(&self) -> usize {
+        self.window
     }
 }
 
@@ -452,6 +588,14 @@ pub struct EmbedInsert<'a, Buf> {
     pub row_offset: usize,
 }
 
+/// bf16 twins (Backend::bf16_twins) of `h`, `z`, `attn` and `mg`.
+struct Twins<B: Backend> {
+    h: B::Buffer,
+    z: B::Buffer,
+    attn: B::Buffer,
+    mg: B::Buffer,
+}
+
 /// Activations for chunks of up to `max_tokens` tokens.
 pub struct Workspace<B: Backend> {
     max_tokens: usize,
@@ -476,6 +620,9 @@ pub struct Workspace<B: Backend> {
     /// MLP gate|up output.
     fused: B::Buffer,
     gu: B::Buffer,
+    /// bf16 twins of the GEMM inputs for up to FUSE_MAX_TOKENS rows, when the backend writes them
+    /// (Backend::bf16_twins).
+    twins: Option<Twins<B>>,
     last: B::Buffer,
     last_n: B::Buffer,
     /// Final-normed hidden rows of the latest `verify` (`[VERIFY_MAX, hidden]`), which condition
@@ -499,9 +646,70 @@ pub struct Workspace<B: Backend> {
     kv_f32: Option<(B::Buffer, B::Buffer)>,
     /// Verify replay rows (allocated with the first verify).
     spec_rows: Option<SpecRows<B>>,
+    /// Where verify's recurrences write their final state: one GDN layer's conv and SSM state,
+    /// shared by every layer and session and never read (commit replays the kept rows from the
+    /// recorded inputs instead, as ninfer's ReplaySSM). Saves a full state copy per lane. The SSM
+    /// part is only `gated_delta_net_out`'s working state (backends may skip writing it).
+    spec_state: Option<(B::Buffer, B::Buffer)>,
     /// `emb` / `rows_hidden` hold `max_tokens` rows (MTP drafting reads them); without, they are
     /// placeholders and `keep_rows` does not fill them.
     rows: bool,
+    /// Physical memory the per-phase buffers share (see [`overlay`]); empty without virtual
+    /// memory. Declared last, so the buffers mapping it drop first.
+    _overlay: Vec<B::Chunk>,
+}
+
+/// Allocates `groups` of buffers (f32 lengths) whose groups share physical memory: each group's
+/// buffers are disjoint, and every group starts at the same physical chunk. For buffers of
+/// phases that are never live together (a layer's GDN mixer, attention mixer and MLP scratch),
+/// this takes the largest group instead of the sum. `None` without virtual memory (or with
+/// `VELOX_NO_OVERLAY`): the caller allocates them separately. Contents start zeroed.
+fn overlay<B: Backend>(
+    b: &B,
+    groups: &[&[usize]],
+) -> Result<Option<(Vec<Vec<B::Buffer>>, Vec<B::Chunk>)>> {
+    let chunk = b.vm_chunk_len();
+    if chunk == 0 || std::env::var_os("VELOX_NO_OVERLAY").is_some() {
+        return Ok(None);
+    }
+    let span = |len: usize| len.max(1).div_ceil(chunk);
+    let need = groups
+        .iter()
+        .map(|g| g.iter().map(|&l| span(l)).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let chunks = (0..need)
+        .map(|_| b.alloc_chunk())
+        .collect::<Result<Vec<_>>>()?;
+    let zero = b.alloc(chunk)?;
+    let mut out = Vec::with_capacity(groups.len());
+    for g in groups {
+        let mut at = 0;
+        let mut bufs = Vec::with_capacity(g.len());
+        for &len in g.iter() {
+            let mut buf = b.alloc_virtual(len)?;
+            for j in 0..span(len) {
+                b.map_chunk(&mut buf, j, &chunks[at + j])?;
+            }
+            at += span(len);
+            bufs.push(buf);
+        }
+        out.push(bufs);
+    }
+    // Chunk contents are undefined; the first group's buffers cover every chunk (it is not
+    // necessarily the largest, so zero through each group).
+    for bufs in &mut out {
+        for buf in bufs.iter_mut() {
+            let len = b.len(buf);
+            let mut off = 0;
+            while off < len {
+                let n = chunk.min(len - off);
+                b.copy(&zero, 0, buf, off, n)?;
+                off += n;
+            }
+        }
+    }
+    Ok(Some((out, chunks)))
 }
 
 pub struct Qwen35Text<B: Backend> {
@@ -574,7 +782,6 @@ impl<B: Backend> Qwen35Text<B> {
             ssm,
             spec: None,
             id: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            parity: false,
             paging: paged.then(|| {
                 let chunk = b.vm_chunk_len();
                 paging::KvPaging::new(chunk, kv_len.div_ceil(chunk))
@@ -594,29 +801,73 @@ impl<B: Backend> Qwen35Text<B> {
         // Fused projections and the fused MLP gate|up only run up to FUSE_MAX_TOKENS rows.
         let tf = t.min(FUSE_MAX_TOKENS);
         let tr = if rows { t } else { 1 };
+        // Scratch of a layer's three phases: the GDN mixer, the attention mixer and the MLP (the
+        // dense SwiGLU, a MoE block's shared expert; routed experts will need their own scratch
+        // once the MoE ops land). Each phase finishes into `y` before the next starts, so with
+        // virtual memory the phases overlay one another.
+        let gdn = [
+            t * c.gdn_qkv(),
+            t * c.gdn_qkv(),
+            t * c.gdn_v(),
+            t * 2 * c.gdn_v_heads,
+            t * c.gdn_v(),
+        ];
+        let attn = [
+            t * c.q_dim(),
+            t * c.q_dim(),
+            t * c.kv_dim(),
+            t * c.kv_dim(),
+            t * c.q_dim(),
+            t * c.kv_dim(),
+            t * c.q_dim(),
+        ];
+        let mlp = [t * c.mlp_width(), t * c.mlp_width()];
+        let (bufs, backing) = match overlay(b, &[&gdn, &attn, &mlp])? {
+            Some(o) => o,
+            None => (
+                [&gdn[..], &attn[..], &mlp[..]]
+                    .iter()
+                    .map(|g| g.iter().map(|&l| b.alloc(l)).collect::<Result<Vec<_>>>())
+                    .collect::<Result<Vec<_>>>()?,
+                Vec::new(),
+            ),
+        };
+        let mut bufs = bufs.into_iter();
+        let mut next = || bufs.next().expect("three groups").into_iter();
+        let (mut g_gdn, mut g_attn, mut g_mlp) = (next(), next(), next());
+        let take = |g: &mut std::vec::IntoIter<B::Buffer>| g.next().expect("group sized above");
         Ok(Workspace {
             max_tokens,
             x: b.alloc(t * c.hidden)?,
             h: b.alloc(t * c.hidden)?,
             y: b.alloc(t * c.hidden)?,
-            qkv: b.alloc(t * c.gdn_qkv())?,
-            conv_out: b.alloc(t * c.gdn_qkv())?,
-            z: b.alloc(t * c.gdn_v())?,
-            ab: b.alloc(t * 2 * c.gdn_v_heads)?,
-            o: b.alloc(t * c.gdn_v())?,
-            q: b.alloc(t * c.q_dim())?,
-            g: b.alloc(t * c.q_dim())?,
-            k: b.alloc(t * c.kv_dim())?,
-            v: b.alloc(t * c.kv_dim())?,
-            qn: b.alloc(t * c.q_dim())?,
-            kn: b.alloc(t * c.kv_dim())?,
-            attn: b.alloc(t * c.q_dim())?,
-            // The dense SwiGLU (a MoE block's shared expert); routed experts will need their own
-            // scratch once the MoE ops land.
-            mg: b.alloc(t * c.mlp_width())?,
-            mu: b.alloc(t * c.mlp_width())?,
+            qkv: take(&mut g_gdn),
+            conv_out: take(&mut g_gdn),
+            z: take(&mut g_gdn),
+            ab: take(&mut g_gdn),
+            o: take(&mut g_gdn),
+            q: take(&mut g_attn),
+            g: take(&mut g_attn),
+            k: take(&mut g_attn),
+            v: take(&mut g_attn),
+            qn: take(&mut g_attn),
+            kn: take(&mut g_attn),
+            attn: take(&mut g_attn),
+            mg: take(&mut g_mlp),
+            mu: take(&mut g_mlp),
             fused: b.alloc(tf * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
             gu: b.alloc(tf * 2 * c.mlp_width())?,
+            // z and attn at every width (their output projections take bf16 at prefill widths
+            // too); h and mg only at the fused widths that consume them.
+            twins: match b.bf16_twins() {
+                true => Some(Twins {
+                    h: b.alloc(tf * c.hidden)?,
+                    z: b.alloc(t * c.gdn_v())?,
+                    attn: b.alloc(t * c.q_dim())?,
+                    mg: b.alloc(tf * c.mlp_width())?,
+                }),
+                false => None,
+            },
             last: b.alloc(c.hidden)?,
             last_n: b.alloc(c.hidden)?,
             logits: b.alloc(c.vocab)?,
@@ -630,7 +881,9 @@ impl<B: Backend> Qwen35Text<B> {
             kv_f32: None,
             features: None,
             spec_rows: None,
+            spec_state: None,
             rows,
+            _overlay: backing,
         })
     }
 
@@ -804,7 +1057,10 @@ impl<B: Backend> Qwen35Text<B> {
                 // Recorded steps launch in segments, so the GPU starts while the rest is submitted.
                 b.graph_break()?;
             }
-            if li == 0 {
+            // Decode and verify widths write bf16 twins of the GEMM inputs (Backend::bf16_twins);
+            // the mixers' output projections read a twin at any width the backend takes it.
+            let twin = t <= FUSE_MAX_TOKENS;
+            let h_twin = if li == 0 {
                 b.rms_norm(
                     &ws.x,
                     w.param(l.input_norm),
@@ -814,20 +1070,13 @@ impl<B: Backend> Qwen35Text<B> {
                     c.eps,
                     NormKind::Offset,
                 )?;
+                false
             } else {
                 // The previous layer's MLP residual, fused with this layer's input norm.
-                b.add_rms_norm(
-                    &mut ws.x,
-                    &ws.y,
-                    w.param(l.input_norm),
-                    &mut ws.h,
-                    t,
-                    hd,
-                    c.eps,
-                    NormKind::Offset,
-                )?;
+                let h_twin = add_norm_h(b, ws, w.param(l.input_norm), t, hd, c.eps, twin)?;
                 self.capture_features(b, ws, li - 1, t)?;
-            }
+                h_twin
+            };
             match &l.mixer {
                 Mixer::Gdn {
                     qkv,
@@ -842,7 +1091,7 @@ impl<B: Backend> Qwen35Text<B> {
                 } => {
                     // While a verify window is recorded, its qkv and a/b rows land directly in the
                     // spec buffers commit replays from, and the recurrent state advances into the
-                    // spec state, so the session keeps the state to roll back to (no copies).
+                    // shared scratch state, so the session keeps the state to roll back to.
                     let Session {
                         spec,
                         conv: s_conv,
@@ -850,23 +1099,19 @@ impl<B: Backend> Qwen35Text<B> {
                         ..
                     } = &mut *s;
                     let (qkv_buf, ab_buf, mut state_out) = match (
-                        spec.as_mut().filter(|sp| sp.recording),
+                        spec.as_ref().filter(|sp| sp.recording),
                         ws.spec_rows.as_mut(),
+                        ws.spec_state.as_mut(),
                     ) {
                         (
-                            Some(Spec {
-                                conv: sc, ssm: ss, ..
-                            }),
+                            Some(_),
                             Some(SpecRows {
                                 qkv: sq,
                                 conv_out: so,
                                 ab: sa,
                             }),
-                        ) => (
-                            &mut sq[gi],
-                            &mut sa[gi],
-                            Some((&mut sc[gi], &mut ss[gi], &mut so[gi])),
-                        ),
+                            Some((sc, ss)),
+                        ) => (&mut sq[gi], &mut sa[gi], Some((sc, ss, &mut so[gi]))),
                         _ => (&mut ws.qkv, &mut ws.ab, None),
                     };
                     match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
@@ -877,17 +1122,27 @@ impl<B: Backend> Qwen35Text<B> {
                                 t,
                                 f.rows,
                                 &mut [
-                                    (&mut *qkv_buf, qkv.row_begin - f.row_begin, qkv.rows),
+                                    (&mut *qkv_buf, qkv.0[0].row_begin - f.row_begin, qkv.rows()),
                                     (&mut ws.z, z.row_begin - f.row_begin, z.rows),
                                 ],
                             )?;
+                            linear_runs(b, |d| w.view(d), &ws.h, ab, ab_buf, &mut ws.conv_out, t)?;
                         }
                         None => {
-                            b.linear(&ws.h, &w.view(qkv), qkv_buf, t)?;
-                            b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
+                            // conv_out ([t, gdn_qkv]) is only written after the projections.
+                            gdn_projections(
+                                b,
+                                |d| w.view(d),
+                                &ws.h,
+                                ws.twins.as_ref().filter(|_| h_twin).map(|tw| &tw.h),
+                                (qkv, &mut *qkv_buf),
+                                (z, &mut ws.z),
+                                (ab, &mut *ab_buf),
+                                &mut ws.conv_out,
+                                t,
+                            )?;
                         }
                     }
-                    b.linear(&ws.h, &w.view(ab), ab_buf, t)?;
                     let mut row0 = 0;
                     for &end in &cuts {
                         let cs = ConvShape {
@@ -908,7 +1163,7 @@ impl<B: Backend> Qwen35Text<B> {
                         match &mut state_out {
                             Some((sc, ss, so)) => {
                                 b.conv1d_silu_from(qkv_buf, cw, &s_conv[gi], sc, so, cs)?;
-                                b.gated_delta_net_from(
+                                b.gated_delta_net_out(
                                     so, ab_buf, al, dt, &s_ssm[gi], ss, &mut ws.o, gs,
                                 )?;
                             }
@@ -932,16 +1187,34 @@ impl<B: Backend> Qwen35Text<B> {
                         row0 = end;
                     }
                     // z = silu(z) * plain_rmsnorm(o)
-                    b.rms_norm_gated(
-                        &ws.o,
-                        w.param(*norm),
-                        &mut ws.z,
-                        t * c.gdn_v_heads,
-                        c.gdn_v_dim,
-                        c.eps,
-                        NormKind::Plain,
-                    )?;
-                    b.linear(&ws.z, &w.view(out), &mut ws.y, t)?;
+                    let rows = t * c.gdn_v_heads;
+                    match ws.twins.as_mut().filter(|_| b.takes_bf16(&w.view(out), t)) {
+                        Some(tw) => {
+                            b.rms_norm_gated_twin(
+                                &ws.o,
+                                w.param(*norm),
+                                &mut ws.z,
+                                &mut tw.z,
+                                rows,
+                                c.gdn_v_dim,
+                                c.eps,
+                                NormKind::Plain,
+                            )?;
+                            linear_from(b, &ws.z, Some(&tw.z), &w.view(out), &mut ws.y, t)?;
+                        }
+                        None => {
+                            b.rms_norm_gated(
+                                &ws.o,
+                                w.param(*norm),
+                                &mut ws.z,
+                                rows,
+                                c.gdn_v_dim,
+                                c.eps,
+                                NormKind::Plain,
+                            )?;
+                            b.linear(&ws.z, &w.view(out), &mut ws.y, t)?;
+                        }
+                    }
                     gi += 1;
                 }
                 Mixer::Attention { .. } => {
@@ -950,21 +1223,21 @@ impl<B: Backend> Qwen35Text<B> {
                         None => Rope::At(rope_pos0),
                     };
                     let kv_format = s.kv_format;
-                    self.attention_mixer(b, ws, &l.mixer, &mut s.kv[ai], kv_format, t, pos0, rope)?;
+                    self.attention_mixer(
+                        b,
+                        ws,
+                        &l.mixer,
+                        &mut s.kv[ai],
+                        kv_format,
+                        (t, pos0),
+                        rope,
+                        (h_twin, true),
+                    )?;
                     ai += 1;
                 }
             }
-            b.add_rms_norm(
-                &mut ws.x,
-                &ws.y,
-                w.param(l.post_norm),
-                &mut ws.h,
-                t,
-                hd,
-                c.eps,
-                NormKind::Offset,
-            )?;
-            self.mlp(b, ws, l, t)?;
+            let h_twin = add_norm_h(b, ws, w.param(l.post_norm), t, hd, c.eps, twin)?;
+            self.mlp(b, ws, l, t, h_twin)?;
             // The MLP residual is added by the next layer's fused input norm.
         }
         b.add(&mut ws.x, &ws.y, t * hd)?;
@@ -1012,6 +1285,9 @@ impl<B: Backend> Qwen35Text<B> {
     /// Gated attention mixer of one layer: `ws.h` (normed input, `t` rows) to `ws.y`, appending
     /// K/V at cache rows `pos0..` of `kv`.
     #[allow(clippy::too_many_arguments)]
+    /// `(h_twin, twin)`: whether `ws.h`'s bf16 twin is current, and whether the gated output's
+    /// twin may be written for the output projection (it is, when the backend takes it at `t`).
+    #[allow(clippy::too_many_arguments)]
     fn attention_mixer(
         &self,
         b: &B,
@@ -1019,9 +1295,9 @@ impl<B: Backend> Qwen35Text<B> {
         mixer: &Mixer,
         kv: &mut (B::Buffer, B::Buffer),
         kv_format: KvFormat,
-        t: usize,
-        pos0: usize,
+        (t, pos0): (usize, usize),
         rope: Rope<'_>,
+        (h_twin, twin): (bool, bool),
     ) -> Result<()> {
         let (c, w) = (&self.cfg, &self.w);
         let Mixer::Attention {
@@ -1054,10 +1330,42 @@ impl<B: Backend> Qwen35Text<B> {
                 )?;
             }
             None => {
-                b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
-                b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
-                b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
-                b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
+                // One linears call: backends quantize ws.h once for the four projections.
+                let part = |d: &WDesc| {
+                    [LinearPart {
+                        w: w.view(d),
+                        col: 0,
+                    }]
+                };
+                let (pq, pg, pk, pv) = (part(query), part(gate), part(key), part(value));
+                b.linears(
+                    &ws.h,
+                    ws.twins.as_ref().filter(|_| h_twin).map(|tw| &tw.h),
+                    &mut [
+                        LinearDst {
+                            y: &mut ws.q,
+                            ld: query.rows,
+                            parts: &pq,
+                        },
+                        LinearDst {
+                            y: &mut ws.g,
+                            ld: gate.rows,
+                            parts: &pg,
+                        },
+                        LinearDst {
+                            y: &mut ws.k,
+                            ld: key.rows,
+                            parts: &pk,
+                        },
+                        LinearDst {
+                            y: &mut ws.v,
+                            ld: value.rows,
+                            parts: &pv,
+                        },
+                    ],
+                    &mut ws.fused,
+                    t,
+                )?;
             }
         }
         b.rms_norm(
@@ -1079,8 +1387,20 @@ impl<B: Backend> Qwen35Text<B> {
             NormKind::Offset,
         )?;
         self.attend_rows(b, ws, kv, kv_format, t, pos0, rope)?;
-        b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
-        b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
+        match ws
+            .twins
+            .as_mut()
+            .filter(|_| twin && b.takes_bf16(&w.view(output), t))
+        {
+            Some(tw) => {
+                b.sigmoid_mul_twin(&mut ws.attn, &ws.g, &mut tw.attn, t * c.q_dim())?;
+                linear_from(b, &ws.attn, Some(&tw.attn), &w.view(output), &mut ws.y, t)?;
+            }
+            None => {
+                b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
+                b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
+            }
+        }
         Ok(())
     }
 
@@ -1192,9 +1512,10 @@ impl<B: Backend> Qwen35Text<B> {
 
     /// FFN of one layer: `ws.h` to `ws.y`. Every forward path (chunks, verify, batched verify, MTP)
     /// goes through here, so a new FFN kind only needs an arm in this match.
-    fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize) -> Result<()> {
+    /// `h_twin`: whether `ws.h`'s bf16 twin is current.
+    fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize, h_twin: bool) -> Result<()> {
         match &l.ffn {
-            Ffn::Dense(d) => self.swiglu_ffn(b, ws, d, t),
+            Ffn::Dense(d) => self.swiglu_ffn(b, ws, d, t, h_twin),
             Ffn::Moe(_) => Err(Error::Unsupported(
                 "sparse MoE FFN execution (planned ops moe_route / moe_experts, see \
                  docs/qwen3_5-text.md) is not implemented yet"
@@ -1204,22 +1525,40 @@ impl<B: Backend> Qwen35Text<B> {
     }
 
     /// `ws.y = down(silu(gate(ws.h)) * up(ws.h))`.
-    fn swiglu_ffn(&self, b: &B, ws: &mut Workspace<B>, d: &DenseFfn, t: usize) -> Result<()> {
+    fn swiglu_ffn(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        d: &DenseFfn,
+        t: usize,
+        h_twin: bool,
+    ) -> Result<()> {
         let w = &self.w;
         let width = d.gate.rows;
-        match d.gate_up.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
-            Some(f) => {
-                b.linear(&ws.h, &w.view(f), &mut ws.gu, t)?;
-                let (g, u) = (d.gate.row_begin - f.row_begin, d.up.row_begin - f.row_begin);
-                b.swiglu(&ws.gu, t, f.rows, g, u, width, &mut ws.mg)?;
-            }
-            None => {
-                b.linear(&ws.h, &w.view(&d.gate), &mut ws.mg, t)?;
-                b.linear(&ws.h, &w.view(&d.up), &mut ws.mu, t)?;
-                b.silu_mul(&mut ws.mg, &ws.mu, t * width)?;
-            }
+        let (gate, up) = (w.view(&d.gate), w.view(&d.up));
+        let down = w.view(&d.down);
+        if let Some(tw) = ws
+            .twins
+            .as_mut()
+            .filter(|_| h_twin && b.swiglu_twin(&gate, &up, t))
+        {
+            // bf16 twins in and out: no activation conversions for gate|up or down.
+            let Twins { h, mg, .. } = tw;
+            b.linear_swiglu_twin(h, &gate, &up, &mut ws.mg, mg, t)?;
+            return linear_from(b, &ws.mg, Some(mg), &down, &mut ws.y, t);
         }
-        b.linear(&ws.mg, &w.view(&d.down), &mut ws.y, t)
+        if t > FUSE_MAX_TOKENS && b.fuses_swiglu(&gate, &up, t) {
+            // Prefill on a backend that fuses this width: no scratch is touched.
+            b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.mu)?;
+        } else if t <= FUSE_MAX_TOKENS && d.gate_up.is_some() {
+            // Decode and verify: the fused projection (ws.gu is the composed op's scratch).
+            b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.gu)?;
+        } else {
+            b.linear(&ws.h, &gate, &mut ws.mg, t)?;
+            b.linear(&ws.h, &up, &mut ws.mu, t)?;
+            b.silu_mul(&mut ws.mg, &ws.mu, t * width)?;
+        }
+        b.linear(&ws.mg, &down, &mut ws.y, t)
     }
 
     /// [`Self::advance`] that also hands every chunk's rows to `on_chunk` (with `ws.keep_rows`
@@ -1275,7 +1614,7 @@ impl<B: Backend> Qwen35Text<B> {
                 VERIFY_MAX.min(ws.max_tokens)
             )));
         }
-        self.ensure_spec(b, s)?;
+        self.ensure_spec(s)?;
         self.ensure_spec_rows(b, ws)?;
         if s.pos + t > s.capacity {
             return Err(Error::Config(format!(
@@ -1338,7 +1677,6 @@ impl<B: Backend> Qwen35Text<B> {
             conv,
             ssm,
             pos,
-            parity,
             ..
         } = &mut *s;
         let sp = spec
@@ -1355,15 +1693,10 @@ impl<B: Backend> Qwen35Text<B> {
                 sp.tokens
             )));
         }
-        if keep == sp.tokens {
-            // The whole window stays: verify left its state in the spec buffers, which become
-            // the session's (graph keys carry the parity, as recordings bind buffers).
-            std::mem::swap(conv, &mut sp.conv);
-            std::mem::swap(ssm, &mut sp.ssm);
-            *parity = !*parity;
-        } else {
-            // The session still holds the state before the window: advance it over the kept
-            // prefix from the recorded inputs, every GDN layer in one step per kept length.
+        {
+            // The session still holds the state before the window (verify wrote its own to
+            // scratch): advance it over the kept prefix from the recorded inputs, every GDN layer
+            // in one step per kept length.
             let rows = ws
                 .spec_rows
                 .as_ref()
@@ -1414,16 +1747,11 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
-    fn ensure_spec(&self, b: &B, s: &mut Session<B>) -> Result<()> {
+    fn ensure_spec(&self, s: &mut Session<B>) -> Result<()> {
         if s.spec.is_some() {
             return Ok(());
         }
-        let like = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
-            bufs.iter().map(|x| b.alloc(b.len(x))).collect()
-        };
         s.spec = Some(Spec {
-            conv: like(&s.conv)?,
-            ssm: like(&s.ssm)?,
             pos0: 0,
             tokens: 0,
             recording: false,
@@ -1432,7 +1760,19 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
+    fn ensure_spec_state(&self, b: &B, ws: &mut Workspace<B>) -> Result<()> {
+        if ws.spec_state.is_none() {
+            let c = &self.cfg;
+            ws.spec_state = Some((
+                b.alloc((c.conv_width - 1) * c.gdn_qkv())?,
+                b.alloc(c.gdn_v_heads * c.gdn_v_dim * c.gdn_k_dim)?,
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_spec_rows(&self, b: &B, ws: &mut Workspace<B>) -> Result<()> {
+        self.ensure_spec_state(b, ws)?;
         if ws.spec_rows.is_some() {
             return Ok(());
         }
@@ -1452,19 +1792,28 @@ impl<B: Backend> Qwen35Text<B> {
     /// Allocates what speculative verify needs for `s` and `ws` now rather than at the first
     /// verify, so a server's memory is committed at startup.
     pub fn reserve_verify(&self, b: &B, s: &mut Session<B>, ws: &mut Workspace<B>) -> Result<()> {
-        self.ensure_spec(b, s)?;
+        self.ensure_spec(s)?;
         self.ensure_spec_rows(b, ws)
     }
 
-    /// Buffers for batches of up to `max_seqs` sequences (see [`Self::verify_batch`]).
-    pub fn batch_workspace(&self, b: &B, max_seqs: usize) -> Result<BatchWorkspace<B>> {
+    /// Buffers for batches of up to `max_seqs` sequences of up to `window` tokens each (at most
+    /// [`VERIFY_MAX`]; see [`Self::verify_batch`]). Every buffer scales with `max_seqs * window`, so
+    /// the window should be what the drafter proposes (drafts + 1), not the limit.
+    pub fn batch_workspace(
+        &self,
+        b: &B,
+        max_seqs: usize,
+        window: usize,
+    ) -> Result<BatchWorkspace<B>> {
         let c = &self.cfg;
-        let rows = max_seqs * VERIFY_MAX;
+        let window = window.clamp(1, VERIFY_MAX);
+        let rows = max_seqs * window;
         let gdn = c.layers.iter().filter(|l| **l == LayerKind::Gdn).count();
         let per_layer =
             |w: usize| -> Result<Vec<B::Buffer>> { (0..gdn).map(|_| b.alloc(rows * w)).collect() };
         Ok(BatchWorkspace {
             max_seqs,
+            window,
             qkv: per_layer(c.gdn_qkv())?,
             conv_out: per_layer(c.gdn_qkv())?,
             ab: per_layer(2 * c.gdn_v_heads)?,
@@ -1506,9 +1855,10 @@ impl<B: Backend> Qwen35Text<B> {
         let mut rows = Vec::with_capacity(n);
         let mut ids = Vec::new();
         for (s, w) in sessions.iter_mut().zip(windows) {
-            if w.is_empty() || w.len() > VERIFY_MAX {
+            if w.is_empty() || w.len() > bw.window {
                 return Err(Error::Shape(format!(
-                    "verify takes 1..={VERIFY_MAX} tokens per sequence"
+                    "batched verify takes 1..={} tokens per sequence",
+                    bw.window
                 )));
             }
             if s.pos + w.len() > s.capacity {
@@ -1516,7 +1866,8 @@ impl<B: Backend> Qwen35Text<B> {
                     "verify window exceeds session capacity".into(),
                 ));
             }
-            self.ensure_spec(b, s)?;
+            self.ensure_spec(s)?;
+            self.ensure_spec_state(b, ws)?;
             s.prepare_kv(b, s.pos, s.pos + w.len())?;
             rows.push((ids.len(), w.len()));
             ids.extend_from_slice(w);
@@ -1589,7 +1940,6 @@ impl<B: Backend> Qwen35Text<B> {
             conv,
             ssm,
             pos,
-            parity,
             ..
         } = &mut *s;
         let sp = spec
@@ -1605,11 +1955,7 @@ impl<B: Backend> Qwen35Text<B> {
                 sp.tokens
             )));
         }
-        if keep == sp.tokens {
-            std::mem::swap(conv, &mut sp.conv);
-            std::mem::swap(ssm, &mut sp.ssm);
-            *parity = !*parity;
-        } else if keep > 0 {
+        if keep > 0 {
             let gdn_params = self.w.layers.iter().filter_map(|l| match &l.mixer {
                 Mixer::Gdn { a_log, dt_bias, .. } => Some((*a_log, *dt_bias)),
                 _ => None,
@@ -1691,9 +2037,10 @@ impl<B: Backend> Qwen35Text<B> {
         let mut ids = prefill.ids.to_vec();
         let mut rows = Vec::with_capacity(n);
         for (s, win) in sessions.iter_mut().zip(windows) {
-            if win.is_empty() || win.len() > VERIFY_MAX {
+            if win.is_empty() || win.len() > bw.window {
                 return Err(Error::Shape(format!(
-                    "verify takes 1..={VERIFY_MAX} tokens per sequence"
+                    "batched verify takes 1..={} tokens per sequence",
+                    bw.window
                 )));
             }
             if s.pos + win.len() > s.capacity {
@@ -1701,7 +2048,8 @@ impl<B: Backend> Qwen35Text<B> {
                     "verify window exceeds session capacity".into(),
                 ));
             }
-            self.ensure_spec(b, s)?;
+            self.ensure_spec(s)?;
+            self.ensure_spec_state(b, ws)?;
             s.prepare_kv(b, s.pos, s.pos + win.len())?;
             rows.push((ids.len() - tp, win.len()));
             ids.extend_from_slice(win);
@@ -1885,17 +2233,39 @@ impl<B: Backend> Qwen35Text<B> {
                                     t,
                                     f.rows,
                                     &mut [
-                                        (&mut *qkv_buf, qkv.row_begin - f.row_begin, qkv.rows),
+                                        (
+                                            &mut *qkv_buf,
+                                            qkv.0[0].row_begin - f.row_begin,
+                                            qkv.rows(),
+                                        ),
                                         (&mut ws.z, z.row_begin - f.row_begin, z.rows),
                                     ],
                                 )?;
+                                linear_runs(
+                                    b,
+                                    |d| w.view(d),
+                                    &ws.h,
+                                    ab,
+                                    ab_buf,
+                                    &mut ws.conv_out,
+                                    t,
+                                )?;
                             }
                             None => {
-                                b.linear(&ws.h, &w.view(qkv), qkv_buf, t)?;
-                                b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
+                                // conv_out ([t, gdn_qkv]) is only written after the projections.
+                                gdn_projections(
+                                    b,
+                                    |d| w.view(d),
+                                    &ws.h,
+                                    None,
+                                    (qkv, &mut *qkv_buf),
+                                    (z, &mut ws.z),
+                                    (ab, &mut *ab_buf),
+                                    &mut ws.conv_out,
+                                    t,
+                                )?;
                             }
                         }
-                        b.linear(&ws.h, &w.view(ab), ab_buf, t)?;
                     }
                     if let Some(p) = pre.as_deref_mut() {
                         if v > 0 {
@@ -1944,12 +2314,11 @@ impl<B: Backend> Qwen35Text<B> {
                     }
                     for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
                         let Session {
-                            spec,
                             conv: s_conv,
                             ssm: s_ssm,
                             ..
                         } = &mut **s;
-                        let sp = spec.as_mut().expect("ensure_spec ran");
+                        let (sc, ss) = ws.spec_state.as_mut().expect("ensure_spec_state ran");
                         let cs = ConvShape {
                             tokens: m,
                             channels: c.gdn_qkv(),
@@ -1968,19 +2337,19 @@ impl<B: Backend> Qwen35Text<B> {
                             &bw.qkv[gi],
                             cw,
                             &s_conv[gi],
-                            &mut sp.conv[gi],
+                            sc,
                             &mut bw.conv_out[gi],
                             cs,
                         )?;
                         // Window outputs go to the workspace's rows after the prefill.
                         let o = if tp > 0 { &mut bw.o } else { &mut ws.o };
-                        b.gated_delta_net_from(
+                        b.gated_delta_net_out(
                             &bw.conv_out[gi],
                             &bw.ab[gi],
                             al,
                             dt,
                             &s_ssm[gi],
-                            &mut sp.ssm[gi],
+                            ss,
                             o,
                             gs,
                         )?;
@@ -2025,7 +2394,7 @@ impl<B: Backend> Qwen35Text<B> {
                 c.eps,
                 NormKind::Offset,
             )?;
-            self.mlp(b, ws, l, t)?;
+            self.mlp(b, ws, l, t, false)?;
         }
         b.add(&mut ws.x, &ws.y, t * hd)?;
         self.capture_features(b, ws, w.layers.len() - 1, t)?;
@@ -2081,10 +2450,42 @@ impl<B: Backend> Qwen35Text<B> {
                 )?;
             }
             None => {
-                b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
-                b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
-                b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
-                b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
+                // One linears call: backends quantize ws.h once for the four projections.
+                let part = |d: &WDesc| {
+                    [LinearPart {
+                        w: w.view(d),
+                        col: 0,
+                    }]
+                };
+                let (pq, pg, pk, pv) = (part(query), part(gate), part(key), part(value));
+                b.linears(
+                    &ws.h,
+                    None,
+                    &mut [
+                        LinearDst {
+                            y: &mut ws.q,
+                            ld: query.rows,
+                            parts: &pq,
+                        },
+                        LinearDst {
+                            y: &mut ws.g,
+                            ld: gate.rows,
+                            parts: &pg,
+                        },
+                        LinearDst {
+                            y: &mut ws.k,
+                            ld: key.rows,
+                            parts: &pk,
+                        },
+                        LinearDst {
+                            y: &mut ws.v,
+                            ld: value.rows,
+                            parts: &pv,
+                        },
+                    ],
+                    &mut ws.fused,
+                    t,
+                )?;
             }
         }
         b.rms_norm(
@@ -2217,4 +2618,58 @@ pub fn shift_inserts<'a, Buf>(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velox_core::backend::ActPolicy;
+    use velox_core::format::WeightFormat;
+    use velox_cpu::CpuBackend;
+
+    #[test]
+    fn split_projection_matches_its_runs() -> Result<()> {
+        // Rows 1..5 of parent 0 ([6, k]) then rows 2..5 of parent 1 ([5, k]), as the IQ3_XXS
+        // artifact stores GDN q|k and v in two parents.
+        let (b, k, t) = (CpuBackend, 8, 3);
+        let p0: Vec<f32> = (0..6 * k).map(|i| (i as f32 * 0.37).sin()).collect();
+        let p1: Vec<f32> = (0..5 * k).map(|i| (i as f32 * 0.11).cos()).collect();
+        let x: Vec<f32> = (0..t * k).map(|i| i as f32 * 0.05 - 0.4).collect();
+        let parents = [b.upload(&p0)?, b.upload(&p1)?];
+        let h = b.upload(&x)?;
+        let d = |parent: usize, n, row_begin, rows| WDesc {
+            parent,
+            format: WeightFormat::F32,
+            n,
+            k,
+            row_begin,
+            rows,
+            act: ActPolicy::A16Only,
+        };
+        let runs = Runs(vec![d(0, 6, 1, 4), d(1, 5, 2, 3)]);
+        let view = |d: &WDesc| WeightView {
+            buf: &parents[d.parent],
+            format: d.format,
+            parent_rows: d.n,
+            k: d.k,
+            row_begin: d.row_begin,
+            rows: d.rows,
+            act: d.act,
+        };
+        let (mut y, mut scratch) = (b.alloc(t * 7)?, b.alloc(t * 4)?);
+        linear_runs(&b, view, &h, &runs, &mut y, &mut scratch, t)?;
+        let mut got = vec![0.0; t * 7];
+        b.download(&y, &mut got)?;
+        let rows: Vec<&[f32]> = (1..5)
+            .map(|r| &p0[r * k..(r + 1) * k])
+            .chain((2..5).map(|r| &p1[r * k..(r + 1) * k]))
+            .collect();
+        for i in 0..t {
+            for (j, w) in rows.iter().enumerate() {
+                let want: f32 = (0..k).map(|c| x[i * k + c] * w[c]).sum();
+                assert!((got[i * 7 + j] - want).abs() < 1e-5, "[{i},{j}]");
+            }
+        }
+        Ok(())
+    }
 }

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind,
-    KvStoreShape, NormKind, RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
+    KvStoreShape, LinearDst, NormKind, RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
 };
 use velox_core::{
     check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, VariantInfo,
@@ -36,6 +36,7 @@ mod ffi {
         ) -> i32;
         pub fn velox_cuda_set_device(device: i32) -> i32;
         pub fn velox_cuda_mem_info(free: *mut usize, total: *mut usize) -> i32;
+        pub fn velox_nvml_used(used: *mut usize, total: *mut usize) -> i32;
         pub fn velox_cuda_profiler(on: i32) -> i32;
         pub fn velox_cuda_malloc_zeroed(ptr: *mut *mut c_void, bytes: usize) -> i32;
         pub fn velox_cuda_host_alloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
@@ -71,6 +72,8 @@ mod ffi {
         pub fn velox_cuda_graph_replay_begin(slot: i32) -> i32;
         pub fn velox_cuda_graph_replay_launch(slot: i32) -> i32;
         pub fn velox_cuda_graph_abort() -> i32;
+        pub fn velox_cuda_graph_release(slot: i32) -> i32;
+        pub fn velox_cuda_graph_bytes() -> usize;
     }
 }
 
@@ -241,12 +244,19 @@ impl Drop for CudaChunk {
     fn drop(&mut self) {
         // SAFETY: the handle came from cuMemCreate and is released exactly once.
         unsafe { ffi::velox_vmm_release(self.handle) };
+        CHUNK_BYTES.fetch_sub(vm_chunk_bytes(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 // SAFETY: a device pointer is a plain address; synchronisation is CUDA's stream ordering.
 unsafe impl Send for CudaBuffer {}
 unsafe impl Sync for CudaBuffer {}
+
+/// Bytes of device buffers (cudaMalloc) alive and at their peak, and of physical chunks alive:
+/// what the engine's memory log reports, to tell its own growth from the driver's.
+static BUFFER_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BUFFER_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CHUNK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl CudaBuffer {
     fn new(len: usize) -> Result<Self> {
@@ -260,6 +270,9 @@ impl CudaBuffer {
                 unsafe { ffi::velox_cuda_malloc_zeroed(&mut ptr, bytes) },
                 "cudaMalloc",
             )?;
+            use std::sync::atomic::Ordering::Relaxed;
+            let live = BUFFER_BYTES.fetch_add(bytes, Relaxed) + bytes;
+            BUFFER_PEAK.fetch_max(live, Relaxed);
         }
         Ok(CudaBuffer {
             ptr: ptr.cast(),
@@ -308,6 +321,7 @@ impl Drop for CudaBuffer {
                     ffi::velox_cuda_free_host(self.ptr.cast());
                 } else {
                     ffi::velox_cuda_free(self.ptr.cast());
+                    BUFFER_BYTES.fetch_sub(self.len * 4, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -373,6 +387,132 @@ pub trait CudaKernels: Send + Sync {
     /// The activation rounding `linear` applies; see [`Backend::linear_act`].
     fn linear_act(&self, _w: &WeightView<'_, CudaBuffer>, _m: usize) -> ActQuant {
         ActQuant::Exact
+    }
+
+    /// Whether `linears` serves these destinations at `m` rows (every part rounded as `linear`
+    /// rounds it). When it does not, the backend composes the op from `linear` and `copy2d`.
+    fn serves_linears(&self, _dsts: &[LinearDst<'_, '_, '_, CudaBuffer>], _m: usize) -> bool {
+        false
+    }
+
+    /// [`Backend::linears`] without scratch, for destinations `serves_linears` accepted (`xb`:
+    /// `x`'s bf16 twin when the caller has one).
+    fn linears(
+        &self,
+        _x: &CudaBuffer,
+        _xb: Option<&CudaBuffer>,
+        _dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linears".into()))
+    }
+
+    /// See [`Backend::takes_bf16`].
+    fn takes_bf16(&self, _w: &WeightView<'_, CudaBuffer>, _m: usize) -> bool {
+        false
+    }
+
+    /// See [`Backend::linear_bf16`].
+    fn linear_bf16(
+        &self,
+        _xb: &CudaBuffer,
+        _w: &WeightView<'_, CudaBuffer>,
+        _y: &mut CudaBuffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_bf16".into()))
+    }
+
+    /// See [`Backend::swiglu_twin`].
+    fn swiglu_twin(
+        &self,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _m: usize,
+    ) -> bool {
+        false
+    }
+
+    /// See [`Backend::linear_swiglu_twin`].
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_twin(
+        &self,
+        _xb: &CudaBuffer,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _out: &mut CudaBuffer,
+        _outb: &mut CudaBuffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_swiglu_twin".into()))
+    }
+
+    /// See [`Backend::add_rms_norm_twin`].
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_twin(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        yb: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        portable::add_rms_norm_twin(acc, x, weight, y, yb, rows, dim, eps, kind)
+    }
+
+    /// See [`Backend::rms_norm_gated_twin`].
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_gated_twin(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        gate: &mut CudaBuffer,
+        gb: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        portable::rms_norm_gated_twin(x, weight, gate, gb, rows, dim, eps, kind)
+    }
+
+    /// See [`Backend::sigmoid_mul_twin`].
+    fn sigmoid_mul_twin(
+        &self,
+        x: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        xb: &mut CudaBuffer,
+        len: usize,
+    ) -> Result<()> {
+        portable::sigmoid_mul_twin(x, gate, xb, len)
+    }
+
+    /// A fused [`Backend::linear_swiglu`] (no scratch). The default reports `Unsupported`, and the
+    /// backend composes the op from `linear` and `swiglu`.
+    fn linear_swiglu(
+        &self,
+        _x: &CudaBuffer,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _out: &mut CudaBuffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("fused linear_swiglu".into()))
+    }
+
+    /// The activation rounding a fused `linear_swiglu` applies, `None` when it is not fused at
+    /// these rows (the backend then reports the composed op's).
+    fn linear_swiglu_act(
+        &self,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _m: usize,
+    ) -> Option<ActQuant> {
+        None
     }
 
     fn embed(
@@ -520,6 +660,21 @@ pub trait CudaKernels: Send + Sync {
         s: GdnShape,
     ) -> Result<()> {
         portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s)
+    }
+
+    /// [`Backend::gated_delta_net_out`]: outputs from `state_in`, no state written.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_out(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+    ) -> Result<()> {
+        portable::gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, out, s)
     }
 
     fn gdn_replay(
@@ -673,10 +828,98 @@ pub struct CudaBackend {
 
 #[derive(Default)]
 struct GraphKeys {
+    /// Slot of each segment key (a step's key, then `key | segment << 56`).
     slots: HashMap<u64, i32>,
     seen: HashSet<u64>,
     /// Static keys recorded at least once: later runs replay.
     recorded: HashSet<u64>,
+    /// Each step's segment slots and when it last ran: a budget releases whole steps, so a
+    /// replay never meets a missing segment.
+    steps: HashMap<u64, GraphStep>,
+    /// Released slots, reused before new ones.
+    free: Vec<i32>,
+    next: i32,
+    clock: u64,
+    /// Device bytes recorded graphs may hold (0: unbounded).
+    budget: usize,
+    released: usize,
+}
+
+#[derive(Default)]
+struct GraphStep {
+    segs: Vec<i32>,
+    used: u64,
+}
+
+impl GraphKeys {
+    /// The slot of segment `seg_key` of step `step`, taking a free one (releasing the least
+    /// recently run other step when all are taken). `None`: no slot.
+    fn slot_for(&mut self, seg_key: u64, step: u64) -> Option<i32> {
+        if let Some(&s) = self.slots.get(&seg_key) {
+            return Some(s);
+        }
+        let s = match self.free.pop() {
+            Some(s) => s,
+            None if self.next < GRAPH_SLOTS => {
+                self.next += 1;
+                self.next - 1
+            }
+            None => {
+                let victim = self.lru(step)?;
+                self.release(victim).ok()?;
+                self.free.pop()?
+            }
+        };
+        self.slots.insert(seg_key, s);
+        self.steps.entry(step).or_default().segs.push(s);
+        Some(s)
+    }
+
+    fn touch(&mut self, step: u64) {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(st) = self.steps.get_mut(&step) {
+            st.used = clock;
+        }
+    }
+
+    /// The least recently run step other than `keep`.
+    fn lru(&self, keep: u64) -> Option<u64> {
+        self.steps
+            .iter()
+            .filter(|(&k, _)| k != keep)
+            .min_by_key(|(_, st)| st.used)
+            .map(|(&k, _)| k)
+    }
+
+    /// Releases every segment graph of `step`; its next run records again.
+    fn release(&mut self, step: u64) -> Result<()> {
+        let Some(st) = self.steps.remove(&step) else {
+            return Ok(());
+        };
+        self.slots.retain(|_, s| !st.segs.contains(s));
+        self.recorded.remove(&step);
+        for s in st.segs {
+            // SAFETY: `s` is a slot this map handed out (in the shim's range).
+            status(unsafe { ffi::velox_cuda_graph_release(s) }, "graph release")?;
+            self.free.push(s);
+        }
+        self.released += 1;
+        Ok(())
+    }
+
+    /// Releases least recently run steps other than `keep` while graphs hold over the budget.
+    fn enforce(&mut self, keep: u64) -> Result<()> {
+        if self.budget == 0 {
+            return Ok(());
+        }
+        // SAFETY: plain query.
+        while unsafe { ffi::velox_cuda_graph_bytes() } > self.budget {
+            let Some(victim) = self.lru(keep) else { break };
+            self.release(victim)?;
+        }
+        Ok(())
+    }
 }
 
 /// Graph slots the shim keeps (`kGraphSlots`).
@@ -880,6 +1123,211 @@ impl Backend for CudaBackend {
         })
     }
 
+    fn linears(
+        &self,
+        x: &CudaBuffer,
+        xb: Option<&CudaBuffer>,
+        dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
+        scratch: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if !self.kernels.serves_linears(dsts, m) {
+            return velox_core::backend::linears_composed(self, x, dsts, scratch, m);
+        }
+        for d in dsts.iter() {
+            for p in d.parts {
+                // A column range is checked as a view of `ld` rows over the destination.
+                check::linear(x.len, &p.w, p.w.buf.len, d.y.len, m)?;
+                if p.col + p.w.rows > d.ld || d.y.len < m * d.ld {
+                    return Err(Error::Shape(format!(
+                        "linears: columns {}..{} of {} x {} in {} values",
+                        p.col,
+                        p.col + p.w.rows,
+                        m,
+                        d.ld,
+                        d.y.len
+                    )));
+                }
+            }
+        }
+        let op = format!("linears m={}", if m <= 16 { "<=16" } else { ">16" });
+        if let Some(xb) = xb {
+            let k = dsts
+                .iter()
+                .flat_map(|d| d.parts.iter())
+                .map(|p| p.w.k)
+                .max()
+                .unwrap_or(0);
+            check::elementwise("linears bf16 twin", &[xb.len * 2], m * k)?;
+        }
+        self.timed(&op, || self.kernels.linears(x, xb, dsts, m))
+    }
+
+    fn bf16_twins(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_twin(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        yb: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        check::rms_norm(acc.len, weight.len, y.len, rows, dim)?;
+        check::elementwise("add_rms_norm", &[x.len], rows * dim)?;
+        check::elementwise("add_rms_norm twin", &[yb.len * 2], rows * dim)?;
+        self.timed("add_rms_norm", || {
+            self.kernels
+                .add_rms_norm_twin(acc, x, weight, y, yb, rows, dim, eps, kind)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_gated_twin(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        gate: &mut CudaBuffer,
+        gb: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        check::rms_norm(x.len, weight.len, gate.len, rows, dim)?;
+        check::elementwise("rms_norm_gated twin", &[gb.len * 2], rows * dim)?;
+        self.timed("rms_norm_gated", || {
+            self.kernels
+                .rms_norm_gated_twin(x, weight, gate, gb, rows, dim, eps, kind)
+        })
+    }
+
+    fn sigmoid_mul_twin(
+        &self,
+        x: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        xb: &mut CudaBuffer,
+        len: usize,
+    ) -> Result<()> {
+        check::elementwise("sigmoid_mul", &[x.len, gate.len], len)?;
+        check::elementwise("sigmoid_mul twin", &[xb.len * 2], len)?;
+        self.timed("sigmoid_mul", || {
+            self.kernels.sigmoid_mul_twin(x, gate, xb, len)
+        })
+    }
+
+    fn takes_bf16(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+        self.kernels.takes_bf16(w, m)
+    }
+
+    fn linear_bf16(
+        &self,
+        xb: &CudaBuffer,
+        w: &WeightView<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if !self.kernels.takes_bf16(w, m) {
+            return Err(Error::Unsupported("linear_bf16 view".into()));
+        }
+        check::linear(xb.len * 2, w, w.buf.len, y.len, m)?;
+        let op = format!(
+            "linear {} m={} bf16 in",
+            w.format.name(),
+            if m <= 16 { "<=16" } else { ">16" }
+        );
+        self.timed(&op, || self.kernels.linear_bf16(xb, w, y, m))
+    }
+
+    fn swiglu_twin(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> bool {
+        self.kernels.swiglu_twin(gate, up, m)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_twin(
+        &self,
+        xb: &CudaBuffer,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        outb: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if !self.kernels.swiglu_twin(gate, up, m) {
+            return Err(Error::Unsupported("linear_swiglu_twin views".into()));
+        }
+        check::linear(xb.len * 2, gate, gate.buf.len, out.len, m)?;
+        check::linear(xb.len * 2, up, up.buf.len, out.len, m)?;
+        check::elementwise("linear_swiglu twin", &[outb.len * 2], m * gate.rows)?;
+        let op = format!(
+            "linear_swiglu {} m={m} [{}x{}] twin",
+            gate.format.name(),
+            gate.rows,
+            gate.k
+        );
+        self.timed(&op, || {
+            self.kernels.linear_swiglu_twin(xb, gate, up, out, outb, m)
+        })
+    }
+
+    fn linear_swiglu(
+        &self,
+        x: &CudaBuffer,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        m: usize,
+        scratch: &mut CudaBuffer,
+    ) -> Result<()> {
+        check::linear(x.len, gate, gate.buf.len, out.len, m)?;
+        check::linear(x.len, up, up.buf.len, out.len, m)?;
+        if self.kernels.linear_swiglu_act(gate, up, m).is_some() {
+            let op = format!(
+                "linear_swiglu {} m={m} [{}x{}]",
+                gate.format.name(),
+                gate.rows,
+                gate.k
+            );
+            return self.timed(&op, || self.kernels.linear_swiglu(x, gate, up, out, m));
+        }
+        velox_core::backend::linear_swiglu_composed(self, x, gate, up, out, m, scratch)
+    }
+
+    fn fuses_swiglu(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> bool {
+        self.kernels.linear_swiglu_act(gate, up, m).is_some()
+    }
+
+    fn linear_swiglu_act(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> ActQuant {
+        self.kernels
+            .linear_swiglu_act(gate, up, m)
+            .unwrap_or_else(|| match velox_core::backend::swiglu_pair(gate, up) {
+                Some((both, _, _)) => self.linear_act(&both, m),
+                None => self.linear_act(gate, m),
+            })
+    }
+
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         let Some(graphs) = &self.graphs else {
             return f();
@@ -896,15 +1344,12 @@ impl Backend for CudaBackend {
             if g.seen.insert(key) {
                 (None, false)
             } else {
-                let next = g.slots.len() as i32;
-                let slot = *g.slots.entry(key).or_insert(next);
-                (
-                    Some(slot),
-                    key & GRAPH_STATIC != 0 && g.recorded.contains(&key),
-                )
+                let slot = g.slot_for(key, key);
+                g.touch(key);
+                (slot, key & GRAPH_STATIC != 0 && g.recorded.contains(&key))
             }
         };
-        let Some(slot) = slot.filter(|&s| s < GRAPH_SLOTS) else {
+        let Some(slot) = slot else {
             return f();
         };
         let mode = if replay {
@@ -947,12 +1392,14 @@ impl Backend for CudaBackend {
             }
         };
         status(launched, "graph launch")?;
-        if !replay && key & GRAPH_STATIC != 0 {
-            graphs
+        if !replay {
+            let mut g = graphs
                 .lock()
-                .map_err(|_| Error::Backend("graph keys poisoned".into()))?
-                .recorded
-                .insert(key);
+                .map_err(|_| Error::Backend("graph keys poisoned".into()))?;
+            if key & GRAPH_STATIC != 0 {
+                g.recorded.insert(key);
+            }
+            g.enforce(key)?;
         }
         Ok(())
     }
@@ -965,17 +1412,17 @@ impl Backend for CudaBackend {
             return Ok(());
         }
         let (key, seg, slot) = GRAPH_SEG.with(std::cell::Cell::get);
-        let next_key = key | (seg + 1) << 56;
-        let next = {
-            let mut g = graphs
-                .lock()
-                .map_err(|_| Error::Backend("graph keys poisoned".into()))?;
-            let n = g.slots.len() as i32;
-            *g.slots.entry(next_key).or_insert(n)
-        };
-        if next >= GRAPH_SLOTS || seg + 1 >= 128 {
-            return Ok(()); // out of slots: the step stays one graph
+        if seg + 1 >= 128 {
+            return Ok(()); // the step stays one graph from here
         }
+        let next_key = key | (seg + 1) << 56;
+        let next = graphs
+            .lock()
+            .map_err(|_| Error::Backend("graph keys poisoned".into()))?
+            .slot_for(next_key, key);
+        let Some(next) = next else {
+            return Ok(()); // out of slots: the step stays one graph
+        };
         // SAFETY: both slots are in the shim's range; the current one was begun by `graph`.
         let r = unsafe {
             if mode == GraphMode::Replay {
@@ -988,6 +1435,46 @@ impl Backend for CudaBackend {
         };
         GRAPH_SEG.with(|c| c.set((key, seg + 1, next)));
         r
+    }
+
+    fn set_graph_budget(&self, bytes: usize) {
+        if let Some(Ok(mut g)) = self.graphs.as_ref().map(Mutex::lock) {
+            g.budget = bytes;
+        }
+    }
+
+    fn graph_stats(&self) -> (usize, usize, usize) {
+        match self.graphs.as_ref().map(Mutex::lock) {
+            // SAFETY: plain query.
+            Some(Ok(g)) => (
+                g.steps.len(),
+                unsafe { ffi::velox_cuda_graph_bytes() },
+                g.released,
+            ),
+            _ => (0, 0, 0),
+        }
+    }
+
+    fn mem_info(&self) -> Option<(usize, usize)> {
+        mem_info().ok().map(|(f, t)| (f as usize, t as usize))
+    }
+
+    fn device_allocs(&self) -> Option<(usize, usize, usize)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        Some((
+            BUFFER_BYTES.load(Relaxed),
+            BUFFER_PEAK.load(Relaxed),
+            CHUNK_BYTES.load(Relaxed),
+        ))
+    }
+
+    fn device_in_use(&self) -> Option<usize> {
+        let (mut used, mut total) = (0usize, 0usize);
+        // SAFETY: out-pointers to live locals.
+        match unsafe { ffi::velox_nvml_used(&mut used, &mut total) } {
+            0 => Some(used),
+            _ => self.mem_info().map(|(free, total)| total - free),
+        }
     }
 
     fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {
@@ -1108,6 +1595,7 @@ impl Backend for CudaBackend {
             unsafe { ffi::velox_vmm_create(&mut handle, chunk) },
             "cuMemCreate",
         )?;
+        CHUNK_BYTES.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
         Ok(CudaChunk { handle })
     }
 
@@ -1554,6 +2042,23 @@ impl Backend for CudaBackend {
         self.staged("gated_delta_net verify", || {
             self.kernels
                 .gated_delta_net(qkv, ab, a_log, dt_bias, Some(state_in), state_out, out, s)
+        })
+    }
+
+    fn gated_delta_net_out(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: &CudaBuffer,
+        _scratch: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+    ) -> Result<()> {
+        self.staged("gated_delta_net verify", || {
+            self.kernels
+                .gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, out, s)
         })
     }
 

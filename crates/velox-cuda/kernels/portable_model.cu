@@ -16,6 +16,7 @@
 #define VELOX_FMT_Q5 5
 #define VELOX_FMT_Q6 6
 #define VELOX_FMT_Q8 7
+#define VELOX_FMT_IQ3_XXS 8
 
 namespace {
 
@@ -49,6 +50,66 @@ __device__ __forceinline__ long long nvfp4_scale_offset(long long n, long long g
     const long long k_tiles = k / 64;
     const long long row_tile = n / 128, row_inner = n % 128, scale_tile = g / 4, scale_lane = g % 4;
     return (row_tile * k_tiles + scale_tile) * 512 + (row_inner % 32) * 16 + (row_inner / 32) * 4 + scale_lane;
+}
+
+// llama.cpp iq3xxs_grid (ggml-common.h, MIT): four magnitudes per entry, little-endian bytes.
+__constant__ uint32_t kIq3XxsGrid[256] = {
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+};
+
+// iq3_xxs_planar_v1, as velox_core::format::iq3_xxs_at documents: a [n, k/256, 96] code plane, then
+// the 256-byte aligned binary16 block scales [n, k/256].
+__device__ float iq3_xxs_at(const WDesc& d, long long row, long long col) {
+    const long long blocks = d.k / 256;
+    const long long bi = row * blocks + col / 256;
+    const uint8_t* code = d.base + bi * 96;
+    const uint8_t* sp = d.base + align256(d.n * blocks * 96) + 2 * bi;
+    const float scale = __half2float(__ushort_as_half(static_cast<unsigned short>(sp[0] | (sp[1] << 8))));
+    const int s = static_cast<int>(col % 256) / 32, j = static_cast<int>(col % 32), e = j / 4;
+    const uint32_t g = kIq3XxsGrid[code[16 * (e / 2) + 2 * s + (e & 1)]];
+    const float magnitude = static_cast<float>((g >> (8 * (j & 3))) & 0xff);
+    // Little-endian u64 lane words, read byte-wise: the view's base need not be 8-byte aligned.
+    auto lane = [code](int q) {
+        uint64_t w = 0;
+        for (int b = 7; b >= 0; --b) w = (w << 8) | code[64 + 8 * q + b];
+        return w;
+    };
+    const uint32_t sign7 = static_cast<uint32_t>(lane(j / 8) >> (7 * s)) & 127u;
+    const uint32_t sign8 = sign7 | ((__popc(sign7) & 1u) << 7);
+    const uint32_t ls = static_cast<uint32_t>(lane(s / 2) >> (56 + 4 * (s & 1))) & 15u;
+    const float v = magnitude * scale * (0.25f + 0.5f * static_cast<float>(ls));
+    return (sign8 >> (j & 7)) & 1u ? -v : v;
 }
 
 // Decoded W[row, col] of the parent matrix.
@@ -91,6 +152,8 @@ __device__ float weight_at(const WDesc& d, long long row, long long col) {
             const uint8_t* s = d.base + scale_off + 2 * gi;
             return __half2float(__ushort_as_half(static_cast<unsigned short>(s[0] | (s[1] << 8)))) * static_cast<float>(q);
         }
+        case VELOX_FMT_IQ3_XXS:
+            return iq3_xxs_at(d, row, col);
         default: {  // NVFP4
             const uint8_t byte = d.base[(row * d.k + col) / 2];
             const uint8_t code = (col & 1) ? (byte >> 4) : (byte & 0xf);
@@ -171,15 +234,71 @@ linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, i
     }
 }
 
-__global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long long row_begin, float* __restrict__ out) {
+// Row-split (q4/q5/q6/q8) rows: a block stages its row's three byte ranges (codes, high plane,
+// scales; each contiguous) in shared memory with 16-byte loads, then decodes from there. The
+// table is often host-mapped, where the cost is per PCIe transaction: one round of wide loads per
+// row instead of several narrow ones per element.
+__global__ void embed_rs_kernel(const uint32_t* __restrict__ ids, WDesc d, long long row_begin, float* __restrict__ out) {
+    extern __shared__ __align__(16) uint8_t em_smem[];
+    const int bits = d.format == VELOX_FMT_Q4 ? 4 : d.format == VELOX_FMT_Q5 ? 5 : d.format == VELOX_FMT_Q6 ? 6 : 8;
+    const int group = bits == 8 ? 32 : 64;
+    const int hb = bits == 5 ? 1 : bits == 6 ? 2 : 0;  // high-plane bits per element
+    const int high = hb * group / 8;                   // high-plane bytes per group
+    const long long gpr = (d.k + 127) / 128 * 128 / group;
+    const long long groups = d.n * gpr;
+    const long long high_off = align256(groups * 32), scale_off = high_off + align256(groups * high);
     const long long row = row_begin + ids[blockIdx.x];
-    for (long long c = threadIdx.x; c < w.k; c += blockDim.x) out[blockIdx.x * w.k + c] = weight_at(w, row, c);
+    const int rg = static_cast<int>((d.k + group - 1) / group);  // groups of this row
+    uint8_t* sc = em_smem;                                           // [rg * 32]
+    uint8_t* sh = em_smem + (rg * 32 + 15) / 16 * 16;                // [rg * high]
+    uint8_t* ss = sh + (rg * high + 15) / 16 * 16;                   // [rg * 2]
+    const uint8_t* codes = d.base + row * gpr * 32;
+    const uint8_t* hp = d.base + high_off + row * gpr * high;
+    const uint8_t* scp = d.base + scale_off + row * gpr * 2;
+    for (int i = threadIdx.x; i < rg * 2; i += blockDim.x)
+        reinterpret_cast<uint4*>(sc)[i] = reinterpret_cast<const uint4*>(codes)[i];
+    for (int i = threadIdx.x; i < rg * high / 8; i += blockDim.x)
+        reinterpret_cast<uint2*>(sh)[i] = reinterpret_cast<const uint2*>(hp)[i];
+    for (int i = threadIdx.x; i < rg; i += blockDim.x)
+        reinterpret_cast<uint16_t*>(ss)[i] = reinterpret_cast<const uint16_t*>(scp)[i];
+    __syncthreads();
+    float* o = out + static_cast<long long>(blockIdx.x) * d.k;
+    for (int e = threadIdx.x; e < d.k; e += blockDim.x) {
+        const int g = e / group, le = e % group;
+        uint32_t u;
+        if (bits == 8) {
+            u = sc[g * 32 + le];
+        } else {
+            const uint8_t byte = sc[g * 32 + le / 2];
+            u = (le & 1) ? (byte >> 4) : (byte & 0xf);
+        }
+        for (int b = 0; b < hb; ++b) {
+            const int t = le * hb + b;
+            u |= static_cast<uint32_t>((sh[g * high + t / 8] >> (t % 8)) & 1) << (4 + b);
+        }
+        const int q = u >= (1u << (bits - 1)) ? static_cast<int>(u) - (1 << bits) : static_cast<int>(u);
+        const float scale = __half2float(__ushort_as_half(static_cast<unsigned short>(ss[2 * g] | (ss[2 * g + 1] << 8))));
+        o[e] = scale * static_cast<float>(q);
+    }
 }
 
-__global__ void sigmoid_mul_kernel(float* __restrict__ x, const float* __restrict__ gate, long long len) {
+// Block (token, column slice): a few tokens still spread over the whole GPU.
+__global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long long row_begin, float* __restrict__ out) {
+    const long long row = row_begin + ids[blockIdx.x];
+    for (long long c = static_cast<long long>(blockIdx.y) * blockDim.x + threadIdx.x; c < w.k;
+         c += static_cast<long long>(gridDim.y) * blockDim.x)
+        out[blockIdx.x * w.k + c] = weight_at(w, row, c);
+}
+
+// xb: null, or the result's bf16 twin.
+__global__ void sigmoid_mul_kernel(float* __restrict__ x, const float* __restrict__ gate, long long len,
+                                   unsigned short* __restrict__ xb) {
     for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < len;
-         i += static_cast<long long>(gridDim.x) * blockDim.x)
-        x[i] = x[i] / (1.0f + expf(-gate[i]));
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const float v = x[i] / (1.0f + expf(-gate[i]));
+        x[i] = v;
+        if (xb != nullptr) xb[i] = velox_bf16_bits(v);
+    }
 }
 
 constexpr int kMaxConvWidth = 8;
@@ -273,7 +392,8 @@ __device__ __forceinline__ void gdn_rows(const float* __restrict__ qkv, const fl
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(k_dim));
     const float neg_a = -expf(a_log[h]), bias = dt_bias[h];
     const size_t row_off = (static_cast<size_t>(h) * v_dim + i) * k_dim;
-    float* row_state = state + row_off;  // written at the end; read from state_in (may alias)
+    // Written at the end (unless state is null: outputs only); read from state_in (may alias).
+    float* row_state = state != nullptr ? state + row_off : nullptr;
     float s[PER];
 #pragma unroll
     for (int p = 0; p < PER; ++p) {
@@ -314,10 +434,118 @@ __device__ __forceinline__ void gdn_rows(const float* __restrict__ qkv, const fl
             if (lane == 0) out[(static_cast<size_t>(t) * v_heads + h) * v_dim + i] = o * inv_sqrt_dk;
         }
     }
+    if (row_state == nullptr) return;
 #pragma unroll
     for (int p = 0; p < PER; ++p) {
         const int d = lane + p * VELOX_WARP;
         if (d < k_dim) row_state[d] = s[p];
+    }
+}
+
+// Windows up to this many tokens (decode, verify, replay) share their per-token head values
+// through shared memory (`GdnHead`); longer ones recompute them per row warp (`gdn_rows`).
+constexpr int kGdnRowsMaxT = 16;
+constexpr int kGdnRowsWarps = 8;  // state rows per block of the per-row kernels
+
+// One head's per-token values every row of it uses: q and k L2-normalized, alpha and beta.
+template <int PER>
+struct GdnHead {
+    float q[kGdnRowsMaxT][PER * VELOX_WARP];
+    float k[kGdnRowsMaxT][PER * VELOX_WARP];
+    float alpha[kGdnRowsMaxT], beta[kGdnRowsMaxT];
+};
+
+// Fills `hd` for head h, one warp per token (the values `gdn_rows` computes in every row warp).
+template <int PER>
+__device__ __forceinline__ void gdn_head_prep(const float* __restrict__ qkv, const float* __restrict__ ab,
+                                              const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                              int tokens, int k_heads, int v_heads, int k_dim, int v_dim, int h,
+                                              GdnHead<PER>& hd) {
+    const int warps = blockDim.x / VELOX_WARP, warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    const int kh = h / (v_heads / k_heads);
+    const int width = 2 * k_heads * k_dim + v_heads * v_dim;
+    const float neg_a = -expf(a_log[h]), bias = dt_bias[h];
+    for (int t = warp; t < tokens; t += warps) {
+        const float* row = qkv + static_cast<size_t>(t) * width;
+        float q[PER], k[PER], qq = 0.0f, kk = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            q[p] = d < k_dim ? row[kh * k_dim + d] : 0.0f;
+            k[p] = d < k_dim ? row[(k_heads + kh) * k_dim + d] : 0.0f;
+            qq += q[p] * q[p];
+            kk += k[p] * k[p];
+        }
+        const float qn = rsqrtf(velox_warp_sum(qq) + 1e-6f), kn = rsqrtf(velox_warp_sum(kk) + 1e-6f);
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            hd.q[t][lane + p * VELOX_WARP] = q[p] * qn;
+            hd.k[t][lane + p * VELOX_WARP] = k[p] * kn;
+        }
+        if (lane == 0) {
+            const float a = ab[static_cast<size_t>(t) * 2 * v_heads + h] + bias;
+            const float b = ab[static_cast<size_t>(t) * 2 * v_heads + v_heads + h];
+            hd.alpha[t] = expf(neg_a * (a > 20.0f ? a : log1pf(expf(a))));
+            hd.beta[t] = 1.0f / (1.0f + expf(-b));
+        }
+    }
+}
+
+// Lanes per state row of `gdn_rows_shared`: a warp updates 8 rows, and a row's dot products
+// reduce over 4 lanes (2 shuffles) instead of a whole warp (5).
+constexpr int kGdnRowLanes = 4;
+constexpr int kGdnRowsPerBlock = kGdnRowsWarps * (VELOX_WARP / kGdnRowLanes);
+
+// `gdn_rows` over a window of at most kGdnRowsMaxT tokens whose head values are in `hd`, for row
+// i with kGdnRowLanes lanes; lane j of the row holds elements j, j + 4, ... (conflict-free
+// shared reads: the row's lanes hit distinct banks, the warp's 8 rows broadcast).
+template <int PER>
+__device__ __forceinline__ void gdn_rows_shared(const float* __restrict__ qkv, const float* state_in, float* state,
+                                                float* __restrict__ out, int tokens, int k_heads, int v_heads,
+                                                int k_dim, int v_dim, int h, int i, int j,
+                                                const GdnHead<PER>& hd) {
+    constexpr int V = PER * VELOX_WARP / kGdnRowLanes;  // values per lane
+    const int width = 2 * k_heads * k_dim + v_heads * v_dim;
+    const float inv_sqrt_dk = rsqrtf(static_cast<float>(k_dim));
+    const bool live = i < v_dim;  // dead lanes still join the shuffles
+    const size_t row_off = (static_cast<size_t>(h) * v_dim + (live ? i : 0)) * k_dim;
+    float s[V];
+#pragma unroll
+    for (int p = 0; p < V; ++p) {
+        const int d = j + p * kGdnRowLanes;
+        s[p] = live && d < k_dim ? state_in[row_off + d] : 0.0f;
+    }
+    auto row_sum = [](float x) {
+        x += __shfl_xor_sync(0xffffffffu, x, 1);
+        return x + __shfl_xor_sync(0xffffffffu, x, 2);
+    };
+    for (int t = 0; t < tokens; ++t) {
+        const float v = live ? qkv[static_cast<size_t>(t) * width + 2 * k_heads * k_dim + h * v_dim + i] : 0.0f;
+        const float alpha = hd.alpha[t];
+        float sk = 0.0f;
+#pragma unroll
+        for (int p = 0; p < V; ++p) {
+            s[p] *= alpha;
+            sk += s[p] * hd.k[t][j + p * kGdnRowLanes];
+        }
+        const float delta = hd.beta[t] * (v - row_sum(sk));
+        float o = 0.0f;
+#pragma unroll
+        for (int p = 0; p < V; ++p) {
+            s[p] += delta * hd.k[t][j + p * kGdnRowLanes];
+            o += s[p] * hd.q[t][j + p * kGdnRowLanes];
+        }
+        if (out != nullptr) {
+            o = row_sum(o);
+            if (live && j == 0) out[(static_cast<size_t>(t) * v_heads + h) * v_dim + i] = o * inv_sqrt_dk;
+        }
+    }
+    // Written at the end (unless state is null: outputs only); read from state_in (may alias).
+    if (state == nullptr || !live) return;
+#pragma unroll
+    for (int p = 0; p < V; ++p) {
+        const int d = j + p * kGdnRowLanes;
+        if (d < k_dim) state[row_off + d] = s[p];
     }
 }
 
@@ -334,6 +562,16 @@ __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const
     }
     const int warps = blockDim.x / VELOX_WARP;
     const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    if (tokens <= kGdnRowsMaxT) {
+        // Grid y counts blocks of kGdnRowsPerBlock rows here (see the launch).
+        __shared__ GdnHead<PER> hd;
+        gdn_head_prep<PER>(qkv, ab, a_log, dt_bias, tokens, k_heads, v_heads, k_dim, v_dim, h, hd);
+        __syncthreads();
+        const int row = blockIdx.y * kGdnRowsPerBlock + threadIdx.x / kGdnRowLanes;
+        gdn_rows_shared<PER>(qkv, state_in, state, out, tokens, k_heads, v_heads, k_dim, v_dim, h, row,
+                             threadIdx.x % kGdnRowLanes, hd);
+        return;
+    }
     if (i >= v_dim) return;
     gdn_rows<PER>(qkv, ab, a_log, dt_bias, state_in, state, out, tokens, k_heads, v_heads, k_dim, v_dim, h, i, lane);
 }
@@ -357,6 +595,16 @@ __global__ void gdn_replay_rows_kernel(const __grid_constant__ GdnReplayTable t,
                                        int k_dim, int v_dim) {
     const int warps = blockDim.x / VELOX_WARP, l = blockIdx.z;
     const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    if (tokens <= kGdnRowsMaxT) {
+        __shared__ GdnHead<PER> hd;
+        gdn_head_prep<PER>(t.conv_out[l], t.ab[l], t.a_log[l], t.dt_bias[l], tokens, k_heads, v_heads, k_dim, v_dim, h,
+                           hd);
+        __syncthreads();
+        const int row = blockIdx.y * kGdnRowsPerBlock + threadIdx.x / kGdnRowLanes;
+        gdn_rows_shared<PER>(t.conv_out[l], t.ssm[l], t.ssm[l], nullptr, tokens, k_heads, v_heads, k_dim, v_dim, h,
+                             row, threadIdx.x % kGdnRowLanes, hd);
+        return;
+    }
     if (i >= v_dim) return;
     gdn_rows<PER>(t.conv_out[l], t.ab[l], t.a_log[l], t.dt_bias[l], t.ssm[l], t.ssm[l], nullptr, tokens,
                   k_heads, v_heads, k_dim, v_dim, h, i, lane);
@@ -532,15 +780,18 @@ __global__ void __launch_bounds__(kGdnThreads)
     }
 }
 
-// The state-dependent part, chunks in order, from the prepare pass's per-chunk matrices.
-template <int DK>
-__global__ void __launch_bounds__(kGdnThreads, 3)
+// The state-dependent part, chunks in order, from the prepare pass's per-chunk matrices. A block
+// owns R * 16 state rows of one head; each thread holds R of them (rows si + 16 r) over 16 columns,
+// so every shared key/query/T/P/D value it reads feeds R rows (the loop is bound by shared-memory
+// reads, not FMAs).
+template <int DK, int R>
+__global__ void __launch_bounds__(kGdnThreads, R > 1 ? 2 : 3)
     gated_delta_net_chunk_kernel(const float* __restrict__ qkv, const float* __restrict__ prep,
                                  float* __restrict__ state, float* __restrict__ out, int tokens, int k_heads,
                                  int v_heads, int v_dim) {
-    constexpr int C = kGdnChunk, VT = kGdnVt, KS = DK + 4, PS = C + 4, RS = VT + 1, NJ = DK / 32;
+    constexpr int C = kGdnChunk, VT = kGdnVt * R, KS = DK + 4, PS = C + 4, RS = VT + 1, NJ = DK / 32;
     constexpr int NV = C * VT / kGdnThreads;
-    static_assert(kGdnThreads == VT * 8 && kGdnThreads == C * 8, "8 threads per state row and per chunk row");
+    static_assert(kGdnThreads == kGdnVt * 8 && kGdnThreads == C * 8, "8 threads per state row group and chunk row");
     __shared__ __align__(16) float ks[C * KS];  // normalized keys
     __shared__ __align__(16) float qs[C * KS];  // normalized queries
     __shared__ __align__(16) float ts[C * PS];  // T
@@ -555,16 +806,21 @@ __global__ void __launch_bounds__(kGdnThreads, 3)
     const size_t width = static_cast<size_t>(2 * k_heads * DK + v_heads * v_dim);
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(DK));
 
-    // Thread (si, dc) owns state row si (and chunk row si for loads) over columns
+    // Thread (si, dc) owns state rows si + 16 r (and chunk row si for loads) over columns
     // dc * 4 + 32 * j + e; its 8-thread group is lane-aligned within the warp.
     const int si = tid / 8, dc = tid % 8;
-    const bool row_ok = i0 + si < v_dim;
-    float* row_state = state + (static_cast<size_t>(h) * v_dim + i0 + si) * DK;
-    float s[NJ][4];
+    bool row_ok[R];
+    float s[R][NJ][4];
 #pragma unroll
-    for (int j = 0; j < NJ; ++j)
+    for (int r = 0; r < R; ++r) {
+        const int col = si + kGdnVt * r;
+        row_ok[r] = i0 + col < v_dim;
+        const float* row_state = state + (static_cast<size_t>(h) * v_dim + i0 + col) * DK;
 #pragma unroll
-        for (int e = 0; e < 4; ++e) s[j][e] = row_ok ? row_state[dc * 4 + 32 * j + e] : 0.0f;
+        for (int j = 0; j < NJ; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) s[r][j][e] = row_ok[r] ? row_state[dc * 4 + 32 * j + e] : 0.0f;
+    }
 
     // Raw inputs of a chunk, loaded into registers while the previous chunk finishes.
     float rq[NJ][4], rk[NJ][4], rv[NV], rt[2], rp[2], rg = 0.0f;
@@ -637,98 +893,134 @@ __global__ void __launch_bounds__(kGdnThreads, 3)
         __syncthreads();
         if (ci + 1 < chunks) load(ci + 1);
 
-        // x = S0[si].k_c, y = S0[si].q_c for chunk rows c, 8 at a time (lane dc ends up owning
-        // c = 8 g + dc): R[c][si] = beta_c (v_c - gamma_c x), and gamma_c y kept for o.
-        float ys[C / 8];
+        // x = S0[row].k_c, y = S0[row].q_c for chunk rows c, 8 at a time (lane dc ends up owning
+        // c = 8 g + dc): R[c][row] = beta_c (v_c - gamma_c x), and gamma_c y kept for o.
+        float ys[R][C / 8];
 #pragma unroll
         for (int g = 0; g < C / 8; ++g) {
-            float x[8], y[8];
+            float x[R][8], y[R][8];
 #pragma unroll
             for (int u = 0; u < 8; ++u) {
                 const int c = 8 * g + u;
-                x[u] = y[u] = 0.0f;
+#pragma unroll
+                for (int r = 0; r < R; ++r) x[r][u] = y[r][u] = 0.0f;
 #pragma unroll
                 for (int j = 0; j < NJ; ++j) {
                     const float4 kv = *reinterpret_cast<const float4*>(&ks[c * KS + dc * 4 + 32 * j]);
                     const float4 qv = *reinterpret_cast<const float4*>(&qs[c * KS + dc * 4 + 32 * j]);
-                    x[u] += kv.x * s[j][0] + kv.y * s[j][1] + kv.z * s[j][2] + kv.w * s[j][3];
-                    y[u] += qv.x * s[j][0] + qv.y * s[j][1] + qv.z * s[j][2] + qv.w * s[j][3];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        x[r][u] += kv.x * s[r][j][0] + kv.y * s[r][j][1] + kv.z * s[r][j][2] + kv.w * s[r][j][3];
+                        y[r][u] += qv.x * s[r][j][0] + qv.y * s[r][j][1] + qv.z * s[r][j][2] + qv.w * s[r][j][3];
+                    }
                 }
             }
-            gdn_reduce_scatter8(x, dc);
-            gdn_reduce_scatter8(y, dc);
             const int c = 8 * g + dc;
-            rs[c * RS + si] = betas[c] * (rs[c * RS + si] - gam[c] * x[0]);
-            ys[g] = gam[c] * y[0];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                gdn_reduce_scatter8(x[r], dc);
+                gdn_reduce_scatter8(y[r], dc);
+                const int col = si + kGdnVt * r;
+                rs[c * RS + col] = betas[c] * (rs[c * RS + col] - gam[c] * x[r][0]);
+                ys[r][g] = gam[c] * y[r][0];
+            }
         }
         __syncthreads();
 
-        // D = T R, o = gamma S0 q + P D, and the state update for state row si (T and P are lower
-        // triangular with explicit zeros).
+        // D = T R, o = gamma S0 q + P D, and the state update for this thread's rows (T and P are
+        // lower triangular with explicit zeros).
         {
-            float acc[C / 8];
+            float acc[R][C / 8];
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) acc[g] = 0.0f;
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) acc[r][g] = 0.0f;
 #pragma unroll 2
             for (int u = 0; u < C; u += 4) {
-                const float r0 = rs[u * RS + si], r1 = rs[(u + 1) * RS + si], r2 = rs[(u + 2) * RS + si],
-                            r3 = rs[(u + 3) * RS + si];
+                float rr[R][4];
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) rr[r][v] = rs[(u + v) * RS + si + kGdnVt * r];
 #pragma unroll
                 for (int g = 0; g < C / 8; ++g) {
                     const float4 t4 = *reinterpret_cast<const float4*>(&ts[(8 * g + dc) * PS + u]);
-                    acc[g] += t4.x * r0 + t4.y * r1 + t4.z * r2 + t4.w * r3;
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+                        acc[r][g] += t4.x * rr[r][0] + t4.y * rr[r][1] + t4.z * rr[r][2] + t4.w * rr[r][3];
                 }
             }
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) ds[(8 * g + dc) * RS + si] = acc[g];
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) ds[(8 * g + dc) * RS + si + kGdnVt * r] = acc[r][g];
         }
         __syncthreads();
         {
-            float acc[C / 8];
+            float acc[R][C / 8];
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) acc[g] = ys[g];
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) acc[r][g] = ys[r][g];
 #pragma unroll 2
             for (int u = 0; u < C; u += 4) {
-                const float d0 = ds[u * RS + si], d1 = ds[(u + 1) * RS + si], d2 = ds[(u + 2) * RS + si],
-                            d3 = ds[(u + 3) * RS + si];
+                float dd[R][4];
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) dd[r][v] = ds[(u + v) * RS + si + kGdnVt * r];
 #pragma unroll
                 for (int g = 0; g < C / 8; ++g) {
                     const float4 p4 = *reinterpret_cast<const float4*>(&ps[(8 * g + dc) * PS + u]);
-                    acc[g] += p4.x * d0 + p4.y * d1 + p4.z * d2 + p4.w * d3;
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+                        acc[r][g] += p4.x * dd[r][0] + p4.y * dd[r][1] + p4.z * dd[r][2] + p4.w * dd[r][3];
                 }
             }
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) {
-                const int c = 8 * g + dc;
-                if (c < n && row_ok)
-                    out[(static_cast<size_t>(t0 + c) * v_heads + h) * v_dim + i0 + si] = acc[g] * inv_sqrt_dk;
-            }
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) {
+                    const int c = 8 * g + dc, col = si + kGdnVt * r;
+                    if (c < n && row_ok[r])
+                        out[(static_cast<size_t>(t0 + c) * v_heads + h) * v_dim + i0 + col] = acc[r][g] * inv_sqrt_dk;
+                }
         }
         {
             const float gl = gam[C - 1];
 #pragma unroll
-            for (int j = 0; j < NJ; ++j)
+            for (int r = 0; r < R; ++r)
 #pragma unroll
-                for (int e = 0; e < 4; ++e) s[j][e] *= gl;
+                for (int j = 0; j < NJ; ++j)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) s[r][j][e] *= gl;
             for (int c = 0; c < n; ++c) {
-                const float dv = ds[c * RS + si] * decay_last[c];
+                float dv[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) dv[r] = ds[c * RS + si + kGdnVt * r] * decay_last[c];
 #pragma unroll
                 for (int j = 0; j < NJ; ++j) {
                     const float4 kv = *reinterpret_cast<const float4*>(&ks[c * KS + dc * 4 + 32 * j]);
-                    s[j][0] += dv * kv.x;
-                    s[j][1] += dv * kv.y;
-                    s[j][2] += dv * kv.z;
-                    s[j][3] += dv * kv.w;
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        s[r][j][0] += dv[r] * kv.x;
+                        s[r][j][1] += dv[r] * kv.y;
+                        s[r][j][2] += dv[r] * kv.z;
+                        s[r][j][3] += dv[r] * kv.w;
+                    }
                 }
             }
         }
         __syncthreads();
     }
-    if (row_ok) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (!row_ok[r]) continue;
+        float* row_state = state + (static_cast<size_t>(h) * v_dim + i0 + si + kGdnVt * r) * DK;
 #pragma unroll
         for (int j = 0; j < NJ; ++j)
 #pragma unroll
-            for (int e = 0; e < 4; ++e) row_state[dc * 4 + 32 * j + e] = s[j][e];
+            for (int e = 0; e < 4; ++e) row_state[dc * 4 + 32 * j + e] = s[r][j][e];
     }
 }
 
@@ -1147,12 +1439,29 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
 
 VELOX_API int velox_portable_embed(const uint32_t* ids, int count, const uint8_t* w, int format, long long n,
                                    long long k, long long row_begin, float* out) {
-    embed_kernel<<<count, 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+    if (count <= 0) return 0;
+    if (format == VELOX_FMT_Q4 || format == VELOX_FMT_Q5 || format == VELOX_FMT_Q6 || format == VELOX_FMT_Q8) {
+        const int group = format == VELOX_FMT_Q8 ? 32 : 64, high = format == VELOX_FMT_Q5 ? 8 : format == VELOX_FMT_Q6 ? 16 : 0;
+        const long long rg = (k + group - 1) / group;
+        const size_t smem = (rg * 32 + 15) / 16 * 16 + (rg * high + 15) / 16 * 16 + rg * 2;
+        if (smem <= 48 * 1024) {
+            embed_rs_kernel<<<count, 256, smem>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+            return velox_launch_status();
+        }
+    }
+    const unsigned slices = static_cast<unsigned>((k + 255) / 256 < 65535 ? (k + 255) / 256 : 65535);
+    embed_kernel<<<dim3(count, slices), 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
     return velox_launch_status();
 }
 
 VELOX_API int velox_portable_sigmoid_mul(float* x, const float* gate, long long len) {
-    sigmoid_mul_kernel<<<velox_grid_1d(len, 256), 256>>>(x, gate, len);
+    sigmoid_mul_kernel<<<velox_grid_1d(len, 256), 256>>>(x, gate, len, nullptr);
+    return velox_launch_status();
+}
+
+// velox_portable_sigmoid_mul that also writes the result rounded to bf16 into xb.
+VELOX_API int velox_portable_sigmoid_mul_twin(float* x, const float* gate, unsigned short* xb, long long len) {
+    sigmoid_mul_kernel<<<velox_grid_1d(len, 256), 256>>>(x, gate, len, xb);
     return velox_launch_status();
 }
 
@@ -1173,14 +1482,15 @@ VELOX_API int velox_portable_conv1d_silu(const float* x, const float* w, const f
     return velox_launch_status();
 }
 
-// state_in: the state before the call; the updated state goes to `state` (may be the same buffer).
-// pp: null, or device [state_in, state_out] staged by a graph step; staged calls take the per-row
-// kernel, which reads the states through it.
+// state_in: the state before the call; the updated state goes to `state` (may be the same buffer;
+// null: outputs only, per-row kernel). pp: null, or device [state_in, state_out] staged by a graph
+// step; staged calls take the per-row kernel, which reads the states through it.
 VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, const float* a_log,
                                              const float* dt_bias, const float* state_in, float* state, float* out,
                                              int tokens, int k_heads, int v_heads, int k_dim, int v_dim,
                                              const long long* pp) {
-    if (pp == nullptr && tokens >= kGdnChunkMinTokens && (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
+    if (pp == nullptr && state != nullptr && tokens >= kGdnChunkMinTokens &&
+        (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
         if (state_in != state) {
             // The chunked kernel updates in place.
             const size_t n = static_cast<size_t>(v_heads) * v_dim * k_dim;
@@ -1191,11 +1501,18 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
         static VeloxScratch scratch;
         float* prep = static_cast<float*>(scratch.get(static_cast<size_t>(v_heads) * chunks * kGdnPrep * sizeof(float)));
         if (prep == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
-        const dim3 pgrid(v_heads, chunks), grid(v_heads, (v_dim + kGdnVt - 1) / kGdnVt), block(kGdnThreads);
-#define VELOX_GDN_CHUNK(DK)                                                                                         \
-    gated_delta_net_prepare_kernel<DK><<<pgrid, block>>>(qkv, ab, a_log, dt_bias, prep, tokens, k_heads, v_heads,   \
-                                                         v_dim);                                                    \
-    gated_delta_net_chunk_kernel<DK><<<grid, block>>>(qkv, prep, state, out, tokens, k_heads, v_heads, v_dim)
+        // State rows per thread: 4 (64 per block) unless the heads are narrower. Qwen3.8 (48 heads,
+        // 128 x 128), 1024 tokens with the prepare pass: 1381 us at 1, 996 at 2, 805 at 4.
+        const int r = v_dim >= 4 * kGdnVt ? 4 : v_dim >= 2 * kGdnVt ? 2 : 1;
+        const dim3 pgrid(v_heads, chunks), grid(v_heads, (v_dim + kGdnVt * r - 1) / (kGdnVt * r)), block(kGdnThreads);
+#define VELOX_GDN_CHUNK_R(DK, R) \
+    gated_delta_net_chunk_kernel<DK, R><<<grid, block>>>(qkv, prep, state, out, tokens, k_heads, v_heads, v_dim)
+#define VELOX_GDN_CHUNK(DK)                                                                                       \
+    gated_delta_net_prepare_kernel<DK><<<pgrid, block>>>(qkv, ab, a_log, dt_bias, prep, tokens, k_heads, v_heads, \
+                                                         v_dim);                                                  \
+    if (r == 4) VELOX_GDN_CHUNK_R(DK, 4);                                                                         \
+    else if (r == 2) VELOX_GDN_CHUNK_R(DK, 2);                                                                    \
+    else VELOX_GDN_CHUNK_R(DK, 1)
         if (k_dim == 32) {
             VELOX_GDN_CHUNK(32);
         } else if (k_dim == 64) {
@@ -1204,10 +1521,13 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
             VELOX_GDN_CHUNK(128);
         }
 #undef VELOX_GDN_CHUNK
+#undef VELOX_GDN_CHUNK_R
         return velox_launch_status();
     }
-    constexpr int kWarps = 4;
-    const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps), block(kWarps * VELOX_WARP);
+    constexpr int kWarps = kGdnRowsWarps;
+    // Short windows: kGdnRowsPerBlock rows per block (4 lanes each); longer: a warp per row.
+    const int rows_per_block = tokens <= kGdnRowsMaxT ? kGdnRowsPerBlock : kWarps;
+    const dim3 grid(v_heads, (v_dim + rows_per_block - 1) / rows_per_block), block(kWarps * VELOX_WARP);
 #define VELOX_GDN(PER)                                                                                     \
     gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state_in, state, out, tokens, k_heads, \
                                                       v_heads, k_dim, v_dim, pp)
@@ -1239,8 +1559,9 @@ VELOX_API int velox_portable_gdn_replay(const float* const* qkv, const float* co
     }
     const GdnReplayTable& t = host;
     gdn_replay_conv_kernel<<<dim3((channels + 255) / 256, layers), 256>>>(t, tokens, channels, width);
-    constexpr int kWarps = 4;
-    const dim3 grid(v_heads, (v_dim + kWarps - 1) / kWarps, layers), block(kWarps * VELOX_WARP);
+    constexpr int kWarps = kGdnRowsWarps;
+    const int rows_per_block = tokens <= kGdnRowsMaxT ? kGdnRowsPerBlock : kWarps;
+    const dim3 grid(v_heads, (v_dim + rows_per_block - 1) / rows_per_block, layers), block(kWarps * VELOX_WARP);
 #define VELOX_GDN_REPLAY(PER) \
     gdn_replay_rows_kernel<PER><<<grid, block>>>(t, tokens, k_heads, v_heads, k_dim, v_dim)
     if (k_dim <= 32) VELOX_GDN_REPLAY(1);

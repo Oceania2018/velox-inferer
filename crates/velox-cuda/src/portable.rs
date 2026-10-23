@@ -96,6 +96,33 @@ extern "C" {
         out: *mut f32,
     ) -> i32;
     fn velox_portable_sigmoid_mul(x: *mut f32, gate: *const f32, len: i64) -> i32;
+    fn velox_portable_sigmoid_mul_twin(
+        x: *mut f32,
+        gate: *const f32,
+        xb: *mut u16,
+        len: i64,
+    ) -> i32;
+    fn velox_portable_add_rms_norm_twin(
+        acc: *mut f32,
+        x: *const f32,
+        weight: *const f32,
+        y: *mut f32,
+        yb: *mut u16,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
+    fn velox_portable_rms_norm_gated_twin(
+        x: *const f32,
+        weight: *const f32,
+        gate: *mut f32,
+        gb: *mut u16,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
     fn velox_portable_conv1d_silu(
         x: *const f32,
         w: *const f32,
@@ -135,6 +162,7 @@ pub fn format_code(f: WeightFormat) -> i32 {
         WeightFormat::Q5G64 => 5,
         WeightFormat::Q6G64 => 6,
         WeightFormat::Q8G32 => 7,
+        WeightFormat::Iq3Xxs => 8,
     }
 }
 
@@ -335,6 +363,103 @@ pub fn sigmoid_mul(x: &mut CudaBuffer, gate: &CudaBuffer, len: usize) -> Result<
     status(
         unsafe { velox_portable_sigmoid_mul(x.as_mut_ptr(), gate.as_ptr(), len as i64) },
         "portable sigmoid_mul",
+    )
+}
+
+/// A bf16 twin of `n` values packs two per f32 slot.
+fn check_twin(what: &str, twin: &CudaBuffer, n: usize) -> Result<()> {
+    check::elementwise(what, &[twin.len() * 2], n)
+}
+
+/// [`add_rms_norm`] that also writes `y` rounded to bf16 into `yb` (see `Backend::add_rms_norm_twin`).
+#[allow(clippy::too_many_arguments)]
+pub fn add_rms_norm_twin(
+    acc: &mut CudaBuffer,
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    y: &mut CudaBuffer,
+    yb: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    kind: NormKind,
+) -> Result<()> {
+    check::rms_norm(acc.len(), weight.len(), y.len(), rows, dim)?;
+    check::elementwise("add_rms_norm", &[x.len()], rows * dim)?;
+    check_twin("add_rms_norm twin", yb, rows * dim)?;
+    let (rows, dim) = (to_i32("rows", rows)?, to_i32("dim", dim)?);
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_add_rms_norm_twin(
+                acc.as_mut_ptr(),
+                x.as_ptr(),
+                weight.as_ptr(),
+                y.as_mut_ptr(),
+                yb.as_mut_ptr().cast(),
+                rows,
+                dim,
+                eps,
+                i32::from(kind == NormKind::Offset),
+            )
+        },
+        "portable add_rms_norm twin",
+    )
+}
+
+/// [`rms_norm_gated`] that also writes the result rounded to bf16 into `gb`.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gated_twin(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    gate: &mut CudaBuffer,
+    gb: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    kind: NormKind,
+) -> Result<()> {
+    check::rms_norm(x.len(), weight.len(), gate.len(), rows, dim)?;
+    check_twin("rms_norm_gated twin", gb, rows * dim)?;
+    let (rows, dim) = (to_i32("rows", rows)?, to_i32("dim", dim)?);
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_rms_norm_gated_twin(
+                x.as_ptr(),
+                weight.as_ptr(),
+                gate.as_mut_ptr(),
+                gb.as_mut_ptr().cast(),
+                rows,
+                dim,
+                eps,
+                i32::from(kind == NormKind::Offset),
+            )
+        },
+        "portable rms_norm_gated twin",
+    )
+}
+
+/// [`sigmoid_mul`] that also writes the result rounded to bf16 into `xb`.
+pub fn sigmoid_mul_twin(
+    x: &mut CudaBuffer,
+    gate: &CudaBuffer,
+    xb: &mut CudaBuffer,
+    len: usize,
+) -> Result<()> {
+    check::elementwise("sigmoid_mul", &[x.len(), gate.len()], len)?;
+    check_twin("sigmoid_mul twin", xb, len)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_sigmoid_mul_twin(
+                x.as_mut_ptr(),
+                gate.as_ptr(),
+                xb.as_mut_ptr().cast(),
+                len as i64,
+            )
+        },
+        "portable sigmoid_mul twin",
     )
 }
 
@@ -627,6 +752,52 @@ pub fn gated_delta_net(
             )
         },
         "portable gated_delta_net",
+    )
+}
+
+/// [`gated_delta_net`] from `state_in` writing only `out` (no state): the per-row kernel with a null
+/// state target, also through graph staging.
+pub fn gated_delta_net_out(
+    qkv: &CudaBuffer,
+    ab: &CudaBuffer,
+    a_log: &CudaBuffer,
+    dt_bias: &CudaBuffer,
+    state_in: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: GdnShape,
+) -> Result<()> {
+    check::gdn(
+        qkv.len(),
+        ab.len(),
+        a_log.len(),
+        dt_bias.len(),
+        state_in.len(),
+        out.len(),
+        &s,
+    )?;
+    let Some(pp) = graph_params(&[state_in.as_ptr() as i64, 0])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above; a null state is never written.
+    status(
+        unsafe {
+            velox_portable_gated_delta_net(
+                qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                ab.as_ptr().add(s.row0 * 2 * s.v_heads),
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                state_in.as_ptr(),
+                std::ptr::null_mut(),
+                out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
+                to_i32("tokens", s.tokens)?,
+                to_i32("k_heads", s.k_heads)?,
+                to_i32("v_heads", s.v_heads)?,
+                to_i32("k_dim", s.k_dim)?,
+                to_i32("v_dim", s.v_dim)?,
+                pp,
+            )
+        },
+        "portable gated_delta_net_out",
     )
 }
 
@@ -1098,7 +1269,14 @@ pub fn attention_block(
         out.len(),
         &s,
     )?;
-    let Some(params) = graph_params(&[s.pos0 as i64, s.ctx_lo as i64])? else {
+    // Graph steps stage the positions and the context rings: a recording serves any sequence.
+    let Some(params) = graph_params(&[
+        s.pos0 as i64,
+        s.ctx_lo as i64,
+        k_ctx.as_ptr() as i64,
+        v_ctx.as_ptr() as i64,
+    ])?
+    else {
         return Ok(());
     };
     // SAFETY: extents validated above.

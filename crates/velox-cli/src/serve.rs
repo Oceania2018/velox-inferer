@@ -14,6 +14,16 @@ use velox_weights::Artifact;
 use crate::args::Args;
 use crate::select::Selected;
 
+/// "; device in use X GiB" (every process, as nvidia-smi counts), when the backend can tell.
+fn in_use<B: Backend>(b: &B) -> String {
+    b.device_in_use().map_or(String::new(), |used| {
+        format!(
+            "; device in use {:.2} GiB",
+            used as f64 / (1u64 << 30) as f64
+        )
+    })
+}
+
 fn build<B>(b: B, art: &Artifact, a: &Args) -> Result<Box<dyn ChatEngine>>
 where
     B: Backend + Send + Sync + 'static,
@@ -52,17 +62,21 @@ where
         eprint!("\rloading {line}   ")
     })?;
     eprintln!(
-        "\nloaded {:.2} GB to the device and {:.2} GB to system RAM in {:.1}s on {}",
+        "\nloaded {:.2} GB to the device and {:.2} GB to system RAM in {:.1}s on {}{}",
         w.bytes as f64 / 1e9,
         w.host_bytes as f64 / 1e9,
         t0.elapsed().as_secs_f64(),
-        b.describe()
+        b.describe(),
+        in_use(&b)
     );
     let engine_cfg = EngineConfig {
         capacity: a.parse("max-context", 32768)?,
         chunk: a.parse("prefill-chunk", 512)?,
         default_max_tokens: a.parse("default-max-tokens", 4096)?,
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
+        // --force-tool-call on|off (default off): requests that offer tools answer with a tool
+        // call only, as ninfer's tool-call grammar does.
+        force_tool_call: a.get("force-tool-call").is_some_and(|v| v == "on"),
         // --ctx-checkpoints N (ninfer's name): with the host store, superseded history points kept
         // per request chain (default 1, as ninfer is deployed; 0: unbounded); with
         // --ctx-checkpoint-store device, checkpoints per lane (default 8).
@@ -82,6 +96,24 @@ where
         // --kv-paging on|off (default on): lanes' attention caches in virtual memory, backed as
         // they grow, with identical prefix chunks shared between lanes.
         kv_paging: a.get("kv-paging").is_none_or(|v| v != "off"),
+        // --kv-capacity N|auto (ninfer's name; default auto): tokens of attention cache in the pool
+        // the lanes share, created at startup; auto takes what device memory leaves after the
+        // weights, workspaces, graph budget and --vram-headroom-mib.
+        kv_capacity: match a.get("kv-capacity") {
+            None | Some("auto") => None,
+            Some(_) => Some(a.parse("kv-capacity", 0)?),
+        },
+        // --vram-headroom-mib N (default 1024, as ninfer): device memory left free at startup.
+        vram_headroom: a.parse::<usize>("vram-headroom-mib", 1024)? << 20,
+        // --vram-budget-mib N: device memory in use (every process, as nvidia-smi counts) once
+        // started, graph budget included; the attention pool gets the rest. Overrides the headroom.
+        vram_budget: match a.get("vram-budget-mib") {
+            None => None,
+            Some(_) => Some(a.parse::<usize>("vram-budget-mib", 0)? << 20),
+        },
+        // --graph-mib N (default 256): device memory recorded CUDA graphs may hold (a 6-way
+        // stress run of production sessions recorded 129 graphs in 0.15 GB).
+        graph_budget: a.parse::<usize>("graph-mib", 256)? << 20,
         // --ctx-lrfu-lambda F: LRFU decay per request of that store (0: LRU).
         lrfu_lambda: a.parse("ctx-lrfu-lambda", 0.1)?,
         // --disk-context-mib N (default 0: off) and --disk-context-dir DIR: NVMe tier below RAM.
@@ -108,9 +140,10 @@ where
         let t1 = Instant::now();
         let v = Qwen35Vision::load(&b, art, cfg.hidden)?;
         eprintln!(
-            "vision tower loaded ({:.2} GB) in {:.1}s",
+            "vision tower loaded ({:.2} GB) in {:.1}s{}",
             v.bytes as f64 / 1e9,
-            t1.elapsed().as_secs_f64()
+            t1.elapsed().as_secs_f64(),
+            in_use(&b)
         );
         Some(v)
     } else {
@@ -121,10 +154,11 @@ where
         let d = DFlashModel::load(&b, art, cfg.hidden)?;
         if let Some(d) = &d {
             eprintln!(
-                "dflash2 drafter loaded ({:.2} GB, {} drafts per block) in {:.1}s",
+                "dflash2 drafter loaded ({:.2} GB, {} drafts per block) in {:.1}s{}",
                 d.bytes as f64 / 1e9,
                 dflash_drafts,
-                t2.elapsed().as_secs_f64()
+                t2.elapsed().as_secs_f64(),
+                in_use(&b)
             );
         }
         d

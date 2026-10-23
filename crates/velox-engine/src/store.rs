@@ -29,6 +29,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 
+/// The state a new entry stores: copied, or owned (taken over when it already lives in system
+/// RAM, copied and handed back when it is on the device).
+enum Src<'a, B: Backend> {
+    Copy(&'a Checkpoint<B>),
+    Own(Checkpoint<B>),
+}
+
 use velox_core::backend::HostAlloc;
 use velox_core::{Backend, Error as CoreError};
 use velox_models::qwen3_5::{
@@ -408,6 +415,11 @@ impl<B: Backend> ContextStore<B> {
         !self.spare.is_empty()
     }
 
+    /// A pinned state ready for use (a prefill snapshot when every device state is taken).
+    pub fn take_spare_state(&mut self) -> Option<Checkpoint<B>> {
+        self.spare.pop()
+    }
+
     /// Whether an entry (resident or being copied to disk) holds exactly `keys`.
     pub fn holds(&self, keys: &[u32]) -> bool {
         self.entries
@@ -555,12 +567,70 @@ impl<B: Backend> ContextStore<B> {
         chain: Option<u64>,
         drafter: Option<(&DFlashModel<B>, &DFlashState<B>)>,
     ) -> Result<u64, CoreError> {
-        let pos = cp.pos;
+        self.insert_from(
+            b,
+            session,
+            keys,
+            Src::Copy(cp),
+            root,
+            chain,
+            drafter,
+            &mut None,
+        )
+    }
+
+    /// [`Self::insert`] that owns `cp`: storage already in system RAM (a prefill snapshot written
+    /// straight there) becomes the entry's without a copy or new pinned memory; a device
+    /// checkpoint is copied and handed back, as is `cp` when the store already holds its keys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_owned(
+        &mut self,
+        b: &B,
+        session: &Session<B>,
+        keys: &[u32],
+        cp: Checkpoint<B>,
+        root: bool,
+        chain: Option<u64>,
+        drafter: Option<(&DFlashModel<B>, &DFlashState<B>)>,
+    ) -> Result<(u64, Option<Checkpoint<B>>), CoreError> {
+        let mut back = None;
+        let id = self.insert_from(
+            b,
+            session,
+            keys,
+            Src::Own(cp),
+            root,
+            chain,
+            drafter,
+            &mut back,
+        )?;
+        Ok((id, back))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_from(
+        &mut self,
+        b: &B,
+        session: &Session<B>,
+        keys: &[u32],
+        cp: Src<'_, B>,
+        root: bool,
+        chain: Option<u64>,
+        drafter: Option<(&DFlashModel<B>, &DFlashState<B>)>,
+        back: &mut Option<Checkpoint<B>>,
+    ) -> Result<u64, CoreError> {
+        let pos = match &cp {
+            Src::Copy(c) => c.pos,
+            Src::Own(c) => c.pos,
+        };
         let keys = &keys[..pos];
         let (lambda, now) = (self.lambda, self.now);
         if let Some(e) = self.entries.iter_mut().find(|e| e.keys == keys) {
             Self::reference(lambda, now, e);
             e.root |= root;
+            if let Src::Own(c) = cp {
+                *back = Some(c);
+            }
             return Ok(e.id);
         }
         let debug = std::env::var_os("VELOX_DEBUG_PREFIX").is_some();
@@ -610,12 +680,29 @@ impl<B: Backend> ContextStore<B> {
             None => None,
         };
         let t_draft = t0.elapsed();
-        let spare = !self.spare.is_empty();
-        let mut state = match self.spare.pop() {
-            Some(s) => s,
-            None => session.blank_checkpoint_in(b, pos, true)?,
+        let mut how = "taken";
+        let state = match cp {
+            Src::Own(c) if c.on_host() => c,
+            cp => {
+                how = if self.spare.is_empty() {
+                    "pinned"
+                } else {
+                    "reused"
+                };
+                let mut state = match self.spare.pop() {
+                    Some(s) => s,
+                    None => session.blank_checkpoint_in(b, pos, true)?,
+                };
+                match cp {
+                    Src::Copy(c) => c.copy_into(b, &mut state)?,
+                    Src::Own(c) => {
+                        c.copy_into(b, &mut state)?;
+                        *back = Some(c);
+                    }
+                }
+                state
+            }
         };
-        cp.copy_into(b, &mut state)?;
         let t_state = t0.elapsed();
         let id = self.next_id;
         self.next_id += 1;
@@ -654,7 +741,7 @@ impl<B: Backend> ContextStore<B> {
                 ms(t_kv),
                 ms(t_draft - t_kv),
                 ms(t_state - t_draft),
-                if spare { "reused" } else { "pinned" },
+                how,
                 ms(t0.elapsed() - t_state)
             );
         }

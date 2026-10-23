@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use velox_core::backend::{
     ActQuant, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind, RopePosShape,
-    RopeShape, WeightView,
+    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, LinearDst, NormKind,
+    RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{DeviceProfile, Op, Result};
 
@@ -106,6 +106,15 @@ impl<B: Backend> Backend for Profiled<B> {
     fn unmap_chunk(&self, buf: &mut B::Buffer, index: usize) -> Result<()> {
         self.inner.unmap_chunk(buf, index)
     }
+    fn mem_info(&self) -> Option<(usize, usize)> {
+        self.inner.mem_info()
+    }
+    fn device_in_use(&self) -> Option<usize> {
+        self.inner.device_in_use()
+    }
+    fn device_allocs(&self) -> Option<(usize, usize, usize)> {
+        self.inner.device_allocs()
+    }
     fn upload_bytes_host(&self, data: &[u8]) -> Result<B::Buffer> {
         self.inner.upload_bytes_host(data)
     }
@@ -155,6 +164,132 @@ impl<B: Backend> Backend for Profiled<B> {
     }
     fn linear_act(&self, w: &WeightView<'_, B::Buffer>, m: usize) -> ActQuant {
         self.inner.linear_act(w, m)
+    }
+    fn linears(
+        &self,
+        x: &B::Buffer,
+        xb: Option<&B::Buffer>,
+        dsts: &mut [LinearDst<'_, '_, '_, B::Buffer>],
+        scratch: &mut B::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        self.time("linears", || self.inner.linears(x, xb, dsts, scratch, m))
+    }
+    fn bf16_twins(&self) -> bool {
+        self.inner.bf16_twins()
+    }
+    fn add_rms_norm_twin(
+        &self,
+        acc: &mut B::Buffer,
+        x: &B::Buffer,
+        weight: &B::Buffer,
+        y: &mut B::Buffer,
+        yb: &mut B::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        self.time("add_rms_norm", || {
+            self.inner
+                .add_rms_norm_twin(acc, x, weight, y, yb, rows, dim, eps, kind)
+        })
+    }
+    fn rms_norm_gated_twin(
+        &self,
+        x: &B::Buffer,
+        weight: &B::Buffer,
+        gate: &mut B::Buffer,
+        gb: &mut B::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        self.time("rms_norm_gated", || {
+            self.inner
+                .rms_norm_gated_twin(x, weight, gate, gb, rows, dim, eps, kind)
+        })
+    }
+    fn sigmoid_mul_twin(
+        &self,
+        x: &mut B::Buffer,
+        gate: &B::Buffer,
+        xb: &mut B::Buffer,
+        len: usize,
+    ) -> Result<()> {
+        self.time("sigmoid_mul", || {
+            self.inner.sigmoid_mul_twin(x, gate, xb, len)
+        })
+    }
+    fn takes_bf16(&self, w: &WeightView<'_, B::Buffer>, m: usize) -> bool {
+        self.inner.takes_bf16(w, m)
+    }
+    fn linear_bf16(
+        &self,
+        xb: &B::Buffer,
+        w: &WeightView<'_, B::Buffer>,
+        y: &mut B::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        let name = format!("linear {} bf16 in", w.format.name());
+        self.time(&name, || self.inner.linear_bf16(xb, w, y, m))
+    }
+    fn swiglu_twin(
+        &self,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        m: usize,
+    ) -> bool {
+        self.inner.swiglu_twin(gate, up, m)
+    }
+    fn linear_swiglu_twin(
+        &self,
+        xb: &B::Buffer,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        out: &mut B::Buffer,
+        outb: &mut B::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        let name = format!("linear_swiglu {} twin", gate.format.name());
+        self.time(&name, || {
+            self.inner.linear_swiglu_twin(xb, gate, up, out, outb, m)
+        })
+    }
+    fn linear_swiglu(
+        &self,
+        x: &B::Buffer,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        out: &mut B::Buffer,
+        m: usize,
+        scratch: &mut B::Buffer,
+    ) -> Result<()> {
+        let name = format!(
+            "linear_swiglu {} {}",
+            gate.format.name(),
+            if m == 1 { "m=1" } else { "m>1" }
+        );
+        self.time(&name, || {
+            self.inner.linear_swiglu(x, gate, up, out, m, scratch)
+        })
+    }
+    fn linear_swiglu_act(
+        &self,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        m: usize,
+    ) -> ActQuant {
+        self.inner.linear_swiglu_act(gate, up, m)
+    }
+    fn fuses_swiglu(
+        &self,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        m: usize,
+    ) -> bool {
+        self.inner.fuses_swiglu(gate, up, m)
     }
     fn embed(
         &self,

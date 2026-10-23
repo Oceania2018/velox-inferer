@@ -32,6 +32,62 @@ VELOX_API int velox_cuda_mem_info(size_t* free_bytes, size_t* total_bytes) {
     return static_cast<int>(cudaMemGetInfo(free_bytes, total_bytes));
 }
 
+// Device memory in use as nvidia-smi reports it (NVML, loaded at run time: no link dependency).
+// Under WDDM cudaMemGetInfo also counts ~1 GiB the driver reserves, which nvidia-smi leaves out;
+// budgets people set are in nvidia-smi's terms.
+#ifdef _WIN32
+VELOX_API int velox_nvml_used(size_t*, size_t*) { return VELOX_ERR_UNSUPPORTED; }
+#else
+#include <dlfcn.h>
+namespace {
+struct NvmlMemoryV1 {
+    unsigned long long total, free, used;
+};
+struct NvmlMemoryV2 {
+    unsigned int version;
+    unsigned long long total, reserved, free, used;
+};
+using NvmlInit = int (*)();
+using NvmlByPci = int (*)(const char*, void**);
+using NvmlMemory = int (*)(void*, void*);
+}  // namespace
+
+VELOX_API int velox_nvml_used(size_t* used, size_t* total) {
+    static void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (lib == nullptr) return VELOX_ERR_UNSUPPORTED;
+    static const auto init = reinterpret_cast<NvmlInit>(dlsym(lib, "nvmlInit_v2"));
+    static const auto by_pci = reinterpret_cast<NvmlByPci>(dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2"));
+    static const auto mem_v2 = reinterpret_cast<NvmlMemory>(dlsym(lib, "nvmlDeviceGetMemoryInfo_v2"));
+    static const auto mem_v1 = reinterpret_cast<NvmlMemory>(dlsym(lib, "nvmlDeviceGetMemoryInfo"));
+    static const int inited = init != nullptr ? init() : -1;
+    if (inited != 0 || by_pci == nullptr) return VELOX_ERR_UNSUPPORTED;
+    int dev = 0;
+    char bus[32] = {0};
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetPCIBusId(bus, sizeof bus, dev) != cudaSuccess)
+        return VELOX_ERR_UNSUPPORTED;
+    void* handle = nullptr;
+    if (by_pci(bus, &handle) != 0) return VELOX_ERR_UNSUPPORTED;
+    if (mem_v2 != nullptr) {
+        NvmlMemoryV2 m{};
+        m.version = static_cast<unsigned int>(sizeof(NvmlMemoryV2)) | (2u << 24);
+        if (mem_v2(handle, &m) == 0) {
+            *used = m.used;
+            *total = m.total;
+            return 0;
+        }
+    }
+    if (mem_v1 != nullptr) {
+        NvmlMemoryV1 m{};
+        if (mem_v1(handle, &m) == 0) {
+            *used = m.used;
+            *total = m.total;
+            return 0;
+        }
+    }
+    return VELOX_ERR_UNSUPPORTED;
+}
+#endif
+
 // Brackets the region an external profiler (ncu --profile-from-start off) collects.
 VELOX_API int velox_cuda_profiler(int on) {
     return static_cast<int>(on ? cudaProfilerStart() : cudaProfilerStop());
@@ -227,8 +283,10 @@ struct GraphSlot {
     unsigned char* dev = nullptr;
     cudaEvent_t done = nullptr;     // recorded after each launch
     bool launched = false;
+    size_t bytes = 0;               // device memory its executable graph took (measured)
 };
 std::vector<GraphSlot> g_slots(kGraphSlots);
+size_t g_graph_bytes = 0;  // sum of the slots' bytes
 int g_region = -1;  // slot whose region stage() fills, -1 outside graphs
 size_t g_region_off = 0;
 
@@ -406,11 +464,21 @@ VELOX_API int velox_cuda_graph_end_launch(int slot) {
         }
     }
     if (exec == nullptr) {
+        // Executable graphs take device memory the caller budgets (velox_cuda_graph_bytes): the
+        // free-memory drop across instantiation is this graph's share (driver pages, so coarse).
+        GraphSlot& s = g_slots[slot];
+        g_graph_bytes -= s.bytes;
+        s.bytes = 0;
+        size_t before = 0, after = 0, total = 0;
+        cudaMemGetInfo(&before, &total);
         if (cudaError_t e = cudaGraphInstantiate(&exec, g, 0)) {
             cudaGraphDestroy(g);
             exec = nullptr;
             return static_cast<int>(e);
         }
+        cudaMemGetInfo(&after, &total);
+        s.bytes = before > after ? before - after : 0;
+        g_graph_bytes += s.bytes;
     }
     cudaGraphDestroy(g);
     return launch_slot(slot);
@@ -422,6 +490,31 @@ VELOX_API int velox_cuda_graph_replay_launch(int slot) {
     std::lock_guard<std::mutex> lock(g_stage.mu);
     g_region = -1;
     return launch_slot(slot);
+}
+
+// Releases slot `slot`'s executable graph (after its last launch completes); its staging region
+// stays for the slot's next capture.
+VELOX_API int velox_cuda_graph_release(int slot) {
+    if (slot < 0 || slot >= kGraphSlots) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    GraphSlot& s = g_slots[slot];
+    if (s.launched) {
+        if (cudaError_t e = cudaEventSynchronize(s.done)) return static_cast<int>(e);
+        s.launched = false;
+    }
+    if (s.exec != nullptr) {
+        if (cudaError_t e = cudaGraphExecDestroy(s.exec)) return static_cast<int>(e);
+        s.exec = nullptr;
+    }
+    g_graph_bytes -= s.bytes;
+    s.bytes = 0;
+    return 0;
+}
+
+// Device bytes the slots' executable graphs hold.
+VELOX_API size_t velox_cuda_graph_bytes() {
+    std::lock_guard<std::mutex> lock(g_stage.mu);
+    return g_graph_bytes;
 }
 
 // Ends a capture or replay whose host code failed, discarding a capture.
