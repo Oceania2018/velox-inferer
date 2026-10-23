@@ -28,6 +28,7 @@ use super::{Qwen35Text, Workspace};
 /// Graph keys (`Backend::graph`) of drafting steps; low bits carry the shape.
 const GRAPH_CONTEXT: u64 = 8 << 16;
 const GRAPH_BLOCK: u64 = 9 << 16;
+const GRAPH_BLOCK_BATCH: u64 = 10 << 16;
 
 static NEXT_DRAFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -873,110 +874,121 @@ impl<B: Backend> DFlashModel<B> {
         };
         let (qd, kvd) = (c.q_dim(), c.kv_dim());
         let k = drafts;
-        b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
-        for (li, l) in self.layers.iter().enumerate() {
-            // Attention branch.
-            self.prepare(b, dw, l.input_norm, &l.attn_conv, rows, w)?;
-            b.linear(&dw.prep, &self.view(&l.qkv), &mut dw.qkv, rows)?;
-            b.split_cols(
-                &dw.qkv,
-                rows,
-                qd + 2 * kvd,
-                &mut [
-                    (&mut dw.q, 0, qd),
-                    (&mut dw.k, qd, kvd),
-                    (&mut dw.v, qd + kvd, kvd),
-                ],
-            )?;
-            b.rms_norm(
-                &dw.q,
-                &self.params[l.q_norm],
-                &mut dw.qn,
-                rows * c.heads,
-                c.head_dim,
-                c.eps,
-                NormKind::Plain,
-            )?;
-            b.rms_norm(
-                &dw.k,
-                &self.params[l.k_norm],
-                &mut dw.bkn,
-                rows * c.kv_heads,
-                c.head_dim,
-                c.eps,
-                NormKind::Plain,
-            )?;
-            for (i, st) in states.iter().enumerate() {
-                // Sequence i's block rows, staged for its rotation and context.
-                let r = i * w;
-                b.copy(&dw.qn, r * qd, &mut dw.sq, 0, w * qd)?;
-                b.copy(&dw.bkn, r * kvd, &mut dw.sk, 0, w * kvd)?;
-                b.copy(&dw.v, r * kvd, &mut dw.sv, 0, w * kvd)?;
-                let rope = |heads| RopeShape {
-                    tokens: w,
-                    heads,
-                    head_dim: c.head_dim,
-                    rotary_dim: c.head_dim,
-                    pos0: st.end,
-                    theta: c.theta,
-                };
-                b.rope(&mut dw.sq, rope(c.heads))?;
-                b.rope(&mut dw.sk, rope(c.kv_heads))?;
-                b.attention_block(
-                    &dw.sq,
-                    &st.k[li],
-                    &st.v[li],
-                    &dw.sk,
-                    &dw.sv,
-                    &mut dw.sattn,
-                    BlockAttnShape {
-                        tokens: w,
-                        heads: c.heads,
-                        kv_heads: c.kv_heads,
-                        head_dim: c.head_dim,
-                        pos0: st.end,
-                        ctx_lo: st.lo,
-                        window: c.window,
-                        ring: c.window,
-                    },
+        // The block forward is one recorded step per batch size and width. Static: positions and
+        // every sequence's context rings are staged, so the recording serves whatever sequences
+        // the batch holds; block attention spans a full window of grid.
+        let key = GRAPH_BLOCK_BATCH
+            | w as u64
+            | (n as u64) << 8
+            | (dw.id.wrapping_mul(97) & 0xffff) << 40
+            | GRAPH_STATIC;
+        b.graph(key, &mut || {
+            b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
+            for (li, l) in self.layers.iter().enumerate() {
+                // Attention branch.
+                self.prepare(b, dw, l.input_norm, &l.attn_conv, rows, w)?;
+                b.linear(&dw.prep, &self.view(&l.qkv), &mut dw.qkv, rows)?;
+                b.split_cols(
+                    &dw.qkv,
+                    rows,
+                    qd + 2 * kvd,
+                    &mut [
+                        (&mut dw.q, 0, qd),
+                        (&mut dw.k, qd, kvd),
+                        (&mut dw.v, qd + kvd, kvd),
+                    ],
                 )?;
-                b.copy(&dw.sattn, 0, &mut dw.attn, r * qd, w * qd)?;
-            }
-            b.linear(&dw.attn, &self.view(&l.output), &mut dw.z, rows)?;
-            self.finish(b, dw, &l.attn_conv, rows, w)?;
-            // MLP branch.
-            self.prepare(b, dw, l.post_norm, &l.mlp_conv, rows, w)?;
-            match &l.gate_up {
-                Some(f) => {
-                    b.linear(&dw.prep, &self.view(f), &mut dw.gu, rows)?;
-                    let (g, u) = (l.gate.row_begin - f.row_begin, l.up.row_begin - f.row_begin);
-                    b.swiglu(&dw.gu, rows, f.rows, g, u, c.intermediate, &mut dw.mg)?;
+                b.rms_norm(
+                    &dw.q,
+                    &self.params[l.q_norm],
+                    &mut dw.qn,
+                    rows * c.heads,
+                    c.head_dim,
+                    c.eps,
+                    NormKind::Plain,
+                )?;
+                b.rms_norm(
+                    &dw.k,
+                    &self.params[l.k_norm],
+                    &mut dw.bkn,
+                    rows * c.kv_heads,
+                    c.head_dim,
+                    c.eps,
+                    NormKind::Plain,
+                )?;
+                for (i, st) in states.iter().enumerate() {
+                    // Sequence i's block rows, staged for its rotation and context.
+                    let r = i * w;
+                    b.copy(&dw.qn, r * qd, &mut dw.sq, 0, w * qd)?;
+                    b.copy(&dw.bkn, r * kvd, &mut dw.sk, 0, w * kvd)?;
+                    b.copy(&dw.v, r * kvd, &mut dw.sv, 0, w * kvd)?;
+                    let rope = |heads| RopeShape {
+                        tokens: w,
+                        heads,
+                        head_dim: c.head_dim,
+                        rotary_dim: c.head_dim,
+                        pos0: st.end,
+                        theta: c.theta,
+                    };
+                    b.rope(&mut dw.sq, rope(c.heads))?;
+                    b.rope(&mut dw.sk, rope(c.kv_heads))?;
+                    b.attention_block(
+                        &dw.sq,
+                        &st.k[li],
+                        &st.v[li],
+                        &dw.sk,
+                        &dw.sv,
+                        &mut dw.sattn,
+                        BlockAttnShape {
+                            tokens: w,
+                            heads: c.heads,
+                            kv_heads: c.kv_heads,
+                            head_dim: c.head_dim,
+                            pos0: st.end,
+                            ctx_lo: st.lo,
+                            window: c.window,
+                            ring: c.window,
+                        },
+                    )?;
+                    b.copy(&dw.sattn, 0, &mut dw.attn, r * qd, w * qd)?;
                 }
-                None => {
-                    b.linear(&dw.prep, &self.view(&l.gate), &mut dw.mg, rows)?;
-                    b.linear(&dw.prep, &self.view(&l.up), &mut dw.mu, rows)?;
-                    b.silu_mul(&mut dw.mg, &dw.mu, rows * c.intermediate)?;
+                b.linear(&dw.attn, &self.view(&l.output), &mut dw.z, rows)?;
+                self.finish(b, dw, &l.attn_conv, rows, w)?;
+                // MLP branch.
+                self.prepare(b, dw, l.post_norm, &l.mlp_conv, rows, w)?;
+                match &l.gate_up {
+                    Some(f) => {
+                        b.linear(&dw.prep, &self.view(f), &mut dw.gu, rows)?;
+                        let (g, u) = (l.gate.row_begin - f.row_begin, l.up.row_begin - f.row_begin);
+                        b.swiglu(&dw.gu, rows, f.rows, g, u, c.intermediate, &mut dw.mg)?;
+                    }
+                    None => {
+                        b.linear(&dw.prep, &self.view(&l.gate), &mut dw.mg, rows)?;
+                        b.linear(&dw.prep, &self.view(&l.up), &mut dw.mu, rows)?;
+                        b.silu_mul(&mut dw.mg, &dw.mu, rows * c.intermediate)?;
+                    }
                 }
+                b.linear(&dw.mg, &self.view(&l.down), &mut dw.z, rows)?;
+                self.finish(b, dw, &l.mlp_conv, rows, w)?;
             }
-            b.linear(&dw.mg, &self.view(&l.down), &mut dw.z, rows)?;
-            self.finish(b, dw, &l.mlp_conv, rows, w)?;
-        }
-        // Mask columns 1 .. w of every block: final norm, proposal head, unary top-k, selector.
-        for i in 0..n {
-            b.copy(&dw.x, (i * w + 1) * h, &mut dw.tail, i * k * h, k * h)?;
-        }
+            // Mask columns 1 .. w of every block: final norm, proposal head, unary top-k, selector.
+            for i in 0..n {
+                b.copy(&dw.x, (i * w + 1) * h, &mut dw.tail, i * k * h, k * h)?;
+            }
+            let m = n * k;
+            b.rms_norm(
+                &dw.tail,
+                &self.params[self.final_norm],
+                &mut dw.hid,
+                m,
+                h,
+                c.eps,
+                NormKind::Plain,
+            )?;
+            b.linear(&dw.hid, &head, &mut dw.logits, m)?;
+            b.linear(&dw.hid, &self.view(&self.hidden_projection), &mut dw.g, m)
+        })?;
         let m = n * k;
-        b.rms_norm(
-            &dw.tail,
-            &self.params[self.final_norm],
-            &mut dw.hid,
-            m,
-            h,
-            c.eps,
-            NormKind::Plain,
-        )?;
-        b.linear(&dw.hid, &head, &mut dw.logits, m)?;
-        b.linear(&dw.hid, &self.view(&self.hidden_projection), &mut dw.g, m)?;
         let nh = head.rows;
         let fetch = c.top_k + if map.is_some() { 8 } else { 0 };
         let all = b.top_k(
