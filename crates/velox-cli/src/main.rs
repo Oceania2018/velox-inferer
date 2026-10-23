@@ -53,9 +53,11 @@ COMMANDS:
       --tokens <list>       token counts, comma separated (default 1,8,64,512)
       --iters <n>           timed iterations (default 50)
   bench-attn              Time causal attention over a KV cache in each storage format
-  bench-verify            Time batched speculative verify rounds against one sequence at a time
       --heads <n> --kv-heads <n> --head-dim <n>  default 24/4, 256 (Qwen3.8)
       --pos0 <n> (16384) --tokens <list> (1,8,16) --kv-format <list> (f32,bf16,fp8,nvfp4) --iters <n> (50)
+  bench-verify            Time batched speculative verify rounds against one sequence at a time
+      --artifact <path> --batch <n> (3) --window <n> (12) --context <n> (13000) --rounds <n> (40)
+      [--keep <n>] [--kv-format nvfp4] [--prefill <n>] (mixed rounds) [--only batched]
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
