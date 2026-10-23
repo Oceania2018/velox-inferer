@@ -69,6 +69,20 @@ fn models_health_metrics() {
         "{metrics}"
     );
     assert!(metrics.contains("variant=\"generic\""));
+    assert!(metrics.lines().any(|l| l == "velox_prompt_tokens_total 0"));
+    let chat = r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#;
+    for _ in 0..2 {
+        assert_eq!(http(port, "POST", "/v1/chat/completions", chat).0, 200);
+    }
+    let (_, metrics) = http(port, "GET", "/metrics", "");
+    assert!(
+        metrics.lines().any(|l| l == "velox_prompt_tokens_total 200"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.lines().any(|l| l == "velox_prompt_tokens_cached_total 120"),
+        "{metrics}"
+    );
     // The daemon's System One probe must read "unsupported".
     assert_eq!(http(port, "POST", "/v1/systemone", "{}").0, 404);
 }
