@@ -427,6 +427,7 @@ struct Job {
     sampler: Sampler,
     max_tokens: usize,
     reply: mpsc::Sender<Result<Done, ApiError>>,
+    queued: Instant,
 }
 
 /// What the worker hands back for a finished request.
@@ -434,8 +435,10 @@ struct Done {
     out: Vec<u32>,
     finish: &'static str,
     start: usize,
+    queue_ms: f64,
     prompt_ms: f64,
     predicted_ms: f64,
+    first_token: Instant,
 }
 
 /// A request's prompt still being fed to its lane.
@@ -484,7 +487,10 @@ struct Active<B: Backend> {
     c: u32,
     finish: Option<&'static str>,
     start: usize,
+    /// From hand-off to admission onto the lane.
+    queue_ms: f64,
     prompt_ms: f64,
+    /// When the first token was sampled.
     t1: Instant,
     /// MTP: cache row of the previous verify and its kept drafts (see `MtpDrafter::draft`).
     mtp_row0: usize,
@@ -1208,6 +1214,7 @@ impl<B: Backend> Core<B> {
                 t0.elapsed().as_secs_f64() * 1e3
             );
         }
+        let queue_ms = t0.duration_since(job.queued).as_secs_f64() * 1e3;
         match r {
             Ok(pre) => Ok(Active {
                 job,
@@ -1216,6 +1223,7 @@ impl<B: Backend> Core<B> {
                 c: 0,
                 finish: None,
                 start: pre.start,
+                queue_ms,
                 prompt_ms: 0.0,
                 t1: Instant::now(),
                 mtp_row0: 0,
@@ -1370,8 +1378,10 @@ impl<B: Backend> Core<B> {
             out: a.out,
             finish: a.finish.unwrap_or("length"),
             start: a.start,
+            queue_ms: a.queue_ms,
             prompt_ms: a.prompt_ms,
             predicted_ms,
+            first_token: a.t1,
         }));
     }
 
@@ -2332,6 +2342,7 @@ where
                 sampler,
                 max_tokens,
                 reply: tx,
+                queued: Instant::now(),
             });
         }
         self.queue.cv.notify_one();
@@ -2359,8 +2370,10 @@ where
             prompt_tokens,
             cached_tokens: done.start as u64,
             completion_tokens: done.out.len() as u64,
+            queue_ms: done.queue_ms,
             prompt_ms: done.prompt_ms,
             predicted_ms: done.predicted_ms,
+            first_token: Some(done.first_token),
         })
     }
 }

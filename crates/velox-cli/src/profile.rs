@@ -169,11 +169,14 @@ impl<B: Backend> Backend for Profiled<B> {
         &self,
         x: &B::Buffer,
         xb: Option<&B::Buffer>,
+        xq: Option<(&B::Buffer, u32)>,
         dsts: &mut [LinearDst<'_, '_, '_, B::Buffer>],
         scratch: &mut B::Buffer,
         m: usize,
     ) -> Result<()> {
-        self.time("linears", || self.inner.linears(x, xb, dsts, scratch, m))
+        self.time("linears", || {
+            self.inner.linears(x, xb, xq, dsts, scratch, m)
+        })
     }
     fn bf16_twins(&self) -> bool {
         self.inner.bf16_twins()
@@ -220,6 +223,55 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> Result<()> {
         self.time("sigmoid_mul", || {
             self.inner.sigmoid_mul_twin(x, gate, xb, len)
+        })
+    }
+    fn int8_twin_layout(&self, w: &WeightView<'_, B::Buffer>, m: usize) -> Option<u32> {
+        self.inner.int8_twin_layout(w, m)
+    }
+    fn int8_twin_slots(&self, m: usize, k: usize, layout: u32) -> usize {
+        self.inner.int8_twin_slots(m, k, layout)
+    }
+    fn add_rms_norm_q8(
+        &self,
+        acc: &mut B::Buffer,
+        x: &B::Buffer,
+        weight: &B::Buffer,
+        y: &mut B::Buffer,
+        yq: &mut B::Buffer,
+        layout: u32,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        self.time("add_rms_norm", || {
+            self.inner
+                .add_rms_norm_q8(acc, x, weight, y, yq, layout, rows, dim, eps, kind)
+        })
+    }
+    fn linear_q8(
+        &self,
+        xq: &B::Buffer,
+        layout: u32,
+        w: &WeightView<'_, B::Buffer>,
+        y: &mut B::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        let name = format!("linear {} q8 twin", w.format.name());
+        self.time(&name, || self.inner.linear_q8(xq, layout, w, y, m))
+    }
+    fn linear_swiglu_q8(
+        &self,
+        xq: &B::Buffer,
+        layout: u32,
+        gate: &WeightView<'_, B::Buffer>,
+        up: &WeightView<'_, B::Buffer>,
+        out: &mut B::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        let name = format!("linear_swiglu {} q8 twin", gate.format.name());
+        self.time(&name, || {
+            self.inner.linear_swiglu_q8(xq, layout, gate, up, out, m)
         })
     }
     fn takes_bf16(&self, w: &WeightView<'_, B::Buffer>, m: usize) -> bool {
@@ -298,6 +350,35 @@ impl<B: Backend> Backend for Profiled<B> {
         out: &mut B::Buffer,
     ) -> Result<()> {
         self.time("embed", || self.inner.embed(ids, table, out))
+    }
+    fn embed_from(
+        &self,
+        ids: &B::Buffer,
+        offset: usize,
+        count: usize,
+        table: &WeightView<'_, B::Buffer>,
+        out: &mut B::Buffer,
+    ) -> Result<()> {
+        self.time("embed_from", || {
+            self.inner.embed_from(ids, offset, count, table, out)
+        })
+    }
+    fn argmax_to(
+        &self,
+        x: &B::Buffer,
+        limit: usize,
+        dst: &mut B::Buffer,
+        dst_offset: usize,
+    ) -> Result<()> {
+        self.time("argmax_to", || {
+            self.inner.argmax_to(x, limit, dst, dst_offset)
+        })
+    }
+    fn fetch_u32_begin(&self, src: &B::Buffer, offset: usize, slot: usize) -> Result<()> {
+        self.inner.fetch_u32_begin(src, offset, slot)
+    }
+    fn fetch_u32(&self, src: &B::Buffer, offset: usize, slot: usize) -> Result<u32> {
+        self.inner.fetch_u32(src, offset, slot)
     }
     fn rms_norm(
         &self,
