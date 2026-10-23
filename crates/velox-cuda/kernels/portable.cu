@@ -693,10 +693,13 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
                                int split_keys,
                                const long long* __restrict__ params) {
     if (params != nullptr) {
-        // Staged by a graph step: the block's position and context start (window-clamped here).
+        // Staged by a graph step: the block's position, context start (window-clamped here) and
+        // context rings, so one recording serves any sequence.
         pos0 = params[0];
         start0 = pos0 + 1 - window;
         if (start0 < params[1]) start0 = params[1];
+        k_ctx = reinterpret_cast<const float*>(params[2]);
+        v_ctx = reinterpret_cast<const float*>(params[3]);
     }
     extern __shared__ float gqa_smem[];
     float* ks = gqa_smem;
@@ -855,7 +858,7 @@ VELOX_API int velox_portable_attention_block(const float* q, const float* k_ctx,
                                              int window, int ring, const long long* params) {
     if (tokens > 65535 || head_dim > 256) return VELOX_ERR_UNSUPPORTED;
     const bool gqa = tokens <= 16 && head_dim % 32 == 0 && heads % kv_heads == 0 && heads / kv_heads > 1;
-    // params: null, or device [pos0, ctx_lo] staged by a graph step (GQA path only).
+    // params: null, or device [pos0, ctx_lo, k_ctx, v_ctx] staged by a graph step (GQA path only).
     if (params != nullptr && !gqa) return VELOX_ERR_UNSUPPORTED;
     // Draft blocks: share each K/V tile across the group's query heads and the block's tokens.
     if (gqa) {

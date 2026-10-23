@@ -53,6 +53,10 @@ pub struct EngineConfig {
     pub default_max_tokens: usize,
     /// Default for `chat_template_kwargs.enable_thinking` (ninfer `--no-thinking` = false).
     pub enable_thinking: bool,
+    /// A request that offers tools answers with a tool call only: the prompt ends in the opening
+    /// `<tool_call>` tag, so the model skips the sentence it would otherwise write first (ninfer's
+    /// tool-call grammar constraint has the same effect; the agent reads the call's own `why`).
+    pub force_tool_call: bool,
     /// Recurrent-state checkpoints kept per lane for prefix reuse (device checkpoints).
     pub max_checkpoints: usize,
     /// Superseded history points the context store keeps per request chain for retries and
@@ -149,6 +153,10 @@ const DEVICE_SPARE: usize = 2;
 /// [`DEVICE_SPARE`], each at most one per lane (`budget_memory`). A prefill snapshot finding none
 /// free takes pinned host storage instead; allocating them per prefill took ~1.4 GB for seconds
 /// when six fresh prompts started together.
+
+/// Opening tag of a Qwen tool call, as the chat template writes it (see
+/// `EngineConfig::force_tool_call`).
+const TOOL_CALL_OPEN: &str = "<tool_call>\n";
 
 /// Lanes whose chain head stays in device memory (the most recently admitted); other heads move
 /// to the context store, from where their next request restores them (~5 ms over PCIe).
@@ -870,7 +878,19 @@ impl<B: Backend> Core<B> {
                 (lane.drafter.as_mut(), self.dflash.as_ref(), dw.as_mut())
             {
                 d.drafts = d.long_block();
-                d.draft(b, dm, dw, model, ws, 0, 0, lane.session.pos, 0, limit, 0.0)?;
+                d.draft(
+                    b,
+                    dm,
+                    dw,
+                    model,
+                    ws,
+                    0,
+                    0,
+                    lane.session.pos,
+                    0,
+                    limit,
+                    &Sampler::greedy(),
+                )?;
             }
         }
         if let Some(bw) = bw.as_mut() {
@@ -1176,6 +1196,18 @@ impl<B: Backend> Core<B> {
         })();
         trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
+        if debug {
+            // Admission runs on the engine thread between rounds; with VELOX_DEBUG_BATCH its GPU
+            // work (state restore, vision encode) is waited for so the time is the whole cost.
+            if std::env::var_os("VELOX_DEBUG_BATCH").is_some() {
+                let _ = self.b.synchronize();
+            }
+            eprintln!(
+                "[admit] lane {li} from {} in {:.1} ms",
+                r.as_ref().map_or(0, |pre| pre.start),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         match r {
             Ok(pre) => Ok(Active {
                 job,
@@ -1463,7 +1495,7 @@ impl<B: Backend> Core<B> {
                 lane.session.pos,
                 a.c,
                 self.fe.public_vocab,
-                a.job.sampler.temperature(),
+                &a.job.sampler,
             )
             .map_err(core)?;
         // `whole`: keep drafts past the request's budget (acceptance stops at the budget anyway),
@@ -1620,7 +1652,7 @@ impl<B: Backend> Core<B> {
                     let Some(Drafter::DFlash(d)) = lanes[a.lane].drafter.as_mut() else {
                         unreachable!("caller checked");
                     };
-                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, a.job.sampler.temperature());
+                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, &a.job.sampler);
                     let budget = if room {
                         picked.len()
                     } else {
@@ -2192,7 +2224,17 @@ impl<B: Backend> Core<B> {
     fn prepare(
         &self,
         req: &Value,
-    ) -> Result<(Prompt, Vec<ImagePatches>, Sampler, usize, Option<Value>), ApiError> {
+    ) -> Result<
+        (
+            Prompt,
+            Vec<ImagePatches>,
+            Sampler,
+            usize,
+            Option<Value>,
+            bool,
+        ),
+        ApiError,
+    > {
         let t_req = Instant::now();
         let Normalized {
             messages,
@@ -2203,11 +2245,21 @@ impl<B: Backend> Core<B> {
             .pointer("/chat_template_kwargs/enable_thinking")
             .and_then(Value::as_bool)
             .unwrap_or(self.cfg.enable_thinking);
-        let text = self
+        let mut text = self
             .fe
             .template
             .render(&messages, tools.as_ref(), thinking, true)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
+        // Forced tool call: the prompt ends in the opening tag, so the model continues inside
+        // the call (`generate` puts the tag back before parsing the output).
+        let forced = self.cfg.force_tool_call
+            && tools
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|t| !t.is_empty());
+        if forced {
+            text.push_str(TOOL_CALL_OPEN);
+        }
         let t_tpl = t_req.elapsed();
         let ids = self.fe.encode(&text).map_err(core)?;
         let t_tok = t_req.elapsed();
@@ -2249,7 +2301,7 @@ impl<B: Backend> Core<B> {
             });
         }
         let sampler = Sampler::from_request(req, thinking);
-        Ok((p, images, sampler, max_tokens, tools))
+        Ok((p, images, sampler, max_tokens, tools, forced))
     }
 }
 
@@ -2265,7 +2317,7 @@ where
 
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
         let core_ = &self.core;
-        let (p, images, sampler, max_tokens, tools) = core_.prepare(req)?;
+        let (p, images, sampler, max_tokens, tools, forced) = core_.prepare(req)?;
         let prompt_tokens = p.ids.len() as u64;
         let (tx, rx) = mpsc::channel();
         {
@@ -2286,7 +2338,10 @@ where
         let done = rx
             .recv()
             .map_err(|_| core(CoreError::Backend("engine worker stopped".into())))??;
-        let text = core_.fe.decode(&done.out).map_err(core)?;
+        let mut text = core_.fe.decode(&done.out).map_err(core)?;
+        if forced {
+            text.insert_str(0, TOOL_CALL_OPEN);
+        }
         let parsed = parse_output(&text, tools.as_ref());
         if !parsed.content.is_empty() {
             emit(Delta::Content(parsed.content));
