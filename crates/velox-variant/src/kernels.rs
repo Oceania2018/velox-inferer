@@ -3,7 +3,7 @@
 
 use velox_core::backend::{
     linear_part_whole, ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, LinearDst,
-    WeightView,
+    NormKind, WeightView,
 };
 use velox_core::check::to_i32;
 use velox_core::{Error, KvFormat, Op, Result, WeightFormat};
@@ -152,6 +152,55 @@ extern "C" {
         ldy: i64,
     ) -> i32;
     fn velox_5060_q8_quantize(x: *const f32, m: i32, k: i64, layout: i32) -> i32;
+    fn velox_5060_q8_act_bytes(m: i32, k: i64) -> usize;
+    fn velox_5060_add_rms_norm_q8(
+        acc: *mut f32,
+        x: *const f32,
+        weight: *const f32,
+        y: *mut f32,
+        blob: *mut u8,
+        layout: i32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
+    fn velox_5060_linear_iq3_q8_from(
+        blob: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+        ldy: i64,
+    ) -> i32;
+    fn velox_5060_linear_rs_q8_from(
+        blob: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        format: i32,
+        y: *mut f32,
+        ldy: i64,
+    ) -> i32;
+    fn velox_5060_linear_swiglu_iq3_q8_from(
+        blob: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        gate_begin: i64,
+        up_w: *const u8,
+        up_parent_rows: i64,
+        up_begin: i64,
+        k: i64,
+        rows: i32,
+        out: *mut f32,
+    ) -> i32;
     fn velox_5060_bf16_act(x: *const f32, m: i32, k: i64, xb: *mut *const u8) -> i32;
     fn velox_5060_gdn_chunk(
         qkv: *const f32,
@@ -166,6 +215,21 @@ extern "C" {
         v_heads: i32,
         k_dim: i32,
         v_dim: i32,
+    ) -> i32;
+    fn velox_5060_gdn_step(
+        qkv: *const f32,
+        ab: *const f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state_in: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        tokens: i32,
+        k_heads: i32,
+        v_heads: i32,
+        k_dim: i32,
+        v_dim: i32,
+        pp: *const i64,
     ) -> i32;
     fn velox_5060_linear_iq3_direct_bf16(
         xb: *const u8,
@@ -552,6 +616,30 @@ fn nvfp4_mma(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     w.format == WeightFormat::Nvfp4 && w.k % 64 == 0 && m >= NVFP4_MMA_MIN_M && !a4
 }
 
+/// Decode windows up to this many tokens run the GDN step kernel (ninfer's recurrent layout:
+/// vector loads of the state, 4 rows per warp); `VELOX_GDN_STEP_MAX_T` overrides it for tuning.
+fn gdn_step_max_t() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VELOX_GDN_STEP_MAX_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    })
+}
+
+/// Whether the step kernel serves `s` with `qkv` (its window row 0 must be 16-byte aligned): the
+/// kernel's own shape contract, checked here so a graph step stages its pointers once.
+fn gdn_step(qkv: &CudaBuffer, s: &velox_core::backend::GdnShape) -> bool {
+    (1..=gdn_step_max_t()).contains(&s.tokens)
+        && matches!(s.k_dim, 32 | 64 | 128)
+        && s.v_dim % 16 == 0
+        && s.k_heads > 0
+        && s.v_heads % s.k_heads == 0
+        && s.qkv_width() % 4 == 0
+        && (qkv.as_ptr() as usize + s.row0 * s.qkv_width() * 4) % 16 == 0
+}
+
 pub struct Rtx5060Kernels;
 
 fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -781,6 +869,7 @@ impl CudaKernels for Rtx5060Kernels {
         &self,
         x: &CudaBuffer,
         twin: Option<&CudaBuffer>,
+        xq: Option<(&CudaBuffer, u32)>,
         dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
         m: usize,
     ) -> Result<()> {
@@ -823,8 +912,12 @@ impl CudaKernels for Rtx5060Kernels {
                 )?;
             }
         }
-        // int8 parts: one quantization per layout, then each GEMM into its columns.
+        // int8 parts: the input's int8 twin when it is in the layout, else one quantization per
+        // layout, then each GEMM into its columns.
         for layout in [0, 1] {
+            let blob = xq
+                .filter(|&(_, l)| l == layout as u32)
+                .map(|(b, _)| b.as_ptr().cast::<u8>());
             let mut quantized = false;
             for d in dsts.iter_mut() {
                 let ld = d.ld;
@@ -833,7 +926,7 @@ impl CudaKernels for Rtx5060Kernels {
                         continue;
                     };
                     let w = &p.w;
-                    if !quantized {
+                    if blob.is_none() && !quantized {
                         // SAFETY: x holds m * k values (CudaBackend::linears checked every part).
                         status(
                             unsafe { velox_5060_q8_quantize(x.as_ptr(), mi, w.k as i64, layout) },
@@ -848,16 +941,24 @@ impl CudaKernels for Rtx5060Kernels {
                         w.k as i64,
                         w.row_begin as i64,
                     );
-                    // SAFETY: the destination holds m * ld values and col + rows <= ld (checked).
+                    // SAFETY: the destination holds m * ld values and col + rows <= ld (checked);
+                    // the twin holds the blob of [m, k] (checked).
                     let y = unsafe { d.y.as_mut_ptr().add(p.col) };
                     status(
                         unsafe {
-                            if f == 3 {
-                                velox_5060_linear_iq3_q8_pre(mi, wp, pr, k, rb, rows, y, ld as i64)
-                            } else {
-                                velox_5060_linear_rs_q8_pre(
+                            match (blob, f) {
+                                (Some(q), 3) => velox_5060_linear_iq3_q8_from(
+                                    q, mi, wp, pr, k, rb, rows, y, ld as i64,
+                                ),
+                                (Some(q), _) => velox_5060_linear_rs_q8_from(
+                                    q, mi, wp, pr, k, rb, rows, f, y, ld as i64,
+                                ),
+                                (None, 3) => velox_5060_linear_iq3_q8_pre(
+                                    mi, wp, pr, k, rb, rows, y, ld as i64,
+                                ),
+                                (None, _) => velox_5060_linear_rs_q8_pre(
                                     mi, wp, pr, k, rb, rows, f, y, ld as i64,
-                                )
+                                ),
                             }
                         },
                         "rtx5060 linears q8",
@@ -897,6 +998,135 @@ impl CudaKernels for Rtx5060Kernels {
             }
         }
         Ok(())
+    }
+
+    /// Int8 twins: the layout the int8 prefill GEMM for `w` reads (q8_layout), for hidden widths
+    /// the fused norm handles (a multiple of 256, at most 12288).
+    fn int8_twin_layout(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<u32> {
+        (w.k % 256 == 0 && w.k <= 12288)
+            .then(|| q8_format(w, m).map(|f| q8_layout(f) as u32))
+            .flatten()
+    }
+
+    fn int8_twin_slots(&self, m: usize, k: usize, _layout: u32) -> usize {
+        let (Ok(mi), Ok(ki)) = (i32::try_from(m), i64::try_from(k)) else {
+            return 0;
+        };
+        // SAFETY: plain value arguments.
+        unsafe { velox_5060_q8_act_bytes(mi, ki) }.div_ceil(4)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_q8(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        yq: &mut CudaBuffer,
+        layout: u32,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        // SAFETY: CudaBackend::add_rms_norm_q8 checked the extents and the twin's slots.
+        status(
+            unsafe {
+                velox_5060_add_rms_norm_q8(
+                    acc.as_mut_ptr(),
+                    x.as_ptr(),
+                    weight.as_ptr(),
+                    y.as_mut_ptr(),
+                    yq.as_mut_ptr().cast::<u8>(),
+                    layout as i32,
+                    to_i32("rows", rows)?,
+                    to_i32("dim", dim)?,
+                    eps,
+                    i32::from(kind == NormKind::Offset),
+                )
+            },
+            "rtx5060 add_rms_norm q8",
+        )
+    }
+
+    fn linear_q8(
+        &self,
+        xq: &CudaBuffer,
+        layout: u32,
+        w: &WeightView<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        let Some(f) = q8_format(w, m).filter(|&f| q8_layout(f) as u32 == layout) else {
+            return Err(Error::Unsupported("linear_q8 view".into()));
+        };
+        let (mi, rows) = (to_i32("m", m)?, to_i32("rows", w.rows)?);
+        let (q, wp) = (xq.as_ptr().cast::<u8>(), w.buf.as_ptr().cast::<u8>());
+        let (pr, k, rb) = (w.parent_rows as i64, w.k as i64, w.row_begin as i64);
+        // SAFETY: CudaBackend::linear_q8 checked the twin, view and output extents.
+        let code = unsafe {
+            if f == 3 {
+                velox_5060_linear_iq3_q8_from(
+                    q,
+                    mi,
+                    wp,
+                    pr,
+                    k,
+                    rb,
+                    rows,
+                    y.as_mut_ptr(),
+                    rows as i64,
+                )
+            } else {
+                velox_5060_linear_rs_q8_from(
+                    q,
+                    mi,
+                    wp,
+                    pr,
+                    k,
+                    rb,
+                    rows,
+                    f,
+                    y.as_mut_ptr(),
+                    rows as i64,
+                )
+            }
+        };
+        status(code, "rtx5060 linear q8 twin")
+    }
+
+    fn linear_swiglu_q8(
+        &self,
+        xq: &CudaBuffer,
+        layout: u32,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if self.linear_swiglu_act(gate, up, m) != Some(ActQuant::Int8G256) || layout != 0 {
+            return Err(Error::Unsupported("linear_swiglu_q8 views".into()));
+        }
+        // SAFETY: CudaBackend::linear_swiglu_q8 checked the twin, views and output extents.
+        status(
+            unsafe {
+                velox_5060_linear_swiglu_iq3_q8_from(
+                    xq.as_ptr().cast::<u8>(),
+                    to_i32("m", m)?,
+                    gate.buf.as_ptr().cast(),
+                    gate.parent_rows as i64,
+                    gate.row_begin as i64,
+                    up.buf.as_ptr().cast(),
+                    up.parent_rows as i64,
+                    up.row_begin as i64,
+                    gate.k as i64,
+                    to_i32("rows", gate.rows)?,
+                    out.as_mut_ptr(),
+                )
+            },
+            "rtx5060 linear_swiglu q8 twin",
+        )
     }
 
     fn takes_bf16(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
@@ -1019,7 +1249,74 @@ impl CudaKernels for Rtx5060Kernels {
                 portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s)
             });
         }
-        portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s)
+        if !gdn_step(qkv, &s) {
+            return portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s);
+        }
+        let si = state_in.map_or(state.as_ptr(), CudaBuffer::as_ptr);
+        let Some(pp) = portable::graph_params(&[si as i64, state.as_mut_ptr() as i64])? else {
+            return Ok(());
+        };
+        // SAFETY: CudaBackend validated the buffers against `s` (check::gdn); `gdn_step` checked
+        // the kernel's shape contract, so it launches (no fallback after staging).
+        status(
+            unsafe {
+                velox_5060_gdn_step(
+                    qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                    ab.as_ptr().add(s.row0 * 2 * s.v_heads),
+                    a_log.as_ptr(),
+                    dt_bias.as_ptr(),
+                    si,
+                    state.as_mut_ptr(),
+                    out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
+                    to_i32("tokens", s.tokens)?,
+                    to_i32("k_heads", s.k_heads)?,
+                    to_i32("v_heads", s.v_heads)?,
+                    to_i32("k_dim", s.k_dim)?,
+                    to_i32("v_dim", s.v_dim)?,
+                    pp,
+                )
+            },
+            "rtx5060 gdn step",
+        )
+    }
+
+    fn gated_delta_net_out(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: velox_core::backend::GdnShape,
+    ) -> Result<()> {
+        if !gdn_step(qkv, &s) {
+            return portable::gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, out, s);
+        }
+        let Some(pp) = portable::graph_params(&[state_in.as_ptr() as i64, 0])? else {
+            return Ok(());
+        };
+        // SAFETY: as in `gated_delta_net`; a null state is never written.
+        status(
+            unsafe {
+                velox_5060_gdn_step(
+                    qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                    ab.as_ptr().add(s.row0 * 2 * s.v_heads),
+                    a_log.as_ptr(),
+                    dt_bias.as_ptr(),
+                    state_in.as_ptr(),
+                    std::ptr::null_mut(),
+                    out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
+                    to_i32("tokens", s.tokens)?,
+                    to_i32("k_heads", s.k_heads)?,
+                    to_i32("v_heads", s.v_heads)?,
+                    to_i32("k_dim", s.k_dim)?,
+                    to_i32("v_dim", s.v_dim)?,
+                    pp,
+                )
+            },
+            "rtx5060 gdn step",
+        )
     }
 
     fn linear_swiglu_act(
