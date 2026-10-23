@@ -248,6 +248,10 @@ __global__ void embed_rs_kernel(const uint32_t* __restrict__ ids, WDesc d, long 
     const long long groups = d.n * gpr;
     const long long high_off = align256(groups * 32), scale_off = high_off + align256(groups * high);
     const long long row = row_begin + ids[blockIdx.x];
+    if (row < 0 || row >= d.n) {  // ids written on the device are not checked by the host
+        for (long long c = threadIdx.x; c < d.k; c += blockDim.x) out[blockIdx.x * d.k + c] = 0.0f;
+        return;
+    }
     const int rg = static_cast<int>((d.k + group - 1) / group);  // groups of this row
     uint8_t* sc = em_smem;                                           // [rg * 32]
     uint8_t* sh = em_smem + (rg * 32 + 15) / 16 * 16;                // [rg * high]
@@ -285,9 +289,10 @@ __global__ void embed_rs_kernel(const uint32_t* __restrict__ ids, WDesc d, long 
 // Block (token, column slice): a few tokens still spread over the whole GPU.
 __global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long long row_begin, float* __restrict__ out) {
     const long long row = row_begin + ids[blockIdx.x];
+    const bool valid = row >= 0 && row < w.n;  // ids written on the device are not checked by the host
     for (long long c = static_cast<long long>(blockIdx.y) * blockDim.x + threadIdx.x; c < w.k;
          c += static_cast<long long>(gridDim.y) * blockDim.x)
-        out[blockIdx.x * w.k + c] = weight_at(w, row, c);
+        out[blockIdx.x * w.k + c] = valid ? weight_at(w, row, c) : 0.0f;
 }
 
 // xb: null, or the result's bf16 twin.

@@ -139,6 +139,8 @@ pub struct Server {
     lanes: Lanes,
     requests: AtomicU64,
     errors: AtomicU64,
+    prompt_tokens: AtomicU64,
+    cached_tokens: AtomicU64,
     started: u64,
 }
 
@@ -248,6 +250,8 @@ impl Server {
             lanes,
             requests: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            prompt_tokens: AtomicU64::new(0),
+            cached_tokens: AtomicU64::new(0),
             started: unix_now(),
         })
     }
@@ -320,11 +324,19 @@ impl Server {
              velox_requests_total {}\n\
              # TYPE velox_request_errors_total counter\n\
              velox_request_errors_total {}\n\
+             # HELP velox_prompt_tokens_total Prompt tokens of completed generations\n\
+             # TYPE velox_prompt_tokens_total counter\n\
+             velox_prompt_tokens_total {}\n\
+             # HELP velox_prompt_tokens_cached_total Prompt tokens served from the prefix cache\n\
+             # TYPE velox_prompt_tokens_cached_total counter\n\
+             velox_prompt_tokens_cached_total {}\n\
              # TYPE velox_info gauge\n\
              velox_info{{{}}} 1\n",
             self.cfg.max_concurrency.max(1),
             self.requests.load(Ordering::Relaxed),
             self.errors.load(Ordering::Relaxed),
+            self.prompt_tokens.load(Ordering::Relaxed),
+            self.cached_tokens.load(Ordering::Relaxed),
             labels.join(",")
         )
     }
@@ -402,6 +414,11 @@ impl Server {
                 io_err = Some(e);
             }
         });
+        // Counted before the stream-error check: a client that hung up still cost the prefill.
+        if let Ok(o) = &result {
+            self.prompt_tokens.fetch_add(o.prompt_tokens, Ordering::Relaxed);
+            self.cached_tokens.fetch_add(o.cached_tokens, Ordering::Relaxed);
+        }
         if let Some(e) = io_err {
             return Err(e);
         }

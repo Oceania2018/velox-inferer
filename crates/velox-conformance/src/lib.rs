@@ -398,7 +398,7 @@ impl<B: Backend> Suite<'_, B> {
             .zip(&lds)
             .map(|((y, p), &ld)| LinearDst { y, ld, parts: p })
             .collect();
-        self.b.linears(&xd, None, &mut dl, &mut scratch, m)?;
+        self.b.linears(&xd, None, None, &mut dl, &mut scratch, m)?;
         drop(dl);
         let (mut got, mut want) = (Vec::new(), Vec::new());
         for ((y, w), &ld) in ys.iter().zip(&wants).zip(&lds) {
@@ -411,6 +411,148 @@ impl<B: Backend> Suite<'_, B> {
         } else {
             let name = name + " (rounding not permitted)";
             self.record(name, Some(Op::Linear), &[f32::NAN], &[0.0], 0.0);
+        }
+        Ok(())
+    }
+
+    /// Int8 twins ([`Backend::int8_twin_layout`]) at `m` rows of width `k`: `add_rms_norm_q8` in
+    /// the layout of `views[0]` (`(format, rows)` of `[rows, k]` parents under `AllowA8`) against
+    /// the oracle, then its twin through `linear_q8` and `linears` on every view of that layout,
+    /// and through `linear_swiglu_q8` for `swiglu` (`(format, width)`): each against the oracle
+    /// on the producer's own output rounded as `ActQuant::Int8G256`, so the twin must quantize
+    /// exactly as the backend's int8 linears do.
+    fn twins_q8(
+        &mut self,
+        m: usize,
+        k: usize,
+        views: &[(WeightFormat, usize)],
+        swiglu: Option<(WeightFormat, usize)>,
+    ) -> Result<()> {
+        let n = m * k;
+        let mut parents = Vec::new();
+        for &(fmt, rows) in views {
+            let bytes = random_weight(&mut self.rng, fmt, rows, k);
+            let (d, c) = (
+                self.b.upload_bytes(&bytes)?,
+                CpuBackend.upload_bytes(&bytes)?,
+            );
+            parents.push((d, c, fmt, rows));
+        }
+        let Some((d0, _, fmt0, rows0)) = parents.first() else {
+            return Ok(());
+        };
+        let view0 = WeightView::full(d0, *fmt0, *rows0, k).with_act(ActPolicy::AllowA8);
+        let Some(layout) = self.b.int8_twin_layout(&view0, m) else {
+            return Ok(());
+        };
+        let slots = self.b.int8_twin_slots(m, k, layout);
+        if slots == 0 {
+            return Ok(());
+        }
+        let (acc, x, w) = (
+            self.rng.vec(n, 1.0),
+            self.rng.vec(n, 1.0),
+            self.rng.vec(k, 0.5),
+        );
+        let (mut accd, xd, wd) = (self.b.upload(&acc)?, self.b.upload(&x)?, self.b.upload(&w)?);
+        let (mut yd, mut yq) = (self.b.alloc(n)?, self.b.alloc(slots)?);
+        self.b.add_rms_norm_q8(
+            &mut accd,
+            &xd,
+            &wd,
+            &mut yd,
+            &mut yq,
+            layout,
+            m,
+            k,
+            1e-6,
+            NormKind::Offset,
+        )?;
+        let (mut acc_c, mut y_c) = (acc.clone(), vec![0.0; n]);
+        CpuBackend.add_rms_norm(&mut acc_c, &x, &w, &mut y_c, m, k, 1e-6, NormKind::Offset)?;
+        let mut got = fetch(self.b, &accd, n)?;
+        got.extend(fetch(self.b, &yd, n)?);
+        let want: Vec<f32> = [acc_c, y_c].concat();
+        let name = format!("int8 twin producer add_rms_norm [{m}x{k}] layout {layout}");
+        self.record(name, None, &got, &want, 1e-5);
+        // The twin through its consumers: the oracle rounds the backend's own output.
+        let mut xr = fetch(self.b, &yd, n)?;
+        quantize_activations(&mut xr, k, ActQuant::Int8G256);
+        for (pd, pc, fmt, rows) in &parents {
+            let (fmt, rows) = (*fmt, *rows);
+            let view = WeightView::full(pd, fmt, rows, k).with_act(ActPolicy::AllowA8);
+            if self.b.int8_twin_layout(&view, m) != Some(layout) {
+                continue;
+            }
+            let mut want = vec![0.0; m * rows];
+            CpuBackend.linear(&xr, &WeightView::full(pc, fmt, rows, k), &mut want, m)?;
+            let mut yo = self.b.alloc(m * rows)?;
+            self.b.linear_q8(&yq, layout, &view, &mut yo, m)?;
+            let got = fetch(self.b, &yo, m * rows)?;
+            let name = format!(
+                "linear_q8 {} [{rows},{k}] m={m} from add_rms_norm twin",
+                fmt.name()
+            );
+            self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+            // linears reading the twin: the part as a column range of a wider destination.
+            let ld = rows + 2;
+            let mut yl = self.b.upload(&vec![0.0; m * ld])?;
+            let parts = [LinearPart {
+                w: WeightView::full(pd, fmt, rows, k).with_act(ActPolicy::AllowA8),
+                col: 1,
+            }];
+            let mut scratch = self.b.alloc(m * rows)?;
+            self.b.linears(
+                &yd,
+                None,
+                Some((&yq, layout)),
+                &mut [LinearDst {
+                    y: &mut yl,
+                    ld,
+                    parts: &parts,
+                }],
+                &mut scratch,
+                m,
+            )?;
+            let got = fetch(self.b, &yl, m * ld)?;
+            let mut want_l = vec![0.0; m * ld];
+            for r in 0..m {
+                want_l[r * ld + 1..r * ld + 1 + rows]
+                    .copy_from_slice(&want[r * rows..(r + 1) * rows]);
+            }
+            let name = format!("linears q8 twin {} [{rows},{k}] m={m}", fmt.name());
+            self.record(name, Some(Op::Linear), &got, &want_l, 2e-4);
+        }
+        if let Some((fmt, width)) = swiglu {
+            let bytes = random_weight(&mut self.rng, fmt, 2 * width, k);
+            let wd = self.b.upload_bytes(&bytes)?;
+            let full = WeightView::full(&wd, fmt, 2 * width, k).with_act(ActPolicy::AllowA8);
+            let (gate, up) = (full.rows(0, width), full.rows(width, width));
+            if self.b.int8_twin_layout(&gate, m) == Some(layout)
+                && self.b.fuses_swiglu(&gate, &up, m)
+            {
+                let wc = CpuBackend.upload_bytes(&bytes)?;
+                let (mut g, mut u) = (vec![0.0; m * width], vec![0.0; m * width]);
+                CpuBackend.linear(
+                    &xr,
+                    &WeightView::full(&wc, fmt, 2 * width, k).rows(0, width),
+                    &mut g,
+                    m,
+                )?;
+                CpuBackend.linear(
+                    &xr,
+                    &WeightView::full(&wc, fmt, 2 * width, k).rows(width, width),
+                    &mut u,
+                    m,
+                )?;
+                CpuBackend.silu_mul(&mut g, &u, m * width)?;
+                let mut out = self.b.alloc(m * width)?;
+                self.b
+                    .linear_swiglu_q8(&yq, layout, &gate, &up, &mut out, m)?;
+                let got = fetch(self.b, &out, m * width)?;
+                let name = format!("linear_swiglu_q8 {} [{width}x2,{k}] m={m}", fmt.name());
+                self.record(name, Some(Op::Linear), &got, &g, SWIGLU_TOL);
+            }
         }
         Ok(())
     }
@@ -815,6 +957,71 @@ impl<B: Backend> Suite<'_, B> {
         self.record(
             format!("embed {} [{n},{k}] ids {ids:?}", fmt.name()),
             Some(Op::Embed),
+            &got,
+            &want,
+            1e-6,
+        );
+        Ok(())
+    }
+
+    /// `argmax_to` must select the id `top_k` (k = 1) does, ties and NaN included, into the device
+    /// slot alone (its neighbours untouched), and `fetch_u32` must return it through the queued
+    /// read.
+    fn argmax_to(&mut self, row_len: usize, limit: usize, coarse: bool) -> Result<()> {
+        let mut x = self.rng.vec(row_len, 4.0);
+        if coarse {
+            x.iter_mut().for_each(|v| *v = (*v * 2.0).round() / 2.0);
+        }
+        x[limit / 2] = x[limit / 3];
+        x[1] = f32::NAN;
+        let want = CpuBackend.top_k(&x, 1, row_len, limit, 1)?[0][0].0;
+        let xd = self.b.upload(&x)?;
+        let mut slot = self.b.upload(&[f32::from_bits(u32::MAX); 3])?;
+        self.b.argmax_to(&xd, limit, &mut slot, 1)?;
+        self.b.fetch_u32_begin(&slot, 1, 3)?;
+        let got = self.b.fetch_u32(&slot, 1, 3)?;
+        let bits = fetch(self.b, &slot, 3)?;
+        let same = got == want
+            && bits[1].to_bits() == want
+            && bits[0].to_bits() == u32::MAX
+            && bits[2].to_bits() == u32::MAX;
+        let name = format!(
+            "argmax_to len={row_len} limit={limit}{}",
+            if coarse { " coarse" } else { "" }
+        );
+        self.record(
+            name,
+            Some(Op::ArgmaxTo),
+            &[if same { 0.0 } else { f32::NAN }],
+            &[0.0],
+            0.0,
+        );
+        Ok(())
+    }
+
+    /// `embed_from` must embed ids held in a device buffer (at an offset, as `argmax_to` leaves
+    /// them) exactly as `embed` embeds them from the host.
+    fn embed_from(&mut self, fmt: WeightFormat, n: usize, k: usize, ids: &[u32]) -> Result<()> {
+        let bytes = random_weight(&mut self.rng, fmt, n, k);
+        let wc = CpuBackend.upload_bytes(&bytes)?;
+        let mut want = vec![0.0; ids.len() * k];
+        CpuBackend.embed(ids, &WeightView::full(&wc, fmt, n, k), &mut want)?;
+        let wd = self.b.upload_bytes(&bytes)?;
+        let mut slots = vec![f32::from_bits(7)];
+        slots.extend(ids.iter().map(|&i| f32::from_bits(i)));
+        let idd = self.b.upload(&slots)?;
+        let mut od = self.b.alloc(ids.len() * k)?;
+        self.b.embed_from(
+            &idd,
+            1,
+            ids.len(),
+            &WeightView::full(&wd, fmt, n, k),
+            &mut od,
+        )?;
+        let got = fetch(self.b, &od, ids.len() * k)?;
+        self.record(
+            format!("embed_from {} [{n},{k}] ids {ids:?}", fmt.name()),
+            Some(Op::EmbedFrom),
             &got,
             &want,
             1e-6,
@@ -1946,6 +2153,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.top_k(7, 131_072, 130_001, 12, true)?;
     s.top_k(2, 20_000, 20_000, 32, true)?;
     s.top_k(2, 20_000, 20_000, 33, true)?;
+    s.argmax_to(248_320, 248_077, false)?;
+    s.argmax_to(5000, 4097, true)?;
+    s.argmax_to(50, 50, false)?;
+    s.embed_from(WeightFormat::Q8G32, 64, 256, &[3, 0, 63, 17])?;
+    s.embed_from(WeightFormat::Q4G64, 40, 128, &[39, 39, 2])?;
     s.top_k(3, 9000, 5, 8, false)?;
     s.embed(WeightFormat::Q5G64, 16, 5120, &[15, 0, 7, 7, 3, 9, 1, 12])?;
     s.embed(WeightFormat::Fp8RowBf16, 50, 64, &[3, 0, 49, 3])?;
@@ -2337,6 +2549,10 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.twins(8, 17408, &[(Iq3Xxs, 32)], None)?;
         // A prefill width: the NVFP4 output projections read the z / attn twins there too.
         s.twins(300, 1024, &[(Nvfp4, 128)], None)?;
+        // int8 twins of a norm's output at prefill widths: the IQ3_XXS layout and the q4/q5 one.
+        s.twins_q8(100, 1024, &[(Iq3Xxs, 48)], Some((Iq3Xxs, 256)))?;
+        s.twins_q8(100, 1024, &[(Q4G64, 96), (Q5G64, 80)], None)?;
+        s.twins_q8(1030, 512, &[(Q5G64, 64), (Iq3Xxs, 32)], None)?;
     }
     Ok(s.results)
 }

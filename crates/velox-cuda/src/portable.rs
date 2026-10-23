@@ -237,6 +237,99 @@ pub fn embed(ids: &[u32], table: &WeightView<'_, CudaBuffer>, out: &mut CudaBuff
     )
 }
 
+/// [`embed`] reading `count` ids at `ids[offset..]` on the device (no staging: the address is
+/// part of a recording).
+pub fn embed_from(
+    ids: &CudaBuffer,
+    offset: usize,
+    count: usize,
+    table: &WeightView<'_, CudaBuffer>,
+    out: &mut CudaBuffer,
+) -> Result<()> {
+    check::embed_from(ids.len(), offset, count, table, table.buf.len(), out.len())?;
+    if count == 0 {
+        return Ok(());
+    }
+    // SAFETY: ids holds offset + count slots and out holds count rows (checked); the kernels
+    // write zeros for an id past the table.
+    status(
+        unsafe {
+            velox_portable_embed(
+                ids.as_ptr().add(offset).cast(),
+                to_i32("ids", count)?,
+                table.buf.as_ptr().cast(),
+                format_code(table.format),
+                table.parent_rows as i64,
+                table.k as i64,
+                table.row_begin as i64,
+                out.as_mut_ptr(),
+            )
+        },
+        "portable embed_from",
+    )
+}
+
+/// See [`velox_core::backend::Backend::argmax_to`].
+pub fn argmax_to(
+    x: &CudaBuffer,
+    limit: usize,
+    dst: &mut CudaBuffer,
+    dst_offset: usize,
+) -> Result<()> {
+    if limit == 0 || limit > x.len() {
+        return Err(velox_core::Error::Shape(format!(
+            "argmax_to: limit {limit} outside the {} values",
+            x.len()
+        )));
+    }
+    if dst_offset >= dst.len() {
+        return Err(velox_core::Error::Shape(format!(
+            "argmax_to: slot {dst_offset} past the {} slots",
+            dst.len()
+        )));
+    }
+    // SAFETY: extents checked above.
+    status(
+        unsafe {
+            velox_portable_argmax_to(
+                x.as_ptr(),
+                x.len() as i64,
+                to_i32("limit", limit)?,
+                dst.as_mut_ptr().add(dst_offset).cast(),
+            )
+        },
+        "portable argmax_to",
+    )
+}
+
+/// See [`velox_core::backend::Backend::fetch_u32_begin`].
+pub fn fetch_u32_begin(src: &CudaBuffer, offset: usize, slot: usize) -> Result<()> {
+    if offset >= src.len() {
+        return Err(velox_core::Error::Shape(format!(
+            "fetch_u32: slot {offset} past the {} slots",
+            src.len()
+        )));
+    }
+    // SAFETY: offset is in bounds (checked); the shim copies 4 bytes into its pinned ring.
+    status(
+        unsafe {
+            velox_portable_fetch_u32_begin(src.as_ptr().add(offset).cast(), to_i32("slot", slot)?)
+        },
+        "portable fetch_u32",
+    )
+}
+
+/// See [`velox_core::backend::Backend::fetch_u32`].
+pub fn fetch_u32(slot: usize) -> Result<u32> {
+    let mut v = 0u32;
+    // SAFETY: out-pointer to a live local.
+    status(
+        unsafe { velox_portable_fetch_u32_wait(to_i32("slot", slot)?, &mut v) },
+        "portable fetch_u32",
+    )?;
+    Ok(v)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn add_rms_norm(
     acc: &mut CudaBuffer,
@@ -1242,6 +1335,9 @@ extern "C" {
         cols: i64,
         params: *const i64,
     ) -> i32;
+    fn velox_portable_argmax_to(x: *const f32, row_len: i64, limit: i32, dst: *mut u32) -> i32;
+    fn velox_portable_fetch_u32_begin(src: *const u32, slot: i32) -> i32;
+    fn velox_portable_fetch_u32_wait(slot: i32, out: *mut u32) -> i32;
     fn velox_portable_copy_param(
         src: *const f32,
         dst: *mut f32,
