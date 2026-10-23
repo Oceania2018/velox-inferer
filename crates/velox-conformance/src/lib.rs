@@ -71,6 +71,11 @@ fn fetch<B: Backend>(b: &B, buf: &B::Buffer, len: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Tolerance of the chunked Gated DeltaNet recurrence (16 tokens and up): backends may form its
+/// products from bf16-rounded operands on an f32 state (ninfer's precision), so the outputs and
+/// the state carry bf16-level rounding.
+const GDN_CHUNK_TOL: f64 = 1e-2;
+
 /// Tolerance of a SwiGLU output and of a GEMM on it: silu(gate) * up scales the gate's f32
 /// accumulation error by |up|, which `max_err` only normalizes by 1 + |out| (the twin cases at
 /// K = 5120 reach 2.6e-4, bit-identical to the f32-input path on the same data).
@@ -1323,7 +1328,15 @@ impl<B: Backend> Suite<'_, B> {
             got.extend(fetch(self.b, &sd, state_len)?);
             want.extend_from_slice(&sc);
             let name = format!("gated_delta_net heads {k_heads}/{v_heads} d {k_dim}/{v_dim} call {i} ({tokens} tokens at row {row0}) + state");
-            self.record(name, Some(Op::GatedDeltaNet), &got, &want, 1e-4);
+            // Chunked widths (16 tokens and up) may run the recurrence with bf16 tensor-core
+            // products on an f32 state (GDN_CHUNK_TOL), and later calls carry that state; per-row
+            // widths are exact f32.
+            let tol = if chunks[..=i].iter().any(|&t| t >= 16) {
+                GDN_CHUNK_TOL
+            } else {
+                1e-4
+            };
+            self.record(name, Some(Op::GatedDeltaNet), &got, &want, tol);
         }
         Ok(())
     }
@@ -1378,7 +1391,8 @@ impl<B: Backend> Suite<'_, B> {
         let name = format!(
             "gated_delta_net_from heads {k_heads}/{v_heads} d {dk} ({tokens} tokens) + states"
         );
-        self.record(name, Some(Op::GatedDeltaNet), &got, &want_o, 1e-4);
+        let tol = if tokens >= 16 { GDN_CHUNK_TOL } else { 1e-4 };
+        self.record(name, Some(Op::GatedDeltaNet), &got, &want_o, tol);
 
         // Outputs only (no state kept): same outputs, the input state untouched.
         let mut od2 = self.b.alloc(out_len)?;
