@@ -57,6 +57,10 @@ pub struct EngineConfig {
     /// `<tool_call>` tag, so the model skips the sentence it would otherwise write first (ninfer's
     /// tool-call grammar constraint has the same effect; the agent reads the call's own `why`).
     pub force_tool_call: bool,
+    /// Streaming requests receive their text as it is generated (ninfer does the same), up to the
+    /// first `<tool_call>`; off: the whole answer at the end. Tool calls and reasoning always
+    /// arrive whole.
+    pub stream_content: bool,
     /// Recurrent-state checkpoints kept per lane for prefix reuse (device checkpoints).
     pub max_checkpoints: usize,
     /// Superseded history points the context store keeps per request chain for retries and
@@ -157,6 +161,26 @@ const DEVICE_SPARE: usize = 2;
 /// Opening tag of a Qwen tool call, as the chat template writes it (see
 /// `EngineConfig::force_tool_call`).
 const TOOL_CALL_OPEN: &str = "<tool_call>\n";
+
+/// The part of a partial answer that is content whatever follows: what `parse_output` returns
+/// as content for every continuation. Held back: text from the first `<tool_call>` on, a trailing
+/// piece of a tag, surrounding whitespace (the parser trims it) and an incomplete UTF-8
+/// character. `None` once the answer has reasoning tags (reasoning is not content).
+fn streamable_content(text: &str) -> Option<&str> {
+    const TAGS: [&str; 3] = ["<tool_call>", "<think>", "</think>"];
+    if text.contains("<think>") || text.contains("</think>") {
+        return None;
+    }
+    let mut end = text.find(TAGS[0]).unwrap_or(text.len());
+    let head = &text[..end];
+    for tag in TAGS {
+        // Tags are ASCII, so `end` stays on a character boundary.
+        if let Some(k) = (1..tag.len()).rev().find(|&k| head.ends_with(&tag[..k])) {
+            end = end.min(head.len() - k);
+        }
+    }
+    Some(text[..end].trim_end_matches('\u{FFFD}').trim())
+}
 
 /// Lanes whose chain head stays in device memory (the most recently admitted); other heads move
 /// to the context store, from where their next request restores them (~5 ms over PCIe).
@@ -426,7 +450,17 @@ struct Job {
     images: Vec<ImagePatches>,
     sampler: Sampler,
     max_tokens: usize,
-    reply: mpsc::Sender<Result<Done, ApiError>>,
+    /// Send the output tokens as each round commits them (`Reply::Tokens`), not only at the end.
+    stream: bool,
+    reply: mpsc::Sender<Reply>,
+    queued: Instant,
+}
+
+/// What the worker sends a request's HTTP thread: committed tokens while it runs (streaming
+/// jobs), then the result.
+enum Reply {
+    Tokens(Vec<u32>),
+    Done(Result<Done, ApiError>),
 }
 
 /// What the worker hands back for a finished request.
@@ -434,8 +468,10 @@ struct Done {
     out: Vec<u32>,
     finish: &'static str,
     start: usize,
+    queue_ms: f64,
     prompt_ms: f64,
     predicted_ms: f64,
+    first_token: Instant,
 }
 
 /// A request's prompt still being fed to its lane.
@@ -480,11 +516,16 @@ struct Active<B: Backend> {
     job: Job,
     lane: usize,
     out: Vec<u32>,
+    /// Output tokens already sent to a streaming job.
+    sent: usize,
     /// The sampled token to feed next.
     c: u32,
     finish: Option<&'static str>,
     start: usize,
+    /// From hand-off to admission onto the lane.
+    queue_ms: f64,
     prompt_ms: f64,
+    /// When the first token was sampled.
     t1: Instant,
     /// MTP: cache row of the previous verify and its kept drafts (see `MtpDrafter::draft`).
     mtp_row0: usize,
@@ -493,6 +534,19 @@ struct Active<B: Backend> {
     cands: Vec<(u32, f32)>,
     /// While the prompt is still being fed.
     pre: Option<Prefill<B>>,
+}
+
+impl<B: Backend> Active<B> {
+    /// Sends a streaming job the output it has not seen yet (`complete` sends the rest).
+    fn send_new(&mut self) {
+        if self.job.stream && self.out.len() > self.sent {
+            let _ = self
+                .job
+                .reply
+                .send(Reply::Tokens(self.out[self.sent..].to_vec()));
+            self.sent = self.out.len();
+        }
+    }
 }
 
 /// Requests handed from the HTTP threads to the worker.
@@ -950,9 +1004,12 @@ impl<B: Backend> Core<B> {
         let mut waiting: VecDeque<Job> = VecDeque::new();
         let mut active: Vec<Active<B>> = Vec::new();
         let mut mem_logged = Instant::now();
+        // Drafter context pages kept ready: a new conversation's captures save two windows, so
+        // a burst of them (see the store's RESERVE_STATES) needs several.
+        const DRAFT_RESERVE_WINDOWS: usize = 6;
         let draft = self.dflash.as_ref().map(|dm| {
             (
-                dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
+                DRAFT_RESERVE_WINDOWS * dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
                 dm.context_page_len(),
             )
         });
@@ -996,7 +1053,7 @@ impl<B: Backend> Core<B> {
                     message: "engine stopped".into(),
                 };
                 for j in waiting.drain(..).chain(active.drain(..).map(|a| a.job)) {
-                    let _ = j.reply.send(Err(gone()));
+                    let _ = j.reply.send(Reply::Done(Err(gone())));
                 }
                 return;
             }
@@ -1021,7 +1078,7 @@ impl<B: Backend> Core<B> {
                         }
                     }
                     Err((job, e)) => {
-                        let _ = job.reply.send(Err(e));
+                        let _ = job.reply.send(Reply::Done(Err(e)));
                     }
                 }
             }
@@ -1034,9 +1091,13 @@ impl<B: Backend> Core<B> {
                     let lane = &mut st.lanes[a.lane];
                     lane.keys.clear();
                     lane.checkpoints.clear();
-                    let _ = a.job.reply.send(Err(e.clone()));
+                    let _ = a.job.reply.send(Reply::Done(Err(e.clone())));
                 }
                 continue;
+            }
+            // Streaming jobs get the tokens this round committed.
+            for a in active.iter_mut() {
+                a.send_new();
             }
             let (done, rest): (Vec<Active<B>>, Vec<Active<B>>) =
                 active.drain(..).partition(|a| a.finish.is_some());
@@ -1208,14 +1269,17 @@ impl<B: Backend> Core<B> {
                 t0.elapsed().as_secs_f64() * 1e3
             );
         }
+        let queue_ms = t0.duration_since(job.queued).as_secs_f64() * 1e3;
         match r {
             Ok(pre) => Ok(Active {
                 job,
                 lane: li,
                 out: Vec::new(),
+                sent: 0,
                 c: 0,
                 finish: None,
                 start: pre.start,
+                queue_ms,
                 prompt_ms: 0.0,
                 t1: Instant::now(),
                 mtp_row0: 0,
@@ -1366,13 +1430,15 @@ impl<B: Backend> Core<B> {
                 a.out.len() as f64 / rounds.max(1) as f64
             );
         }
-        let _ = a.job.reply.send(Ok(Done {
+        let _ = a.job.reply.send(Reply::Done(Ok(Done {
             out: a.out,
             finish: a.finish.unwrap_or("length"),
             start: a.start,
+            queue_ms: a.queue_ms,
             prompt_ms: a.prompt_ms,
             predicted_ms,
-        }));
+            first_token: a.t1,
+        })));
     }
 
     /// One step for every active request: decoding requests take their pending token, then draft,
@@ -1390,6 +1456,9 @@ impl<B: Backend> Core<B> {
             if a.out.len() >= a.job.max_tokens {
                 a.finish = Some("length");
             }
+            // The token sampled last round (the first one: at the end of the prefill) goes out
+            // now, not after this round's forward pass.
+            a.send_new();
         }
         let live: Vec<usize> = (0..active.len())
             .filter(|&i| active[i].pre.is_none() && active[i].finish.is_none())
@@ -2221,6 +2290,13 @@ impl<B: Backend> Core<B> {
 
     /// Request-side preparation: the rendered, tokenized prompt with its images, the sampler and
     /// the completion budget.
+    /// Whether the request's answer opens with reasoning (`chat_template_kwargs.enable_thinking`).
+    fn thinking(&self, req: &Value) -> bool {
+        req.pointer("/chat_template_kwargs/enable_thinking")
+            .and_then(Value::as_bool)
+            .unwrap_or(self.cfg.enable_thinking)
+    }
+
     fn prepare(
         &self,
         req: &Value,
@@ -2241,10 +2317,7 @@ impl<B: Backend> Core<B> {
             tools,
             images: urls,
         } = normalize_request(req)?;
-        let thinking = req
-            .pointer("/chat_template_kwargs/enable_thinking")
-            .and_then(Value::as_bool)
-            .unwrap_or(self.cfg.enable_thinking);
+        let thinking = self.thinking(req);
         let mut text = self
             .fe
             .template
@@ -2319,6 +2392,12 @@ where
         let core_ = &self.core;
         let (p, images, sampler, max_tokens, tools, forced) = core_.prepare(req)?;
         let prompt_tokens = p.ids.len() as u64;
+        // A forced call has no text before it, reasoning arrives whole, and non-streaming answers
+        // are assembled whole anyway.
+        let stream = core_.cfg.stream_content
+            && !forced
+            && !core_.thinking(req)
+            && req.get("stream").and_then(Value::as_bool) == Some(true);
         let (tx, rx) = mpsc::channel();
         {
             let mut q = self
@@ -2331,20 +2410,42 @@ where
                 images,
                 sampler,
                 max_tokens,
+                stream,
                 reply: tx,
+                queued: Instant::now(),
             });
         }
         self.queue.cv.notify_one();
-        let done = rx
-            .recv()
-            .map_err(|_| core(CoreError::Backend("engine worker stopped".into())))??;
+        let stopped = || core(CoreError::Backend("engine worker stopped".into()));
+        let mut tokens = Vec::new();
+        // Content already emitted: always a prefix of what `parse_output` returns at the end.
+        let mut streamed = String::new();
+        let done = loop {
+            match rx.recv().map_err(|_| stopped())? {
+                Reply::Tokens(t) => {
+                    tokens.extend(t);
+                    let text = core_.fe.decode(&tokens).map_err(core)?;
+                    if let Some(s) = streamable_content(&text) {
+                        if s.len() > streamed.len() && s.starts_with(streamed.as_str()) {
+                            emit(Delta::Content(s[streamed.len()..].to_string()));
+                            streamed = s.to_string();
+                        }
+                    }
+                }
+                Reply::Done(r) => break r?,
+            }
+        };
         let mut text = core_.fe.decode(&done.out).map_err(core)?;
         if forced {
             text.insert_str(0, TOOL_CALL_OPEN);
         }
         let parsed = parse_output(&text, tools.as_ref());
-        if !parsed.content.is_empty() {
-            emit(Delta::Content(parsed.content));
+        match parsed.content.strip_prefix(streamed.as_str()) {
+            Some(rest) if !rest.is_empty() => emit(Delta::Content(rest.to_string())),
+            Some(_) => {}
+            // Cannot happen while `streamable_content` follows `parse_output`; the client then
+            // already holds a prefix of the answer, and repeating it would be worse.
+            None => eprintln!("stream: emitted content is not a prefix of the parsed answer"),
         }
         let has_calls = !parsed.tool_calls.is_empty();
         for call in parsed.tool_calls {
@@ -2359,8 +2460,10 @@ where
             prompt_tokens,
             cached_tokens: done.start as u64,
             completion_tokens: done.out.len() as u64,
+            queue_ms: done.queue_ms,
             prompt_ms: done.prompt_ms,
             predicted_ms: done.predicted_ms,
+            first_token: Some(done.first_token),
         })
     }
 }
@@ -2417,5 +2520,24 @@ mod tests {
     fn prefix_length() {
         assert_eq!(common_prefix(&[1, 2, 3], &[1, 2, 4, 5]), 2);
         assert_eq!(common_prefix(&[], &[1]), 0);
+    }
+
+    #[test]
+    fn streamed_content_is_a_prefix_of_the_parsed_answer() {
+        let answer = "\n I'll open the menü < settings.\n\n<tool_call>\n<function=click>\n\
+                      <parameter=x>\n4\n</parameter>\n</function>\n</tool_call>";
+        let content = parse_output(answer, None).content;
+        let mut last = "";
+        for end in (0..=answer.len()).filter(|&i| answer.is_char_boundary(i)) {
+            let s = streamable_content(&answer[..end]).unwrap();
+            assert!(content.starts_with(s), "{s:?} at {end}");
+            assert!(s.starts_with(last), "streamed text shrank at {end}");
+            last = s;
+        }
+        assert_eq!(last, content);
+        // An incomplete character and a partial tag are held back.
+        assert_eq!(streamable_content("ok \u{FFFD}"), Some("ok"));
+        assert_eq!(streamable_content("ok <tool_"), Some("ok"));
+        assert_eq!(streamable_content("<think>\nplan"), None);
     }
 }
