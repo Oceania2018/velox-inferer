@@ -35,7 +35,8 @@ __device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
 // skipped warp-uniformly).
 template <int NT>
 __global__ void __launch_bounds__(kW * 32) bf16_skinny_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
-                                                              int m, int k, int rows, float* __restrict__ y) {
+                                                              int m, int k, int rows, float* __restrict__ y,
+                                                              long long ldy) {
     __shared__ float sum[kTokens][kRows];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -100,21 +101,21 @@ __global__ void __launch_bounds__(kW * 32) bf16_skinny_kernel(const float* __res
     const int n_here = min(kRows, rows - n0);
     for (int i = threadIdx.x; i < kTokens * n_here; i += kW * 32) {
         const int tt = i / n_here, r = i % n_here;
-        if (t0 + tt < m) y[static_cast<long long>(t0 + tt) * rows + n0 + r] = sum[tt][r];
+        if (t0 + tt < m) y[static_cast<long long>(t0 + tt) * ldy + n0 + r] = sum[tt][r];
     }
 }
 
 }  // namespace
 
-// y[m, rows] = bf16(x) . W[row_begin.., :]^T for a contiguous bf16 weight [parent_rows, k];
-// k % 32 == 0, x and the weight 16-byte aligned. Returns VELOX_ERR_UNSUPPORTED otherwise.
+// y[t * ldy + r] = bf16(x) . W[row_begin + r, :] for a contiguous bf16 weight [parent_rows, k],
+// r < rows <= ldy; k % 32 == 0, x and the weight 16-byte aligned. VELOX_ERR_UNSUPPORTED otherwise.
 VELOX_API int velox_5060_linear_bf16_skinny(const float* x, int m, const uint8_t* w, long long k, long long row_begin,
-                                            int rows, float* y) {
-    if (m <= 0 || rows <= 0 || k % 32 != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
+                                            int rows, float* y, long long ldy) {
+    if (m <= 0 || rows <= 0 || ldy < rows || k % 32 != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
         reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const auto* wb = reinterpret_cast<const __nv_bfloat16*>(w) + row_begin * k;
     const dim3 grid((rows + kRows - 1) / kRows, (m + kTokens - 1) / kTokens);
-    bf16_skinny_kernel<kRows / 8><<<grid, kW * 32>>>(x, wb, m, static_cast<int>(k), rows, y);
+    bf16_skinny_kernel<kRows / 8><<<grid, kW * 32>>>(x, wb, m, static_cast<int>(k), rows, y, ldy);
     return velox_launch_status();
 }

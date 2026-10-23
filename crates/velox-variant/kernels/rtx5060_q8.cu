@@ -133,6 +133,12 @@ struct Act {
     const float* sx;
     int stride;
 };
+// The last quantization (velox_5060_q8_quantize), which the _pre GEMMs read.
+struct Last {
+    Act a;
+    int m = 0, k = 0, layout = -1;
+} g_last;
+
 int quantize(const float* x, int m, int k, int layout, Act& out) {
     const int stride = stride_of(m);
     const size_t xb = (static_cast<size_t>(m) * k + 255) / 256 * 256;
@@ -143,6 +149,7 @@ int quantize(const float* x, int m, int k, int layout, Act& out) {
     const long long threads = static_cast<long long>(m) * (k / 8);
     quantize_act<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(x, m, k, xq, sx, stride, layout);
     out = {xq, sx, stride};
+    g_last = {out, m, k, layout};
     return velox_launch_status();
 }
 
@@ -180,7 +187,8 @@ struct Iq3Args {
     const uint8_t* w2;  // up parent (PAIR)
     long long parent_rows, parent_rows2, row_begin, row_begin2;
     int rows;           // output rows
-    float* y;           // [m, rows]
+    float* y;           // [m, ldy]
+    long long ldy;      // output row stride (>= rows)
 };
 
 // CTA = WM warps x 16 MT weight rows over BN = 8 NT tokens and the full K. Each warp loads its rows'
@@ -379,17 +387,17 @@ __global__ void __launch_bounds__(WM * 32, MB) iq3_q8_kernel(Iq3Args p) {
             if (PAIR) {
                 const int o = tile * 8 + gid;
                 if (o >= p.rows) continue;
-                if (t < p.m) p.y[static_cast<long long>(t) * p.rows + o] = v[0] / (1.0f + expf(-v[0])) * v[2];
-                if (t + 1 < p.m) p.y[static_cast<long long>(t + 1) * p.rows + o] = v[1] / (1.0f + expf(-v[1])) * v[3];
+                if (t < p.m) p.y[static_cast<long long>(t) * p.ldy + o] = v[0] / (1.0f + expf(-v[0])) * v[2];
+                if (t + 1 < p.m) p.y[static_cast<long long>(t + 1) * p.ldy + o] = v[1] / (1.0f + expf(-v[1])) * v[3];
             } else {
                 const int o = tile * 16 + gid;
                 if (o < p.rows) {
-                    if (t < p.m) p.y[static_cast<long long>(t) * p.rows + o] = v[0];
-                    if (t + 1 < p.m) p.y[static_cast<long long>(t + 1) * p.rows + o] = v[1];
+                    if (t < p.m) p.y[static_cast<long long>(t) * p.ldy + o] = v[0];
+                    if (t + 1 < p.m) p.y[static_cast<long long>(t + 1) * p.ldy + o] = v[1];
                 }
                 if (o + 8 < p.rows) {
-                    if (t < p.m) p.y[static_cast<long long>(t) * p.rows + o + 8] = v[2];
-                    if (t + 1 < p.m) p.y[static_cast<long long>(t + 1) * p.rows + o + 8] = v[3];
+                    if (t < p.m) p.y[static_cast<long long>(t) * p.ldy + o + 8] = v[2];
+                    if (t + 1 < p.m) p.y[static_cast<long long>(t + 1) * p.ldy + o + 8] = v[3];
                 }
             }
         }
@@ -442,7 +450,8 @@ struct RsArgs {
     const uint8_t* w;
     long long parent_rows, row_begin;
     int rows;
-    float* y;
+    float* y;       // [m, ldy]
+    long long ldy;  // output row stride (>= rows)
 };
 
 // CTA = WM warps x 16 MT rows over 8 NT tokens; each warp loads its rows' codes straight into
@@ -605,7 +614,7 @@ __global__ void __launch_bounds__(WM * 32, MB) rs_q8_kernel(RsArgs p) {
         for (int ni = 0; ni < NT; ++ni) {
             const int t = token0 + ni * 8 + lid * 2;
             auto put = [&](int token, int row, float value) {
-                if (token < p.m && row < p.rows) p.y[static_cast<long long>(token) * p.rows + row] = value;
+                if (token < p.m && row < p.rows) p.y[static_cast<long long>(token) * p.ldy + row] = value;
             };
             put(t, r0, acc[mi][ni][0]);
             put(t + 1, r0, acc[mi][ni][1]);
@@ -632,7 +641,7 @@ VELOX_API int velox_5060_linear_iq3_q8(const float* x, int m, const uint8_t* w, 
                                        long long row_begin, int rows, float* y) {
     if (k > (1ll << 30)) return VELOX_ERR_UNSUPPORTED;
     Iq3Args p{};
-    p.m = m, p.k = static_cast<int>(k), p.rows = rows, p.y = y;
+    p.m = m, p.k = static_cast<int>(k), p.rows = rows, p.y = y, p.ldy = rows;
     p.w = p.w2 = w;
     p.parent_rows = p.parent_rows2 = parent_rows;
     p.row_begin = p.row_begin2 = row_begin;
@@ -646,7 +655,7 @@ VELOX_API int velox_5060_linear_swiglu_iq3_q8(const float* x, int m, const uint8
                                               long long up_begin, long long k, int rows, float* out) {
     if (k > (1ll << 30)) return VELOX_ERR_UNSUPPORTED;
     Iq3Args p{};
-    p.m = m, p.k = static_cast<int>(k), p.rows = rows, p.y = out;
+    p.m = m, p.k = static_cast<int>(k), p.rows = rows, p.y = out, p.ldy = rows;
     p.w = w, p.parent_rows = parent_rows, p.row_begin = gate_begin;
     p.w2 = up_w, p.parent_rows2 = up_parent_rows, p.row_begin2 = up_begin;
     return run_iq3<true>(x, p);
@@ -661,6 +670,41 @@ VELOX_API int velox_5060_linear_rs_q8(const float* x, int m, const uint8_t* w, l
         return VELOX_ERR_UNSUPPORTED;
     Act a;
     if (const int e = quantize(x, m, static_cast<int>(k), 1, a)) return e;
-    RsArgs p{a.xq, a.sx, a.stride, m, static_cast<int>(k), w, parent_rows, row_begin, rows, y};
+    RsArgs p{a.xq, a.sx, a.stride, m, static_cast<int>(k), w, parent_rows, row_begin, rows, y, rows};
+    return format == 5 ? launch_rs<true>(p) : launch_rs<false>(p);
+}
+
+// Quantizes x [m, k] (ActQuant::Int8G256) in `layout` (0: IQ3_XXS, 1: q4/q5) for the _pre GEMMs
+// below, which then share it: one quantization for several projections of the same input.
+VELOX_API int velox_5060_q8_quantize(const float* x, int m, long long k, int layout) {
+    if (m < 1 || k % 256 != 0 || k > (1ll << 30) || (layout != 0 && layout != 1) ||
+        reinterpret_cast<uintptr_t>(x) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    Act a;
+    return quantize(x, m, static_cast<int>(k), layout, a);
+}
+
+// velox_5060_linear_iq3_q8 / _rs_q8 on the last velox_5060_q8_quantize (same m, k and the
+// format's layout), writing y[t * ldy + r]. VELOX_ERR_UNSUPPORTED when the quantization differs.
+VELOX_API int velox_5060_linear_iq3_q8_pre(int m, const uint8_t* w, long long parent_rows, long long k,
+                                           long long row_begin, int rows, float* y, long long ldy) {
+    if (g_last.m != m || g_last.k != k || g_last.layout != 0 || rows <= 0 || ldy < rows ||
+        reinterpret_cast<uintptr_t>(w) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    Iq3Args p{};
+    p.xq = g_last.a.xq, p.sx = g_last.a.sx, p.stride = g_last.a.stride;
+    p.m = m, p.k = static_cast<int>(k), p.rows = rows, p.y = y, p.ldy = ldy;
+    p.w = p.w2 = w;
+    p.parent_rows = p.parent_rows2 = parent_rows;
+    p.row_begin = p.row_begin2 = row_begin;
+    return m >= 1024 ? launch_iq3<1, 16, 8, 1, false>(p) : launch_iq3<1, 8, 4, 2, false>(p);
+}
+
+VELOX_API int velox_5060_linear_rs_q8_pre(int m, const uint8_t* w, long long parent_rows, long long k,
+                                          long long row_begin, int rows, int format, float* y, long long ldy) {
+    if (g_last.m != m || g_last.k != k || g_last.layout != 1 || rows <= 0 || ldy < rows ||
+        (format != 4 && format != 5) || reinterpret_cast<uintptr_t>(w) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    RsArgs p{g_last.a.xq, g_last.a.sx, g_last.a.stride, m, static_cast<int>(k), w, parent_rows, row_begin, rows, y, ldy};
     return format == 5 ? launch_rs<true>(p) : launch_rs<false>(p);
 }

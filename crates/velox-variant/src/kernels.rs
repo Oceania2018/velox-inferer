@@ -2,7 +2,8 @@
 //! when the kernel reports the shape as unsupported.
 
 use velox_core::backend::{
-    ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, WeightView,
+    linear_part_whole, ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, LinearDst,
+    WeightView,
 };
 use velox_core::check::to_i32;
 use velox_core::{Error, KvFormat, Op, Result, WeightFormat};
@@ -148,6 +149,29 @@ extern "C" {
         row_begin: i64,
         rows: i32,
         y: *mut f32,
+        ldy: i64,
+    ) -> i32;
+    fn velox_5060_q8_quantize(x: *const f32, m: i32, k: i64, layout: i32) -> i32;
+    fn velox_5060_linear_iq3_q8_pre(
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+        ldy: i64,
+    ) -> i32;
+    fn velox_5060_linear_rs_q8_pre(
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        format: i32,
+        y: *mut f32,
+        ldy: i64,
     ) -> i32;
     fn velox_5060_linear_iq3_direct(
         x: *const f32,
@@ -388,6 +412,21 @@ fn q8_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     }
 }
 
+/// The int8 kernels' activation layout for a `q8_format` code (0: IQ3_XXS, 1: q4/q5).
+fn q8_layout(format: i32) -> i32 {
+    if format == 3 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Whether `linears` writes this part in place at `m` tokens: int8 parts (which also share one
+/// quantization per layout) and bf16 few-row ones.
+fn linears_in_place(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    q8_format(w, m).is_some() || bf16_skinny(w, m)
+}
+
 /// NVFP4 views the FP4-activation path does not serve (A16-only, or not 128-row aligned) from
 /// this many tokens: the tiled bf16 tensor-core kernel (ninfer's prefill kernel and schedule).
 /// Below, the sliced-K kernel in 16-token blocks.
@@ -603,6 +642,105 @@ impl CudaKernels for Rtx5060Kernels {
         }
     }
 
+    fn serves_linears(&self, dsts: &[LinearDst<'_, '_, '_, CudaBuffer>], m: usize) -> bool {
+        // Every part in place or a whole destination (`linear`), and something to gain: an int8
+        // quantization shared, or a column range written without a copy.
+        let parts = || {
+            dsts.iter()
+                .flat_map(|d| d.parts.iter().map(move |p| (p, d.ld)))
+        };
+        let shared = parts()
+            .filter(|(p, _)| q8_format(&p.w, m).is_some())
+            .count()
+            > 1;
+        let ranges = parts().any(|(p, ld)| !linear_part_whole(p, ld));
+        (shared || ranges)
+            && parts().all(|(p, ld)| linears_in_place(&p.w, m) || linear_part_whole(p, ld))
+    }
+
+    fn linears(
+        &self,
+        x: &CudaBuffer,
+        dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
+        m: usize,
+    ) -> Result<()> {
+        let mi = to_i32("m", m)?;
+        // int8 parts: one quantization per layout, then each GEMM into its columns.
+        for layout in [0, 1] {
+            let mut quantized = false;
+            for d in dsts.iter_mut() {
+                let ld = d.ld;
+                for p in d.parts {
+                    let Some(f) = q8_format(&p.w, m).filter(|&f| q8_layout(f) == layout) else {
+                        continue;
+                    };
+                    let w = &p.w;
+                    if !quantized {
+                        // SAFETY: x holds m * k values (CudaBackend::linears checked every part).
+                        status(
+                            unsafe { velox_5060_q8_quantize(x.as_ptr(), mi, w.k as i64, layout) },
+                            "rtx5060 q8 quantize",
+                        )?;
+                        quantized = true;
+                    }
+                    let rows = to_i32("rows", w.rows)?;
+                    let (wp, pr, k, rb) = (
+                        w.buf.as_ptr().cast::<u8>(),
+                        w.parent_rows as i64,
+                        w.k as i64,
+                        w.row_begin as i64,
+                    );
+                    // SAFETY: the destination holds m * ld values and col + rows <= ld (checked).
+                    let y = unsafe { d.y.as_mut_ptr().add(p.col) };
+                    status(
+                        unsafe {
+                            if f == 3 {
+                                velox_5060_linear_iq3_q8_pre(mi, wp, pr, k, rb, rows, y, ld as i64)
+                            } else {
+                                velox_5060_linear_rs_q8_pre(
+                                    mi, wp, pr, k, rb, rows, f, y, ld as i64,
+                                )
+                            }
+                        },
+                        "rtx5060 linears q8",
+                    )?;
+                }
+            }
+        }
+        for d in dsts.iter_mut() {
+            let ld = d.ld;
+            for p in d.parts {
+                let w = &p.w;
+                if q8_format(w, m).is_some() {
+                    continue;
+                }
+                if bf16_skinny(w, m) {
+                    // SAFETY: as above.
+                    let y = unsafe { d.y.as_mut_ptr().add(p.col) };
+                    status(
+                        unsafe {
+                            velox_5060_linear_bf16_skinny(
+                                x.as_ptr(),
+                                mi,
+                                w.buf.as_ptr().cast::<u8>(),
+                                w.k as i64,
+                                w.row_begin as i64,
+                                to_i32("rows", w.rows)?,
+                                y,
+                                ld as i64,
+                            )
+                        },
+                        "rtx5060 linears bf16 skinny",
+                    )?;
+                } else {
+                    // serves_linears admitted it as a whole destination.
+                    self.linear(x, w, d.y, m)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn linear_swiglu_act(
         &self,
         gate: &WeightView<'_, CudaBuffer>,
@@ -748,6 +886,7 @@ impl CudaKernels for Rtx5060Kernels {
                                 rb,
                                 rows,
                                 y.as_mut_ptr(),
+                                rows as i64,
                             )
                         },
                         "rtx5060 linear bf16 skinny",
