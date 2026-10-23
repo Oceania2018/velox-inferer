@@ -1,0 +1,2 @@
+# nvcc flags for this branch's kernels: RTX 5090 Laptop GPU (GB203) only.
+-gencode arch=compute_120a,code=sm_120a
