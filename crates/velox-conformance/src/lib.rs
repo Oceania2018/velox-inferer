@@ -368,7 +368,7 @@ impl<B: Backend> Suite<'_, B> {
             .zip(&lds)
             .map(|((y, p), &ld)| LinearDst { y, ld, parts: p })
             .collect();
-        self.b.linears(&xd, &mut dl, &mut scratch, m)?;
+        self.b.linears(&xd, None, &mut dl, &mut scratch, m)?;
         drop(dl);
         let (mut got, mut want) = (Vec::new(), Vec::new());
         for ((y, w), &ld) in ys.iter().zip(&wants).zip(&lds) {
@@ -381,6 +381,155 @@ impl<B: Backend> Suite<'_, B> {
         } else {
             let name = name + " (rounding not permitted)";
             self.record(name, Some(Op::Linear), &[f32::NAN], &[0.0], 0.0);
+        }
+        Ok(())
+    }
+
+    /// bf16 twins ([`Backend::bf16_twins`]) at `m` rows of width `k`: every producer's f32 output
+    /// against the oracle, and its twin through each consumer the backend accepts: `linear_bf16`
+    /// on `views` (`(format, rows)` of a `[rows, k]` parent) and, for `swiglu` (`(format,
+    /// width)`), `linear_swiglu_twin` whose output twin then feeds `linear_bf16` on a `[64,
+    /// width]` view of the same format. Consumers are checked against the oracle on the
+    /// producer's own output rounded to bf16, so the twin must match that rounding exactly.
+    fn twins(
+        &mut self,
+        m: usize,
+        k: usize,
+        views: &[(WeightFormat, usize)],
+        swiglu: Option<(WeightFormat, usize)>,
+    ) -> Result<()> {
+        if !self.b.bf16_twins() {
+            return Ok(());
+        }
+        let n = m * k;
+        let (acc, x, w) = (
+            self.rng.vec(n, 1.0),
+            self.rng.vec(n, 1.0),
+            self.rng.vec(k, 0.5),
+        );
+        let (gate_in, o) = (self.rng.vec(n, 2.0), self.rng.vec(n, 1.0));
+        let wn = self.rng.vec(128, 0.5);
+        // Producers on the backend.
+        let (mut accd, xd, wd) = (self.b.upload(&acc)?, self.b.upload(&x)?, self.b.upload(&w)?);
+        let (mut yd, mut yb) = (self.b.alloc(n)?, self.b.alloc(n)?);
+        self.b.add_rms_norm_twin(
+            &mut accd,
+            &xd,
+            &wd,
+            &mut yd,
+            &mut yb,
+            m,
+            k,
+            1e-6,
+            NormKind::Offset,
+        )?;
+        let (od, wnd) = (self.b.upload(&o)?, self.b.upload(&wn)?);
+        let (mut zd, mut zb) = (self.b.upload(&gate_in)?, self.b.alloc(n)?);
+        self.b.rms_norm_gated_twin(
+            &od,
+            &wnd,
+            &mut zd,
+            &mut zb,
+            n / 128,
+            128,
+            1e-6,
+            NormKind::Plain,
+        )?;
+        let (mut sd, mut sb) = (self.b.upload(&o)?, self.b.alloc(n)?);
+        let gd = self.b.upload(&gate_in)?;
+        self.b.sigmoid_mul_twin(&mut sd, &gd, &mut sb, n)?;
+        // Their f32 outputs against the oracle.
+        let (mut acc_c, mut y_c) = (acc.clone(), vec![0.0; n]);
+        CpuBackend.add_rms_norm(&mut acc_c, &x, &w, &mut y_c, m, k, 1e-6, NormKind::Offset)?;
+        let mut z_c = gate_in.clone();
+        CpuBackend.rms_norm_gated(&o, &wn, &mut z_c, n / 128, 128, 1e-6, NormKind::Plain)?;
+        let mut s_c = o.clone();
+        CpuBackend.sigmoid_mul(&mut s_c, &gate_in, n)?;
+        let mut got = fetch(self.b, &accd, n)?;
+        got.extend(fetch(self.b, &yd, n)?);
+        got.extend(fetch(self.b, &zd, n)?);
+        got.extend(fetch(self.b, &sd, n)?);
+        let want: Vec<f32> = [acc_c, y_c, z_c, s_c].concat();
+        let name = format!("bf16 twin producers [{m}x{k}]");
+        self.record(name, None, &got, &want, 1e-5);
+        // Twins through their consumers: the oracle rounds the backend's own outputs.
+        let produced = [
+            ("add_rms_norm", &yd, &yb),
+            ("rms_norm_gated", &zd, &zb),
+            ("sigmoid_mul", &sd, &sb),
+        ];
+        for &(fmt, rows) in views {
+            let bytes = random_weight(&mut self.rng, fmt, rows, k);
+            let wd = self.b.upload_bytes(&bytes)?;
+            let view = WeightView::full(&wd, fmt, rows, k);
+            if !self.b.takes_bf16(&view, m) {
+                continue;
+            }
+            let wc = CpuBackend.upload_bytes(&bytes)?;
+            for (what, full, twin) in produced {
+                let mut xr = fetch(self.b, full, n)?;
+                quantize_activations(&mut xr, k, ActQuant::Bf16);
+                let mut want = vec![0.0; m * rows];
+                CpuBackend.linear(&xr, &WeightView::full(&wc, fmt, rows, k), &mut want, m)?;
+                let mut yo = self.b.alloc(m * rows)?;
+                self.b.linear_bf16(twin, &view, &mut yo, m)?;
+                let got = fetch(self.b, &yo, m * rows)?;
+                let name = format!(
+                    "linear_bf16 {} [{rows},{k}] m={m} from {what} twin",
+                    fmt.name()
+                );
+                self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+            }
+        }
+        if let Some((fmt, width)) = swiglu {
+            let bytes = random_weight(&mut self.rng, fmt, 2 * width, k);
+            let wd = self.b.upload_bytes(&bytes)?;
+            let gate = WeightView::full(&wd, fmt, 2 * width, k).rows(0, width);
+            let up = WeightView::full(&wd, fmt, 2 * width, k).rows(width, width);
+            if self.b.swiglu_twin(&gate, &up, m) {
+                let wc = CpuBackend.upload_bytes(&bytes)?;
+                let mut xr = fetch(self.b, &yd, n)?;
+                quantize_activations(&mut xr, k, ActQuant::Bf16);
+                let (mut g, mut u) = (vec![0.0; m * width], vec![0.0; m * width]);
+                CpuBackend.linear(
+                    &xr,
+                    &WeightView::full(&wc, fmt, 2 * width, k).rows(0, width),
+                    &mut g,
+                    m,
+                )?;
+                CpuBackend.linear(
+                    &xr,
+                    &WeightView::full(&wc, fmt, 2 * width, k).rows(width, width),
+                    &mut u,
+                    m,
+                )?;
+                CpuBackend.silu_mul(&mut g, &u, m * width)?;
+                let (mut out, mut outb) = (self.b.alloc(m * width)?, self.b.alloc(m * width)?);
+                self.b
+                    .linear_swiglu_twin(&yb, &gate, &up, &mut out, &mut outb, m)?;
+                let got = fetch(self.b, &out, m * width)?;
+                let name = format!("linear_swiglu_twin {} [{width}x2,{k}] m={m}", fmt.name());
+                self.record(name, Some(Op::Linear), &got, &g, 2e-4);
+                // The output twin feeding the down projection.
+                let dbytes = random_weight(&mut self.rng, fmt, 64, width);
+                let dd = self.b.upload_bytes(&dbytes)?;
+                let down = WeightView::full(&dd, fmt, 64, width);
+                if self.b.takes_bf16(&down, m) {
+                    let dc = CpuBackend.upload_bytes(&dbytes)?;
+                    let mut hr = got.clone();
+                    quantize_activations(&mut hr, width, ActQuant::Bf16);
+                    let mut want = vec![0.0; m * 64];
+                    CpuBackend.linear(&hr, &WeightView::full(&dc, fmt, 64, width), &mut want, m)?;
+                    let mut yo = self.b.alloc(m * 64)?;
+                    self.b.linear_bf16(&outb, &down, &mut yo, m)?;
+                    let got = fetch(self.b, &yo, m * 64)?;
+                    let name = format!(
+                        "linear_bf16 {} [64,{width}] m={m} from swiglu twin",
+                        fmt.name()
+                    );
+                    self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+                }
+            }
         }
         Ok(())
     }
@@ -2103,6 +2252,20 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             &[(Q4G64, 64, 0, 64)],
         ];
         s.linears(attn, 768, 100, ActPolicy::AllowA8)?;
+    }
+    // Prefill widths on a grid of a few tiles with a long K (kernel sets may split K there).
+    s.linear_act(WeightFormat::Fp8RowBf16, 256, 4096, 0, 256, 100, a8)?;
+    s.linear_act(WeightFormat::Nvfp4, 256, 4096, 0, 256, 100, a4)?;
+    // bf16 twins of GEMM inputs at decode and verify widths (backends that write them).
+    {
+        use WeightFormat::{Iq3Xxs, Nvfp4, Q4G64, Q5G64};
+        let views = [(Q4G64, 96), (Q5G64, 80), (Nvfp4, 128), (Iq3Xxs, 48)];
+        for m in [2, 8, 13] {
+            s.twins(m, 1024, &views, Some((Iq3Xxs, 256)))?;
+        }
+        // The dense MLP's own K: gate/up at 5120, down at 17408.
+        s.twins(8, 5120, &[(Iq3Xxs, 32)], Some((Iq3Xxs, 256)))?;
+        s.twins(8, 17408, &[(Iq3Xxs, 32)], None)?;
     }
     Ok(s.results)
 }

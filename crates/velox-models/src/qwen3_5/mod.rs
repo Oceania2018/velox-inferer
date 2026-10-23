@@ -87,6 +87,7 @@ where
     let ld = runs.rows();
     b.linears(
         h,
+        None,
         &mut [LinearDst {
             y,
             ld,
@@ -98,12 +99,14 @@ where
 }
 
 /// The GDN input projections of `h` as one [`Backend::linears`] call (backends quantize `h`
-/// once): q | k | v into `qkv_y`, z into `z_y` and a | b into `ab_y`.
+/// once; `hb`: its bf16 twin when there is one): q | k | v into `qkv_y`, z into `z_y` and a | b
+/// into `ab_y`.
 #[allow(clippy::too_many_arguments)]
 fn gdn_projections<'w, B: Backend>(
     b: &B,
     view: impl Fn(&WDesc) -> WeightView<'w, B::Buffer>,
     h: &B::Buffer,
+    hb: Option<&B::Buffer>,
     (qkv, qkv_y): (&Runs, &mut B::Buffer),
     (z, z_y): (&WDesc, &mut B::Buffer),
     (ab, ab_y): (&Runs, &mut B::Buffer),
@@ -118,6 +121,7 @@ where
     let (qkv_ld, ab_ld) = (qkv.rows(), ab.rows());
     b.linears(
         h,
+        hb,
         &mut [
             LinearDst {
                 y: qkv_y,
@@ -138,6 +142,46 @@ where
         scratch,
         t,
     )
+}
+
+/// `x += y; h = norm(x)` (the residual add fused with the next norm), also into `h`'s bf16 twin
+/// when `twin` and the workspace has twins. Returns whether the twin now mirrors `h`.
+#[allow(clippy::too_many_arguments)]
+fn add_norm_h<B: Backend>(
+    b: &B,
+    ws: &mut Workspace<B>,
+    weight: &B::Buffer,
+    t: usize,
+    hd: usize,
+    eps: f32,
+    twin: bool,
+) -> Result<bool> {
+    let Workspace { x, y, h, twins, .. } = ws;
+    match twins.as_mut().filter(|_| twin) {
+        Some(tw) => {
+            b.add_rms_norm_twin(x, y, weight, h, &mut tw.h, t, hd, eps, NormKind::Offset)?;
+            Ok(true)
+        }
+        None => {
+            b.add_rms_norm(x, y, weight, h, t, hd, eps, NormKind::Offset)?;
+            Ok(false)
+        }
+    }
+}
+
+/// `y = x . W^T` from `x`'s bf16 twin when the caller has it and the backend takes it.
+fn linear_from<B: Backend>(
+    b: &B,
+    x: &B::Buffer,
+    xb: Option<&B::Buffer>,
+    w: &WeightView<'_, B::Buffer>,
+    y: &mut B::Buffer,
+    t: usize,
+) -> Result<()> {
+    match xb.filter(|_| b.takes_bf16(w, t)) {
+        Some(xb) => b.linear_bf16(xb, w, y, t),
+        None => b.linear(x, w, y, t),
+    }
 }
 
 /// Most tokens one `verify` call may feed (the anchor plus drafts).
@@ -542,6 +586,14 @@ pub struct EmbedInsert<'a, Buf> {
     pub row_offset: usize,
 }
 
+/// bf16 twins (Backend::bf16_twins) of `h`, `z`, `attn` and `mg`.
+struct Twins<B: Backend> {
+    h: B::Buffer,
+    z: B::Buffer,
+    attn: B::Buffer,
+    mg: B::Buffer,
+}
+
 /// Activations for chunks of up to `max_tokens` tokens.
 pub struct Workspace<B: Backend> {
     max_tokens: usize,
@@ -566,6 +618,9 @@ pub struct Workspace<B: Backend> {
     /// MLP gate|up output.
     fused: B::Buffer,
     gu: B::Buffer,
+    /// bf16 twins of the GEMM inputs for up to FUSE_MAX_TOKENS rows, when the backend writes them
+    /// (Backend::bf16_twins).
+    twins: Option<Twins<B>>,
     last: B::Buffer,
     last_n: B::Buffer,
     /// Final-normed hidden rows of the latest `verify` (`[VERIFY_MAX, hidden]`), which condition
@@ -800,6 +855,15 @@ impl<B: Backend> Qwen35Text<B> {
             mu: take(&mut g_mlp),
             fused: b.alloc(tf * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
             gu: b.alloc(tf * 2 * c.mlp_width())?,
+            twins: match b.bf16_twins() {
+                true => Some(Twins {
+                    h: b.alloc(tf * c.hidden)?,
+                    z: b.alloc(tf * c.gdn_v())?,
+                    attn: b.alloc(tf * c.q_dim())?,
+                    mg: b.alloc(tf * c.mlp_width())?,
+                }),
+                false => None,
+            },
             last: b.alloc(c.hidden)?,
             last_n: b.alloc(c.hidden)?,
             logits: b.alloc(c.vocab)?,
@@ -989,7 +1053,9 @@ impl<B: Backend> Qwen35Text<B> {
                 // Recorded steps launch in segments, so the GPU starts while the rest is submitted.
                 b.graph_break()?;
             }
-            if li == 0 {
+            // Decode and verify widths write bf16 twins of the GEMM inputs (Backend::bf16_twins).
+            let twin = t <= FUSE_MAX_TOKENS;
+            let h_twin = if li == 0 {
                 b.rms_norm(
                     &ws.x,
                     w.param(l.input_norm),
@@ -999,20 +1065,13 @@ impl<B: Backend> Qwen35Text<B> {
                     c.eps,
                     NormKind::Offset,
                 )?;
+                false
             } else {
                 // The previous layer's MLP residual, fused with this layer's input norm.
-                b.add_rms_norm(
-                    &mut ws.x,
-                    &ws.y,
-                    w.param(l.input_norm),
-                    &mut ws.h,
-                    t,
-                    hd,
-                    c.eps,
-                    NormKind::Offset,
-                )?;
+                let h_twin = add_norm_h(b, ws, w.param(l.input_norm), t, hd, c.eps, twin)?;
                 self.capture_features(b, ws, li - 1, t)?;
-            }
+                h_twin
+            };
             match &l.mixer {
                 Mixer::Gdn {
                     qkv,
@@ -1070,6 +1129,7 @@ impl<B: Backend> Qwen35Text<B> {
                                 b,
                                 |d| w.view(d),
                                 &ws.h,
+                                ws.twins.as_ref().filter(|_| h_twin).map(|tw| &tw.h),
                                 (qkv, &mut *qkv_buf),
                                 (z, &mut ws.z),
                                 (ab, &mut *ab_buf),
@@ -1122,16 +1182,34 @@ impl<B: Backend> Qwen35Text<B> {
                         row0 = end;
                     }
                     // z = silu(z) * plain_rmsnorm(o)
-                    b.rms_norm_gated(
-                        &ws.o,
-                        w.param(*norm),
-                        &mut ws.z,
-                        t * c.gdn_v_heads,
-                        c.gdn_v_dim,
-                        c.eps,
-                        NormKind::Plain,
-                    )?;
-                    b.linear(&ws.z, &w.view(out), &mut ws.y, t)?;
+                    let rows = t * c.gdn_v_heads;
+                    match ws.twins.as_mut().filter(|_| twin) {
+                        Some(tw) => {
+                            b.rms_norm_gated_twin(
+                                &ws.o,
+                                w.param(*norm),
+                                &mut ws.z,
+                                &mut tw.z,
+                                rows,
+                                c.gdn_v_dim,
+                                c.eps,
+                                NormKind::Plain,
+                            )?;
+                            linear_from(b, &ws.z, Some(&tw.z), &w.view(out), &mut ws.y, t)?;
+                        }
+                        None => {
+                            b.rms_norm_gated(
+                                &ws.o,
+                                w.param(*norm),
+                                &mut ws.z,
+                                rows,
+                                c.gdn_v_dim,
+                                c.eps,
+                                NormKind::Plain,
+                            )?;
+                            b.linear(&ws.z, &w.view(out), &mut ws.y, t)?;
+                        }
+                    }
                     gi += 1;
                 }
                 Mixer::Attention { .. } => {
@@ -1140,21 +1218,21 @@ impl<B: Backend> Qwen35Text<B> {
                         None => Rope::At(rope_pos0),
                     };
                     let kv_format = s.kv_format;
-                    self.attention_mixer(b, ws, &l.mixer, &mut s.kv[ai], kv_format, t, pos0, rope)?;
+                    self.attention_mixer(
+                        b,
+                        ws,
+                        &l.mixer,
+                        &mut s.kv[ai],
+                        kv_format,
+                        (t, pos0),
+                        rope,
+                        (h_twin, twin),
+                    )?;
                     ai += 1;
                 }
             }
-            b.add_rms_norm(
-                &mut ws.x,
-                &ws.y,
-                w.param(l.post_norm),
-                &mut ws.h,
-                t,
-                hd,
-                c.eps,
-                NormKind::Offset,
-            )?;
-            self.mlp(b, ws, l, t)?;
+            let h_twin = add_norm_h(b, ws, w.param(l.post_norm), t, hd, c.eps, twin)?;
+            self.mlp(b, ws, l, t, h_twin)?;
             // The MLP residual is added by the next layer's fused input norm.
         }
         b.add(&mut ws.x, &ws.y, t * hd)?;
@@ -1202,6 +1280,9 @@ impl<B: Backend> Qwen35Text<B> {
     /// Gated attention mixer of one layer: `ws.h` (normed input, `t` rows) to `ws.y`, appending
     /// K/V at cache rows `pos0..` of `kv`.
     #[allow(clippy::too_many_arguments)]
+    /// `(h_twin, twin)`: whether `ws.h`'s bf16 twin is current, and whether to write the gated
+    /// output's twin for the output projection.
+    #[allow(clippy::too_many_arguments)]
     fn attention_mixer(
         &self,
         b: &B,
@@ -1209,9 +1290,9 @@ impl<B: Backend> Qwen35Text<B> {
         mixer: &Mixer,
         kv: &mut (B::Buffer, B::Buffer),
         kv_format: KvFormat,
-        t: usize,
-        pos0: usize,
+        (t, pos0): (usize, usize),
         rope: Rope<'_>,
+        (h_twin, twin): (bool, bool),
     ) -> Result<()> {
         let (c, w) = (&self.cfg, &self.w);
         let Mixer::Attention {
@@ -1254,6 +1335,7 @@ impl<B: Backend> Qwen35Text<B> {
                 let (pq, pg, pk, pv) = (part(query), part(gate), part(key), part(value));
                 b.linears(
                     &ws.h,
+                    ws.twins.as_ref().filter(|_| h_twin).map(|tw| &tw.h),
                     &mut [
                         LinearDst {
                             y: &mut ws.q,
@@ -1300,8 +1382,16 @@ impl<B: Backend> Qwen35Text<B> {
             NormKind::Offset,
         )?;
         self.attend_rows(b, ws, kv, kv_format, t, pos0, rope)?;
-        b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
-        b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
+        match ws.twins.as_mut().filter(|_| twin) {
+            Some(tw) => {
+                b.sigmoid_mul_twin(&mut ws.attn, &ws.g, &mut tw.attn, t * c.q_dim())?;
+                linear_from(b, &ws.attn, Some(&tw.attn), &w.view(output), &mut ws.y, t)?;
+            }
+            None => {
+                b.sigmoid_mul(&mut ws.attn, &ws.g, t * c.q_dim())?;
+                b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
+            }
+        }
         Ok(())
     }
 
@@ -1413,9 +1503,10 @@ impl<B: Backend> Qwen35Text<B> {
 
     /// FFN of one layer: `ws.h` to `ws.y`. Every forward path (chunks, verify, batched verify, MTP)
     /// goes through here, so a new FFN kind only needs an arm in this match.
-    fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize) -> Result<()> {
+    /// `h_twin`: whether `ws.h`'s bf16 twin is current.
+    fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize, h_twin: bool) -> Result<()> {
         match &l.ffn {
-            Ffn::Dense(d) => self.swiglu_ffn(b, ws, d, t),
+            Ffn::Dense(d) => self.swiglu_ffn(b, ws, d, t, h_twin),
             Ffn::Moe(_) => Err(Error::Unsupported(
                 "sparse MoE FFN execution (planned ops moe_route / moe_experts, see \
                  docs/qwen3_5-text.md) is not implemented yet"
@@ -1425,10 +1516,28 @@ impl<B: Backend> Qwen35Text<B> {
     }
 
     /// `ws.y = down(silu(gate(ws.h)) * up(ws.h))`.
-    fn swiglu_ffn(&self, b: &B, ws: &mut Workspace<B>, d: &DenseFfn, t: usize) -> Result<()> {
+    fn swiglu_ffn(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        d: &DenseFfn,
+        t: usize,
+        h_twin: bool,
+    ) -> Result<()> {
         let w = &self.w;
         let width = d.gate.rows;
         let (gate, up) = (w.view(&d.gate), w.view(&d.up));
+        let down = w.view(&d.down);
+        if let Some(tw) = ws
+            .twins
+            .as_mut()
+            .filter(|_| h_twin && b.swiglu_twin(&gate, &up, t))
+        {
+            // bf16 twins in and out: no activation conversions for gate|up or down.
+            let Twins { h, mg, .. } = tw;
+            b.linear_swiglu_twin(h, &gate, &up, &mut ws.mg, mg, t)?;
+            return linear_from(b, &ws.mg, Some(mg), &down, &mut ws.y, t);
+        }
         if t > FUSE_MAX_TOKENS && b.fuses_swiglu(&gate, &up, t) {
             // Prefill on a backend that fuses this width: no scratch is touched.
             b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.mu)?;
@@ -1440,7 +1549,7 @@ impl<B: Backend> Qwen35Text<B> {
             b.linear(&ws.h, &up, &mut ws.mu, t)?;
             b.silu_mul(&mut ws.mg, &ws.mu, t * width)?;
         }
-        b.linear(&ws.mg, &w.view(&d.down), &mut ws.y, t)
+        b.linear(&ws.mg, &down, &mut ws.y, t)
     }
 
     /// [`Self::advance`] that also hands every chunk's rows to `on_chunk` (with `ws.keep_rows`
@@ -2139,6 +2248,7 @@ impl<B: Backend> Qwen35Text<B> {
                                     b,
                                     |d| w.view(d),
                                     &ws.h,
+                                    None,
                                     (qkv, &mut *qkv_buf),
                                     (z, &mut ws.z),
                                     (ab, &mut *ab_buf),
@@ -2275,7 +2385,7 @@ impl<B: Backend> Qwen35Text<B> {
                 c.eps,
                 NormKind::Offset,
             )?;
-            self.mlp(b, ws, l, t)?;
+            self.mlp(b, ws, l, t, false)?;
         }
         b.add(&mut ws.x, &ws.y, t * hd)?;
         self.capture_features(b, ws, w.layers.len() - 1, t)?;
@@ -2341,6 +2451,7 @@ impl<B: Backend> Qwen35Text<B> {
                 let (pq, pg, pk, pv) = (part(query), part(gate), part(key), part(value));
                 b.linears(
                     &ws.h,
+                    None,
                     &mut [
                         LinearDst {
                             y: &mut ws.q,

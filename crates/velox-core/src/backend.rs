@@ -471,14 +471,109 @@ pub trait Backend {
     /// parts (one activation quantization) and write column ranges in place; the default
     /// ([`linears_composed`]) runs `linear` per part, through `scratch` (`[m, w.rows]` of the
     /// widest part that is not a whole destination) for column ranges.
+    ///
+    /// `xb`: `x`'s bf16 twin (see [`Self::bf16_twins`]) when the caller has one; backends may
+    /// read it for parts they round to bf16.
     fn linears(
         &self,
         x: &Self::Buffer,
+        xb: Option<&Self::Buffer>,
         dsts: &mut [LinearDst<'_, '_, '_, Self::Buffer>],
         scratch: &mut Self::Buffer,
         m: usize,
     ) -> Result<()> {
+        let _ = xb;
         linears_composed(self, x, dsts, scratch, m)
+    }
+
+    /// Whether the `_twin` producer ops are available: [`Self::add_rms_norm_twin`],
+    /// [`Self::rms_norm_gated_twin`], [`Self::sigmoid_mul_twin`]. A twin is a buffer holding the
+    /// same values rounded to bf16 (RNE) in the backend's layout (allocate it with `alloc(n)`), for
+    /// linears that round their activations to bf16 anyway: [`Self::linear_bf16`],
+    /// [`Self::linear_swiglu_twin`] and `linears` read it instead of converting `x` themselves.
+    fn bf16_twins(&self) -> bool {
+        false
+    }
+    /// [`Self::add_rms_norm`] that also writes `y`'s bf16 twin into `yb`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_twin(
+        &self,
+        _acc: &mut Self::Buffer,
+        _x: &Self::Buffer,
+        _weight: &Self::Buffer,
+        _y: &mut Self::Buffer,
+        _yb: &mut Self::Buffer,
+        _rows: usize,
+        _dim: usize,
+        _eps: f32,
+        _kind: NormKind,
+    ) -> Result<()> {
+        Err(Error::Unsupported("add_rms_norm_twin".into()))
+    }
+    /// [`Self::rms_norm_gated`] that also writes the result's bf16 twin into `gb`.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_gated_twin(
+        &self,
+        _x: &Self::Buffer,
+        _weight: &Self::Buffer,
+        _gate: &mut Self::Buffer,
+        _gb: &mut Self::Buffer,
+        _rows: usize,
+        _dim: usize,
+        _eps: f32,
+        _kind: NormKind,
+    ) -> Result<()> {
+        Err(Error::Unsupported("rms_norm_gated_twin".into()))
+    }
+    /// [`Self::sigmoid_mul`] that also writes the result's bf16 twin into `xb`.
+    fn sigmoid_mul_twin(
+        &self,
+        _x: &mut Self::Buffer,
+        _gate: &Self::Buffer,
+        _xb: &mut Self::Buffer,
+        _len: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("sigmoid_mul_twin".into()))
+    }
+    /// Whether [`Self::linear_bf16`] serves this view at `m` rows: `linear` rounds its activations
+    /// to bf16 there (`linear_act` is `ActQuant::Bf16`) and can take them already rounded.
+    fn takes_bf16(&self, _w: &WeightView<'_, Self::Buffer>, _m: usize) -> bool {
+        false
+    }
+    /// `linear` from `x`'s bf16 twin `xb`: the same result as `linear` on `x`, for views
+    /// [`Self::takes_bf16`] accepts.
+    fn linear_bf16(
+        &self,
+        _xb: &Self::Buffer,
+        _w: &WeightView<'_, Self::Buffer>,
+        _y: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_bf16".into()))
+    }
+    /// Whether [`Self::linear_swiglu_twin`] serves these views at `m` rows (a fused
+    /// `linear_swiglu` that rounds its input to bf16).
+    fn swiglu_twin(
+        &self,
+        _gate: &WeightView<'_, Self::Buffer>,
+        _up: &WeightView<'_, Self::Buffer>,
+        _m: usize,
+    ) -> bool {
+        false
+    }
+    /// Fused `linear_swiglu` from `x`'s bf16 twin `xb`, also writing `out`'s bf16 twin into
+    /// `outb`: the same `out` as `linear_swiglu` on `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_twin(
+        &self,
+        _xb: &Self::Buffer,
+        _gate: &WeightView<'_, Self::Buffer>,
+        _up: &WeightView<'_, Self::Buffer>,
+        _out: &mut Self::Buffer,
+        _outb: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_swiglu_twin".into()))
     }
     /// A SwiGLU FFN's projections: `out[r][i] = silu((x_r . gate_i)) * (x_r . up_i)` for `m` rows
     /// of `x`, where `gate` and `up` are views of the same width, format and K. Backends fuse it
