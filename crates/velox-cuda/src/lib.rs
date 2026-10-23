@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind,
-    KvStoreShape, NormKind, RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
+    KvStoreShape, LinearDst, NormKind, RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
 };
 use velox_core::{
     check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, VariantInfo,
@@ -387,6 +387,22 @@ pub trait CudaKernels: Send + Sync {
     /// The activation rounding `linear` applies; see [`Backend::linear_act`].
     fn linear_act(&self, _w: &WeightView<'_, CudaBuffer>, _m: usize) -> ActQuant {
         ActQuant::Exact
+    }
+
+    /// Whether `linears` serves these destinations at `m` rows (every part rounded as `linear`
+    /// rounds it). When it does not, the backend composes the op from `linear` and `copy2d`.
+    fn serves_linears(&self, _dsts: &[LinearDst<'_, '_, '_, CudaBuffer>], _m: usize) -> bool {
+        false
+    }
+
+    /// [`Backend::linears`] without scratch, for destinations `serves_linears` accepted.
+    fn linears(
+        &self,
+        _x: &CudaBuffer,
+        _dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linears".into()))
     }
 
     /// A fused [`Backend::linear_swiglu`] (no scratch). The default reports `Unsupported`, and the
@@ -1019,6 +1035,36 @@ impl Backend for CudaBackend {
             self.kernels
                 .swiglu(src, rows, src_cols, gate, up, width, out)
         })
+    }
+
+    fn linears(
+        &self,
+        x: &CudaBuffer,
+        dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
+        scratch: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if !self.kernels.serves_linears(dsts, m) {
+            return velox_core::backend::linears_composed(self, x, dsts, scratch, m);
+        }
+        for d in dsts.iter() {
+            for p in d.parts {
+                // A column range is checked as a view of `ld` rows over the destination.
+                check::linear(x.len, &p.w, p.w.buf.len, d.y.len, m)?;
+                if p.col + p.w.rows > d.ld || d.y.len < m * d.ld {
+                    return Err(Error::Shape(format!(
+                        "linears: columns {}..{} of {} x {} in {} values",
+                        p.col,
+                        p.col + p.w.rows,
+                        m,
+                        d.ld,
+                        d.y.len
+                    )));
+                }
+            }
+        }
+        let op = format!("linears m={}", if m <= 16 { "<=16" } else { ">16" });
+        self.timed(&op, || self.kernels.linears(x, dsts, m))
     }
 
     fn linear_swiglu(
