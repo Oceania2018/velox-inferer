@@ -7,7 +7,7 @@ use velox_core::backend::{
 };
 use velox_core::check::to_i32;
 use velox_core::{Error, KvFormat, Op, Result, WeightFormat};
-use velox_cuda::{portable, status, CudaBuffer, CudaKernels};
+use velox_cuda::{graph_mode, portable, status, CudaBuffer, CudaKernels, GraphMode};
 
 extern "C" {
     fn velox_5060_matmul_small_m(
@@ -153,6 +153,20 @@ extern "C" {
     ) -> i32;
     fn velox_5060_q8_quantize(x: *const f32, m: i32, k: i64, layout: i32) -> i32;
     fn velox_5060_bf16_act(x: *const f32, m: i32, k: i64, xb: *mut *const u8) -> i32;
+    fn velox_5060_gdn_chunk(
+        qkv: *const f32,
+        ab: *const f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state_in: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        tokens: i32,
+        k_heads: i32,
+        v_heads: i32,
+        k_dim: i32,
+        v_dim: i32,
+    ) -> i32;
     fn velox_5060_linear_iq3_direct_bf16(
         xb: *const u8,
         m: i32,
@@ -942,6 +956,53 @@ impl CudaKernels for Rtx5060Kernels {
             },
             "rtx5060 linear_swiglu twin",
         )
+    }
+
+    /// Prefill widths outside recorded steps: the chunked recurrence on bf16 tensor cores (f32
+    /// state, bf16 products; ninfer's precision). Qwen3.8 (48 heads, 128 x 128) at 1024 tokens:
+    /// 657 us exact f32 -> see the commit. Decode widths and recorded steps stay on main's exact
+    /// kernels.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: Option<&CudaBuffer>,
+        state: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        s: velox_core::backend::GdnShape,
+    ) -> Result<()> {
+        let chunked = s.tokens >= 16
+            && s.v_dim % 4 == 0
+            && matches!(s.k_dim, 32 | 64 | 128)
+            && s.v_heads % s.k_heads == 0
+            && graph_mode() == GraphMode::None;
+        if chunked {
+            let si = state_in.map_or(state.as_ptr(), CudaBuffer::as_ptr);
+            // SAFETY: CudaBackend validated the buffers against `s` (check::gdn) before this hook.
+            let code = unsafe {
+                velox_5060_gdn_chunk(
+                    qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                    ab.as_ptr().add(s.row0 * 2 * s.v_heads),
+                    a_log.as_ptr(),
+                    dt_bias.as_ptr(),
+                    si,
+                    state.as_mut_ptr(),
+                    out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
+                    to_i32("tokens", s.tokens)?,
+                    to_i32("k_heads", s.k_heads)?,
+                    to_i32("v_heads", s.v_heads)?,
+                    to_i32("k_dim", s.k_dim)?,
+                    to_i32("v_dim", s.v_dim)?,
+                )
+            };
+            return or_fallback(status(code, "rtx5060 gdn chunk"), || {
+                portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s)
+            });
+        }
+        portable::gated_delta_net(qkv, ab, a_log, dt_bias, state_in, state, out, s)
     }
 
     fn linear_swiglu_act(
