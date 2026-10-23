@@ -724,15 +724,18 @@ __global__ void __launch_bounds__(kGdnThreads)
     }
 }
 
-// The state-dependent part, chunks in order, from the prepare pass's per-chunk matrices.
-template <int DK>
-__global__ void __launch_bounds__(kGdnThreads, 3)
+// The state-dependent part, chunks in order, from the prepare pass's per-chunk matrices. A block
+// owns R * 16 state rows of one head; each thread holds R of them (rows si + 16 r) over 16 columns,
+// so every shared key/query/T/P/D value it reads feeds R rows (the loop is bound by shared-memory
+// reads, not FMAs).
+template <int DK, int R>
+__global__ void __launch_bounds__(kGdnThreads, R > 1 ? 2 : 3)
     gated_delta_net_chunk_kernel(const float* __restrict__ qkv, const float* __restrict__ prep,
                                  float* __restrict__ state, float* __restrict__ out, int tokens, int k_heads,
                                  int v_heads, int v_dim) {
-    constexpr int C = kGdnChunk, VT = kGdnVt, KS = DK + 4, PS = C + 4, RS = VT + 1, NJ = DK / 32;
+    constexpr int C = kGdnChunk, VT = kGdnVt * R, KS = DK + 4, PS = C + 4, RS = VT + 1, NJ = DK / 32;
     constexpr int NV = C * VT / kGdnThreads;
-    static_assert(kGdnThreads == VT * 8 && kGdnThreads == C * 8, "8 threads per state row and per chunk row");
+    static_assert(kGdnThreads == kGdnVt * 8 && kGdnThreads == C * 8, "8 threads per state row group and chunk row");
     __shared__ __align__(16) float ks[C * KS];  // normalized keys
     __shared__ __align__(16) float qs[C * KS];  // normalized queries
     __shared__ __align__(16) float ts[C * PS];  // T
@@ -747,16 +750,21 @@ __global__ void __launch_bounds__(kGdnThreads, 3)
     const size_t width = static_cast<size_t>(2 * k_heads * DK + v_heads * v_dim);
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(DK));
 
-    // Thread (si, dc) owns state row si (and chunk row si for loads) over columns
+    // Thread (si, dc) owns state rows si + 16 r (and chunk row si for loads) over columns
     // dc * 4 + 32 * j + e; its 8-thread group is lane-aligned within the warp.
     const int si = tid / 8, dc = tid % 8;
-    const bool row_ok = i0 + si < v_dim;
-    float* row_state = state + (static_cast<size_t>(h) * v_dim + i0 + si) * DK;
-    float s[NJ][4];
+    bool row_ok[R];
+    float s[R][NJ][4];
 #pragma unroll
-    for (int j = 0; j < NJ; ++j)
+    for (int r = 0; r < R; ++r) {
+        const int col = si + kGdnVt * r;
+        row_ok[r] = i0 + col < v_dim;
+        const float* row_state = state + (static_cast<size_t>(h) * v_dim + i0 + col) * DK;
 #pragma unroll
-        for (int e = 0; e < 4; ++e) s[j][e] = row_ok ? row_state[dc * 4 + 32 * j + e] : 0.0f;
+        for (int j = 0; j < NJ; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) s[r][j][e] = row_ok[r] ? row_state[dc * 4 + 32 * j + e] : 0.0f;
+    }
 
     // Raw inputs of a chunk, loaded into registers while the previous chunk finishes.
     float rq[NJ][4], rk[NJ][4], rv[NV], rt[2], rp[2], rg = 0.0f;
@@ -829,98 +837,134 @@ __global__ void __launch_bounds__(kGdnThreads, 3)
         __syncthreads();
         if (ci + 1 < chunks) load(ci + 1);
 
-        // x = S0[si].k_c, y = S0[si].q_c for chunk rows c, 8 at a time (lane dc ends up owning
-        // c = 8 g + dc): R[c][si] = beta_c (v_c - gamma_c x), and gamma_c y kept for o.
-        float ys[C / 8];
+        // x = S0[row].k_c, y = S0[row].q_c for chunk rows c, 8 at a time (lane dc ends up owning
+        // c = 8 g + dc): R[c][row] = beta_c (v_c - gamma_c x), and gamma_c y kept for o.
+        float ys[R][C / 8];
 #pragma unroll
         for (int g = 0; g < C / 8; ++g) {
-            float x[8], y[8];
+            float x[R][8], y[R][8];
 #pragma unroll
             for (int u = 0; u < 8; ++u) {
                 const int c = 8 * g + u;
-                x[u] = y[u] = 0.0f;
+#pragma unroll
+                for (int r = 0; r < R; ++r) x[r][u] = y[r][u] = 0.0f;
 #pragma unroll
                 for (int j = 0; j < NJ; ++j) {
                     const float4 kv = *reinterpret_cast<const float4*>(&ks[c * KS + dc * 4 + 32 * j]);
                     const float4 qv = *reinterpret_cast<const float4*>(&qs[c * KS + dc * 4 + 32 * j]);
-                    x[u] += kv.x * s[j][0] + kv.y * s[j][1] + kv.z * s[j][2] + kv.w * s[j][3];
-                    y[u] += qv.x * s[j][0] + qv.y * s[j][1] + qv.z * s[j][2] + qv.w * s[j][3];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        x[r][u] += kv.x * s[r][j][0] + kv.y * s[r][j][1] + kv.z * s[r][j][2] + kv.w * s[r][j][3];
+                        y[r][u] += qv.x * s[r][j][0] + qv.y * s[r][j][1] + qv.z * s[r][j][2] + qv.w * s[r][j][3];
+                    }
                 }
             }
-            gdn_reduce_scatter8(x, dc);
-            gdn_reduce_scatter8(y, dc);
             const int c = 8 * g + dc;
-            rs[c * RS + si] = betas[c] * (rs[c * RS + si] - gam[c] * x[0]);
-            ys[g] = gam[c] * y[0];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                gdn_reduce_scatter8(x[r], dc);
+                gdn_reduce_scatter8(y[r], dc);
+                const int col = si + kGdnVt * r;
+                rs[c * RS + col] = betas[c] * (rs[c * RS + col] - gam[c] * x[r][0]);
+                ys[r][g] = gam[c] * y[r][0];
+            }
         }
         __syncthreads();
 
-        // D = T R, o = gamma S0 q + P D, and the state update for state row si (T and P are lower
-        // triangular with explicit zeros).
+        // D = T R, o = gamma S0 q + P D, and the state update for this thread's rows (T and P are
+        // lower triangular with explicit zeros).
         {
-            float acc[C / 8];
+            float acc[R][C / 8];
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) acc[g] = 0.0f;
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) acc[r][g] = 0.0f;
 #pragma unroll 2
             for (int u = 0; u < C; u += 4) {
-                const float r0 = rs[u * RS + si], r1 = rs[(u + 1) * RS + si], r2 = rs[(u + 2) * RS + si],
-                            r3 = rs[(u + 3) * RS + si];
+                float rr[R][4];
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) rr[r][v] = rs[(u + v) * RS + si + kGdnVt * r];
 #pragma unroll
                 for (int g = 0; g < C / 8; ++g) {
                     const float4 t4 = *reinterpret_cast<const float4*>(&ts[(8 * g + dc) * PS + u]);
-                    acc[g] += t4.x * r0 + t4.y * r1 + t4.z * r2 + t4.w * r3;
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+                        acc[r][g] += t4.x * rr[r][0] + t4.y * rr[r][1] + t4.z * rr[r][2] + t4.w * rr[r][3];
                 }
             }
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) ds[(8 * g + dc) * RS + si] = acc[g];
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) ds[(8 * g + dc) * RS + si + kGdnVt * r] = acc[r][g];
         }
         __syncthreads();
         {
-            float acc[C / 8];
+            float acc[R][C / 8];
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) acc[g] = ys[g];
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) acc[r][g] = ys[r][g];
 #pragma unroll 2
             for (int u = 0; u < C; u += 4) {
-                const float d0 = ds[u * RS + si], d1 = ds[(u + 1) * RS + si], d2 = ds[(u + 2) * RS + si],
-                            d3 = ds[(u + 3) * RS + si];
+                float dd[R][4];
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) dd[r][v] = ds[(u + v) * RS + si + kGdnVt * r];
 #pragma unroll
                 for (int g = 0; g < C / 8; ++g) {
                     const float4 p4 = *reinterpret_cast<const float4*>(&ps[(8 * g + dc) * PS + u]);
-                    acc[g] += p4.x * d0 + p4.y * d1 + p4.z * d2 + p4.w * d3;
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+                        acc[r][g] += p4.x * dd[r][0] + p4.y * dd[r][1] + p4.z * dd[r][2] + p4.w * dd[r][3];
                 }
             }
 #pragma unroll
-            for (int g = 0; g < C / 8; ++g) {
-                const int c = 8 * g + dc;
-                if (c < n && row_ok)
-                    out[(static_cast<size_t>(t0 + c) * v_heads + h) * v_dim + i0 + si] = acc[g] * inv_sqrt_dk;
-            }
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int g = 0; g < C / 8; ++g) {
+                    const int c = 8 * g + dc, col = si + kGdnVt * r;
+                    if (c < n && row_ok[r])
+                        out[(static_cast<size_t>(t0 + c) * v_heads + h) * v_dim + i0 + col] = acc[r][g] * inv_sqrt_dk;
+                }
         }
         {
             const float gl = gam[C - 1];
 #pragma unroll
-            for (int j = 0; j < NJ; ++j)
+            for (int r = 0; r < R; ++r)
 #pragma unroll
-                for (int e = 0; e < 4; ++e) s[j][e] *= gl;
+                for (int j = 0; j < NJ; ++j)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) s[r][j][e] *= gl;
             for (int c = 0; c < n; ++c) {
-                const float dv = ds[c * RS + si] * decay_last[c];
+                float dv[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) dv[r] = ds[c * RS + si + kGdnVt * r] * decay_last[c];
 #pragma unroll
                 for (int j = 0; j < NJ; ++j) {
                     const float4 kv = *reinterpret_cast<const float4*>(&ks[c * KS + dc * 4 + 32 * j]);
-                    s[j][0] += dv * kv.x;
-                    s[j][1] += dv * kv.y;
-                    s[j][2] += dv * kv.z;
-                    s[j][3] += dv * kv.w;
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        s[r][j][0] += dv[r] * kv.x;
+                        s[r][j][1] += dv[r] * kv.y;
+                        s[r][j][2] += dv[r] * kv.z;
+                        s[r][j][3] += dv[r] * kv.w;
+                    }
                 }
             }
         }
         __syncthreads();
     }
-    if (row_ok) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (!row_ok[r]) continue;
+        float* row_state = state + (static_cast<size_t>(h) * v_dim + i0 + si + kGdnVt * r) * DK;
 #pragma unroll
         for (int j = 0; j < NJ; ++j)
 #pragma unroll
-            for (int e = 0; e < 4; ++e) row_state[dc * 4 + 32 * j + e] = s[j][e];
+            for (int e = 0; e < 4; ++e) row_state[dc * 4 + 32 * j + e] = s[r][j][e];
     }
 }
 
@@ -1384,11 +1428,18 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
         static VeloxScratch scratch;
         float* prep = static_cast<float*>(scratch.get(static_cast<size_t>(v_heads) * chunks * kGdnPrep * sizeof(float)));
         if (prep == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
-        const dim3 pgrid(v_heads, chunks), grid(v_heads, (v_dim + kGdnVt - 1) / kGdnVt), block(kGdnThreads);
-#define VELOX_GDN_CHUNK(DK)                                                                                         \
-    gated_delta_net_prepare_kernel<DK><<<pgrid, block>>>(qkv, ab, a_log, dt_bias, prep, tokens, k_heads, v_heads,   \
-                                                         v_dim);                                                    \
-    gated_delta_net_chunk_kernel<DK><<<grid, block>>>(qkv, prep, state, out, tokens, k_heads, v_heads, v_dim)
+        // State rows per thread: 4 (64 per block) unless the heads are narrower. Qwen3.8 (48 heads,
+        // 128 x 128), 1024 tokens with the prepare pass: 1381 us at 1, 996 at 2, 805 at 4.
+        const int r = v_dim >= 4 * kGdnVt ? 4 : v_dim >= 2 * kGdnVt ? 2 : 1;
+        const dim3 pgrid(v_heads, chunks), grid(v_heads, (v_dim + kGdnVt * r - 1) / (kGdnVt * r)), block(kGdnThreads);
+#define VELOX_GDN_CHUNK_R(DK, R) \
+    gated_delta_net_chunk_kernel<DK, R><<<grid, block>>>(qkv, prep, state, out, tokens, k_heads, v_heads, v_dim)
+#define VELOX_GDN_CHUNK(DK)                                                                                       \
+    gated_delta_net_prepare_kernel<DK><<<pgrid, block>>>(qkv, ab, a_log, dt_bias, prep, tokens, k_heads, v_heads, \
+                                                         v_dim);                                                  \
+    if (r == 4) VELOX_GDN_CHUNK_R(DK, 4);                                                                         \
+    else if (r == 2) VELOX_GDN_CHUNK_R(DK, 2);                                                                    \
+    else VELOX_GDN_CHUNK_R(DK, 1)
         if (k_dim == 32) {
             VELOX_GDN_CHUNK(32);
         } else if (k_dim == 64) {
@@ -1397,6 +1448,7 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
             VELOX_GDN_CHUNK(128);
         }
 #undef VELOX_GDN_CHUNK
+#undef VELOX_GDN_CHUNK_R
         return velox_launch_status();
     }
     constexpr int kWarps = kGdnRowsWarps;
