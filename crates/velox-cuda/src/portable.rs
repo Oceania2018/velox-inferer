@@ -1145,7 +1145,14 @@ pub fn attention_block(
         out.len(),
         &s,
     )?;
-    let Some(params) = graph_params(&[s.pos0 as i64, s.ctx_lo as i64])? else {
+    // Graph steps stage the positions and the context rings: a recording serves any sequence.
+    let Some(params) = graph_params(&[
+        s.pos0 as i64,
+        s.ctx_lo as i64,
+        k_ctx.as_ptr() as i64,
+        v_ctx.as_ptr() as i64,
+    ])?
+    else {
         return Ok(());
     };
     // SAFETY: extents validated above.
