@@ -307,6 +307,10 @@ fn stream_chat(ep: &Endpoint, body: &[u8]) -> Result<Measured> {
         }
     }
     let total = ms(t0);
+    // Local inspection of what the model produced (confidential: never leaves the machine).
+    if std::env::var_os("VELOX_REPLAY_DUMP").is_some() {
+        eprintln!("[output] {}", String::from_utf8_lossy(&output));
+    }
     Ok(Measured {
         ttft,
         total,
