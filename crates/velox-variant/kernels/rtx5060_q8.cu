@@ -139,6 +139,77 @@ struct Last {
     int m = 0, k = 0, layout = -1;
 } g_last;
 
+// Bytes of a caller-owned activation blob for [m, k] (velox_5060_q8_act_bytes): xq [m, k] int8 padded
+// to 256 bytes, then sx [k / 256, stride_of(m)] f32. The same layout as the shared scratch.
+size_t act_bytes(int m, int k) {
+    const size_t xb = (static_cast<size_t>(m) * k + 255) / 256 * 256;
+    return xb + static_cast<size_t>(k / kGroup) * stride_of(m) * 4;
+}
+
+Act act_of(const void* blob, int m, int k) {
+    const size_t xb = (static_cast<size_t>(m) * k + 255) / 256 * 256;
+    const auto* base = static_cast<const uint8_t*>(blob);
+    return {reinterpret_cast<const int8_t*>(base), reinterpret_cast<const float*>(base + xb), stride_of(m)};
+}
+
+// add_rms_norm (main's math: acc += x; y = acc * rsqrt(mean(acc^2) + eps) * (offset + w)) that also
+// quantizes y as quantize_act does (bf16 rounding, then one scale per 256 values) into a blob in
+// `layout`, so a norm's output reaches the int8 GEMMs without a quantization pass. One block per
+// row; the row's bf16-rounded values wait in shared memory for the group pass (dim * 4 bytes).
+__global__ void __launch_bounds__(1024) add_rms_norm_q8_kernel(float* __restrict__ acc, const float* __restrict__ x,
+                                                               const float* __restrict__ weight, float* __restrict__ y,
+                                                               int8_t* __restrict__ xq, float* __restrict__ sx, int stride,
+                                                               int dim, float eps, float offset, int layout) {
+    extern __shared__ __align__(16) float vs[];
+    __shared__ float scratch[VELOX_WARP];
+    const int row = blockIdx.x;
+    const size_t base = static_cast<size_t>(row) * dim;
+    float4* a4 = reinterpret_cast<float4*>(acc + base);
+    const float4* x4 = reinterpret_cast<const float4*>(x + base);
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim / 4; i += blockDim.x) {
+        float4 a = a4[i];
+        const float4 b = x4[i];
+        a.x += b.x, a.y += b.y, a.z += b.z, a.w += b.w;
+        a4[i] = a;
+        ss += a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+    }
+    ss = velox_block_sum(ss, scratch);
+    const float inv = rsqrtf(ss / dim + eps);
+    const float4* w4 = reinterpret_cast<const float4*>(weight);
+    float4* y4 = reinterpret_cast<float4*>(y + base);
+    for (int i = threadIdx.x; i < dim / 4; i += blockDim.x) {
+        const float4 a = a4[i], w = w4[i];
+        const float4 v = make_float4(a.x * inv * (offset + w.x), a.y * inv * (offset + w.y), a.z * inv * (offset + w.z),
+                                     a.w * inv * (offset + w.w));
+        y4[i] = v;
+        reinterpret_cast<float4*>(vs)[i] =
+            make_float4(__bfloat162float(__float2bfloat16_rn(v.x)), __bfloat162float(__float2bfloat16_rn(v.y)),
+                        __bfloat162float(__float2bfloat16_rn(v.z)), __bfloat162float(__float2bfloat16_rn(v.w)));
+    }
+    __syncthreads();
+    const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP, warps = blockDim.x / VELOX_WARP;
+    for (int g = warp; g < dim / kGroup; g += warps) {
+        const float4 a = reinterpret_cast<const float4*>(vs + g * kGroup + lane * 8)[0];
+        const float4 b = reinterpret_cast<const float4*>(vs + g * kGroup + lane * 8)[1];
+        const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(v[i]));
+        amax = velox_warp_max(amax);
+        const float qinv = amax > 0.0f ? __fdiv_rn(127.0f, amax) : 0.0f;
+        unsigned q[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) q[i] = static_cast<unsigned>(__float2int_rn(__fmul_rn(v[i], qinv))) & 0xffu;
+        const uint2 packed = layout == 0 ? make_uint2(q[0] | q[1] << 8 | q[2] << 16 | q[3] << 24,
+                                                      q[4] | q[5] << 8 | q[6] << 16 | q[7] << 24)
+                                         : make_uint2(q[0] | q[2] << 8 | q[4] << 16 | q[6] << 24,
+                                                      q[1] | q[3] << 8 | q[5] << 16 | q[7] << 24);
+        *reinterpret_cast<uint2*>(xq + base + g * kGroup + lane * 8) = packed;
+        if (lane == 0) sx[static_cast<long long>(g) * stride + row] = __fdiv_rn(amax, 127.0f);
+    }
+}
+
 int quantize(const float* x, int m, int k, int layout, Act& out) {
     const int stride = stride_of(m);
     const size_t xb = (static_cast<size_t>(m) * k + 255) / 256 * 256;
@@ -672,6 +743,71 @@ VELOX_API int velox_5060_linear_rs_q8(const float* x, int m, const uint8_t* w, l
     if (const int e = quantize(x, m, static_cast<int>(k), 1, a)) return e;
     RsArgs p{a.xq, a.sx, a.stride, m, static_cast<int>(k), w, parent_rows, row_begin, rows, y, rows};
     return format == 5 ? launch_rs<true>(p) : launch_rs<false>(p);
+}
+
+// Bytes of a caller-owned int8 activation blob for [m, k] (see act_bytes), 0 when unsupported.
+VELOX_API size_t velox_5060_q8_act_bytes(int m, long long k) {
+    if (m < 1 || k < 256 || k % 256 != 0 || k > (1ll << 30)) return 0;
+    return act_bytes(m, static_cast<int>(k));
+}
+
+// add_rms_norm over `rows` rows of `dim` (a multiple of 256, at most 12288) that also writes y's
+// int8 activation blob in `layout` (0: IQ3_XXS, 1: q4/q5), as velox_5060_q8_quantize would.
+VELOX_API int velox_5060_add_rms_norm_q8(float* acc, const float* x, const float* weight, float* y, void* blob,
+                                         int layout, int rows, int dim, float eps, int offset) {
+    if (rows < 1 || dim < 256 || dim % 256 != 0 || dim > 12288 || (layout != 0 && layout != 1) ||
+        reinterpret_cast<uintptr_t>(acc) % 16 != 0 || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(y) % 16 != 0 || reinterpret_cast<uintptr_t>(weight) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    const Act a = act_of(blob, rows, dim);
+    add_rms_norm_q8_kernel<<<rows, 1024, static_cast<size_t>(dim) * sizeof(float)>>>(
+        acc, x, weight, y, const_cast<int8_t*>(a.xq), const_cast<float*>(a.sx), a.stride, dim, eps,
+        offset ? 1.0f : 0.0f, layout);
+    return velox_launch_status();
+}
+
+// velox_5060_linear_iq3_q8 / _rs_q8 / _swiglu_iq3_q8 on a caller's blob (layout 0 / 1 / 0, from
+// velox_5060_add_rms_norm_q8), writing y[t * ldy + r].
+VELOX_API int velox_5060_linear_iq3_q8_from(const void* blob, int m, const uint8_t* w, long long parent_rows,
+                                            long long k, long long row_begin, int rows, float* y, long long ldy) {
+    if (m < 1 || rows <= 0 || ldy < rows || k % 256 != 0 || k > (1ll << 30) ||
+        reinterpret_cast<uintptr_t>(w) % 16 != 0 || reinterpret_cast<uintptr_t>(blob) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    const Act a = act_of(blob, m, static_cast<int>(k));
+    Iq3Args p{};
+    p.xq = a.xq, p.sx = a.sx, p.stride = a.stride;
+    p.m = m, p.k = static_cast<int>(k), p.rows = rows, p.y = y, p.ldy = ldy;
+    p.w = p.w2 = w;
+    p.parent_rows = p.parent_rows2 = parent_rows;
+    p.row_begin = p.row_begin2 = row_begin;
+    return m >= 1024 ? launch_iq3<1, 16, 8, 1, false>(p) : launch_iq3<1, 8, 4, 2, false>(p);
+}
+
+VELOX_API int velox_5060_linear_rs_q8_from(const void* blob, int m, const uint8_t* w, long long parent_rows,
+                                           long long k, long long row_begin, int rows, int format, float* y,
+                                           long long ldy) {
+    if (m < 1 || rows <= 0 || ldy < rows || k % 256 != 0 || k > (1ll << 30) || (format != 4 && format != 5) ||
+        reinterpret_cast<uintptr_t>(w) % 16 != 0 || reinterpret_cast<uintptr_t>(blob) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    const Act a = act_of(blob, m, static_cast<int>(k));
+    RsArgs p{a.xq, a.sx, a.stride, m, static_cast<int>(k), w, parent_rows, row_begin, rows, y, ldy};
+    return format == 5 ? launch_rs<true>(p) : launch_rs<false>(p);
+}
+
+VELOX_API int velox_5060_linear_swiglu_iq3_q8_from(const void* blob, int m, const uint8_t* w, long long parent_rows,
+                                                   long long gate_begin, const uint8_t* up_w,
+                                                   long long up_parent_rows, long long up_begin, long long k,
+                                                   int rows, float* out) {
+    if (m < 1 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(w) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(up_w) % 16 != 0 || reinterpret_cast<uintptr_t>(blob) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    const Act a = act_of(blob, m, static_cast<int>(k));
+    Iq3Args p{};
+    p.xq = a.xq, p.sx = a.sx, p.stride = a.stride;
+    p.m = m, p.k = static_cast<int>(k), p.rows = rows, p.y = out, p.ldy = rows;
+    p.w = w, p.parent_rows = parent_rows, p.row_begin = gate_begin;
+    p.w2 = up_w, p.parent_rows2 = up_parent_rows, p.row_begin2 = up_begin;
+    return m >= 1024 ? launch_iq3<1, 16, 8, 1, true>(p) : launch_iq3<1, 8, 4, 2, true>(p);
 }
 
 // Quantizes x [m, k] (ActQuant::Int8G256) in `layout` (0: IQ3_XXS, 1: q4/q5) for the _pre GEMMs
