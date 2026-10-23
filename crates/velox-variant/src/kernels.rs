@@ -153,6 +153,40 @@ extern "C" {
     ) -> i32;
     fn velox_5060_q8_quantize(x: *const f32, m: i32, k: i64, layout: i32) -> i32;
     fn velox_5060_bf16_act(x: *const f32, m: i32, k: i64, xb: *mut *const u8) -> i32;
+    fn velox_5060_linear_iq3_direct_bf16(
+        xb: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5060_linear_swiglu_iq3_direct_twin(
+        xb: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        gate_begin: i64,
+        up_w: *const u8,
+        up_parent_rows: i64,
+        up_begin: i64,
+        k: i64,
+        rows: i32,
+        out: *mut f32,
+        outb: *mut u16,
+    ) -> i32;
+    fn velox_5060_linear_nvfp4_sliced_bf16(
+        xb: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_rs_sliced_bf16(
         xb: *const u8,
         m: i32,
@@ -443,6 +477,29 @@ fn rs_shared(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     }
 }
 
+/// The kernel `linear_bf16` runs for a view at `m` tokens, reading a bf16 twin (natural order)
+/// instead of converting: the direct IQ3_XXS kernel, the q4/q5 sliced-K one and the NVFP4 sliced-K
+/// one, at the widths `linear` serves with them.
+#[derive(Clone, Copy)]
+enum Bf16In {
+    Iq3,
+    Rs(i32),
+    Nvfp4,
+}
+
+fn bf16_in(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<Bf16In> {
+    if !(1..=SKINNY16_MAX_M).contains(&m) {
+        return None;
+    }
+    if skinny_iq3(w, m) && iq3_direct(m) {
+        return Some(Bf16In::Iq3);
+    }
+    if let Some(f) = rs_shared(w, m) {
+        return Some(Bf16In::Rs(f));
+    }
+    (skinny16_format(w, m) == Some(0) && w.k % 512 == 0).then_some(Bf16In::Nvfp4)
+}
+
 /// Whether `linears` writes this part in place at `m` tokens: int8 parts (which share one
 /// quantization per layout), q4/q5 sliced-K ones (which share one bf16 conversion) and bf16
 /// few-row ones.
@@ -688,12 +745,14 @@ impl CudaKernels for Rtx5060Kernels {
     fn linears(
         &self,
         x: &CudaBuffer,
+        twin: Option<&CudaBuffer>,
         dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
         m: usize,
     ) -> Result<()> {
         let mi = to_i32("m", m)?;
-        // q4/q5 sliced-K parts: one bf16 conversion, then each GEMM into its columns.
-        let mut xb: *const u8 = std::ptr::null();
+        // q4/q5 sliced-K parts: the input's bf16 twin, or one conversion, then each GEMM into its
+        // columns.
+        let mut xb: *const u8 = twin.map_or(std::ptr::null(), |t| t.as_ptr().cast::<u8>());
         for d in dsts.iter_mut() {
             let ld = d.ld;
             for p in d.parts {
@@ -803,6 +862,79 @@ impl CudaKernels for Rtx5060Kernels {
             }
         }
         Ok(())
+    }
+
+    fn takes_bf16(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+        self.linear_act(w, m) == ActQuant::Bf16 && bf16_in(w, m).is_some()
+    }
+
+    fn linear_bf16(
+        &self,
+        xb: &CudaBuffer,
+        w: &WeightView<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        let (mi, rows) = (to_i32("m", m)?, to_i32("rows", w.rows)?);
+        let (xp, wp) = (xb.as_ptr().cast::<u8>(), w.buf.as_ptr().cast::<u8>());
+        let (pr, k, rb) = (w.parent_rows as i64, w.k as i64, w.row_begin as i64);
+        let yp = y.as_mut_ptr();
+        // SAFETY: CudaBackend::linear_bf16 checked the twin, view and output extents.
+        let code = match bf16_in(w, m) {
+            Some(Bf16In::Iq3) => unsafe {
+                velox_5060_linear_iq3_direct_bf16(xp, mi, wp, pr, k, rb, rows, yp)
+            },
+            Some(Bf16In::Rs(f)) => unsafe {
+                velox_5060_linear_rs_sliced_bf16(xp, mi, wp, pr, k, rb, rows, f, yp, rows as i64)
+            },
+            Some(Bf16In::Nvfp4) => unsafe {
+                velox_5060_linear_nvfp4_sliced_bf16(xp, mi, wp, pr, k, rb, rows, yp)
+            },
+            None => return Err(Error::Unsupported("linear_bf16 view".into())),
+        };
+        status(code, "rtx5060 linear bf16 twin")
+    }
+
+    fn swiglu_twin(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> bool {
+        self.linear_swiglu_act(gate, up, m) == Some(ActQuant::Bf16)
+            && gate.format == WeightFormat::Iq3Xxs
+            && iq3_direct(m)
+    }
+
+    fn linear_swiglu_twin(
+        &self,
+        xb: &CudaBuffer,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        outb: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        // SAFETY: CudaBackend::linear_swiglu_twin checked the twins, views and output extents.
+        status(
+            unsafe {
+                velox_5060_linear_swiglu_iq3_direct_twin(
+                    xb.as_ptr().cast::<u8>(),
+                    to_i32("m", m)?,
+                    gate.buf.as_ptr().cast(),
+                    gate.parent_rows as i64,
+                    gate.row_begin as i64,
+                    up.buf.as_ptr().cast(),
+                    up.parent_rows as i64,
+                    up.row_begin as i64,
+                    gate.k as i64,
+                    to_i32("rows", gate.rows)?,
+                    out.as_mut_ptr(),
+                    outb.as_mut_ptr().cast(),
+                )
+            },
+            "rtx5060 linear_swiglu twin",
+        )
     }
 
     fn linear_swiglu_act(

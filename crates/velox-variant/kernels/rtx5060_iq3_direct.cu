@@ -120,6 +120,7 @@ __device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
 struct Up {
     const uint8_t* w;
     long long parent_rows, row_begin;
+    unsigned short* yb = nullptr;  // PAIR: null, or out's bf16 twin (RNE)
 };
 
 // Short rows (gate/up, K = 5120: at most IQ3_DIRECT_LONG_BLOCKS K blocks) run with fewer warps, a
@@ -347,7 +348,14 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
                     for (int j = 0; j < 2; ++j) {
                         const int t = ni * 8 + 2 * q + j;
                         const float g = c[ni][j];
-                        if (t < m) y[static_cast<long long>(t) * rows + r] = g / (1.0f + expf(-g)) * c[ni][2 + j];
+                        if (t < m) {
+                            const float v = g / (1.0f + expf(-g)) * c[ni][2 + j];
+                            y[static_cast<long long>(t) * rows + r] = v;
+                            if (up.yb != nullptr) {
+                                const __nv_bfloat16 h = __float2bfloat16_rn(v);
+                                up.yb[static_cast<long long>(t) * rows + r] = *reinterpret_cast<const unsigned short*>(&h);
+                            }
+                        }
                     }
             }
             continue;
@@ -415,6 +423,24 @@ int run(const float* x, int m, const uint8_t* w, long long parent_rows, long lon
                      : launch<IQ3_DIRECT_W_SHORT, 2, 2, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up);
 }
 
+// The bf16 kernels on activations already rounded to bf16 (a producer's twin, natural order).
+template <bool PAIR>
+int run_bf16(const __nv_bfloat16* x16, int m, const uint8_t* w, long long parent_rows, long long k,
+             long long row_begin, int rows, float* y, Up up) {
+    if (m < 1 || m > 16 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) ||
+        reinterpret_cast<uintptr_t>(x16) % 16 != 0 || reinterpret_cast<uintptr_t>(w) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(up.w) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    const int ki = static_cast<int>(k);
+    const bool long_rows = k / 256 > IQ3_DIRECT_LONG_BLOCKS;
+    if (m <= 8) {
+        return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 1, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up)
+                         : launch<IQ3_DIRECT_W_SHORT, 1, 1, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up);
+    }
+    return long_rows ? launch<IQ3_DIRECT_W_LONG, 1, 2, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up)
+                     : launch<IQ3_DIRECT_W_SHORT, 2, 2, PAIR>(x16, w, parent_rows, ki, row_begin, rows, m, y, up);
+}
+
 }  // namespace
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T for an iq3_xxs_planar_v1 parent [parent_rows, k],
@@ -433,4 +459,20 @@ VELOX_API int velox_5060_linear_swiglu_iq3_direct(const float* x, int m, const u
                                                   long long up_parent_rows, long long up_begin, long long k, int rows,
                                                   float* out) {
     return run<true>(x, m, w, parent_rows, k, gate_begin, rows, out, Up{up_w, up_parent_rows, up_begin});
+}
+
+// velox_5060_linear_iq3_direct on a bf16 twin xb [m, k] (no conversion launch).
+VELOX_API int velox_5060_linear_iq3_direct_bf16(const void* xb, int m, const uint8_t* w, long long parent_rows,
+                                                long long k, long long row_begin, int rows, float* y) {
+    return run_bf16<false>(static_cast<const __nv_bfloat16*>(xb), m, w, parent_rows, k, row_begin, rows, y,
+                           Up{w, parent_rows, row_begin});
+}
+
+// velox_5060_linear_swiglu_iq3_direct on a bf16 twin xb, also writing out's bf16 twin into outb.
+VELOX_API int velox_5060_linear_swiglu_iq3_direct_twin(const void* xb, int m, const uint8_t* w, long long parent_rows,
+                                                       long long gate_begin, const uint8_t* up_w,
+                                                       long long up_parent_rows, long long up_begin, long long k,
+                                                       int rows, float* out, unsigned short* outb) {
+    return run_bf16<true>(static_cast<const __nv_bfloat16*>(xb), m, w, parent_rows, k, gate_begin, rows, out,
+                          Up{up_w, up_parent_rows, up_begin, outb});
 }
