@@ -530,6 +530,19 @@ struct Active<B: Backend> {
     pre: Option<Prefill<B>>,
 }
 
+impl<B: Backend> Active<B> {
+    /// Sends a streaming job the output it has not seen yet (`complete` sends the rest).
+    fn send_new(&mut self) {
+        if self.job.stream && self.out.len() > self.sent {
+            let _ = self
+                .job
+                .reply
+                .send(Reply::Tokens(self.out[self.sent..].to_vec()));
+            self.sent = self.out.len();
+        }
+    }
+}
+
 /// Requests handed from the HTTP threads to the worker.
 struct JobQueue {
     jobs: Mutex<VecDeque<Job>>,
@@ -985,9 +998,12 @@ impl<B: Backend> Core<B> {
         let mut waiting: VecDeque<Job> = VecDeque::new();
         let mut active: Vec<Active<B>> = Vec::new();
         let mut mem_logged = Instant::now();
+        // Drafter context pages kept ready: a new conversation's captures save two windows, so
+        // a burst of them (see the store's RESERVE_STATES) needs several.
+        const DRAFT_RESERVE_WINDOWS: usize = 6;
         let draft = self.dflash.as_ref().map(|dm| {
             (
-                dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
+                DRAFT_RESERVE_WINDOWS * dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
                 dm.context_page_len(),
             )
         });
@@ -1073,13 +1089,9 @@ impl<B: Backend> Core<B> {
                 }
                 continue;
             }
-            // Streaming jobs get the tokens this round committed (`complete` sends the rest).
-            for a in active
-                .iter_mut()
-                .filter(|a| a.job.stream && a.out.len() > a.sent)
-            {
-                let _ = a.job.reply.send(Reply::Tokens(a.out[a.sent..].to_vec()));
-                a.sent = a.out.len();
+            // Streaming jobs get the tokens this round committed.
+            for a in active.iter_mut() {
+                a.send_new();
             }
             let (done, rest): (Vec<Active<B>>, Vec<Active<B>>) =
                 active.drain(..).partition(|a| a.finish.is_some());
@@ -1434,6 +1446,9 @@ impl<B: Backend> Core<B> {
             if a.out.len() >= a.job.max_tokens {
                 a.finish = Some("length");
             }
+            // The token sampled last round (the first one: at the end of the prefill) goes out
+            // now, not after this round's forward pass.
+            a.send_new();
         }
         let live: Vec<usize> = (0..active.len())
             .filter(|&i| active[i].pre.is_none() && active[i].finish.is_none())
