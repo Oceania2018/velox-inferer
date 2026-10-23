@@ -723,9 +723,20 @@ impl<B: Backend> Suite<'_, B> {
     }
 
     /// `top_k` must agree exactly (indices and values) with the host selection, including ties
-    /// (lower index first) and NaN (ranked last).
-    fn top_k(&mut self, rows: usize, row_len: usize, limit: usize, k: usize) -> Result<()> {
+    /// (lower index first) and NaN (ranked last). `coarse` rounds every value to a multiple of 0.5,
+    /// so the top k is mostly ties.
+    fn top_k(
+        &mut self,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        k: usize,
+        coarse: bool,
+    ) -> Result<()> {
         let mut x = self.rng.vec(rows * row_len, 4.0);
+        if coarse {
+            x.iter_mut().for_each(|v| *v = (*v * 2.0).round() / 2.0);
+        }
         // Ties and NaN: copy a value forward and poison a few entries.
         for r in 0..rows {
             let base = r * row_len;
@@ -1877,10 +1888,17 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         })?;
     }
     s.concat_cols(7, 13, 5)?;
-    s.top_k(2, 248_320, 248_077, 64)?;
-    s.top_k(3, 5000, 4097, 20)?;
-    s.top_k(1, 50, 50, 64)?;
-    s.top_k(4, 1000, 1000, 1)?;
+    s.top_k(2, 248_320, 248_077, 64, false)?;
+    s.top_k(3, 5000, 4097, 20, false)?;
+    s.top_k(1, 50, 50, 64, false)?;
+    s.top_k(4, 1000, 1000, 1, false)?;
+    // Draft proposals: a few rows over a large head, small k (selected by reductions).
+    s.top_k(7, 131_072, 131_072, 16, false)?;
+    s.top_k(7, 131_072, 130_001, 12, true)?;
+    s.top_k(2, 20_000, 20_000, 32, true)?;
+    s.top_k(2, 20_000, 20_000, 33, true)?;
+    s.top_k(3, 9000, 5, 8, false)?;
+    s.embed(WeightFormat::Q5G64, 16, 5120, &[15, 0, 7, 7, 3, 9, 1, 12])?;
     s.embed(WeightFormat::Fp8RowBf16, 50, 64, &[3, 0, 49, 3])?;
     s.embed(WeightFormat::Bf16, 10, 130, &[9, 1])?;
     s.embed(WeightFormat::Nvfp4, 128, 64, &[127, 0, 64])?;
@@ -2159,7 +2177,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Iq3Xxs, 200, 256, 17, 150, 33)?;
     s.embed(WeightFormat::Iq3Xxs, 12, 512, &[11, 0, 5])?;
     // Greedy speculative verify: the argmax of each row of a verify window.
-    s.top_k(8, 248_320, 248_077, 1)?;
+    s.top_k(8, 248_320, 248_077, 1, false)?;
     // Fused SwiGLU projections at decode and verify widths: the dense MLP's formats, ragged
     // widths, both row orders and separate parents.
     for m in [1, 2, 8, 16] {

@@ -240,6 +240,24 @@ pub struct DFlashWorkspace<B: Backend> {
     hid: B::Buffer,
     logits: B::Buffer,
     g: B::Buffer,
+    /// `g` copied to host-mapped memory ahead of the top-k, whose synchronization covers it.
+    g_host: B::Buffer,
+}
+
+/// The first `n` values of `buf` (from [`Backend::alloc_host`]) once the device work writing it
+/// has completed: read in place when the host can address it, else downloaded.
+fn host_rows<B: Backend>(b: &B, buf: &B::Buffer, n: usize) -> Result<Vec<f32>> {
+    match b.host_bytes(buf) {
+        Some(bytes) => Ok(bytes[..n * 4]
+            .chunks_exact(4)
+            .map(|v| f32::from_ne_bytes([v[0], v[1], v[2], v[3]]))
+            .collect()),
+        None => {
+            let mut out = vec![0.0; n];
+            b.download(buf, &mut out)?;
+            Ok(out)
+        }
+    }
 }
 
 /// One block's proposal: per mask column, the unary candidates (global id, score) and the
@@ -422,6 +440,7 @@ impl<B: Backend> DFlashModel<B> {
             hid: b.alloc(w * h)?,
             logits: b.alloc(w * head_rows)?,
             g: b.alloc(w * c.rank)?,
+            g_host: b.alloc_host(w * c.rank)?,
         })
     }
 
@@ -805,7 +824,8 @@ impl<B: Backend> DFlashModel<B> {
                 NormKind::Plain,
             )?;
             b.linear(&dw.hid, &head, &mut dw.logits, k)?;
-            b.linear(&dw.hid, &self.view(&self.hidden_projection), &mut dw.g, k)
+            b.linear(&dw.hid, &self.view(&self.hidden_projection), &mut dw.g, k)?;
+            b.copy(&dw.g, 0, &mut dw.g_host, 0, k * c.rank)
         })?;
         let n = head.rows;
         let fetch = c.top_k + if map.is_some() { 8 } else { 0 };
@@ -826,8 +846,7 @@ impl<B: Backend> DFlashModel<B> {
                     .collect()
             })
             .collect();
-        let mut g = vec![0.0; k * c.rank];
-        b.download(&dw.g, &mut g)?;
+        let g = host_rows(b, &dw.g_host, k * c.rank)?;
         Ok(BlockCandidates { cands, g })
     }
 
@@ -977,6 +996,7 @@ impl<B: Backend> DFlashModel<B> {
         )?;
         b.linear(&dw.hid, &head, &mut dw.logits, m)?;
         b.linear(&dw.hid, &self.view(&self.hidden_projection), &mut dw.g, m)?;
+        b.copy(&dw.g, 0, &mut dw.g_host, 0, m * c.rank)?;
         let nh = head.rows;
         let fetch = c.top_k + if map.is_some() { 8 } else { 0 };
         let all = b.top_k(
@@ -986,8 +1006,7 @@ impl<B: Backend> DFlashModel<B> {
             if map.is_some() { nh } else { limit.min(nh) },
             fetch,
         )?;
-        let mut g = vec![0.0; m * c.rank];
-        b.download(&dw.g, &mut g)?;
+        let g = host_rows(b, &dw.g_host, m * c.rank)?;
         let mut rows_iter = all.into_iter();
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
