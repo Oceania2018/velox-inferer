@@ -9,8 +9,11 @@
 // Both operands are 32 bytes of codes per row per MMA k-step, so one tile loop serves both. The
 // host-side reference rounding is velox_core::quant; the quantizers below perform the same
 // single-precision operations in the same order.
+#include <cuda.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include <mutex>
 #include <unordered_map>
@@ -42,6 +45,9 @@ __device__ __forceinline__ uint32_t e2m1x2(float lo, float hi) {
 
 // One thread per 16-element group. Rows in [m, m_pad) are written as zeros so the GEMM can read
 // whole tiles. codes: [m_pad, k/2], scales: [m_pad, k/16].
+// KMAJOR (the TMA path): scales[(k64 * m_pad + row) * 4 + q] for group 4 * k64 + q, so a k64 step's
+// words for consecutive rows are contiguous.
+template <bool KMAJOR = false>
 __global__ void quant_nvfp4_kernel(const float* __restrict__ x, int m, int m_pad, int k, float divisor,
                                    uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
     const int groups = k / 16;
@@ -75,7 +81,8 @@ __global__ void quant_nvfp4_kernel(const float* __restrict__ x, int m, int m_pad
         }
     }
     *reinterpret_cast<uint2*>(codes + g * 8) = packed;
-    scales[g] = s;
+    if (KMAJOR) scales[(static_cast<long long>(grp / 4) * m_pad + row) * 4 + grp % 4] = s;
+    else scales[g] = s;
 }
 
 // One block per row: scale = amax / 448, codes = e4m3(x * (1 / scale)). codes: [m_pad, k].
@@ -235,6 +242,7 @@ struct GemmArgs {
     long long parent_rows2;
     long long row_begin2;
     float alpha2;
+    int m_pad;                // TMA path: activation rows as quantized (its scales are k64-major)
 };
 
 __device__ __forceinline__ const uint8_t* fp4_scale_plane(const uint8_t* w, long long parent_rows, int kb) {
@@ -300,90 +308,13 @@ __device__ __forceinline__ void load_stage(Smem<C, SW>& s, const GemmArgs& p, in
     }
 }
 
+// Writes a block's tile from its warps' accumulators.
+// Epilogue: c0,c1 at (row g, cols 2q, 2q+1); c2,c3 at row g+8. Scales are linear in the
+// accumulator, so split-K partials can be scaled before they are summed.
 template <class C, int KIND, bool SW>
-__global__ void __launch_bounds__(C::THREADS, 1) gemm_kernel(GemmArgs p) {
-    extern __shared__ __align__(128) uint8_t smem_raw[];
-    Smem<C, SW>& s = *reinterpret_cast<Smem<C, SW>*>(smem_raw);
-    const int n0 = blockIdx.x * (SW ? C::BN / 2 : C::BN), m0 = blockIdx.y * C::BM;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int wm = warp / C::WN, wn = warp % C::WN;
-    const int kt_begin = blockIdx.z * p.kt_per_split;
-    const int kt_end = min(p.kb / C::BK, kt_begin + p.kt_per_split);
-    const int kt_count = kt_end - kt_begin;
-    float* y = p.y + static_cast<long long>(blockIdx.z) * p.m * p.rows;
-
-#pragma unroll
-    for (int st = 0; st < C::ST - 1; ++st) {
-        if (st < kt_count) load_stage<C, KIND, SW>(s, p, st, kt_begin + st, m0, n0);
-        cp_commit();
-    }
-
-    float acc[C::MT][C::NT][4];
-#pragma unroll
-    for (int i = 0; i < C::MT; ++i)
-#pragma unroll
-        for (int j = 0; j < C::NT; ++j)
-#pragma unroll
-            for (int v = 0; v < 4; ++v) acc[i][j][v] = 0.0f;
-
-    // ldmatrix lane roles. A x4: matrices (rows 0-7 | 8-15) x (bytes 0-15 | 16-31).
-    const int a_row = (lane & 7) + (((lane >> 3) & 1) << 3), a_byte = (lane >> 4) << 4;
-    // B x4 covers two n8 tiles: matrices (tile0 lo, tile0 hi, tile1 lo, tile1 hi).
-    const int b_row = (lane & 7) + ((lane >> 4) << 3), b_byte = ((lane >> 3) & 1) << 4;
-    const int sfa_row = ((lane & 1) << 3) | (lane >> 2);
-    const int sfb_row = lane >> 2;
+__device__ __forceinline__ void store_tile(const float (&acc)[C::MT][C::NT][4], const GemmArgs& p, float* y, int m0,
+                                           int n0, int wm, int wn, int lane) {
     constexpr int WROWS = C::MT * 16;
-
-    for (int i = 0; i < kt_count; ++i) {
-        cp_wait<C::ST - 2>();
-        __syncthreads();
-        const int next = i + C::ST - 1;
-        if (next < kt_count) load_stage<C, KIND, SW>(s, p, next % C::ST, kt_begin + next, m0, n0);
-        cp_commit();
-        const int st = i % C::ST;
-#pragma unroll
-        for (int ks = 0; ks < C::KS; ++ks) {
-            uint32_t af[C::MT][4], bf[C::NT][2], sfa[C::MT], sfb[C::NT];
-#pragma unroll
-            for (int mt = 0; mt < C::MT; ++mt) {
-                const int r = wm * WROWS + mt * 16 + a_row;
-                ldmatrix_x4(af[mt], s.a[st] + swz<C::BK>(r, ks * 32 + a_byte));
-                if (KIND == kFp4) sfa[mt] = s.a_scale[st][wm * WROWS + mt * 16 + sfa_row][ks];
-            }
-#pragma unroll
-            for (int nt = 0; nt < C::NT; nt += 2) {
-                const int r = wn * (C::NT * 8) + nt * 8 + b_row;
-                uint32_t t4[4];
-                ldmatrix_x4(t4, s.b[st] + swz<C::BK>(r, ks * 32 + b_byte));
-                bf[nt][0] = t4[0], bf[nt][1] = t4[1], bf[nt + 1][0] = t4[2], bf[nt + 1][1] = t4[3];
-            }
-            if (KIND == kFp4) {
-#pragma unroll
-                for (int nt = 0; nt < C::NT; ++nt) {
-                    int half = 0, r;
-                    if (SW) {
-                        int col;
-                        swiglu_row<C>(wn * (C::NT * 8) + nt * 8 + sfb_row, half, col);
-                        r = static_cast<int>(((half ? p.row_begin2 : p.row_begin) + n0 + col) & 127);
-                    } else {
-                        r = static_cast<int>((p.row_begin + n0) & 127) + wn * (C::NT * 8) + nt * 8 + sfb_row;
-                    }
-                    sfb[nt] = *reinterpret_cast<const uint32_t*>(&s.b_scale[st][ks][half][(r & 31) * 16 + (r >> 5) * 4]);
-                }
-            }
-#pragma unroll
-            for (int mt = 0; mt < C::MT; ++mt)
-#pragma unroll
-                for (int nt = 0; nt < C::NT; ++nt) {
-                    if (KIND == kFp4) mma_fp4(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1], sfa[mt], sfb[nt]);
-                    else mma_fp8(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1]);
-                }
-        }
-    }
-    cp_wait<0>();
-
-    // Epilogue: c0,c1 at (row g, cols 2q, 2q+1); c2,c3 at row g+8. Scales are linear in the
-    // accumulator, so split-K partials can be scaled before they are summed.
     const int g = lane >> 2, q = lane & 3;
     if (SW) {
         // out = silu(gate) * up, as the portable swiglu kernel computes it from the sums scaled as
@@ -457,6 +388,278 @@ __global__ void __launch_bounds__(C::THREADS, 1) gemm_kernel(GemmArgs p) {
             }
         }
     }
+}
+
+template <class C, int KIND, bool SW>
+__global__ void __launch_bounds__(C::THREADS, 1) gemm_kernel(GemmArgs p) {
+    extern __shared__ __align__(128) uint8_t smem_raw[];
+    Smem<C, SW>& s = *reinterpret_cast<Smem<C, SW>*>(smem_raw);
+    const int n0 = blockIdx.x * (SW ? C::BN / 2 : C::BN), m0 = blockIdx.y * C::BM;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int wm = warp / C::WN, wn = warp % C::WN;
+    const int kt_begin = blockIdx.z * p.kt_per_split;
+    const int kt_end = min(p.kb / C::BK, kt_begin + p.kt_per_split);
+    const int kt_count = kt_end - kt_begin;
+
+#pragma unroll
+    for (int st = 0; st < C::ST - 1; ++st) {
+        if (st < kt_count) load_stage<C, KIND, SW>(s, p, st, kt_begin + st, m0, n0);
+        cp_commit();
+    }
+
+    float acc[C::MT][C::NT][4];
+#pragma unroll
+    for (int i = 0; i < C::MT; ++i)
+#pragma unroll
+        for (int j = 0; j < C::NT; ++j)
+#pragma unroll
+            for (int v = 0; v < 4; ++v) acc[i][j][v] = 0.0f;
+
+    // ldmatrix lane roles. A x4: matrices (rows 0-7 | 8-15) x (bytes 0-15 | 16-31).
+    const int a_row = (lane & 7) + (((lane >> 3) & 1) << 3), a_byte = (lane >> 4) << 4;
+    // B x4 covers two n8 tiles: matrices (tile0 lo, tile0 hi, tile1 lo, tile1 hi).
+    const int b_row = (lane & 7) + ((lane >> 4) << 3), b_byte = ((lane >> 3) & 1) << 4;
+    const int sfa_row = ((lane & 1) << 3) | (lane >> 2);
+    const int sfb_row = lane >> 2;
+    constexpr int WROWS = C::MT * 16;
+
+    for (int i = 0; i < kt_count; ++i) {
+        cp_wait<C::ST - 2>();
+        __syncthreads();
+        const int next = i + C::ST - 1;
+        if (next < kt_count) load_stage<C, KIND, SW>(s, p, next % C::ST, kt_begin + next, m0, n0);
+        cp_commit();
+        const int st = i % C::ST;
+#pragma unroll
+        for (int ks = 0; ks < C::KS; ++ks) {
+            uint32_t af[C::MT][4], bf[C::NT][2], sfa[C::MT], sfb[C::NT];
+#pragma unroll
+            for (int mt = 0; mt < C::MT; ++mt) {
+                const int r = wm * WROWS + mt * 16 + a_row;
+                ldmatrix_x4(af[mt], s.a[st] + swz<C::BK>(r, ks * 32 + a_byte));
+                if (KIND == kFp4) sfa[mt] = s.a_scale[st][wm * WROWS + mt * 16 + sfa_row][ks];
+            }
+#pragma unroll
+            for (int nt = 0; nt < C::NT; nt += 2) {
+                const int r = wn * (C::NT * 8) + nt * 8 + b_row;
+                uint32_t t4[4];
+                ldmatrix_x4(t4, s.b[st] + swz<C::BK>(r, ks * 32 + b_byte));
+                bf[nt][0] = t4[0], bf[nt][1] = t4[1], bf[nt + 1][0] = t4[2], bf[nt + 1][1] = t4[3];
+            }
+            if (KIND == kFp4) {
+#pragma unroll
+                for (int nt = 0; nt < C::NT; ++nt) {
+                    int half = 0, r;
+                    if (SW) {
+                        int col;
+                        swiglu_row<C>(wn * (C::NT * 8) + nt * 8 + sfb_row, half, col);
+                        r = static_cast<int>(((half ? p.row_begin2 : p.row_begin) + n0 + col) & 127);
+                    } else {
+                        r = static_cast<int>((p.row_begin + n0) & 127) + wn * (C::NT * 8) + nt * 8 + sfb_row;
+                    }
+                    sfb[nt] = *reinterpret_cast<const uint32_t*>(&s.b_scale[st][ks][half][(r & 31) * 16 + (r >> 5) * 4]);
+                }
+            }
+#pragma unroll
+            for (int mt = 0; mt < C::MT; ++mt)
+#pragma unroll
+                for (int nt = 0; nt < C::NT; ++nt) {
+                    if (KIND == kFp4) mma_fp4(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1], sfa[mt], sfb[nt]);
+                    else mma_fp8(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1]);
+                }
+        }
+    }
+    cp_wait<0>();
+    store_tile<C, KIND, SW>(acc, p, p.y + static_cast<long long>(blockIdx.z) * p.m * p.rows, m0, n0, wm, wn, lane);
+}
+
+// ---------------------------------------------------------------------------------------------
+// TMA prefill GEMM (Wide and Big tiles): thread 0 feeds the stages with TMA (2D tensor maps for the code
+// tiles, whose 64-byte swizzle is swz<64>; 1D bulk copies for the scales) and mbarriers; every warp
+// only runs ldmatrix and MMA. In the cp.async kernel every thread computed and issued its share of
+// each stage's copies, and the copies kept the shared-memory pipe the top stall (ncu, NVFP4
+// [34816,5120] m = 1536: MIO throttle 28%). A separate producer warp capped the 288-thread kernel
+// at 168 registers and spilled the accumulators.
+
+// Stages per tile: Wide fills three within the shared-memory limit; Big tiles finish a stage in half
+// the time, so they keep more in flight.
+template <class C>
+__host__ __device__ constexpr int tma_stages() {
+    return C::BM >= 256 ? 3 : 5;
+}
+
+template <class C, bool SW, int kTmaStages = tma_stages<C>()>
+struct TmaSmem {
+    // Code tiles first, each a multiple of 1024 bytes from a 1024-aligned base (the swizzle atom).
+    uint8_t a[kTmaStages][C::BM * C::BK];
+    uint8_t b[kTmaStages][C::BN * C::BK];
+    uint32_t a_scale[kTmaStages][C::KS][C::BM];           // FP4: k64-major activation scale words
+    uint8_t b_scale[kTmaStages][C::KS][SW ? 2 : 1][512];  // FP4: the weight's 128x4 tiles, as stored
+    uint64_t full[kTmaStages], empty[kTmaStages];
+};
+
+__device__ __forceinline__ void mbar_init(uint64_t* b, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_u32(b)), "r"(count));
+}
+__device__ __forceinline__ void mbar_expect_tx(uint64_t* b, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(b)), "r"(bytes)
+                 : "memory");
+}
+__device__ __forceinline__ void mbar_arrive(uint64_t* b) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(smem_u32(b)) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* b, int parity) {
+    asm volatile(
+        "{\n.reg .pred p;\nVELOX_MBAR_WAIT_%=:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@!p bra VELOX_MBAR_WAIT_%=;\n}\n" ::"r"(smem_u32(b)),
+        "r"(parity)
+        : "memory");
+}
+__device__ __forceinline__ void tma_2d(void* dst, const CUtensorMap* map, int x, int y, uint64_t* bar) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n" ::"r"(
+            smem_u32(dst)),
+        "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(smem_u32(bar))
+        : "memory");
+}
+__device__ __forceinline__ void bulk_1d(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(
+                     smem_u32(dst)),
+                 "l"(src), "r"(bytes), "r"(smem_u32(bar))
+                 : "memory");
+}
+
+// tm_a: activation codes [m_pad, kb], box BK x BM. tm_b / tm_b2: weight (gate / up) codes
+// [parent_rows, kb], box BK x BN (SwiGLU: BK x NT * 4, one per warp column group and half).
+template <class C, int KIND, bool SW>
+__global__ void __launch_bounds__(C::THREADS, 1)
+    gemm_tma_kernel(const __grid_constant__ CUtensorMap tm_a, const __grid_constant__ CUtensorMap tm_b,
+                    const __grid_constant__ CUtensorMap tm_b2, GemmArgs p) {
+    static_assert(C::BK == 64, "the 64-byte TMA swizzle is swz<64>");
+    constexpr int kTmaStages = tma_stages<C>();
+    extern __shared__ uint8_t smem_raw[];
+    TmaSmem<C, SW>& s =
+        *reinterpret_cast<TmaSmem<C, SW>*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+    const int n0 = blockIdx.x * (SW ? C::BN / 2 : C::BN), m0 = blockIdx.y * C::BM;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    constexpr int kConsumers = C::WM * C::WN;  // every warp computes; thread 0 also issues the copies
+    // Split-K: blockIdx.z takes stages [z * kt_per_split, ...) and writes its partial sums.
+    const int kt_begin = blockIdx.z * p.kt_per_split;
+    const int kt_count = min(p.kb / C::BK, kt_begin + p.kt_per_split) - kt_begin;
+    float* y = p.y + static_cast<long long>(blockIdx.z) * p.m * p.rows;
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < kTmaStages; ++i) {
+            mbar_init(&s.full[i], 1);
+            mbar_init(&s.empty[i], kConsumers);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+
+    // One thread issues a stage: the code tiles by tensor map, the FP4 scales by bulk copy.
+    auto issue = [&](int i) {
+        const int st = i % kTmaStages;
+        constexpr uint32_t kTiles = C::BM * C::BK + C::BN * C::BK;
+        constexpr uint32_t kScales = KIND == kFp4 ? C::KS * (C::BM * 4 + (SW ? 2 : 1) * 512) : 0;
+        mbar_expect_tx(&s.full[st], kTiles + kScales);
+        const int kbyte = (kt_begin + i) * C::BK;
+        tma_2d(s.a[st], &tm_a, kbyte, m0, &s.full[st]);
+        if (SW) {
+            constexpr int half_rows = C::NT * 4;
+#pragma unroll
+            for (int g = 0; g < C::WN; ++g)
+#pragma unroll
+                for (int half = 0; half < 2; ++half)
+                    tma_2d(s.b[st] + (g * C::NT * 8 + half * half_rows) * C::BK, half ? &tm_b2 : &tm_b, kbyte,
+                           static_cast<int>((half ? p.row_begin2 : p.row_begin) + n0 + g * half_rows), &s.full[st]);
+        } else {
+            tma_2d(s.b[st], &tm_b, kbyte, static_cast<int>(p.row_begin + n0), &s.full[st]);
+        }
+        if (KIND == kFp4) {
+            const int k64 = (kt_begin + i) * C::KS;
+#pragma unroll
+            for (int ks = 0; ks < C::KS; ++ks) {
+                bulk_1d(s.a_scale[st][ks], p.a_scales + (static_cast<long long>(k64 + ks) * p.m_pad + m0) * 4,
+                        C::BM * 4, &s.full[st]);
+#pragma unroll
+                for (int half = 0; half < (SW ? 2 : 1); ++half) {
+                    const uint8_t* plane = half ? fp4_scale_plane(p.w2, p.parent_rows2, p.kb)
+                                                : fp4_scale_plane(p.w, p.parent_rows, p.kb);
+                    const long long tile = ((half ? p.row_begin2 : p.row_begin) + n0) / 128;
+                    bulk_1d(s.b_scale[st][ks][half], plane + (tile * (p.k / 64) + k64 + ks) * 512, 512, &s.full[st]);
+                }
+            }
+        }
+    };
+    if (threadIdx.x == 0)
+        for (int i = 0; i < kTmaStages - 1 && i < kt_count; ++i) issue(i);
+
+    const int wm = warp / C::WN, wn = warp % C::WN;
+    float acc[C::MT][C::NT][4];
+#pragma unroll
+    for (int i = 0; i < C::MT; ++i)
+#pragma unroll
+        for (int j = 0; j < C::NT; ++j)
+#pragma unroll
+            for (int v = 0; v < 4; ++v) acc[i][j][v] = 0.0f;
+    const int a_row = (lane & 7) + (((lane >> 3) & 1) << 3), a_byte = (lane >> 4) << 4;
+    const int b_row = (lane & 7) + ((lane >> 4) << 3), b_byte = ((lane >> 3) & 1) << 4;
+    const int sfa_row = ((lane & 1) << 3) | (lane >> 2);
+    const int sfb_row = lane >> 2;
+    constexpr int WROWS = C::MT * 16;
+
+    for (int i = 0; i < kt_count; ++i) {
+        const int st = i % kTmaStages;
+        // Refill the buffer stage i - 1 used once every warp has released it.
+        if (threadIdx.x == 0 && i + kTmaStages - 1 < kt_count) {
+            if (i > 0) mbar_wait(&s.empty[(i - 1) % kTmaStages], ((i - 1) / kTmaStages) & 1);
+            issue(i + kTmaStages - 1);
+        }
+        mbar_wait(&s.full[st], (i / kTmaStages) & 1);
+#pragma unroll
+        for (int ks = 0; ks < C::KS; ++ks) {
+            uint32_t af[C::MT][4], bf[C::NT][2], sfa[C::MT], sfb[C::NT];
+#pragma unroll
+            for (int mt = 0; mt < C::MT; ++mt) {
+                const int r = wm * WROWS + mt * 16 + a_row;
+                ldmatrix_x4(af[mt], s.a[st] + swz<C::BK>(r, ks * 32 + a_byte));
+                if (KIND == kFp4) sfa[mt] = s.a_scale[st][ks][wm * WROWS + mt * 16 + sfa_row];
+            }
+#pragma unroll
+            for (int nt = 0; nt < C::NT; nt += 2) {
+                const int r = wn * (C::NT * 8) + nt * 8 + b_row;
+                uint32_t t4[4];
+                ldmatrix_x4(t4, s.b[st] + swz<C::BK>(r, ks * 32 + b_byte));
+                bf[nt][0] = t4[0], bf[nt][1] = t4[1], bf[nt + 1][0] = t4[2], bf[nt + 1][1] = t4[3];
+            }
+            if (KIND == kFp4) {
+#pragma unroll
+                for (int nt = 0; nt < C::NT; ++nt) {
+                    int half = 0, r;
+                    if (SW) {
+                        int col;
+                        swiglu_row<C>(wn * (C::NT * 8) + nt * 8 + sfb_row, half, col);
+                        r = static_cast<int>(((half ? p.row_begin2 : p.row_begin) + n0 + col) & 127);
+                    } else {
+                        r = static_cast<int>((p.row_begin + n0) & 127) + wn * (C::NT * 8) + nt * 8 + sfb_row;
+                    }
+                    sfb[nt] =
+                        *reinterpret_cast<const uint32_t*>(&s.b_scale[st][ks][half][(r & 31) * 16 + (r >> 5) * 4]);
+                }
+            }
+#pragma unroll
+            for (int mt = 0; mt < C::MT; ++mt)
+#pragma unroll
+                for (int nt = 0; nt < C::NT; ++nt) {
+                    if (KIND == kFp4) mma_fp4(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1], sfa[mt], sfb[nt]);
+                    else mma_fp8(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1]);
+                }
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&s.empty[st]);
+    }
+    store_tile<C, KIND, SW>(acc, p, y, m0, n0, wm, wn, lane);
 }
 
 __global__ void sum_splits(const float* __restrict__ part, int splits, long long n, float* __restrict__ y) {
@@ -541,13 +744,17 @@ int launch_gemm(const GemmArgs& p) {
 
 // Quantizes x to NVFP4 codes and scales padded to the tile height mt; returns the codes (scales
 // follow at codes + m_pad * k / 2), or null when the scratch could not grow.
-uint8_t* quantize_a4(const float* x, int m, int mt, long long k, float input_divisor) {
+uint8_t* quantize_a4(const float* x, int m, int mt, long long k, float input_divisor, bool kmajor = false) {
     const int m_pad = (m + mt - 1) / mt * mt;
     const size_t code_bytes = static_cast<size_t>(m_pad) * k / 2;
     uint8_t* buf = g_scratch.get(code_bytes + static_cast<size_t>(m_pad) * k / 16);
     if (!buf) return nullptr;
     const long long groups = static_cast<long long>(m_pad) * (k / 16);
-    quant_nvfp4_kernel<<<velox_grid_1d(groups, 256), 256>>>(x, m, m_pad, static_cast<int>(k), input_divisor, buf,
+    if (kmajor)
+        quant_nvfp4_kernel<true><<<velox_grid_1d(groups, 256), 256>>>(x, m, m_pad, static_cast<int>(k), input_divisor,
+                                                                      buf, buf + code_bytes);
+    else
+        quant_nvfp4_kernel<<<velox_grid_1d(groups, 256), 256>>>(x, m, m_pad, static_cast<int>(k), input_divisor, buf,
                                                             buf + code_bytes);
     return buf;
 }
@@ -570,6 +777,112 @@ int weight_divisor(const uint8_t* w, long long parent_rows, long long k, float& 
     return 0;
 }
 
+// TMA tensor maps. The encoder is the driver's cuTensorMapEncodeTiled, looked up at run time (no
+// link-time dependency on libcuda).
+using EncodeTiled = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
+                                 const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
+                                 CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+
+EncodeTiled encoder() {
+    static const EncodeTiled fn = []() -> EncodeTiled {
+        void* f = nullptr;
+        cudaDriverEntryPointQueryResult q;
+        if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &f, 12000, cudaEnableDefault, &q) !=
+                cudaSuccess ||
+            q != cudaDriverEntryPointSuccess)
+            return nullptr;
+        return reinterpret_cast<EncodeTiled>(f);
+    }();
+    return fn;
+}
+
+// VELOX_NO_TMA=1 keeps the cp.async kernel for every tile (A/B).
+bool tma_enabled() {
+    static const bool on = getenv("VELOX_NO_TMA") == nullptr && encoder() != nullptr;
+    return on;
+}
+
+// A [rows, row_bytes] byte matrix read in box_bytes x box_rows boxes with the 64-byte swizzle; rows
+// past the end read as zeros.
+bool encode_map(CUtensorMap* map, const void* base, long long rows, long long row_bytes, int box_bytes,
+                int box_rows) {
+    const cuuint64_t dims[2] = {static_cast<cuuint64_t>(row_bytes), static_cast<cuuint64_t>(rows)};
+    const cuuint64_t strides[1] = {static_cast<cuuint64_t>(row_bytes)};
+    const cuuint32_t box[2] = {static_cast<cuuint32_t>(box_bytes), static_cast<cuuint32_t>(box_rows)};
+    const cuuint32_t elem[2] = {1, 1};
+    return encoder()(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base), dims, strides, box, elem,
+                     CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                     CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
+// Weights are immutable: one map per (parent, box height), encoded once.
+bool weight_map(CUtensorMap* out, const uint8_t* w, long long parent_rows, int kb, int box_rows) {
+    struct Key {
+        const uint8_t* w;
+        long long rows;
+        int kb, box;
+        bool operator==(const Key& o) const { return w == o.w && rows == o.rows && kb == o.kb && box == o.box; }
+    };
+    struct Hash {
+        size_t operator()(const Key& k) const {
+            return std::hash<const void*>()(k.w) ^ (static_cast<size_t>(k.rows) << 1) ^
+                   (static_cast<size_t>(k.box) << 40);
+        }
+    };
+    static std::mutex mu;
+    static std::unordered_map<Key, CUtensorMap, Hash> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    const Key key{w, parent_rows, kb, box_rows};
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        CUtensorMap map;
+        if (!encode_map(&map, w, parent_rows, kb, 64, box_rows)) return false;
+        it = cache.emplace(key, map).first;
+    }
+    *out = it->second;
+    return true;
+}
+
+// A prefill tile (Wide or Big) through the TMA kernel. p.a: [m_pad, kb] codes (FP4: k64-major scales
+// at p.a_scales); returns VELOX_ERR_UNSUPPORTED when a map cannot be encoded (the caller falls back).
+template <class C, int KIND, bool SW>
+int launch_tma(GemmArgs p) {
+    CUtensorMap ta, tb, tb2;
+    const int box_b = SW ? C::NT * 4 : C::BN;
+    if (!encode_map(&ta, p.a, p.m_pad, p.kb, C::BK, C::BM) || !weight_map(&tb, p.w, p.parent_rows, p.kb, box_b))
+        return VELOX_ERR_UNSUPPORTED;
+    if (SW) {
+        if (!weight_map(&tb2, p.w2, p.parent_rows2, p.kb, box_b)) return VELOX_ERR_UNSUPPORTED;
+    } else {
+        tb2 = tb;
+    }
+    constexpr size_t smem = sizeof(TmaSmem<C, SW>) + 1024;
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(gemm_tma_kernel<C, KIND, SW>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        configured = true;
+    }
+    const int bn = SW ? C::BN / 2 : C::BN;
+    const int kt_total = p.kb / C::BK;
+    const long long blocks = static_cast<long long>((p.rows + bn - 1) / bn) * ((p.m + C::BM - 1) / C::BM);
+    // Split K as launch_cfg does for an under-filled grid (never for SwiGLU).
+    int splits = 1;
+    while (!SW && blocks < 64 && blocks * splits < 2 * kSms && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
+    p.kt_per_split = (kt_total + splits - 1) / splits;
+    float* y = p.y;
+    if (splits > 1) {
+        p.y = reinterpret_cast<float*>(g_part.get(static_cast<size_t>(splits) * p.m * p.rows * sizeof(float)));
+        if (!p.y) return static_cast<int>(cudaErrorMemoryAllocation);
+    }
+    const dim3 grid((p.rows + bn - 1) / bn, (p.m + C::BM - 1) / C::BM, splits);
+    gemm_tma_kernel<C, KIND, SW><<<grid, C::THREADS, smem>>>(ta, tb, tb2, p);
+    if (splits > 1) {
+        const long long n = static_cast<long long>(p.m) * p.rows;
+        sum_splits<<<velox_grid_1d(n, 256), 256>>>(p.y, splits, n, y);
+    }
+    return velox_launch_status();
+}
+
 }  // namespace
 
 // y[m, rows] = nvfp4(x) . W[row_begin.., :]^T for an NVFP4 weight. Requires k % 128 == 0,
@@ -580,13 +893,21 @@ VELOX_API int velox_5090_linear_a4(const float* x, int m, const uint8_t* w, long
         return VELOX_ERR_UNSUPPORTED;
     const int mt = m_tile(m, rows);
     const int m_pad = (m + mt - 1) / mt * mt;
-    uint8_t* codes = quantize_a4(x, m, mt, k, input_divisor);
-    if (!codes) return static_cast<int>(cudaErrorMemoryAllocation);
     float wd;
     if (const int e = weight_divisor(w, parent_rows, k, wd)) return e;
+    // NVFP4 on 128 x 128 tiles stays on cp.async: the long-K down projection measured 5-9% slower
+    // through TMA there (RTX 5090, [5120,17408] m = 256 / 1536: 101 / 354 -> 110 / 377 us).
+    const bool tma = tma_enabled() && mt == Wide::BM;
+    uint8_t* codes = quantize_a4(x, m, mt, k, input_divisor, tma);
+    if (!codes) return static_cast<int>(cudaErrorMemoryAllocation);
     GemmArgs p{codes, codes + static_cast<size_t>(m_pad) * k / 2, nullptr, w, parent_rows, row_begin, rows, m,
                static_cast<int>(k), static_cast<int>(k / 2), 1.0f / (input_divisor * wd), 0, y};
+    p.m_pad = m_pad;
     if (const int e = velox_launch_status()) return e;
+    if (tma) {
+        if (const int e = launch_tma<Wide, kFp4, false>(p); e != VELOX_ERR_UNSUPPORTED) return e;
+        quantize_a4(x, m, mt, k, input_divisor);  // row-major scales for the cp.async kernel
+    }
     return launch_gemm<kFp4>(p);
 }
 
@@ -606,15 +927,21 @@ VELOX_API int velox_5090_linear_swiglu_a4(const float* x, int m, const uint8_t* 
     const bool wide = use_wide(m, 2 * rows);
     const int mt = wide ? Wide::BM : Big::BM;
     const int m_pad = (m + mt - 1) / mt * mt;
-    uint8_t* codes = quantize_a4(x, m, mt, k, input_divisor);
+    const bool tma = tma_enabled();
+    uint8_t* codes = quantize_a4(x, m, mt, k, input_divisor, tma);
     if (!codes) return static_cast<int>(cudaErrorMemoryAllocation);
     float dg, du;
     if (const int e = weight_divisor(wg, parent_rows_g, k, dg)) return e;
     if (const int e = weight_divisor(wu, parent_rows_u, k, du)) return e;
     GemmArgs p{codes, codes + static_cast<size_t>(m_pad) * k / 2, nullptr, wg, parent_rows_g, row_begin_g, rows, m,
                static_cast<int>(k), static_cast<int>(k / 2), 1.0f / (input_divisor * dg), 0, y,
-               wu, parent_rows_u, row_begin_u, 1.0f / (input_divisor * du)};
+               wu, parent_rows_u, row_begin_u, 1.0f / (input_divisor * du), m_pad};
     if (const int e = velox_launch_status()) return e;
+    if (tma) {
+        const int e = wide ? launch_tma<Wide, kFp4, true>(p) : launch_tma<Big, kFp4, true>(p);
+        if (e != VELOX_ERR_UNSUPPORTED) return e;
+        quantize_a4(x, m, mt, k, input_divisor);
+    }
     return wide ? launch_cfg<Wide, kFp4, true>(p) : launch_cfg<Big, kFp4, true>(p);
 }
 
@@ -632,6 +959,11 @@ VELOX_API int velox_5090_linear_a8(const float* x, int m, const uint8_t* w, long
     if (const int e = velox_launch_status()) return e;
     GemmArgs p{buf, nullptr, row_scale, w, parent_rows, row_begin, rows, m, static_cast<int>(k),
                static_cast<int>(k), 1.0f, 0, y};
+    p.m_pad = m_pad;
+    if (tma_enabled() && m > kSmallMaxM) {
+        const int e = mt == Wide::BM ? launch_tma<Wide, kFp8, false>(p) : launch_tma<Big, kFp8, false>(p);
+        if (e != VELOX_ERR_UNSUPPORTED) return e;
+    }
     return launch_gemm<kFp8>(p);
 }
 
@@ -652,6 +984,10 @@ VELOX_API int velox_5090_linear_swiglu_a8(const float* x, int m, const uint8_t* 
     quant_fp8_kernel<<<m_pad, 256>>>(x, m, static_cast<int>(k), buf, row_scale);
     if (const int e = velox_launch_status()) return e;
     GemmArgs p{buf, nullptr, row_scale, wg, parent_rows_g, row_begin_g, rows, m, static_cast<int>(k),
-               static_cast<int>(k), 1.0f, 0, y, wu, parent_rows_u, row_begin_u, 1.0f};
+               static_cast<int>(k), 1.0f, 0, y, wu, parent_rows_u, row_begin_u, 1.0f, m_pad};
+    if (tma_enabled()) {
+        const int e = wide ? launch_tma<Wide, kFp8, true>(p) : launch_tma<Big, kFp8, true>(p);
+        if (e != VELOX_ERR_UNSUPPORTED) return e;
+    }
     return wide ? launch_cfg<Wide, kFp8, true>(p) : launch_cfg<Big, kFp8, true>(p);
 }
