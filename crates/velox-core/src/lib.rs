@@ -20,8 +20,8 @@ pub mod variant;
 
 pub use backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, ConvShape, CopySpec,
-    FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape, NormKind, RopeLayout,
-    RopePosShape, RopeShape, WeightView, GRAPH_KV_BUCKET, GRAPH_STATIC,
+    FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape, LinearDst, LinearPart,
+    NormKind, RopeLayout, RopePosShape, RopeShape, WeightView, GRAPH_KV_BUCKET, GRAPH_STATIC,
 };
 pub use error::{Error, Result};
 pub use format::WeightFormat;

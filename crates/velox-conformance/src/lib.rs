@@ -8,7 +8,7 @@
 use velox_core::backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
     CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape,
-    NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    LinearDst, LinearPart, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::kv::{decode_cache, encode_cache, KvFormat};
@@ -288,6 +288,97 @@ impl<B: Backend> Suite<'_, B> {
             self.record(name, Some(Op::Linear), &got, &want, 2e-4);
         } else {
             // Rounding the policy forbids fails whatever the numbers say.
+            let name = name + " (rounding not permitted)";
+            self.record(name, Some(Op::Linear), &[f32::NAN], &[0.0], 0.0);
+        }
+        Ok(())
+    }
+
+    /// `linears` against the oracle: one input, destinations of `ld = parts' rows + 2` columns
+    /// (the last two must stay zero), each part a view `(format, parent rows, begin, rows)` of
+    /// its own random parent under `policy`, rounded as `linear_act` reports for it.
+    fn linears(
+        &mut self,
+        dsts: &[&[(WeightFormat, usize, usize, usize)]],
+        k: usize,
+        m: usize,
+        policy: ActPolicy,
+    ) -> Result<()> {
+        let x = self.rng.vec(m * k, 1.0);
+        let xd = self.b.upload(&x)?;
+        let mut parents = Vec::new();
+        for d in dsts {
+            for &(fmt, n, _, _) in *d {
+                let bytes = random_weight(&mut self.rng, fmt, n, k);
+                parents.push((
+                    self.b.upload_bytes(&bytes)?,
+                    CpuBackend.upload_bytes(&bytes)?,
+                ));
+            }
+        }
+        let lds: Vec<usize> = dsts
+            .iter()
+            .map(|d| d.iter().map(|p| p.3).sum::<usize>() + 2)
+            .collect();
+        let mut ys = Vec::new();
+        for &ld in &lds {
+            ys.push(self.b.upload(&vec![0.0; m * ld])?);
+        }
+        let widest = dsts
+            .iter()
+            .flat_map(|d| d.iter().map(|p| p.3))
+            .max()
+            .unwrap_or(1);
+        let mut scratch = self.b.alloc(m * widest)?;
+        let (mut parts, mut wants, mut tags, mut permitted_all) =
+            (Vec::new(), Vec::new(), Vec::new(), true);
+        let mut pi = 0;
+        for (d, &ld) in dsts.iter().zip(&lds) {
+            let (mut col, mut dp, mut want) = (0, Vec::new(), vec![0.0; m * ld]);
+            for &(fmt, n, begin, rows) in *d {
+                let view = WeightView::full(&parents[pi].0, fmt, n, k)
+                    .rows(begin, rows)
+                    .with_act(policy);
+                let act = self.b.linear_act(&view, m);
+                permitted_all &= permitted(act, policy);
+                let mut xq = x.clone();
+                quantize_activations(&mut xq, k, act);
+                let mut part = vec![0.0; m * rows];
+                CpuBackend.linear(
+                    &xq,
+                    &WeightView::full(&parents[pi].1, fmt, n, k).rows(begin, rows),
+                    &mut part,
+                    m,
+                )?;
+                for t in 0..m {
+                    want[t * ld + col..t * ld + col + rows]
+                        .copy_from_slice(&part[t * rows..(t + 1) * rows]);
+                }
+                tags.push(format!("{}:{rows}", fmt.name()));
+                dp.push(LinearPart { w: view, col });
+                col += rows;
+                pi += 1;
+            }
+            parts.push(dp);
+            wants.push(want);
+        }
+        let mut dl: Vec<LinearDst<'_, '_, '_, B::Buffer>> = ys
+            .iter_mut()
+            .zip(&parts)
+            .zip(&lds)
+            .map(|((y, p), &ld)| LinearDst { y, ld, parts: p })
+            .collect();
+        self.b.linears(&xd, &mut dl, &mut scratch, m)?;
+        drop(dl);
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for ((y, w), &ld) in ys.iter().zip(&wants).zip(&lds) {
+            got.extend(fetch(self.b, y, m * ld)?);
+            want.extend_from_slice(w);
+        }
+        let name = format!("linears [{}] k={k} m={m}", tags.join(" "));
+        if permitted_all {
+            self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+        } else {
             let name = name + " (rounding not permitted)";
             self.record(name, Some(Op::Linear), &[f32::NAN], &[0.0], 0.0);
         }
@@ -1967,7 +2058,16 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     // ragged columns, a view not starting on a tile, and a wide grid.
     s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 256, 192, 0, 130, false, true, a8)?;
     s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 320, 200, 17, 300, true, false, a8)?;
-    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 128, 4096, 0, 1030, false, true, a8)?;
+    s.linear_swiglu_with(
+        WeightFormat::Fp8RowBf16,
+        128,
+        4096,
+        0,
+        1030,
+        false,
+        true,
+        a8,
+    )?;
     // IQ3_XXS at the dense MLP's own K (gate/up 5120, down 17408), which kernels specialize on,
     // at decode and verify widths.
     for m in [1, 8] {
@@ -1979,6 +2079,34 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear_act(WeightFormat::Nvfp4, 512, 2048, 128, 384, 24, a4)?;
     s.linear_act(WeightFormat::Nvfp4, 384, 640, 128, 256, 48, a4)?;
     s.linear_act(WeightFormat::Nvfp4, 256, 1024, 0, 256, 64, a4)?;
+    // bf16 weights with few rows (GDN gate projections) at prefill widths: a full chunk, a row
+    // view spanning two 128-row blocks with ragged tokens, and K off the 32-value step.
+    s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 1030)?;
+    s.linear(WeightFormat::Bf16, 300, 1024, 40, 200, 100)?;
+    s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 40)?;
+    // Several projections of one input (Backend::linears): runs into column ranges, a whole
+    // destination, mixed formats, at decode, verify and prefill widths under A8 and A16.
+    {
+        use WeightFormat::{Bf16, Iq3Xxs, Q4G64, Q5G64};
+        let gdn: &[&[(WeightFormat, usize, usize, usize)]] = &[
+            &[(Q4G64, 256, 0, 128), (Q5G64, 192, 64, 96)],
+            &[(Q5G64, 160, 32, 128)],
+            &[(Bf16, 48, 0, 48), (Bf16, 40, 8, 24)],
+        ];
+        for m in [1, 8, 70, 130] {
+            s.linears(gdn, 512, m, ActPolicy::AllowA8)?;
+        }
+        s.linears(gdn, 512, 70, ActPolicy::A16Only)?;
+        let attn: &[&[(WeightFormat, usize, usize, usize)]] = &[
+            &[(Iq3Xxs, 128, 0, 128)],
+            &[(Q5G64, 128, 0, 128)],
+            &[(Q4G64, 64, 0, 64)],
+        ];
+        s.linears(attn, 768, 100, ActPolicy::AllowA8)?;
+    }
+    // Prefill widths on a grid of a few tiles with a long K (kernel sets may split K there).
+    s.linear_act(WeightFormat::Fp8RowBf16, 256, 4096, 0, 256, 100, a8)?;
+    s.linear_act(WeightFormat::Nvfp4, 256, 4096, 0, 256, 100, a4)?;
     Ok(s.results)
 }
 
