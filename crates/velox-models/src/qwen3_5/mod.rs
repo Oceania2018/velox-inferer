@@ -857,11 +857,13 @@ impl<B: Backend> Qwen35Text<B> {
             mu: take(&mut g_mlp),
             fused: b.alloc(tf * (c.gdn_qkv() + c.gdn_v()).max(2 * c.q_dim() + 2 * c.kv_dim()))?,
             gu: b.alloc(tf * 2 * c.mlp_width())?,
+            // z and attn at every width (their output projections take bf16 at prefill widths
+            // too); h and mg only at the fused widths that consume them.
             twins: match b.bf16_twins() {
                 true => Some(Twins {
                     h: b.alloc(tf * c.hidden)?,
-                    z: b.alloc(tf * c.gdn_v())?,
-                    attn: b.alloc(tf * c.q_dim())?,
+                    z: b.alloc(t * c.gdn_v())?,
+                    attn: b.alloc(t * c.q_dim())?,
                     mg: b.alloc(tf * c.mlp_width())?,
                 }),
                 false => None,
@@ -1055,7 +1057,8 @@ impl<B: Backend> Qwen35Text<B> {
                 // Recorded steps launch in segments, so the GPU starts while the rest is submitted.
                 b.graph_break()?;
             }
-            // Decode and verify widths write bf16 twins of the GEMM inputs (Backend::bf16_twins).
+            // Decode and verify widths write bf16 twins of the GEMM inputs (Backend::bf16_twins);
+            // the mixers' output projections read a twin at any width the backend takes it.
             let twin = t <= FUSE_MAX_TOKENS;
             let h_twin = if li == 0 {
                 b.rms_norm(
@@ -1185,7 +1188,7 @@ impl<B: Backend> Qwen35Text<B> {
                     }
                     // z = silu(z) * plain_rmsnorm(o)
                     let rows = t * c.gdn_v_heads;
-                    match ws.twins.as_mut().filter(|_| twin) {
+                    match ws.twins.as_mut().filter(|_| b.takes_bf16(&w.view(out), t)) {
                         Some(tw) => {
                             b.rms_norm_gated_twin(
                                 &ws.o,
@@ -1228,7 +1231,7 @@ impl<B: Backend> Qwen35Text<B> {
                         kv_format,
                         (t, pos0),
                         rope,
-                        (h_twin, twin),
+                        (h_twin, true),
                     )?;
                     ai += 1;
                 }
@@ -1282,8 +1285,8 @@ impl<B: Backend> Qwen35Text<B> {
     /// Gated attention mixer of one layer: `ws.h` (normed input, `t` rows) to `ws.y`, appending
     /// K/V at cache rows `pos0..` of `kv`.
     #[allow(clippy::too_many_arguments)]
-    /// `(h_twin, twin)`: whether `ws.h`'s bf16 twin is current, and whether to write the gated
-    /// output's twin for the output projection.
+    /// `(h_twin, twin)`: whether `ws.h`'s bf16 twin is current, and whether the gated output's
+    /// twin may be written for the output projection (it is, when the backend takes it at `t`).
     #[allow(clippy::too_many_arguments)]
     fn attention_mixer(
         &self,
@@ -1384,7 +1387,11 @@ impl<B: Backend> Qwen35Text<B> {
             NormKind::Offset,
         )?;
         self.attend_rows(b, ws, kv, kv_format, t, pos0, rope)?;
-        match ws.twins.as_mut().filter(|_| twin) {
+        match ws
+            .twins
+            .as_mut()
+            .filter(|_| twin && b.takes_bf16(&w.view(output), t))
+        {
             Some(tw) => {
                 b.sigmoid_mul_twin(&mut ws.attn, &ws.g, &mut tw.attn, t * c.q_dim())?;
                 linear_from(b, &ws.attn, Some(&tw.attn), &w.view(output), &mut ws.y, t)?;
