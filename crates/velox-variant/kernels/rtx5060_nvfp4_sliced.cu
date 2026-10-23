@@ -385,6 +385,20 @@ VELOX_API int velox_5060_linear_nvfp4_mma(const float* x, int m, const uint8_t* 
                     : launch_mma<64>(xb, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
 }
 
+// velox_5060_linear_nvfp4_mma on a bf16 twin xb [m, k] (no conversion launch).
+VELOX_API int velox_5060_linear_nvfp4_mma_bf16(const void* xb, int m, const uint8_t* w, long long parent_rows,
+                                               long long k, long long row_begin, int rows, float* y) {
+    if (m < 1 || rows <= 0 || k % kMmaBK != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(w) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(xb) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    float divisor;
+    if (const int e = divisor_of(w, parent_rows, k, divisor)) return e;
+    const auto* x16 = static_cast<const __nv_bfloat16*>(xb);
+    const int ki = static_cast<int>(k);
+    return m <= 192 ? launch_mma<32>(x16, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y)
+                    : launch_mma<64>(x16, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
+}
+
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T / divisor for an NVFP4 parent [parent_rows, k],
 // 1 <= m <= 16, k % 512 == 0. Returns VELOX_ERR_UNSUPPORTED for anything else.
 VELOX_API int velox_5060_linear_nvfp4_sliced(const float* x, int m, const uint8_t* w, long long parent_rows,

@@ -191,6 +191,16 @@ extern "C" {
         out: *mut f32,
         outb: *mut u16,
     ) -> i32;
+    fn velox_5060_linear_nvfp4_mma_bf16(
+        xb: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_nvfp4_sliced_bf16(
         xb: *const u8,
         m: i32,
@@ -500,15 +510,19 @@ fn rs_shared(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
 
 /// The kernel `linear_bf16` runs for a view at `m` tokens, reading a bf16 twin (natural order)
 /// instead of converting: the direct IQ3_XXS kernel, the q4/q5 sliced-K one and the NVFP4 sliced-K
-/// one, at the widths `linear` serves with them.
+/// one at the widths `linear` serves with them, and the NVFP4 mma GEMM at prefill widths.
 #[derive(Clone, Copy)]
 enum Bf16In {
     Iq3,
     Rs(i32),
     Nvfp4,
+    Nvfp4Mma,
 }
 
 fn bf16_in(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<Bf16In> {
+    if nvfp4_mma(w, m) {
+        return Some(Bf16In::Nvfp4Mma);
+    }
     if !(1..=SKINNY16_MAX_M).contains(&m) {
         return None;
     }
@@ -910,6 +924,9 @@ impl CudaKernels for Rtx5060Kernels {
             },
             Some(Bf16In::Nvfp4) => unsafe {
                 velox_5060_linear_nvfp4_sliced_bf16(xp, mi, wp, pr, k, rb, rows, yp)
+            },
+            Some(Bf16In::Nvfp4Mma) => unsafe {
+                velox_5060_linear_nvfp4_mma_bf16(xp, mi, wp, pr, k, rb, rows, yp)
             },
             None => return Err(Error::Unsupported("linear_bf16 view".into())),
         };
