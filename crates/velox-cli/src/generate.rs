@@ -422,9 +422,10 @@ fn dflash_generate<B: Backend>(
             keep += 1;
         }
         let next = rows[keep - 1][0].0;
+        // Commit is timed as submitted, not waited for (like the server): the next draft's
+        // submission overlaps it, and its GPU time lands in the next round's drafting.
         let tc = Instant::now();
         model.commit(b, s, ws, keep)?;
-        b.synchronize()?;
         commit_s += tc.elapsed().as_secs_f64();
         rounds += 1;
         proposed += window.len() - 1;
