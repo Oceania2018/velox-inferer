@@ -401,6 +401,7 @@ pub trait CudaKernels: Send + Sync {
         &self,
         _x: &CudaBuffer,
         _xb: Option<&CudaBuffer>,
+        _xq: Option<(&CudaBuffer, u32)>,
         _dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
         _m: usize,
     ) -> Result<()> {
@@ -445,6 +446,55 @@ pub trait CudaKernels: Send + Sync {
         _m: usize,
     ) -> Result<()> {
         Err(Error::Unsupported("linear_swiglu_twin".into()))
+    }
+
+    /// See [`Backend::int8_twin_layout`].
+    fn int8_twin_layout(&self, _w: &WeightView<'_, CudaBuffer>, _m: usize) -> Option<u32> {
+        None
+    }
+    /// See [`Backend::int8_twin_slots`].
+    fn int8_twin_slots(&self, _m: usize, _k: usize, _layout: u32) -> usize {
+        0
+    }
+    /// See [`Backend::add_rms_norm_q8`].
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_q8(
+        &self,
+        _acc: &mut CudaBuffer,
+        _x: &CudaBuffer,
+        _weight: &CudaBuffer,
+        _y: &mut CudaBuffer,
+        _yq: &mut CudaBuffer,
+        _layout: u32,
+        _rows: usize,
+        _dim: usize,
+        _eps: f32,
+        _kind: NormKind,
+    ) -> Result<()> {
+        Err(Error::Unsupported("add_rms_norm_q8".into()))
+    }
+    /// See [`Backend::linear_q8`].
+    fn linear_q8(
+        &self,
+        _xq: &CudaBuffer,
+        _layout: u32,
+        _w: &WeightView<'_, CudaBuffer>,
+        _y: &mut CudaBuffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_q8".into()))
+    }
+    /// See [`Backend::linear_swiglu_q8`].
+    fn linear_swiglu_q8(
+        &self,
+        _xq: &CudaBuffer,
+        _layout: u32,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _out: &mut CudaBuffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_swiglu_q8".into()))
     }
 
     /// See [`Backend::add_rms_norm_twin`].
@@ -1066,6 +1116,17 @@ pub(crate) fn upload_raw(data: &[u8]) -> Result<CudaBuffer> {
     Ok(buf)
 }
 
+/// An int8 twin must hold the `slots` its layout takes (0: no such twin here).
+fn check_q8_twin(what: &str, twin: &CudaBuffer, slots: usize) -> Result<()> {
+    if slots == 0 || twin.len < slots {
+        return Err(Error::Shape(format!(
+            "{what}: int8 twin of {} slots, layout needs {slots}",
+            twin.len
+        )));
+    }
+    Ok(())
+}
+
 impl Backend for CudaBackend {
     fn top_k(
         &self,
@@ -1127,6 +1188,7 @@ impl Backend for CudaBackend {
         &self,
         x: &CudaBuffer,
         xb: Option<&CudaBuffer>,
+        xq: Option<(&CudaBuffer, u32)>,
         dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
         scratch: &mut CudaBuffer,
         m: usize,
@@ -1151,16 +1213,19 @@ impl Backend for CudaBackend {
             }
         }
         let op = format!("linears m={}", if m <= 16 { "<=16" } else { ">16" });
+        let k = dsts
+            .iter()
+            .flat_map(|d| d.parts.iter())
+            .map(|p| p.w.k)
+            .max()
+            .unwrap_or(0);
         if let Some(xb) = xb {
-            let k = dsts
-                .iter()
-                .flat_map(|d| d.parts.iter())
-                .map(|p| p.w.k)
-                .max()
-                .unwrap_or(0);
             check::elementwise("linears bf16 twin", &[xb.len * 2], m * k)?;
         }
-        self.timed(&op, || self.kernels.linears(x, xb, dsts, m))
+        if let Some((xq, layout)) = xq {
+            check_q8_twin("linears", xq, self.kernels.int8_twin_slots(m, k, layout))?;
+        }
+        self.timed(&op, || self.kernels.linears(x, xb, xq, dsts, m))
     }
 
     fn bf16_twins(&self) -> bool {
@@ -1279,6 +1344,87 @@ impl Backend for CudaBackend {
         );
         self.timed(&op, || {
             self.kernels.linear_swiglu_twin(xb, gate, up, out, outb, m)
+        })
+    }
+
+    fn int8_twin_layout(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<u32> {
+        self.kernels.int8_twin_layout(w, m)
+    }
+
+    fn int8_twin_slots(&self, m: usize, k: usize, layout: u32) -> usize {
+        self.kernels.int8_twin_slots(m, k, layout)
+    }
+
+    fn add_rms_norm_q8(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        yq: &mut CudaBuffer,
+        layout: u32,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        check::rms_norm(acc.len, weight.len, y.len, rows, dim)?;
+        check::elementwise("add_rms_norm", &[x.len], rows * dim)?;
+        check_q8_twin(
+            "add_rms_norm",
+            yq,
+            self.kernels.int8_twin_slots(rows, dim, layout),
+        )?;
+        self.timed("add_rms_norm", || {
+            self.kernels
+                .add_rms_norm_q8(acc, x, weight, y, yq, layout, rows, dim, eps, kind)
+        })
+    }
+
+    fn linear_q8(
+        &self,
+        xq: &CudaBuffer,
+        layout: u32,
+        w: &WeightView<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if self.kernels.int8_twin_layout(w, m) != Some(layout) {
+            return Err(Error::Unsupported("linear_q8 view".into()));
+        }
+        check_q8_twin("linear", xq, self.kernels.int8_twin_slots(m, w.k, layout))?;
+        check::linear(m * w.k, w, w.buf.len, y.len, m)?;
+        let op = format!("linear {} m=>16 q8 in", w.format.name());
+        self.timed(&op, || self.kernels.linear_q8(xq, layout, w, y, m))
+    }
+
+    fn linear_swiglu_q8(
+        &self,
+        xq: &CudaBuffer,
+        layout: u32,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if self.kernels.int8_twin_layout(gate, m) != Some(layout) {
+            return Err(Error::Unsupported("linear_swiglu_q8 views".into()));
+        }
+        check_q8_twin(
+            "linear_swiglu",
+            xq,
+            self.kernels.int8_twin_slots(m, gate.k, layout),
+        )?;
+        check::linear(m * gate.k, gate, gate.buf.len, out.len, m)?;
+        check::linear(m * up.k, up, up.buf.len, out.len, m)?;
+        let op = format!(
+            "linear_swiglu {} m={m} [{}x{}] q8 twin",
+            gate.format.name(),
+            gate.rows,
+            gate.k
+        );
+        self.timed(&op, || {
+            self.kernels.linear_swiglu_q8(xq, layout, gate, up, out, m)
         })
     }
 
