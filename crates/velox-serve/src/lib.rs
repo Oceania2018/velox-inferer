@@ -64,10 +64,15 @@ pub struct Outcome {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub completion_tokens: u64,
+    /// Engine-side wait from hand-off until the request's prefill began.
+    pub queue_ms: f64,
     /// Server-side prefill time of the uncached prompt tokens.
     pub prompt_ms: f64,
     /// Server-side time from the first to the last generated token.
     pub predicted_ms: f64,
+    /// When the first token was sampled. Engines that emit their output only once it is complete
+    /// must set it; without it the first emitted delta stands in.
+    pub first_token: Option<Instant>,
 }
 
 pub trait ChatEngine: Send + Sync {
@@ -124,6 +129,50 @@ impl Lanes {
     }
 }
 
+/// Histogram bucket bounds (seconds), ninfer's, so one query reads both engines.
+const BUCKETS: [f64; 20] = [
+    0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0,
+    160.0, 320.0, 640.0, 1280.0,
+];
+
+#[derive(Default)]
+struct Histogram {
+    /// Per-bucket counts (inclusive upper bounds), the last for `+Inf`.
+    bins: [u64; BUCKETS.len() + 1],
+    sum: f64,
+}
+
+impl Histogram {
+    fn observe(&mut self, seconds: f64) {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return;
+        }
+        self.bins[BUCKETS.partition_point(|&b| b < seconds)] += 1;
+        self.sum += seconds;
+    }
+
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} histogram");
+        let mut count = 0;
+        for (i, n) in self.bins.iter().enumerate() {
+            count += n;
+            let le = BUCKETS.get(i).map_or("+Inf".to_string(), f64::to_string);
+            let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {count}");
+        }
+        let _ = writeln!(out, "{name}_sum {}\n{name}_count {count}", self.sum);
+    }
+}
+
+/// Latency of settled generations (completed, or abandoned by the client); engine failures are
+/// counted in `velox_request_errors_total` only.
+#[derive(Default)]
+struct Latency {
+    ttft: Histogram,
+    queue: Histogram,
+    duration: Histogram,
+}
+
 struct LaneGuard<'a>(&'a Lanes);
 
 impl Drop for LaneGuard<'_> {
@@ -141,6 +190,7 @@ pub struct Server {
     errors: AtomicU64,
     prompt_tokens: AtomicU64,
     cached_tokens: AtomicU64,
+    latency: Mutex<Latency>,
     started: u64,
 }
 
@@ -252,6 +302,7 @@ impl Server {
             errors: AtomicU64::new(0),
             prompt_tokens: AtomicU64::new(0),
             cached_tokens: AtomicU64::new(0),
+            latency: Mutex::default(),
             started: unix_now(),
         })
     }
@@ -316,7 +367,7 @@ impl Server {
             .chain(self.cfg.info.iter().cloned())
             .map(|(k, v)| format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect();
-        format!(
+        let mut out = format!(
             "# HELP velox_max_concurrency Concurrent generation lanes fixed at startup\n\
              # TYPE velox_max_concurrency gauge\n\
              velox_max_concurrency {}\n\
@@ -338,7 +389,24 @@ impl Server {
             self.prompt_tokens.load(Ordering::Relaxed),
             self.cached_tokens.load(Ordering::Relaxed),
             labels.join(",")
-        )
+        );
+        let l = self.latency.lock().unwrap();
+        l.ttft.render(
+            &mut out,
+            "velox_time_to_first_token_seconds",
+            "Request receipt through the first sampled token, including preparation and queueing",
+        );
+        l.queue.render(
+            &mut out,
+            "velox_request_queue_seconds",
+            "Wait for a lane and for the engine to admit the request",
+        );
+        l.duration.render(
+            &mut out,
+            "velox_request_duration_seconds",
+            "Request receipt through generation settlement, including client cancellation",
+        );
+        out
     }
 
     fn validate(&self, body: &[u8]) -> Result<Value, ApiError> {
@@ -364,6 +432,7 @@ impl Server {
     }
 
     fn chat(&self, w: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+        let t_req = Instant::now();
         self.requests.fetch_add(1, Ordering::Relaxed);
         let req = match self.validate(body) {
             Ok(r) => r,
@@ -382,13 +451,16 @@ impl Server {
         let model = self.cfg.model_id.clone();
         let chunk = |delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
 
+        let t_lane = Instant::now();
         let _lane = self.lanes.acquire();
         let t0 = Instant::now();
         let mut content = String::new();
         let mut tool_calls = Vec::new();
         let mut headers_sent = false;
         let mut io_err = None;
+        let mut first_delta = None;
         let result = self.engine.generate(&req, &mut |d| {
+            first_delta.get_or_insert_with(Instant::now);
             if !stream {
                 match d {
                     Delta::Content(t) => content.push_str(&t),
@@ -418,6 +490,13 @@ impl Server {
         if let Ok(o) = &result {
             self.prompt_tokens.fetch_add(o.prompt_tokens, Ordering::Relaxed);
             self.cached_tokens.fetch_add(o.cached_tokens, Ordering::Relaxed);
+            let mut l = self.latency.lock().unwrap();
+            if let Some(t) = o.first_token.or(first_delta) {
+                l.ttft.observe(t.duration_since(t_req).as_secs_f64());
+            }
+            l.queue
+                .observe((t0 - t_lane).as_secs_f64() + o.queue_ms / 1e3);
+            l.duration.observe(t_req.elapsed().as_secs_f64());
         }
         if let Some(e) = io_err {
             return Err(e);
