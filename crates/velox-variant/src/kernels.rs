@@ -152,6 +152,19 @@ extern "C" {
         ldy: i64,
     ) -> i32;
     fn velox_5060_q8_quantize(x: *const f32, m: i32, k: i64, layout: i32) -> i32;
+    fn velox_5060_bf16_act(x: *const f32, m: i32, k: i64, xb: *mut *const u8) -> i32;
+    fn velox_5060_linear_rs_sliced_bf16(
+        xb: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        format: i32,
+        y: *mut f32,
+        ldy: i64,
+    ) -> i32;
     fn velox_5060_linear_iq3_q8_pre(
         m: i32,
         w: *const u8,
@@ -381,7 +394,7 @@ fn iq3_direct(m: usize) -> bool {
 /// bf16 weights with few rows (the GDN gate projections) past the skinny widths: the bf16
 /// tensor-core kernel. Qwen3.8 a/b ([96, 5120]) at 1024 tokens: 228 us exact f32 (portable) -> 64 us.
 fn bf16_skinny(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
-    w.format == WeightFormat::Bf16 && m > SKINNY16_MAX_M && w.rows <= 256 && w.k % 32 == 0
+    w.format == WeightFormat::Bf16 && m >= 2 && w.rows <= 256 && w.k % 32 == 0
 }
 
 /// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
@@ -421,10 +434,20 @@ fn q8_layout(format: i32) -> i32 {
     }
 }
 
-/// Whether `linears` writes this part in place at `m` tokens: int8 parts (which also share one
-/// quantization per layout) and bf16 few-row ones.
+/// Format code (4/5) of a q4/q5 part `linears` runs on the sliced-K kernel from a shared bf16
+/// conversion: the widths `linear` serves with it, up to one 16-token block, K without padding.
+fn rs_shared(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
+    match skinny16_format(w, m) {
+        Some(f @ (4 | 5)) if m <= SKINNY16_MAX_M && w.k % 128 == 0 => Some(f),
+        _ => None,
+    }
+}
+
+/// Whether `linears` writes this part in place at `m` tokens: int8 parts (which share one
+/// quantization per layout), q4/q5 sliced-K ones (which share one bf16 conversion) and bf16
+/// few-row ones.
 fn linears_in_place(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
-    q8_format(w, m).is_some() || bf16_skinny(w, m)
+    q8_format(w, m).is_some() || rs_shared(w, m).is_some() || bf16_skinny(w, m)
 }
 
 /// NVFP4 views the FP4-activation path does not serve (A16-only, or not 128-row aligned) from
@@ -652,7 +675,11 @@ impl CudaKernels for Rtx5060Kernels {
         let shared = parts()
             .filter(|(p, _)| q8_format(&p.w, m).is_some())
             .count()
-            > 1;
+            > 1
+            || parts()
+                .filter(|(p, _)| rs_shared(&p.w, m).is_some())
+                .count()
+                > 1;
         let ranges = parts().any(|(p, ld)| !linear_part_whole(p, ld));
         (shared || ranges)
             && parts().all(|(p, ld)| linears_in_place(&p.w, m) || linear_part_whole(p, ld))
@@ -665,6 +692,43 @@ impl CudaKernels for Rtx5060Kernels {
         m: usize,
     ) -> Result<()> {
         let mi = to_i32("m", m)?;
+        // q4/q5 sliced-K parts: one bf16 conversion, then each GEMM into its columns.
+        let mut xb: *const u8 = std::ptr::null();
+        for d in dsts.iter_mut() {
+            let ld = d.ld;
+            for p in d.parts {
+                let Some(f) = rs_shared(&p.w, m) else {
+                    continue;
+                };
+                let w = &p.w;
+                if xb.is_null() {
+                    // SAFETY: x holds m * k values (CudaBackend::linears checked every part).
+                    status(
+                        unsafe { velox_5060_bf16_act(x.as_ptr(), mi, w.k as i64, &mut xb) },
+                        "rtx5060 bf16 activations",
+                    )?;
+                }
+                // SAFETY: the destination holds m * ld values and col + rows <= ld (checked).
+                let y = unsafe { d.y.as_mut_ptr().add(p.col) };
+                status(
+                    unsafe {
+                        velox_5060_linear_rs_sliced_bf16(
+                            xb,
+                            mi,
+                            w.buf.as_ptr().cast::<u8>(),
+                            w.parent_rows as i64,
+                            w.k as i64,
+                            w.row_begin as i64,
+                            to_i32("rows", w.rows)?,
+                            f,
+                            y,
+                            ld as i64,
+                        )
+                    },
+                    "rtx5060 linears rs sliced",
+                )?;
+            }
+        }
         // int8 parts: one quantization per layout, then each GEMM into its columns.
         for layout in [0, 1] {
             let mut quantized = false;
@@ -711,7 +775,7 @@ impl CudaKernels for Rtx5060Kernels {
             let ld = d.ld;
             for p in d.parts {
                 let w = &p.w;
-                if q8_format(w, m).is_some() {
+                if q8_format(w, m).is_some() || rs_shared(w, m).is_some() {
                     continue;
                 }
                 if bf16_skinny(w, m) {

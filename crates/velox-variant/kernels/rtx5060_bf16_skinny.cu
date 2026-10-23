@@ -16,7 +16,6 @@ namespace {
 
 constexpr int kW = 8;         // warps per block, splitting K
 constexpr int kTokens = 16;   // tokens per block (one MMA tile)
-constexpr int kRows = 128;    // weight rows per block (16 n-tiles)
 
 __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                          uint32_t b0, uint32_t b1) {
@@ -37,6 +36,7 @@ template <int NT>
 __global__ void __launch_bounds__(kW * 32) bf16_skinny_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                                               int m, int k, int rows, float* __restrict__ y,
                                                               long long ldy) {
+    constexpr int kRows = 8 * NT;  // weight rows per block
     __shared__ float sum[kTokens][kRows];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -115,7 +115,13 @@ VELOX_API int velox_5060_linear_bf16_skinny(const float* x, int m, const uint8_t
         reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const auto* wb = reinterpret_cast<const __nv_bfloat16*>(w) + row_begin * k;
-    const dim3 grid((rows + kRows - 1) / kRows, (m + kTokens - 1) / kTokens);
-    bf16_skinny_kernel<kRows / 8><<<grid, kW * 32>>>(x, wb, m, static_cast<int>(k), rows, y, ldy);
+    // Prefill: 128 rows per block (16 n-tiles). Up to one token tile: 8 rows per block, so a few
+    // dozen rows still spread over a dozen SMs.
+    if (m <= kTokens) {
+        bf16_skinny_kernel<1><<<dim3((rows + 7) / 8, 1), kW * 32>>>(x, wb, m, static_cast<int>(k), rows, y, ldy);
+    } else {
+        const dim3 grid((rows + 127) / 128, (m + kTokens - 1) / kTokens);
+        bf16_skinny_kernel<16><<<grid, kW * 32>>>(x, wb, m, static_cast<int>(k), rows, y, ldy);
+    }
     return velox_launch_status();
 }

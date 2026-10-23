@@ -82,7 +82,8 @@ __device__ __forceinline__ uint32_t pair_of(uint32_t code, uint32_t high8, int b
 template <int F, int T, int GPR>
 __global__ void __launch_bounds__(kThreads, 6)
 rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows,
-                 int k_rt, int kp_rt, long long view_begin, int rows, int m, float* __restrict__ y) {
+                 int k_rt, int kp_rt, long long view_begin, int rows, int m, float* __restrict__ y,
+                 long long ldy) {
     constexpr int NT = T / 8;
     __shared__ Smem<T> sm;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, lid = lane & 3;
@@ -196,12 +197,12 @@ rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict_
         // x, y: row gid, tokens 2 lid, 2 lid + 1; z, w: row gid + 8.
         const int ra = r0 + gid, rb = ra + 8, t = ni * 8 + 2 * lid;
         if (ra < rows) {
-            if (t < m) y[static_cast<long long>(t) * rows + ra] = s.x;
-            if (t + 1 < m) y[static_cast<long long>(t + 1) * rows + ra] = s.y;
+            if (t < m) y[static_cast<long long>(t) * ldy + ra] = s.x;
+            if (t + 1 < m) y[static_cast<long long>(t + 1) * ldy + ra] = s.y;
         }
         if (rb < rows) {
-            if (t < m) y[static_cast<long long>(t) * rows + rb] = s.z;
-            if (t + 1 < m) y[static_cast<long long>(t + 1) * rows + rb] = s.w;
+            if (t < m) y[static_cast<long long>(t) * ldy + rb] = s.z;
+            if (t + 1 < m) y[static_cast<long long>(t + 1) * ldy + rb] = s.w;
         }
     }
 }
@@ -221,19 +222,30 @@ VeloxScratch g_x;
 
 template <int F, int T, int GPR>
 int launch(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, long long rb, int rows, int m,
-           float* y) {
-    rs_sliced_kernel<F, T, GPR><<<(rows + kR - 1) / kR, kThreads>>>(x, w, n, k, kp, rb, rows, m, y);
+           float* y, long long ldy) {
+    rs_sliced_kernel<F, T, GPR><<<(rows + kR - 1) / kR, kThreads>>>(x, w, n, k, kp, rb, rows, m, y, ldy);
     return velox_launch_status();
 }
 
 template <int F, int T>
 int launch_k(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, long long rb, int rows, int m,
-             float* y) {
+             float* y, long long ldy) {
     // The model's input widths as compile-time constants (the tile loop unrolls).
-    if (k == 5120 && kp == 5120) return launch<F, T, 80>(x, w, n, k, kp, rb, rows, m, y);
-    if (k == 6144 && kp == 6144) return launch<F, T, 96>(x, w, n, k, kp, rb, rows, m, y);
-    return launch<F, T, 0>(x, w, n, k, kp, rb, rows, m, y);
+    if (k == 5120 && kp == 5120) return launch<F, T, 80>(x, w, n, k, kp, rb, rows, m, y, ldy);
+    if (k == 6144 && kp == 6144) return launch<F, T, 96>(x, w, n, k, kp, rb, rows, m, y, ldy);
+    return launch<F, T, 0>(x, w, n, k, kp, rb, rows, m, y, ldy);
 }
+
+int run(const __nv_bfloat16* xb, int m, const uint8_t* w, long long parent_rows, int ki, int kp, long long row_begin,
+        int rows, int format, float* y, long long ldy) {
+    if (format == kQ5)
+        return m <= 8 ? launch_k<kQ5, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy)
+                      : launch_k<kQ5, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy);
+    return m <= 8 ? launch_k<kQ4, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy)
+                  : launch_k<kQ4, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy);
+}
+
+VeloxScratch g_shared;
 
 }  // namespace
 
@@ -248,9 +260,30 @@ VELOX_API int velox_5060_linear_rs_sliced(const float* x, int m, const uint8_t* 
     auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * kp * 2));
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16_pad<<<velox_grid_1d(static_cast<long long>(m) * kp, 256), 256>>>(x, m, ki, kp, xb);
-    if (format == kQ5)
-        return m <= 8 ? launch_k<kQ5, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y)
-                      : launch_k<kQ5, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y);
-    return m <= 8 ? launch_k<kQ4, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y)
-                  : launch_k<kQ4, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y);
+    return run(xb, m, w, parent_rows, ki, kp, row_begin, rows, format, y, rows);
+}
+
+// x [m, k] f32 -> bf16 (RNE) in a scratch that velox_5060_linear_rs_sliced_bf16 calls then read:
+// one conversion for several projections of the same input. k % 128 == 0 (no column padding).
+// The scratch is reused by the next call (stream order keeps earlier readers correct).
+VELOX_API int velox_5060_bf16_act(const float* x, int m, long long k, const void** xb_out) {
+    if (m < 1 || m > 16 || k % 128 != 0 || k > (1ll << 30)) return VELOX_ERR_UNSUPPORTED;
+    const int ki = static_cast<int>(k);
+    auto* xb = static_cast<__nv_bfloat16*>(g_shared.get(static_cast<size_t>(m) * ki * 2));
+    if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
+    to_bf16_pad<<<velox_grid_1d(static_cast<long long>(m) * ki, 256), 256>>>(x, m, ki, ki, xb);
+    *xb_out = xb;
+    return velox_launch_status();
+}
+
+// velox_5060_linear_rs_sliced on activations converted by velox_5060_bf16_act, writing
+// y[t * ldy + r] (rows <= ldy).
+VELOX_API int velox_5060_linear_rs_sliced_bf16(const void* xb, int m, const uint8_t* w, long long parent_rows,
+                                               long long k, long long row_begin, int rows, int format, float* y,
+                                               long long ldy) {
+    if (m < 1 || m > 16 || rows <= 0 || ldy < rows || k % 128 != 0 || k > (1ll << 30) ||
+        reinterpret_cast<uintptr_t>(w) % 16 != 0 || (format != kQ4 && format != kQ5))
+        return VELOX_ERR_UNSUPPORTED;
+    const int ki = static_cast<int>(k);
+    return run(static_cast<const __nv_bfloat16*>(xb), m, w, parent_rows, ki, ki, row_begin, rows, format, y, ldy);
 }
