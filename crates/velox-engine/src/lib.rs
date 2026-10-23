@@ -870,7 +870,19 @@ impl<B: Backend> Core<B> {
                 (lane.drafter.as_mut(), self.dflash.as_ref(), dw.as_mut())
             {
                 d.drafts = d.long_block();
-                d.draft(b, dm, dw, model, ws, 0, 0, lane.session.pos, 0, limit, 0.0)?;
+                d.draft(
+                    b,
+                    dm,
+                    dw,
+                    model,
+                    ws,
+                    0,
+                    0,
+                    lane.session.pos,
+                    0,
+                    limit,
+                    &Sampler::greedy(),
+                )?;
             }
         }
         if let Some(bw) = bw.as_mut() {
@@ -1176,6 +1188,18 @@ impl<B: Backend> Core<B> {
         })();
         trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
+        if debug {
+            // Admission runs on the engine thread between rounds; with VELOX_DEBUG_BATCH its GPU
+            // work (state restore, vision encode) is waited for so the time is the whole cost.
+            if std::env::var_os("VELOX_DEBUG_BATCH").is_some() {
+                let _ = self.b.synchronize();
+            }
+            eprintln!(
+                "[admit] lane {li} from {} in {:.1} ms",
+                r.as_ref().map_or(0, |pre| pre.start),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         match r {
             Ok(pre) => Ok(Active {
                 job,
@@ -1463,7 +1487,7 @@ impl<B: Backend> Core<B> {
                 lane.session.pos,
                 a.c,
                 self.fe.public_vocab,
-                a.job.sampler.temperature(),
+                &a.job.sampler,
             )
             .map_err(core)?;
         // `whole`: keep drafts past the request's budget (acceptance stops at the budget anyway),
@@ -1620,7 +1644,7 @@ impl<B: Backend> Core<B> {
                     let Some(Drafter::DFlash(d)) = lanes[a.lane].drafter.as_mut() else {
                         unreachable!("caller checked");
                     };
-                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, a.job.sampler.temperature());
+                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, &a.job.sampler);
                     let budget = if room {
                         picked.len()
                     } else {

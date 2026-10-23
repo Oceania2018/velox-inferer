@@ -1096,21 +1096,24 @@ impl<B: Backend> DFlashModel<B> {
 
     /// The conditional candidate walk: per mask column `i`, scores
     /// `E[c] = u[c] + sum_r pred[prev, r] g_i[r] succ[cand_c, r]` with `prev` the anchor, then each
-    /// selected draft. Greedy (`temperature <= 0`) takes the lowest-rank maximum; otherwise draws
-    /// from softmax(E / temperature) with `uniform` in [0, 1). Returns the drafts and, per draft,
-    /// the proposal distribution it was drawn from (for verification).
+    /// selected draft. `proposal` turns the column's (id, score) pairs (scores on a logit scale,
+    /// in candidate order) and the drafts so far into the distribution to draw from, as (id,
+    /// probability) summing to 1: the target sampler's own transforms, so that the proposal
+    /// overlaps the target as much as it can (greedy: one entry, the argmax). `uniform` draws in
+    /// [0, 1). Returns the drafts and, per draft, the distribution it was drawn from (for
+    /// verification).
     #[allow(clippy::type_complexity)]
     pub fn select(
         &self,
         bc: &BlockCandidates,
         anchor: u32,
-        temperature: f32,
+        proposal: &mut dyn FnMut(&[(u32, f32)], &[u32]) -> Vec<(u32, f32)>,
         uniform: &mut dyn FnMut() -> f32,
     ) -> (Vec<u32>, Vec<Vec<(u32, f32)>>) {
         let r = self.cfg.rank;
         let bf = |v: u16| f32::from_bits(u32::from(v) << 16);
         let mut prev = anchor;
-        let (mut drafts, mut qs) = (Vec::new(), Vec::new());
+        let (mut drafts, mut qs): (Vec<u32>, Vec<Vec<(u32, f32)>>) = (Vec::new(), Vec::new());
         for (i, cands) in bc.cands.iter().enumerate() {
             if cands.is_empty() {
                 break;
@@ -1118,42 +1121,32 @@ impl<B: Backend> DFlashModel<B> {
             let g = &bc.g[i * r..(i + 1) * r];
             let p = &self.pred[prev as usize * r..][..r];
             let pg: Vec<f32> = p.iter().zip(g).map(|(&a, &b)| bf(a) * b).collect();
-            let e: Vec<f32> = cands
+            let scored: Vec<(u32, f32)> = cands
                 .iter()
                 .map(|&(id, u)| {
                     let s = &self.succ[id as usize * r..][..r];
-                    u + pg.iter().zip(s).map(|(&a, &b)| a * bf(b)).sum::<f32>()
+                    (
+                        id,
+                        u + pg.iter().zip(s).map(|(&a, &b)| a * bf(b)).sum::<f32>(),
+                    )
                 })
                 .collect();
-            let (pick, q) = if temperature <= 0.0 {
-                let mut best = 0;
-                for (j, &v) in e.iter().enumerate() {
-                    if v > e[best] {
-                        best = j;
-                    }
-                }
-                (best, vec![(cands[best].0, 1.0)])
-            } else {
-                let m = e.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let w: Vec<f32> = e.iter().map(|&v| ((v - m) / temperature).exp()).collect();
-                let total: f32 = w.iter().sum();
-                let q: Vec<(u32, f32)> = cands
-                    .iter()
-                    .zip(&w)
-                    .map(|(&(id, _), &x)| (id, x / total))
-                    .collect();
-                let mut u = uniform() * total;
-                let mut pick = w.len() - 1;
-                for (j, &x) in w.iter().enumerate() {
+            let q = proposal(&scored, &drafts);
+            if q.is_empty() {
+                break;
+            }
+            let mut pick = q.len() - 1;
+            if q.len() > 1 {
+                let mut u = uniform();
+                for (j, &(_, x)) in q.iter().enumerate() {
                     u -= x;
                     if u <= 0.0 {
                         pick = j;
                         break;
                     }
                 }
-                (pick, q)
-            };
-            prev = cands[pick].0;
+            }
+            prev = q[pick].0;
             drafts.push(prev);
             qs.push(q);
         }
