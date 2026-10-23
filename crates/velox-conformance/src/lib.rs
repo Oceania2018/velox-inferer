@@ -1979,6 +1979,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear_act(WeightFormat::Nvfp4, 512, 2048, 128, 384, 24, a4)?;
     s.linear_act(WeightFormat::Nvfp4, 384, 640, 128, 256, 48, a4)?;
     s.linear_act(WeightFormat::Nvfp4, 256, 1024, 0, 256, 64, a4)?;
+    // bf16 weights with few rows (GDN gate projections) at prefill widths: a full chunk, a row
+    // view spanning two 128-row blocks with ragged tokens, and K off the 32-value step.
+    s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 1030)?;
+    s.linear(WeightFormat::Bf16, 300, 1024, 40, 200, 100)?;
+    s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 40)?;
     Ok(s.results)
 }
 
