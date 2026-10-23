@@ -239,10 +239,15 @@ __global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long lon
     for (long long c = threadIdx.x; c < w.k; c += blockDim.x) out[blockIdx.x * w.k + c] = weight_at(w, row, c);
 }
 
-__global__ void sigmoid_mul_kernel(float* __restrict__ x, const float* __restrict__ gate, long long len) {
+// xb: null, or the result's bf16 twin.
+__global__ void sigmoid_mul_kernel(float* __restrict__ x, const float* __restrict__ gate, long long len,
+                                   unsigned short* __restrict__ xb) {
     for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < len;
-         i += static_cast<long long>(gridDim.x) * blockDim.x)
-        x[i] = x[i] / (1.0f + expf(-gate[i]));
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const float v = x[i] / (1.0f + expf(-gate[i]));
+        x[i] = v;
+        if (xb != nullptr) xb[i] = velox_bf16_bits(v);
+    }
 }
 
 constexpr int kMaxConvWidth = 8;
@@ -1388,7 +1393,13 @@ VELOX_API int velox_portable_embed(const uint32_t* ids, int count, const uint8_t
 }
 
 VELOX_API int velox_portable_sigmoid_mul(float* x, const float* gate, long long len) {
-    sigmoid_mul_kernel<<<velox_grid_1d(len, 256), 256>>>(x, gate, len);
+    sigmoid_mul_kernel<<<velox_grid_1d(len, 256), 256>>>(x, gate, len, nullptr);
+    return velox_launch_status();
+}
+
+// velox_portable_sigmoid_mul that also writes the result rounded to bf16 into xb.
+VELOX_API int velox_portable_sigmoid_mul_twin(float* x, const float* gate, unsigned short* xb, long long len) {
+    sigmoid_mul_kernel<<<velox_grid_1d(len, 256), 256>>>(x, gate, len, xb);
     return velox_launch_status();
 }
 

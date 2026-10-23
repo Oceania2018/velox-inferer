@@ -52,9 +52,10 @@ __global__ void rms_norm_warp_kernel(const float* __restrict__ x, const float* _
     for (int i = lane; i < dim; i += VELOX_WARP) yr[i] = xr[i] * inv * (offset + weight[i]);
 }
 
-// gate = silu(gate) * rms_norm(x): one warp per row.
+// gate = silu(gate) * rms_norm(x): one warp per row. gb: null, or the result's bf16 twin.
 __global__ void rms_norm_gated_kernel(const float* __restrict__ x, const float* __restrict__ weight,
-                                      float* __restrict__ gate, int rows, int dim, float eps, float offset) {
+                                      float* __restrict__ gate, int rows, int dim, float eps, float offset,
+                                      unsigned short* __restrict__ gb) {
     const int row = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
     const int lane = threadIdx.x % VELOX_WARP;
     if (row >= rows) return;
@@ -66,7 +67,9 @@ __global__ void rms_norm_gated_kernel(const float* __restrict__ x, const float* 
     const float inv = rsqrtf(ss / dim + eps);
     for (int i = lane; i < dim; i += VELOX_WARP) {
         const float g = gr[i];
-        gr[i] = g / (1.0f + expf(-g)) * (xr[i] * inv * (offset + weight[i]));
+        const float v = g / (1.0f + expf(-g)) * (xr[i] * inv * (offset + weight[i]));
+        gr[i] = v;
+        if (gb != nullptr) gb[static_cast<size_t>(row) * dim + i] = velox_bf16_bits(v);
     }
 }
 
@@ -176,9 +179,10 @@ VELOX_API int velox_portable_matmul(const float* x, const float* w, float* y, in
 
 namespace {
 // Residual add fused with the RMS norm that follows it: acc += x, y = norm(acc). One block per
-// row; float4 accesses when the width allows.
+// row; float4 accesses when the width allows. yb: null, or y's bf16 twin.
 __global__ void add_rms_norm_kernel(float* __restrict__ acc, const float* __restrict__ x, const float* __restrict__ weight,
-                                    float* __restrict__ y, int dim, float eps, float offset) {
+                                    float* __restrict__ y, int dim, float eps, float offset,
+                                    unsigned short* __restrict__ yb) {
     __shared__ float scratch[VELOX_WARP];
     const size_t base = static_cast<size_t>(blockIdx.x) * dim;
     float ss = 0.0f;
@@ -208,11 +212,21 @@ __global__ void add_rms_norm_kernel(float* __restrict__ acc, const float* __rest
         float4* y4 = reinterpret_cast<float4*>(y + base);
         for (int i = threadIdx.x; i < dim / 4; i += blockDim.x) {
             const float4 a = a4[i], w = w4[i];
-            y4[i] = make_float4(a.x * inv * (offset + w.x), a.y * inv * (offset + w.y), a.z * inv * (offset + w.z),
-                                a.w * inv * (offset + w.w));
+            const float4 v = make_float4(a.x * inv * (offset + w.x), a.y * inv * (offset + w.y),
+                                         a.z * inv * (offset + w.z), a.w * inv * (offset + w.w));
+            y4[i] = v;
+            if (yb != nullptr) {
+                const unsigned int lo = velox_bf16_bits(v.x) | (static_cast<unsigned int>(velox_bf16_bits(v.y)) << 16);
+                const unsigned int hi = velox_bf16_bits(v.z) | (static_cast<unsigned int>(velox_bf16_bits(v.w)) << 16);
+                reinterpret_cast<uint2*>(yb + base)[i] = make_uint2(lo, hi);
+            }
         }
     } else {
-        for (int i = threadIdx.x; i < dim; i += blockDim.x) y[base + i] = acc[base + i] * inv * (offset + weight[i]);
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            const float v = acc[base + i] * inv * (offset + weight[i]);
+            y[base + i] = v;
+            if (yb != nullptr) yb[base + i] = velox_bf16_bits(v);
+        }
     }
 }
 }  // namespace
@@ -221,7 +235,16 @@ VELOX_API int velox_portable_add_rms_norm(float* acc, const float* x, const floa
                                           float eps, int offset) {
     if (rows <= 0) return 0;
     // Few rows per call (the residual stream): the widest block shortens each row's serial work.
-    add_rms_norm_kernel<<<rows, 1024>>>(acc, x, weight, y, dim, eps, offset ? 1.0f : 0.0f);
+    add_rms_norm_kernel<<<rows, 1024>>>(acc, x, weight, y, dim, eps, offset ? 1.0f : 0.0f, nullptr);
+    return velox_launch_status();
+}
+
+// velox_portable_add_rms_norm that also writes y rounded to bf16 into yb ([rows, dim], 8-byte
+// aligned).
+VELOX_API int velox_portable_add_rms_norm_twin(float* acc, const float* x, const float* weight, float* y,
+                                               unsigned short* yb, int rows, int dim, float eps, int offset) {
+    if (rows <= 0) return 0;
+    add_rms_norm_kernel<<<rows, 1024>>>(acc, x, weight, y, dim, eps, offset ? 1.0f : 0.0f, yb);
     return velox_launch_status();
 }
 
@@ -239,7 +262,14 @@ VELOX_API int velox_portable_rms_norm(const float* x, const float* weight, float
 
 VELOX_API int velox_portable_rms_norm_gated(const float* x, const float* weight, float* gate, int rows, int dim,
                                             float eps, int offset) {
-    rms_norm_gated_kernel<<<(rows + 7) / 8, 256>>>(x, weight, gate, rows, dim, eps, offset ? 1.0f : 0.0f);
+    rms_norm_gated_kernel<<<(rows + 7) / 8, 256>>>(x, weight, gate, rows, dim, eps, offset ? 1.0f : 0.0f, nullptr);
+    return velox_launch_status();
+}
+
+// velox_portable_rms_norm_gated that also writes the result rounded to bf16 into gb.
+VELOX_API int velox_portable_rms_norm_gated_twin(const float* x, const float* weight, float* gate,
+                                                 unsigned short* gb, int rows, int dim, float eps, int offset) {
+    rms_norm_gated_kernel<<<(rows + 7) / 8, 256>>>(x, weight, gate, rows, dim, eps, offset ? 1.0f : 0.0f, gb);
     return velox_launch_status();
 }
 
