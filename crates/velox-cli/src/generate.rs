@@ -409,7 +409,19 @@ fn dflash_generate<B: Backend>(
             }
         }
         let td = Instant::now();
-        let (drafts, _) = dr.draft(b, &dm, &mut dw, model, ws, row, kept, s.pos, c, limit, 0.0)?;
+        let (drafts, _) = dr.draft(
+            b,
+            &dm,
+            &mut dw,
+            model,
+            ws,
+            row,
+            kept,
+            s.pos,
+            c,
+            limit,
+            &velox_engine::Sampler::greedy(),
+        )?;
         draft_s += td.elapsed().as_secs_f64();
         let mut window = vec![c];
         window.extend(drafts.iter().copied().take(max_tokens - out.len()));

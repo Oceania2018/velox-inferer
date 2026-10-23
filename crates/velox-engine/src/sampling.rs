@@ -82,6 +82,19 @@ impl Sampler {
         self.draw(&d)
     }
 
+    /// The proposal distribution a drafter should draw its next draft from, given its candidates
+    /// as (id, score) with scores on a logit scale: this step's transforms (presence penalty over
+    /// the output so far plus the block's earlier `drafts`, temperature, top-k, top-p), as the
+    /// target's own distribution gets. Acceptance is the overlap of proposal and target (the sum
+    /// of min(p, q)), so matching their transforms raises it; verification stays exact for any q.
+    /// Greedy returns the single argmax after the penalty.
+    pub fn proposal(&self, scored: &[(u32, f32)], drafts: &[u32]) -> Vec<(u32, f32)> {
+        self.distribution_with(scored, drafts)
+            .into_iter()
+            .map(|(id, p)| (id, p as f32))
+            .collect()
+    }
+
     /// Speculative sampling with a deterministic draft: accepts `draft` with probability p(draft)
     /// under this step's distribution. On rejection returns the token drawn from p with `draft`
     /// removed (the residual max(p - q, 0) for a one-hot q), so the output distribution is exactly
@@ -131,10 +144,18 @@ impl Sampler {
     /// The step's distribution over the kept candidates (presence penalty, then greedy, or
     /// temperature + top-k + top-p), as (id, probability) summing to 1.
     fn distribution(&self, cands: &[(u32, f32)]) -> Vec<(u32, f64)> {
+        self.distribution_with(cands, &[])
+    }
+
+    /// [`Self::distribution`] with `extra` tokens counted as seen too (a drafter's earlier drafts
+    /// of the same block).
+    fn distribution_with(&self, cands: &[(u32, f32)], extra: &[u32]) -> Vec<(u32, f64)> {
         let mut c: Vec<(u32, f32)> = cands
             .iter()
             .map(|&(id, l)| {
-                let pen = if self.seen.contains(&id) {
+                let pen = if self.presence_penalty != 0.0
+                    && (self.seen.contains(&id) || extra.contains(&id))
+                {
                     self.presence_penalty
                 } else {
                     0.0
