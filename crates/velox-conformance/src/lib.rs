@@ -2335,6 +2335,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         // The dense MLP's own K: gate/up at 5120, down at 17408.
         s.twins(8, 5120, &[(Iq3Xxs, 32)], Some((Iq3Xxs, 256)))?;
         s.twins(8, 17408, &[(Iq3Xxs, 32)], None)?;
+        // A prefill width: the NVFP4 output projections read the z / attn twins there too.
+        s.twins(300, 1024, &[(Nvfp4, 128)], None)?;
     }
     Ok(s.results)
 }
