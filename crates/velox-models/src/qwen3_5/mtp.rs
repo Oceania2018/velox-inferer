@@ -164,7 +164,16 @@ impl<B: Backend> Qwen35Text<B> {
             }
         };
         // The MTP cache stays f32 whatever the target session stores.
-        self.attention_mixer(b, ws, &l.mixer, &mut ms.kv, KvFormat::F32, t, pos0, rope)?;
+        self.attention_mixer(
+            b,
+            ws,
+            &l.mixer,
+            &mut ms.kv,
+            KvFormat::F32,
+            (t, pos0),
+            rope,
+            (false, false),
+        )?;
         b.add(&mut ws.x, &ws.y, t * hd)?;
         b.rms_norm(
             &ws.x,
@@ -175,7 +184,7 @@ impl<B: Backend> Qwen35Text<B> {
             c.eps,
             NormKind::Offset,
         )?;
-        self.mlp(b, ws, l, t)?;
+        self.mlp(b, ws, l, t, false)?;
         b.add(&mut ws.x, &ws.y, t * hd)?;
         b.rms_norm(
             &ws.x,

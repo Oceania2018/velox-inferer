@@ -395,14 +395,100 @@ pub trait CudaKernels: Send + Sync {
         false
     }
 
-    /// [`Backend::linears`] without scratch, for destinations `serves_linears` accepted.
+    /// [`Backend::linears`] without scratch, for destinations `serves_linears` accepted (`xb`:
+    /// `x`'s bf16 twin when the caller has one).
     fn linears(
         &self,
         _x: &CudaBuffer,
+        _xb: Option<&CudaBuffer>,
         _dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
         _m: usize,
     ) -> Result<()> {
         Err(Error::Unsupported("linears".into()))
+    }
+
+    /// See [`Backend::takes_bf16`].
+    fn takes_bf16(&self, _w: &WeightView<'_, CudaBuffer>, _m: usize) -> bool {
+        false
+    }
+
+    /// See [`Backend::linear_bf16`].
+    fn linear_bf16(
+        &self,
+        _xb: &CudaBuffer,
+        _w: &WeightView<'_, CudaBuffer>,
+        _y: &mut CudaBuffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_bf16".into()))
+    }
+
+    /// See [`Backend::swiglu_twin`].
+    fn swiglu_twin(
+        &self,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _m: usize,
+    ) -> bool {
+        false
+    }
+
+    /// See [`Backend::linear_swiglu_twin`].
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_twin(
+        &self,
+        _xb: &CudaBuffer,
+        _gate: &WeightView<'_, CudaBuffer>,
+        _up: &WeightView<'_, CudaBuffer>,
+        _out: &mut CudaBuffer,
+        _outb: &mut CudaBuffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_swiglu_twin".into()))
+    }
+
+    /// See [`Backend::add_rms_norm_twin`].
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_twin(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        yb: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        portable::add_rms_norm_twin(acc, x, weight, y, yb, rows, dim, eps, kind)
+    }
+
+    /// See [`Backend::rms_norm_gated_twin`].
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_gated_twin(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        gate: &mut CudaBuffer,
+        gb: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        portable::rms_norm_gated_twin(x, weight, gate, gb, rows, dim, eps, kind)
+    }
+
+    /// See [`Backend::sigmoid_mul_twin`].
+    fn sigmoid_mul_twin(
+        &self,
+        x: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        xb: &mut CudaBuffer,
+        len: usize,
+    ) -> Result<()> {
+        portable::sigmoid_mul_twin(x, gate, xb, len)
     }
 
     /// A fused [`Backend::linear_swiglu`] (no scratch). The default reports `Unsupported`, and the
@@ -1040,6 +1126,7 @@ impl Backend for CudaBackend {
     fn linears(
         &self,
         x: &CudaBuffer,
+        xb: Option<&CudaBuffer>,
         dsts: &mut [LinearDst<'_, '_, '_, CudaBuffer>],
         scratch: &mut CudaBuffer,
         m: usize,
@@ -1064,7 +1151,135 @@ impl Backend for CudaBackend {
             }
         }
         let op = format!("linears m={}", if m <= 16 { "<=16" } else { ">16" });
-        self.timed(&op, || self.kernels.linears(x, dsts, m))
+        if let Some(xb) = xb {
+            let k = dsts
+                .iter()
+                .flat_map(|d| d.parts.iter())
+                .map(|p| p.w.k)
+                .max()
+                .unwrap_or(0);
+            check::elementwise("linears bf16 twin", &[xb.len * 2], m * k)?;
+        }
+        self.timed(&op, || self.kernels.linears(x, xb, dsts, m))
+    }
+
+    fn bf16_twins(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_twin(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        yb: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        check::rms_norm(acc.len, weight.len, y.len, rows, dim)?;
+        check::elementwise("add_rms_norm", &[x.len], rows * dim)?;
+        check::elementwise("add_rms_norm twin", &[yb.len * 2], rows * dim)?;
+        self.timed("add_rms_norm", || {
+            self.kernels
+                .add_rms_norm_twin(acc, x, weight, y, yb, rows, dim, eps, kind)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_gated_twin(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        gate: &mut CudaBuffer,
+        gb: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        kind: NormKind,
+    ) -> Result<()> {
+        check::rms_norm(x.len, weight.len, gate.len, rows, dim)?;
+        check::elementwise("rms_norm_gated twin", &[gb.len * 2], rows * dim)?;
+        self.timed("rms_norm_gated", || {
+            self.kernels
+                .rms_norm_gated_twin(x, weight, gate, gb, rows, dim, eps, kind)
+        })
+    }
+
+    fn sigmoid_mul_twin(
+        &self,
+        x: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        xb: &mut CudaBuffer,
+        len: usize,
+    ) -> Result<()> {
+        check::elementwise("sigmoid_mul", &[x.len, gate.len], len)?;
+        check::elementwise("sigmoid_mul twin", &[xb.len * 2], len)?;
+        self.timed("sigmoid_mul", || {
+            self.kernels.sigmoid_mul_twin(x, gate, xb, len)
+        })
+    }
+
+    fn takes_bf16(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+        self.kernels.takes_bf16(w, m)
+    }
+
+    fn linear_bf16(
+        &self,
+        xb: &CudaBuffer,
+        w: &WeightView<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if !self.kernels.takes_bf16(w, m) {
+            return Err(Error::Unsupported("linear_bf16 view".into()));
+        }
+        check::linear(xb.len * 2, w, w.buf.len, y.len, m)?;
+        let op = format!(
+            "linear {} m={} bf16 in",
+            w.format.name(),
+            if m <= 16 { "<=16" } else { ">16" }
+        );
+        self.timed(&op, || self.kernels.linear_bf16(xb, w, y, m))
+    }
+
+    fn swiglu_twin(
+        &self,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        m: usize,
+    ) -> bool {
+        self.kernels.swiglu_twin(gate, up, m)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_twin(
+        &self,
+        xb: &CudaBuffer,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        outb: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        if !self.kernels.swiglu_twin(gate, up, m) {
+            return Err(Error::Unsupported("linear_swiglu_twin views".into()));
+        }
+        check::linear(xb.len * 2, gate, gate.buf.len, out.len, m)?;
+        check::linear(xb.len * 2, up, up.buf.len, out.len, m)?;
+        check::elementwise("linear_swiglu twin", &[outb.len * 2], m * gate.rows)?;
+        let op = format!(
+            "linear_swiglu {} m={m} [{}x{}] twin",
+            gate.format.name(),
+            gate.rows,
+            gate.k
+        );
+        self.timed(&op, || {
+            self.kernels.linear_swiglu_twin(xb, gate, up, out, outb, m)
+        })
     }
 
     fn linear_swiglu(

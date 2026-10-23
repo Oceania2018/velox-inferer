@@ -96,6 +96,33 @@ extern "C" {
         out: *mut f32,
     ) -> i32;
     fn velox_portable_sigmoid_mul(x: *mut f32, gate: *const f32, len: i64) -> i32;
+    fn velox_portable_sigmoid_mul_twin(
+        x: *mut f32,
+        gate: *const f32,
+        xb: *mut u16,
+        len: i64,
+    ) -> i32;
+    fn velox_portable_add_rms_norm_twin(
+        acc: *mut f32,
+        x: *const f32,
+        weight: *const f32,
+        y: *mut f32,
+        yb: *mut u16,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
+    fn velox_portable_rms_norm_gated_twin(
+        x: *const f32,
+        weight: *const f32,
+        gate: *mut f32,
+        gb: *mut u16,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
     fn velox_portable_conv1d_silu(
         x: *const f32,
         w: *const f32,
@@ -336,6 +363,103 @@ pub fn sigmoid_mul(x: &mut CudaBuffer, gate: &CudaBuffer, len: usize) -> Result<
     status(
         unsafe { velox_portable_sigmoid_mul(x.as_mut_ptr(), gate.as_ptr(), len as i64) },
         "portable sigmoid_mul",
+    )
+}
+
+/// A bf16 twin of `n` values packs two per f32 slot.
+fn check_twin(what: &str, twin: &CudaBuffer, n: usize) -> Result<()> {
+    check::elementwise(what, &[twin.len() * 2], n)
+}
+
+/// [`add_rms_norm`] that also writes `y` rounded to bf16 into `yb` (see `Backend::add_rms_norm_twin`).
+#[allow(clippy::too_many_arguments)]
+pub fn add_rms_norm_twin(
+    acc: &mut CudaBuffer,
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    y: &mut CudaBuffer,
+    yb: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    kind: NormKind,
+) -> Result<()> {
+    check::rms_norm(acc.len(), weight.len(), y.len(), rows, dim)?;
+    check::elementwise("add_rms_norm", &[x.len()], rows * dim)?;
+    check_twin("add_rms_norm twin", yb, rows * dim)?;
+    let (rows, dim) = (to_i32("rows", rows)?, to_i32("dim", dim)?);
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_add_rms_norm_twin(
+                acc.as_mut_ptr(),
+                x.as_ptr(),
+                weight.as_ptr(),
+                y.as_mut_ptr(),
+                yb.as_mut_ptr().cast(),
+                rows,
+                dim,
+                eps,
+                i32::from(kind == NormKind::Offset),
+            )
+        },
+        "portable add_rms_norm twin",
+    )
+}
+
+/// [`rms_norm_gated`] that also writes the result rounded to bf16 into `gb`.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gated_twin(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    gate: &mut CudaBuffer,
+    gb: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    kind: NormKind,
+) -> Result<()> {
+    check::rms_norm(x.len(), weight.len(), gate.len(), rows, dim)?;
+    check_twin("rms_norm_gated twin", gb, rows * dim)?;
+    let (rows, dim) = (to_i32("rows", rows)?, to_i32("dim", dim)?);
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_rms_norm_gated_twin(
+                x.as_ptr(),
+                weight.as_ptr(),
+                gate.as_mut_ptr(),
+                gb.as_mut_ptr().cast(),
+                rows,
+                dim,
+                eps,
+                i32::from(kind == NormKind::Offset),
+            )
+        },
+        "portable rms_norm_gated twin",
+    )
+}
+
+/// [`sigmoid_mul`] that also writes the result rounded to bf16 into `xb`.
+pub fn sigmoid_mul_twin(
+    x: &mut CudaBuffer,
+    gate: &CudaBuffer,
+    xb: &mut CudaBuffer,
+    len: usize,
+) -> Result<()> {
+    check::elementwise("sigmoid_mul", &[x.len(), gate.len()], len)?;
+    check_twin("sigmoid_mul twin", xb, len)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_sigmoid_mul_twin(
+                x.as_mut_ptr(),
+                gate.as_ptr(),
+                xb.as_mut_ptr().cast(),
+                len as i64,
+            )
+        },
+        "portable sigmoid_mul twin",
     )
 }
 
