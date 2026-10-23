@@ -518,13 +518,13 @@ __device__ __forceinline__ void mbar_wait(uint64_t* b, int parity) {
 }
 __device__ __forceinline__ void tma_2d(void* dst, const CUtensorMap* map, int x, int y, uint64_t* bar) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n" ::"r"(
+        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n" ::"r"(
             smem_u32(dst)),
         "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(smem_u32(bar))
         : "memory");
 }
 __device__ __forceinline__ void bulk_1d(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(
                      smem_u32(dst)),
                  "l"(src), "r"(bytes), "r"(smem_u32(bar))
                  : "memory");
