@@ -74,6 +74,9 @@ where
         chunk: a.parse("prefill-chunk", 512)?,
         default_max_tokens: a.parse("default-max-tokens", 4096)?,
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
+        // --force-tool-call on|off (default off): requests that offer tools answer with a tool
+        // call only, as ninfer's tool-call grammar does.
+        force_tool_call: a.get("force-tool-call").is_some_and(|v| v == "on"),
         // --ctx-checkpoints N (ninfer's name): with the host store, superseded history points kept
         // per request chain (default 1, as ninfer is deployed; 0: unbounded); with
         // --ctx-checkpoint-store device, checkpoints per lane (default 8).
