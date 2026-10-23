@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde_json::json;
 use velox_core::{Backend, Error, KvFormat, Result};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{argmax, Qwen35Text, TextConfig, TextWeights};
+use velox_models::qwen3_5::{Qwen35Text, TextConfig, TextWeights};
 use velox_weights::Artifact;
 
 use crate::args::Args;
@@ -175,14 +175,26 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             )?;
             continue;
         }
+        // Greedy on the device: each step selects its id into the workspace's slot and the next
+        // step embeds from there, so one step is always queued behind the running one and the
+        // device never waits for the host; the host fetches a step's id while the next runs.
+        // Step k yields id k; steps past max_tokens - 1 are not queued (a step queued before an
+        // EOS is wasted; the session is dropped anyway).
+        let limit = fe.public_vocab;
         let t1 = Instant::now();
-        let mut logits = model.forward(b, &mut session, &mut ws, &ids)?;
+        model.advance(b, &mut session, &mut ws, &ids, None, &[])?;
+        model.argmax_into(b, &mut ws, limit, 0)?;
+        if max_tokens >= 2 {
+            model.advance_from(b, &mut session, &mut ws)?;
+            model.argmax_into(b, &mut ws, limit, 1)?;
+        }
+        let mut next = model.next_id(b, &ws, 0)?;
         let prefill = t1.elapsed().as_secs_f64();
         on_phase("prefill");
         let mut out = Vec::new();
         let t2 = Instant::now();
+        let mut step = 0usize;
         loop {
-            let next = argmax(&logits, fe.public_vocab);
             if fe.is_eos(next) {
                 break;
             }
@@ -190,7 +202,12 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             if out.len() >= max_tokens {
                 break;
             }
-            logits = model.forward(b, &mut session, &mut ws, &[next])?;
+            step += 1; // its step is queued; queue the one after before fetching its id
+            if step + 1 < max_tokens {
+                model.advance_from(b, &mut session, &mut ws)?;
+                model.argmax_into(b, &mut ws, limit, (step + 1) % 8)?;
+            }
+            next = model.next_id(b, &ws, step % 8)?;
         }
         let decode = t2.elapsed().as_secs_f64();
         on_phase("decode");

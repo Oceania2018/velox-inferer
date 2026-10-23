@@ -683,7 +683,21 @@ __global__ void attention_block_partial_kernel(const float* __restrict__ q, cons
 // (token x head of the group), so each K/V tile is read once into shared memory for all of them.
 // Keys are indexed over token 0's view (the widest): context positions [start0, pos0), then the
 // block's rows; a row skips context keys before its own window start.
-template <int PER, int TK>
+//
+// Within a tile of kGqaTile keys a lane owns one key: it forms that key's score against each of
+// its warp's rows (the row's query read through L1, the key padded in shared memory so the lanes
+// hit distinct banks), the tile's softmax is one warp reduction per row, and the value sum walks
+// the tile with each probability broadcast from its lane. A lane's output slice is dims
+// 4 (lane + 32 c) .. + 3, so value rows are read as float4. This is ~3x fewer instructions than a
+// warp reduction per (row, key).
+constexpr int kGqaTile = VELOX_WARP;  // keys per tile: one per lane
+
+__device__ __forceinline__ float gqa_warp_max(float v) {
+    for (int o = VELOX_WARP / 2; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+template <int PER>
 __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
     attention_block_gqa_kernel(const float* __restrict__ q, const float* __restrict__ k_ctx,
                                const float* __restrict__ v_ctx, const float* __restrict__ k_blk,
@@ -701,14 +715,17 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
         k_ctx = reinterpret_cast<const float*>(params[2]);
         v_ctx = reinterpret_cast<const float*>(params[3]);
     }
+    constexpr int KS = PER * VELOX_WARP + 4;  // padded key stride (floats): lanes on distinct banks
+    constexpr int NV = PER >= 4 ? PER / 4 : 1;  // float4 chunks of a lane's output slice
     extern __shared__ float gqa_smem[];
-    float* ks = gqa_smem;
-    float* vs = gqa_smem + TK * head_dim;
+    float* ks = gqa_smem;                     // [kGqaTile][KS]
+    float* vs = gqa_smem + kGqaTile * KS;     // [kGqaTile][PER * VELOX_WARP]
     const int kvh = blockIdx.x, sp = blockIdx.y, rg = blockIdx.z;
     const int group = heads / kv_heads, rows = tokens * group;
     const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
     const int n_ctx = static_cast<int>(pos0 - start0);
-    float qr[kGqaRowsPerWarp][PER], acc[kGqaRowsPerWarp][PER], m[kGqaRowsPerWarp], l[kGqaRowsPerWarp];
+    const float* qrow[kGqaRowsPerWarp];
+    float acc[kGqaRowsPerWarp][NV * 4], m[kGqaRowsPerWarp], l[kGqaRowsPerWarp];
     int first[kGqaRowsPerWarp];  // first visible key index; rows past `rows` see nothing
 #pragma unroll
     for (int i = 0; i < kGqaRowsPerWarp; ++i) {
@@ -717,19 +734,16 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
         long long start = pos0 + t + 1 - window;
         if (start < start0) start = start0;
         first[i] = r < rows ? static_cast<int>(start - start0) : 0x7fffffff;
+        qrow[i] = q + (r < rows ? (static_cast<size_t>(t) * heads + h) * head_dim : 0);
         m[i] = -INFINITY;
         l[i] = 0.0f;
 #pragma unroll
-        for (int p = 0; p < PER; ++p) {
-            const int d = lane + p * VELOX_WARP;
-            qr[i][p] = r < rows && d < head_dim ? q[(static_cast<size_t>(t) * heads + h) * head_dim + d] * scale : 0.0f;
-            acc[i][p] = 0.0f;
-        }
+        for (int e = 0; e < NV * 4; ++e) acc[i][e] = 0.0f;
     }
     const int j0 = sp * split_keys, j1 = min(j0 + split_keys, n_ctx + tokens);
     const int vec = head_dim / 4;
-    for (int base = j0; base < j1; base += TK) {
-        const int n = min(TK, j1 - base);
+    for (int base = j0; base < j1; base += kGqaTile) {
+        const int n = min(kGqaTile, j1 - base);
         __syncthreads();
         for (int idx = threadIdx.x; idx < n * vec; idx += blockDim.x) {
             const int key = idx / vec, d4 = idx % vec, j = base + key;
@@ -737,27 +751,64 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
             const float* kb = j < n_ctx ? k_ctx : k_blk;
             const float* vb = j < n_ctx ? v_ctx : v_blk;
             const size_t off = (row * kv_heads + kvh) * head_dim;
-            reinterpret_cast<float4*>(ks)[key * vec + d4] = reinterpret_cast<const float4*>(kb + off)[d4];
+            *reinterpret_cast<float4*>(ks + key * KS + 4 * d4) = reinterpret_cast<const float4*>(kb + off)[d4];
             reinterpret_cast<float4*>(vs)[key * vec + d4] = reinterpret_cast<const float4*>(vb + off)[d4];
         }
         __syncthreads();
+        // Scores: this lane's key against the warp's rows.
+        const int j = base + lane;
+        float s[kGqaRowsPerWarp];
+#pragma unroll
+        for (int i = 0; i < kGqaRowsPerWarp; ++i) s[i] = 0.0f;
+        const float* kr = ks + lane * KS;
+#pragma unroll 4
+        for (int d4 = 0; d4 < vec; ++d4) {
+            const float4 kv = *reinterpret_cast<const float4*>(kr + 4 * d4);
+#pragma unroll
+            for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+                const float4 qv = __ldg(reinterpret_cast<const float4*>(qrow[i]) + d4);
+                s[i] = fmaf(qv.x, kv.x, s[i]);
+                s[i] = fmaf(qv.y, kv.y, s[i]);
+                s[i] = fmaf(qv.z, kv.z, s[i]);
+                s[i] = fmaf(qv.w, kv.w, s[i]);
+            }
+        }
+        // The tile's softmax per row, folded into the running (m, l, acc).
+        float p[kGqaRowsPerWarp];
 #pragma unroll
         for (int i = 0; i < kGqaRowsPerWarp; ++i) {
-            for (int jj = max(0, first[i] - base); jj < n; ++jj) {  // warp-uniform bounds
-                const float* kr = ks + jj * head_dim;
-                float s = 0.0f;
+            const bool vis = lane < n && j >= first[i];
+            s[i] = vis ? s[i] * scale : -INFINITY;
+            const float mt = gqa_warp_max(s[i]);
+            if (mt == -INFINITY) {  // warp-uniform: the row sees no key of this tile
+                p[i] = 0.0f;
+                continue;
+            }
+            const float m_new = fmaxf(m[i], mt);
+            const float corr = expf(m[i] - m_new);
+            p[i] = expf(s[i] - m_new);
+            l[i] = l[i] * corr + velox_warp_sum(p[i]);
+            m[i] = m_new;
 #pragma unroll
-                for (int p = 0; p < PER; ++p)
-                    if (lane + p * VELOX_WARP < head_dim) s += qr[i][p] * kr[lane + p * VELOX_WARP];
-                s = velox_warp_sum(s);
-                const float m_new = fmaxf(m[i], s);
-                const float corr = expf(m[i] - m_new), pj = expf(s - m_new);
-                l[i] = l[i] * corr + pj;
-                const float* vr = vs + jj * head_dim;
+            for (int e = 0; e < NV * 4; ++e) acc[i][e] *= corr;
+        }
+        for (int jj = 0; jj < n; ++jj) {
+            float pj[kGqaRowsPerWarp];
 #pragma unroll
-                for (int p = 0; p < PER; ++p)
-                    if (lane + p * VELOX_WARP < head_dim) acc[i][p] = acc[i][p] * corr + pj * vr[lane + p * VELOX_WARP];
-                m[i] = m_new;
+            for (int i = 0; i < kGqaRowsPerWarp; ++i) pj[i] = __shfl_sync(0xffffffffu, p[i], jj);
+#pragma unroll
+            for (int c = 0; c < NV; ++c) {
+                const int d0 = 4 * (lane + VELOX_WARP * c);
+                if (d0 < head_dim) {
+                    const float4 vv = *reinterpret_cast<const float4*>(vs + jj * head_dim + d0);
+#pragma unroll
+                    for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+                        acc[i][4 * c] = fmaf(pj[i], vv.x, acc[i][4 * c]);
+                        acc[i][4 * c + 1] = fmaf(pj[i], vv.y, acc[i][4 * c + 1]);
+                        acc[i][4 * c + 2] = fmaf(pj[i], vv.z, acc[i][4 * c + 2]);
+                        acc[i][4 * c + 3] = fmaf(pj[i], vv.w, acc[i][4 * c + 3]);
+                    }
+                }
             }
         }
     }
@@ -768,9 +819,11 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
         const int t = r / group, h = kvh * group + r % group;
         const size_t idx = (static_cast<size_t>(t) * heads + h) * splits + sp;
 #pragma unroll
-        for (int p = 0; p < PER; ++p) {
-            const int d = lane + p * VELOX_WARP;
-            if (d < head_dim) part_acc[idx * head_dim + d] = acc[i][p];
+        for (int c = 0; c < NV; ++c) {
+            const int d0 = 4 * (lane + VELOX_WARP * c);
+            if (d0 < head_dim)
+                *reinterpret_cast<float4*>(part_acc + idx * head_dim + d0) =
+                    make_float4(acc[i][4 * c], acc[i][4 * c + 1], acc[i][4 * c + 2], acc[i][4 * c + 3]);
         }
         if (lane == 0) {
             part_ml[2 * idx] = m[i];
@@ -783,7 +836,7 @@ template <int PER>
 int attention_block_gqa(const float* q, const float* k_ctx, const float* v_ctx, const float* k_blk,
                         const float* v_blk, float* out, int tokens, int heads, int kv_heads, int head_dim,
                         long long pos0, long long ctx_lo, int window, int ring, const long long* params) {
-    constexpr int TK = PER >= 8 ? 16 : 32;
+    constexpr int TK = kGqaTile;
     long long start0 = pos0 + 1 - window;  // token 0 sees the most context
     if (start0 < ctx_lo) start0 = ctx_lo;
     // Graph steps size the grid for a full window; the kernel reads the actual span.
@@ -801,8 +854,17 @@ int attention_block_gqa(const float* q, const float* k_ctx, const float* v_ctx, 
     float* part_acc = scratch;
     float* part_ml = scratch + parts * head_dim;
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    const size_t smem = static_cast<size_t>(2) * TK * head_dim * sizeof(float);
-    attention_block_gqa_kernel<PER, TK><<<dim3(kv_heads, splits, rgs), kGqaWarps * VELOX_WARP, smem>>>(
+    const size_t smem = static_cast<size_t>(kGqaTile) * (PER * VELOX_WARP + 4 + PER * VELOX_WARP) * sizeof(float);
+    if (smem > 48 * 1024) {
+        static bool opted = false;  // engine work is serialized
+        if (!opted) {
+            if (cudaError_t e = cudaFuncSetAttribute(attention_block_gqa_kernel<PER>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)))
+                return static_cast<int>(e);
+            opted = true;
+        }
+    }
+    attention_block_gqa_kernel<PER><<<dim3(kv_heads, splits, rgs), kGqaWarps * VELOX_WARP, smem>>>(
         q, k_ctx, v_ctx, k_blk, v_blk, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, start0, window,
         ring, scale, splits, split_keys, params);
     attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
