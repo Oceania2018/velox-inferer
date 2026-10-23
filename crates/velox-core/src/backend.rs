@@ -677,6 +677,68 @@ pub trait Backend {
         table: &WeightView<'_, Self::Buffer>,
         out: &mut Self::Buffer,
     ) -> Result<()>;
+    /// [`Self::embed`] with the ids on the device: `count` u32 ids (their bits in f32 slots) at
+    /// `ids[offset..]`, as [`Self::argmax_to`] writes them, so a step can consume the previous
+    /// step's choice without the host. Ids must be below the table's rows (a device kernel that
+    /// cannot check them writes a zero row instead).
+    fn embed_from(
+        &self,
+        ids: &Self::Buffer,
+        offset: usize,
+        count: usize,
+        table: &WeightView<'_, Self::Buffer>,
+        out: &mut Self::Buffer,
+    ) -> Result<()> {
+        crate::check::embed_from(
+            self.len(ids),
+            offset,
+            count,
+            table,
+            self.len(table.buf),
+            self.len(out),
+        )?;
+        let mut host = vec![0.0f32; self.len(ids)];
+        self.synchronize()?;
+        self.download(ids, &mut host)?;
+        let ids: Vec<u32> = host[offset..offset + count]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        self.embed(&ids, table, out)
+    }
+    /// The index of the best of the first `limit` values of `x` (ranked as [`Self::top_k`]:
+    /// value descending, index ascending, NaN last), written as a u32 (its bits) into
+    /// `dst[dst_offset]` on the device.
+    fn argmax_to(
+        &self,
+        x: &Self::Buffer,
+        limit: usize,
+        dst: &mut Self::Buffer,
+        dst_offset: usize,
+    ) -> Result<()> {
+        let best = self
+            .top_k(x, 1, self.len(x), limit, 1)?
+            .pop()
+            .and_then(|row| row.first().map(|c| c.0))
+            .ok_or_else(|| Error::Shape("argmax_to: no value to select".into()))?;
+        let one = self.upload(&[f32::from_bits(best)])?;
+        self.copy(&one, 0, dst, dst_offset, 1)
+    }
+    /// Queues a read of the u32 at `src[offset]` into host slot `slot` (0..8) behind the work
+    /// queued so far. [`Self::fetch_u32`] with the same slot then waits for that read alone, so
+    /// work queued after it (the next step) keeps the device busy meanwhile.
+    fn fetch_u32_begin(&self, _src: &Self::Buffer, _offset: usize, _slot: usize) -> Result<()> {
+        Ok(())
+    }
+    /// The value a [`Self::fetch_u32_begin`] with the same arguments queued (waiting for it).
+    fn fetch_u32(&self, src: &Self::Buffer, offset: usize, _slot: usize) -> Result<u32> {
+        let mut host = vec![0.0f32; self.len(src)];
+        self.synchronize()?;
+        self.download(src, &mut host)?;
+        host.get(offset)
+            .map(|v| v.to_bits())
+            .ok_or_else(|| Error::Shape(format!("fetch_u32: slot {offset} past the buffer")))
+    }
     /// RMS norm of `rows` rows of width `dim`; see [`NormKind`] for the weighting.
     #[allow(clippy::too_many_arguments)]
     fn rms_norm(

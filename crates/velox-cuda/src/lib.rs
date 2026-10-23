@@ -574,6 +574,18 @@ pub trait CudaKernels: Send + Sync {
         portable::embed(ids, table, out)
     }
 
+    /// See [`Backend::embed_from`].
+    fn embed_from(
+        &self,
+        ids: &CudaBuffer,
+        offset: usize,
+        count: usize,
+        table: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+    ) -> Result<()> {
+        portable::embed_from(ids, offset, count, table, out)
+    }
+
     fn rms_norm(
         &self,
         x: &CudaBuffer,
@@ -1945,6 +1957,40 @@ impl Backend for CudaBackend {
     ) -> Result<()> {
         check::embed(ids, table, table.buf.len, out.len)?;
         self.staged("embed", || self.kernels.embed(ids, table, out))
+    }
+
+    fn embed_from(
+        &self,
+        ids: &CudaBuffer,
+        offset: usize,
+        count: usize,
+        table: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+    ) -> Result<()> {
+        check::embed_from(ids.len, offset, count, table, table.buf.len, out.len)?;
+        self.timed("embed_from", || {
+            self.kernels.embed_from(ids, offset, count, table, out)
+        })
+    }
+
+    fn argmax_to(
+        &self,
+        x: &CudaBuffer,
+        limit: usize,
+        dst: &mut CudaBuffer,
+        dst_offset: usize,
+    ) -> Result<()> {
+        self.timed("argmax_to", || {
+            portable::argmax_to(x, limit, dst, dst_offset)
+        })
+    }
+
+    fn fetch_u32_begin(&self, src: &CudaBuffer, offset: usize, slot: usize) -> Result<()> {
+        portable::fetch_u32_begin(src, offset, slot)
+    }
+
+    fn fetch_u32(&self, _src: &CudaBuffer, _offset: usize, slot: usize) -> Result<u32> {
+        portable::fetch_u32(slot)
     }
 
     fn rms_norm(

@@ -351,6 +351,35 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> Result<()> {
         self.time("embed", || self.inner.embed(ids, table, out))
     }
+    fn embed_from(
+        &self,
+        ids: &B::Buffer,
+        offset: usize,
+        count: usize,
+        table: &WeightView<'_, B::Buffer>,
+        out: &mut B::Buffer,
+    ) -> Result<()> {
+        self.time("embed_from", || {
+            self.inner.embed_from(ids, offset, count, table, out)
+        })
+    }
+    fn argmax_to(
+        &self,
+        x: &B::Buffer,
+        limit: usize,
+        dst: &mut B::Buffer,
+        dst_offset: usize,
+    ) -> Result<()> {
+        self.time("argmax_to", || {
+            self.inner.argmax_to(x, limit, dst, dst_offset)
+        })
+    }
+    fn fetch_u32_begin(&self, src: &B::Buffer, offset: usize, slot: usize) -> Result<()> {
+        self.inner.fetch_u32_begin(src, offset, slot)
+    }
+    fn fetch_u32(&self, src: &B::Buffer, offset: usize, slot: usize) -> Result<u32> {
+        self.inner.fetch_u32(src, offset, slot)
+    }
     fn rms_norm(
         &self,
         x: &B::Buffer,

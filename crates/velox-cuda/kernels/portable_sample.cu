@@ -264,3 +264,71 @@ VELOX_API int velox_portable_top_k(const float* x, int rows, long long row_len, 
     memcpy(host_idx, stage + outn * 4, outn * 4);
     return 0;
 }
+
+namespace {
+
+// argmax_merge writing the best index as a u32 (the row's best is always found: limit >= 1).
+__global__ void __launch_bounds__(256) argmax_merge_to(const float* __restrict__ cand_v, const int* __restrict__ cand_i,
+                                                       int n, unsigned int* __restrict__ dst) {
+    float v = -INFINITY;
+    int i = -1;
+    for (int j = threadIdx.x; j < n; j += 256) keep_best(v, i, cand_v[j], cand_i[j]);
+    block_best<256>(v, i);
+    if (threadIdx.x == 0) *dst = static_cast<unsigned int>(i < 0 ? 0 : i);
+}
+
+Scratch g_argmax;  // its own scratch: a captured step must keep its addresses
+
+// Pinned slots the device writes u32 values into, each with an event the host waits on.
+constexpr int kFetchSlots = 8;
+struct FetchRing {
+    std::mutex mu;
+    unsigned int* host = nullptr;
+    cudaEvent_t ev[kFetchSlots] = {};
+    int init() {
+        if (host) return 0;
+        if (cudaError_t e = cudaHostAlloc(reinterpret_cast<void**>(&host), kFetchSlots * sizeof(unsigned int),
+                                          cudaHostAllocDefault))
+            return static_cast<int>(e);
+        for (int s = 0; s < kFetchSlots; ++s)
+            if (cudaError_t e = cudaEventCreateWithFlags(&ev[s], cudaEventDisableTiming)) return static_cast<int>(e);
+        return 0;
+    }
+} g_fetch;
+
+}  // namespace
+
+// The index of the best of the first `limit` values of one row (ranked as top_k: value desc,
+// index asc, NaN last), written to dst as a u32 on the device, so the next step can read it there.
+VELOX_API int velox_portable_argmax_to(const float* x, long long row_len, int limit, unsigned int* dst) {
+    const int slices = (limit + kSlice - 1) / kSlice;
+    if (limit <= 0 || row_len < limit) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_argmax.mu);
+    uint8_t* base = g_argmax.get(static_cast<size_t>(slices) * 8);
+    if (!base) return static_cast<int>(cudaErrorMemoryAllocation);
+    float* cand_v = reinterpret_cast<float*>(base);
+    int* cand_i = reinterpret_cast<int*>(base + static_cast<size_t>(slices) * 4);
+    argmax_slices<<<dim3(slices, 1), 256>>>(x, row_len, limit, cand_v, cand_i);
+    argmax_merge_to<<<1, 256>>>(cand_v, cand_i, slices, dst);
+    return velox_launch_status();
+}
+
+// Queues a copy of the u32 at src into pinned slot `slot` (0 <= slot < 8) behind the work queued
+// so far, with an event; `velox_portable_fetch_u32_wait` waits for that event and reads the slot.
+VELOX_API int velox_portable_fetch_u32_begin(const unsigned int* src, int slot) {
+    if (slot < 0 || slot >= kFetchSlots) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_fetch.mu);
+    if (const int e = g_fetch.init()) return e;
+    if (cudaError_t e = cudaMemcpyAsync(g_fetch.host + slot, src, sizeof(unsigned int), cudaMemcpyDeviceToHost, 0))
+        return static_cast<int>(e);
+    return static_cast<int>(cudaEventRecord(g_fetch.ev[slot], 0));
+}
+
+VELOX_API int velox_portable_fetch_u32_wait(int slot, unsigned int* out) {
+    if (slot < 0 || slot >= kFetchSlots) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_fetch.mu);
+    if (const int e = g_fetch.init()) return e;
+    if (cudaError_t e = cudaEventSynchronize(g_fetch.ev[slot])) return static_cast<int>(e);
+    *out = g_fetch.host[slot];
+    return 0;
+}

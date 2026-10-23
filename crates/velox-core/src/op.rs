@@ -37,6 +37,8 @@ pub enum Op {
     RmsNormGated,
     CopyBatch,
     LinearSwiglu,
+    EmbedFrom,
+    ArgmaxTo,
 }
 
 impl Op {
@@ -71,6 +73,8 @@ impl Op {
         Op::RmsNormGated,
         Op::CopyBatch,
         Op::LinearSwiglu,
+        Op::EmbedFrom,
+        Op::ArgmaxTo,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -105,6 +109,8 @@ impl Op {
             Op::RmsNormGated => "rms_norm_gated",
             Op::CopyBatch => "copy_batch",
             Op::LinearSwiglu => "linear_swiglu",
+            Op::EmbedFrom => "embed_from",
+            Op::ArgmaxTo => "argmax_to",
         }
     }
 }
