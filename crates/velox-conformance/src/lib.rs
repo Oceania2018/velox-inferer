@@ -2104,6 +2104,9 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         ];
         s.linears(attn, 768, 100, ActPolicy::AllowA8)?;
     }
+    // Prefill widths on a grid of a few tiles with a long K (kernel sets may split K there).
+    s.linear_act(WeightFormat::Fp8RowBf16, 256, 4096, 0, 256, 100, a8)?;
+    s.linear_act(WeightFormat::Nvfp4, 256, 4096, 0, 256, 100, a4)?;
     Ok(s.results)
 }
 
