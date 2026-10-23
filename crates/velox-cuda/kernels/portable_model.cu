@@ -234,9 +234,12 @@ linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, i
     }
 }
 
+// Block (token, column slice): a few tokens still spread over the whole GPU.
 __global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long long row_begin, float* __restrict__ out) {
     const long long row = row_begin + ids[blockIdx.x];
-    for (long long c = threadIdx.x; c < w.k; c += blockDim.x) out[blockIdx.x * w.k + c] = weight_at(w, row, c);
+    for (long long c = static_cast<long long>(blockIdx.y) * blockDim.x + threadIdx.x; c < w.k;
+         c += static_cast<long long>(gridDim.y) * blockDim.x)
+        out[blockIdx.x * w.k + c] = weight_at(w, row, c);
 }
 
 // xb: null, or the result's bf16 twin.
@@ -1388,7 +1391,8 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
 
 VELOX_API int velox_portable_embed(const uint32_t* ids, int count, const uint8_t* w, int format, long long n,
                                    long long k, long long row_begin, float* out) {
-    embed_kernel<<<count, 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+    const unsigned slices = static_cast<unsigned>((k + 255) / 256 < 65535 ? (k + 255) / 256 : 65535);
+    embed_kernel<<<dim3(count, slices), 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
     return velox_launch_status();
 }
 
