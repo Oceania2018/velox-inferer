@@ -10,8 +10,8 @@ mod vision;
 mod weights;
 
 use velox_core::backend::{
-    AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, NormKind, RopeLayout,
-    RopePosShape, RopeShape, WeightView,
+    AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, LinearDst, LinearPart,
+    NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{CopySpec, Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
@@ -53,8 +53,24 @@ pub struct Session<B: Backend> {
 /// chunks keep them separate, where per-matrix GEMM tiles are faster than the split copy saves.
 const FUSE_MAX_TOKENS: usize = 16;
 
-/// `y[t, runs.rows()] = h . W^T` for a projection stored as `runs`. With several runs, each is
-/// computed into `scratch` (at least `t x` its rows) and copied to its columns of `y`.
+/// The views of a projection's runs, at their columns of the concatenated output.
+fn run_parts<'w, Buf>(
+    view: &impl Fn(&WDesc) -> WeightView<'w, Buf>,
+    runs: &Runs,
+) -> Vec<LinearPart<'w, Buf>> {
+    let mut col = 0;
+    runs.0
+        .iter()
+        .map(|d| {
+            let part = LinearPart { w: view(d), col };
+            col += d.rows;
+            part
+        })
+        .collect()
+}
+
+/// `y = h . W^T` for a projection stored as runs: each run lands in its columns of `y`
+/// ([`Backend::linears`]; `scratch` holds `[t, rows]` of a run when the backend copies).
 fn linear_runs<'w, B: Backend>(
     b: &B,
     view: impl Fn(&WDesc) -> WeightView<'w, B::Buffer>,
@@ -67,27 +83,61 @@ fn linear_runs<'w, B: Backend>(
 where
     B::Buffer: 'w,
 {
-    if let Some(d) = runs.single() {
-        return b.linear(h, &view(d), y, t);
-    }
-    let (total, mut col) = (runs.rows(), 0);
-    for d in &runs.0 {
-        b.linear(h, &view(d), scratch, t)?;
-        b.copy2d(
-            scratch,
+    let parts = run_parts(&view, runs);
+    let ld = runs.rows();
+    b.linears(
+        h,
+        &mut [LinearDst {
             y,
-            Copy2dShape {
-                rows: t,
-                cols: d.rows,
-                src_offset: 0,
-                src_stride: d.rows,
-                dst_offset: col,
-                dst_stride: total,
+            ld,
+            parts: &parts,
+        }],
+        scratch,
+        t,
+    )
+}
+
+/// The GDN input projections of `h` as one [`Backend::linears`] call (backends quantize `h`
+/// once): q | k | v into `qkv_y`, z into `z_y` and a | b into `ab_y`.
+#[allow(clippy::too_many_arguments)]
+fn gdn_projections<'w, B: Backend>(
+    b: &B,
+    view: impl Fn(&WDesc) -> WeightView<'w, B::Buffer>,
+    h: &B::Buffer,
+    (qkv, qkv_y): (&Runs, &mut B::Buffer),
+    (z, z_y): (&WDesc, &mut B::Buffer),
+    (ab, ab_y): (&Runs, &mut B::Buffer),
+    scratch: &mut B::Buffer,
+    t: usize,
+) -> Result<()>
+where
+    B::Buffer: 'w,
+{
+    let (qkv_parts, ab_parts) = (run_parts(&view, qkv), run_parts(&view, ab));
+    let z_parts = [LinearPart { w: view(z), col: 0 }];
+    let (qkv_ld, ab_ld) = (qkv.rows(), ab.rows());
+    b.linears(
+        h,
+        &mut [
+            LinearDst {
+                y: qkv_y,
+                ld: qkv_ld,
+                parts: &qkv_parts,
             },
-        )?;
-        col += d.rows;
-    }
-    Ok(())
+            LinearDst {
+                y: z_y,
+                ld: z.rows,
+                parts: &z_parts,
+            },
+            LinearDst {
+                y: ab_y,
+                ld: ab_ld,
+                parts: &ab_parts,
+            },
+        ],
+        scratch,
+        t,
+    )
 }
 
 /// Most tokens one `verify` call may feed (the anchor plus drafts).
@@ -1012,22 +1062,22 @@ impl<B: Backend> Qwen35Text<B> {
                                     (&mut ws.z, z.row_begin - f.row_begin, z.rows),
                                 ],
                             )?;
+                            linear_runs(b, |d| w.view(d), &ws.h, ab, ab_buf, &mut ws.conv_out, t)?;
                         }
                         None => {
                             // conv_out ([t, gdn_qkv]) is only written after the projections.
-                            linear_runs(
+                            gdn_projections(
                                 b,
                                 |d| w.view(d),
                                 &ws.h,
-                                qkv,
-                                qkv_buf,
+                                (qkv, &mut *qkv_buf),
+                                (z, &mut ws.z),
+                                (ab, &mut *ab_buf),
                                 &mut ws.conv_out,
                                 t,
                             )?;
-                            b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
                         }
                     }
-                    linear_runs(b, |d| w.view(d), &ws.h, ab, ab_buf, &mut ws.conv_out, t)?;
                     let mut row0 = 0;
                     for &end in &cuts {
                         let cs = ConvShape {
@@ -1194,10 +1244,41 @@ impl<B: Backend> Qwen35Text<B> {
                 )?;
             }
             None => {
-                b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
-                b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
-                b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
-                b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
+                // One linears call: backends quantize ws.h once for the four projections.
+                let part = |d: &WDesc| {
+                    [LinearPart {
+                        w: w.view(d),
+                        col: 0,
+                    }]
+                };
+                let (pq, pg, pk, pv) = (part(query), part(gate), part(key), part(value));
+                b.linears(
+                    &ws.h,
+                    &mut [
+                        LinearDst {
+                            y: &mut ws.q,
+                            ld: query.rows,
+                            parts: &pq,
+                        },
+                        LinearDst {
+                            y: &mut ws.g,
+                            ld: gate.rows,
+                            parts: &pg,
+                        },
+                        LinearDst {
+                            y: &mut ws.k,
+                            ld: key.rows,
+                            parts: &pk,
+                        },
+                        LinearDst {
+                            y: &mut ws.v,
+                            ld: value.rows,
+                            parts: &pv,
+                        },
+                    ],
+                    &mut ws.fused,
+                    t,
+                )?;
             }
         }
         b.rms_norm(
@@ -2042,22 +2123,30 @@ impl<B: Backend> Qwen35Text<B> {
                                         (&mut ws.z, z.row_begin - f.row_begin, z.rows),
                                     ],
                                 )?;
-                            }
-                            None => {
-                                // conv_out ([t, gdn_qkv]) is only written after the projections.
                                 linear_runs(
                                     b,
                                     |d| w.view(d),
                                     &ws.h,
-                                    qkv,
-                                    qkv_buf,
+                                    ab,
+                                    ab_buf,
                                     &mut ws.conv_out,
                                     t,
                                 )?;
-                                b.linear(&ws.h, &w.view(z), &mut ws.z, t)?;
+                            }
+                            None => {
+                                // conv_out ([t, gdn_qkv]) is only written after the projections.
+                                gdn_projections(
+                                    b,
+                                    |d| w.view(d),
+                                    &ws.h,
+                                    (qkv, &mut *qkv_buf),
+                                    (z, &mut ws.z),
+                                    (ab, &mut *ab_buf),
+                                    &mut ws.conv_out,
+                                    t,
+                                )?;
                             }
                         }
-                        linear_runs(b, |d| w.view(d), &ws.h, ab, ab_buf, &mut ws.conv_out, t)?;
                     }
                     if let Some(p) = pre.as_deref_mut() {
                         if v > 0 {
@@ -2242,10 +2331,41 @@ impl<B: Backend> Qwen35Text<B> {
                 )?;
             }
             None => {
-                b.linear(&ws.h, &w.view(query), &mut ws.q, t)?;
-                b.linear(&ws.h, &w.view(gate), &mut ws.g, t)?;
-                b.linear(&ws.h, &w.view(key), &mut ws.k, t)?;
-                b.linear(&ws.h, &w.view(value), &mut ws.v, t)?;
+                // One linears call: backends quantize ws.h once for the four projections.
+                let part = |d: &WDesc| {
+                    [LinearPart {
+                        w: w.view(d),
+                        col: 0,
+                    }]
+                };
+                let (pq, pg, pk, pv) = (part(query), part(gate), part(key), part(value));
+                b.linears(
+                    &ws.h,
+                    &mut [
+                        LinearDst {
+                            y: &mut ws.q,
+                            ld: query.rows,
+                            parts: &pq,
+                        },
+                        LinearDst {
+                            y: &mut ws.g,
+                            ld: gate.rows,
+                            parts: &pg,
+                        },
+                        LinearDst {
+                            y: &mut ws.k,
+                            ld: key.rows,
+                            parts: &pk,
+                        },
+                        LinearDst {
+                            y: &mut ws.v,
+                            ld: value.rows,
+                            parts: &pv,
+                        },
+                    ],
+                    &mut ws.fused,
+                    t,
+                )?;
             }
         }
         b.rms_norm(

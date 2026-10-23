@@ -375,6 +375,28 @@ impl<Buf> Clone for WeightView<'_, Buf> {
 
 impl<Buf> Copy for WeightView<'_, Buf> {}
 
+/// One weight view of [`Backend::linears`], written to columns `col .. col + w.rows` of its
+/// destination.
+pub struct LinearPart<'w, Buf> {
+    pub w: WeightView<'w, Buf>,
+    pub col: usize,
+}
+
+impl<Buf> Clone for LinearPart<'_, Buf> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Buf> Copy for LinearPart<'_, Buf> {}
+
+/// A destination of [`Backend::linears`]: `m` rows of `ld` values whose columns `parts` fill.
+pub struct LinearDst<'y, 'p, 'w, Buf> {
+    pub y: &'y mut Buf,
+    pub ld: usize,
+    pub parts: &'p [LinearPart<'w, Buf>],
+}
+
 impl<'a, Buf> WeightView<'a, Buf> {
     /// The whole parent matrix.
     pub fn full(buf: &'a Buf, format: WeightFormat, n: usize, k: usize) -> Self {
@@ -443,6 +465,20 @@ pub trait Backend {
     /// that `w.act` permits.
     fn linear_act(&self, _w: &WeightView<'_, Self::Buffer>, _m: usize) -> ActQuant {
         ActQuant::Exact
+    }
+    /// Several projections of the same `m` rows of `x`, each part into a column range of its
+    /// destination and rounded as `linear` rounds it (`linear_act`). Backends share work between
+    /// parts (one activation quantization) and write column ranges in place; the default
+    /// ([`linears_composed`]) runs `linear` per part, through `scratch` (`[m, w.rows]` of the
+    /// widest part that is not a whole destination) for column ranges.
+    fn linears(
+        &self,
+        x: &Self::Buffer,
+        dsts: &mut [LinearDst<'_, '_, '_, Self::Buffer>],
+        scratch: &mut Self::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        linears_composed(self, x, dsts, scratch, m)
     }
     /// A SwiGLU FFN's projections: `out[r][i] = silu((x_r . gate_i)) * (x_r . up_i)` for `m` rows
     /// of `x`, where `gate` and `up` are views of the same width, format and K. Backends fuse it
@@ -979,6 +1015,51 @@ pub fn swiglu_pair<'a, Buf>(
     } else {
         None
     }
+}
+
+/// Whether a part covers its whole destination (`linear` writes it directly).
+pub fn linear_part_whole<Buf>(part: &LinearPart<'_, Buf>, ld: usize) -> bool {
+    part.col == 0 && part.w.rows == ld
+}
+
+/// [`Backend::linears`] from `linear` and `copy2d`.
+pub fn linears_composed<B: Backend + ?Sized>(
+    b: &B,
+    x: &B::Buffer,
+    dsts: &mut [LinearDst<'_, '_, '_, B::Buffer>],
+    scratch: &mut B::Buffer,
+    m: usize,
+) -> Result<()> {
+    for d in dsts.iter_mut() {
+        for p in d.parts {
+            if p.col + p.w.rows > d.ld {
+                return Err(Error::Shape(format!(
+                    "linears: columns {}..{} past the destination's {}",
+                    p.col,
+                    p.col + p.w.rows,
+                    d.ld
+                )));
+            }
+            if linear_part_whole(p, d.ld) {
+                b.linear(x, &p.w, d.y, m)?;
+                continue;
+            }
+            b.linear(x, &p.w, scratch, m)?;
+            b.copy2d(
+                scratch,
+                d.y,
+                Copy2dShape {
+                    rows: m,
+                    cols: p.w.rows,
+                    src_offset: 0,
+                    src_stride: p.w.rows,
+                    dst_offset: p.col,
+                    dst_stride: d.ld,
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// [`Backend::linear_swiglu`] from `linear` and `swiglu` / `silu_mul`.

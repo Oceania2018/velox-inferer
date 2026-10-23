@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use velox_core::backend::{
     ActQuant, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind, RopePosShape,
-    RopeShape, WeightView,
+    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, LinearDst, NormKind,
+    RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{DeviceProfile, Op, Result};
 
@@ -164,6 +164,15 @@ impl<B: Backend> Backend for Profiled<B> {
     }
     fn linear_act(&self, w: &WeightView<'_, B::Buffer>, m: usize) -> ActQuant {
         self.inner.linear_act(w, m)
+    }
+    fn linears(
+        &self,
+        x: &B::Buffer,
+        dsts: &mut [LinearDst<'_, '_, '_, B::Buffer>],
+        scratch: &mut B::Buffer,
+        m: usize,
+    ) -> Result<()> {
+        self.time("linears", || self.inner.linears(x, dsts, scratch, m))
     }
     fn linear_swiglu(
         &self,
