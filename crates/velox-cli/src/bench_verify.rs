@@ -1,13 +1,17 @@
 //! `velox bench-verify`: wall time of speculative verify rounds for a batch of sequences
 //! (`Qwen35Text::verify_batch` + `commit_batched`) against the same windows verified one sequence
 //! at a time (`verify` + `commit`), on synthetic sessions at a fixed context length (timing does
-//! not depend on the cache contents).
+//! not depend on the cache contents). `--prefill N` makes every batched round a mixed step that also
+//! feeds N prompt tokens of one more sequence (the serving engine's round while a prompt prefills);
+//! `--only batched` skips the one-at-a-time rounds, e.g. for a `VELOX_GPU_TIMING=1` op breakdown.
 
 use std::process::ExitCode;
 use std::time::Instant;
 
 use velox_core::{Backend, Error, KvFormat, Result};
-use velox_models::qwen3_5::{DFlashModel, Qwen35Text, TextConfig, TextWeights, VERIFY_MAX};
+use velox_models::qwen3_5::{
+    DFlashModel, PrefillChunk, Qwen35Text, TextConfig, TextWeights, VERIFY_MAX,
+};
 use velox_weights::Artifact;
 
 use crate::args::Args;
@@ -31,6 +35,8 @@ fn bench<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
     let rounds: usize = a.parse("rounds", 40)?;
     let keep: usize = a.parse("keep", m / 2)?;
     let kv_format = KvFormat::parse(a.get("kv-format").unwrap_or("nvfp4"))?;
+    let prefill: usize = a.parse("prefill", 0)?;
+    let only_batched = a.get("only") == Some("batched");
     if m == 0 || m > VERIFY_MAX || keep == 0 || keep > m || n == 0 {
         return Err(Error::Config(format!(
             "--window 1..={VERIFY_MAX}, --keep 1..=window, --batch >= 1"
@@ -56,13 +62,35 @@ fn bench<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
         sessions.push(s);
     }
     let mut bw = model.batch_workspace(b, n.max(2), m)?;
+    if prefill + n * m > ws.max_tokens() {
+        return Err(Error::Config(format!(
+            "--prefill {prefill} and {n} x {m} window rows exceed the {}-row workspace",
+            ws.max_tokens()
+        )));
+    }
+    // The prefilling sequence: the same chunk at the same position every round.
+    let mut prefilling = model.session_with(b, context + prefill + 64, kv_format)?;
+    let chunk: Vec<u32> = (0..prefill as u32).map(|i| 1000 + i % 5000).collect();
     let window: Vec<u32> = (1..=m as u32).collect();
     let limit = model.cfg.vocab;
 
-    let batch_round = |sessions: &mut Vec<_>, ws: &mut _, bw: &mut _| -> Result<()> {
+    let mut batch_round = |sessions: &mut Vec<_>, ws: &mut _, bw: &mut _| -> Result<()> {
         let mut refs: Vec<&mut _> = sessions.iter_mut().collect();
         let windows: Vec<&[u32]> = vec![&window[..]; n];
-        model.verify_batch(b, &mut refs, ws, bw, &windows, 8, limit)?;
+        if prefill > 0 {
+            prefilling.pos = context;
+            let chunk = PrefillChunk {
+                session: &mut prefilling,
+                ids: &chunk,
+                positions: None,
+                inserts: &[],
+                snaps: &mut [],
+                candidates: false,
+            };
+            model.mixed_step(b, chunk, &mut refs, ws, bw, &windows, 8, limit)?;
+        } else {
+            model.verify_batch(b, &mut refs, ws, bw, &windows, 8, limit)?;
+        }
         for s in refs {
             model.commit_batched(b, s, bw, keep)?;
         }
@@ -105,6 +133,13 @@ fn bench<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
         b.synchronize()?;
         #[cfg(feature = "cuda")]
         velox_cuda::profiler(false)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if only_batched {
+        let batched = time(&mut || batch_round(&mut sessions, &mut ws, &mut bw))?;
+        println!(
+            "{n} sequences x {m}-token windows at {context} keys (keep {keep}), {prefill} prefill tokens: \n             batched {batched:.2} ms/round"
+        );
         return Ok(ExitCode::SUCCESS);
     }
     let solo = time(&mut || solo_round(&mut sessions, &mut ws))?;
