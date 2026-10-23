@@ -140,6 +140,15 @@ extern "C" {
         format: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5060_linear_bf16_skinny(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5060_linear_iq3_direct(
         x: *const f32,
         m: i32,
@@ -343,6 +352,12 @@ fn gemv_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
 /// one (gate/up 239 vs 227, down 151 vs 137 us, bench-linear).
 fn iq3_direct(m: usize) -> bool {
     m.min(SKINNY16_MAX_M) <= 8
+}
+
+/// bf16 weights with few rows (the GDN gate projections) past the skinny widths: the bf16
+/// tensor-core kernel. Qwen3.8 a/b ([96, 5120]) at 1024 tokens: 228 us exact f32 (portable) -> 64 us.
+fn bf16_skinny(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    w.format == WeightFormat::Bf16 && m > SKINNY16_MAX_M && w.rows <= 256 && w.k % 32 == 0
 }
 
 /// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
@@ -557,6 +572,9 @@ impl CudaKernels for Rtx5060Kernels {
         if skinny_iq3(w, m) || (m == 1 && skinny16_format(w, m).is_some()) {
             return ActQuant::Bf16;
         }
+        if bf16_skinny(w, m) {
+            return ActQuant::Bf16;
+        }
         if m <= GEMV_MAX_M {
             return ActQuant::Exact;
         }
@@ -719,6 +737,22 @@ impl CudaKernels for Rtx5060Kernels {
                 None => Err(Error::Unsupported("int8 linear shape".into())),
             },
             ActQuant::Bf16 => {
+                if bf16_skinny(w, m) {
+                    return status(
+                        unsafe {
+                            velox_5060_linear_bf16_skinny(
+                                x.as_ptr(),
+                                mi,
+                                wp,
+                                k,
+                                rb,
+                                rows,
+                                y.as_mut_ptr(),
+                            )
+                        },
+                        "rtx5060 linear bf16 skinny",
+                    );
+                }
                 if nvfp4_mma(w, m) {
                     return status(
                         unsafe {
