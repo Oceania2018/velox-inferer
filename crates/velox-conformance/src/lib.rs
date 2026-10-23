@@ -964,6 +964,71 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `argmax_to` must select the id `top_k` (k = 1) does, ties and NaN included, into the device
+    /// slot alone (its neighbours untouched), and `fetch_u32` must return it through the queued
+    /// read.
+    fn argmax_to(&mut self, row_len: usize, limit: usize, coarse: bool) -> Result<()> {
+        let mut x = self.rng.vec(row_len, 4.0);
+        if coarse {
+            x.iter_mut().for_each(|v| *v = (*v * 2.0).round() / 2.0);
+        }
+        x[limit / 2] = x[limit / 3];
+        x[1] = f32::NAN;
+        let want = CpuBackend.top_k(&x, 1, row_len, limit, 1)?[0][0].0;
+        let xd = self.b.upload(&x)?;
+        let mut slot = self.b.upload(&[f32::from_bits(u32::MAX); 3])?;
+        self.b.argmax_to(&xd, limit, &mut slot, 1)?;
+        self.b.fetch_u32_begin(&slot, 1, 3)?;
+        let got = self.b.fetch_u32(&slot, 1, 3)?;
+        let bits = fetch(self.b, &slot, 3)?;
+        let same = got == want
+            && bits[1].to_bits() == want
+            && bits[0].to_bits() == u32::MAX
+            && bits[2].to_bits() == u32::MAX;
+        let name = format!(
+            "argmax_to len={row_len} limit={limit}{}",
+            if coarse { " coarse" } else { "" }
+        );
+        self.record(
+            name,
+            Some(Op::ArgmaxTo),
+            &[if same { 0.0 } else { f32::NAN }],
+            &[0.0],
+            0.0,
+        );
+        Ok(())
+    }
+
+    /// `embed_from` must embed ids held in a device buffer (at an offset, as `argmax_to` leaves
+    /// them) exactly as `embed` embeds them from the host.
+    fn embed_from(&mut self, fmt: WeightFormat, n: usize, k: usize, ids: &[u32]) -> Result<()> {
+        let bytes = random_weight(&mut self.rng, fmt, n, k);
+        let wc = CpuBackend.upload_bytes(&bytes)?;
+        let mut want = vec![0.0; ids.len() * k];
+        CpuBackend.embed(ids, &WeightView::full(&wc, fmt, n, k), &mut want)?;
+        let wd = self.b.upload_bytes(&bytes)?;
+        let mut slots = vec![f32::from_bits(7)];
+        slots.extend(ids.iter().map(|&i| f32::from_bits(i)));
+        let idd = self.b.upload(&slots)?;
+        let mut od = self.b.alloc(ids.len() * k)?;
+        self.b.embed_from(
+            &idd,
+            1,
+            ids.len(),
+            &WeightView::full(&wd, fmt, n, k),
+            &mut od,
+        )?;
+        let got = fetch(self.b, &od, ids.len() * k)?;
+        self.record(
+            format!("embed_from {} [{n},{k}] ids {ids:?}", fmt.name()),
+            Some(Op::EmbedFrom),
+            &got,
+            &want,
+            1e-6,
+        );
+        Ok(())
+    }
+
     fn rms_norm(&mut self, rows: usize, dim: usize, kind: NormKind) -> Result<()> {
         let x = self.rng.vec(rows * dim, 3.0);
         let w = self.rng.vec(dim, 1.0);
@@ -2088,6 +2153,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.top_k(7, 131_072, 130_001, 12, true)?;
     s.top_k(2, 20_000, 20_000, 32, true)?;
     s.top_k(2, 20_000, 20_000, 33, true)?;
+    s.argmax_to(248_320, 248_077, false)?;
+    s.argmax_to(5000, 4097, true)?;
+    s.argmax_to(50, 50, false)?;
+    s.embed_from(WeightFormat::Q8G32, 64, 256, &[3, 0, 63, 17])?;
+    s.embed_from(WeightFormat::Q4G64, 40, 128, &[39, 39, 2])?;
     s.top_k(3, 9000, 5, 8, false)?;
     s.embed(WeightFormat::Q5G64, 16, 5120, &[15, 0, 7, 7, 3, 9, 1, 12])?;
     s.embed(WeightFormat::Fp8RowBf16, 50, 64, &[3, 0, 49, 3])?;

@@ -628,6 +628,23 @@ impl HTwin {
 }
 
 /// Activations for chunks of up to `max_tokens` tokens.
+/// Where a chunk's token ids come from: the host, or `count` ids in the workspace's device slot
+/// (`next_id`, written by `argmax_into`).
+#[derive(Clone, Copy)]
+enum Ids<'a> {
+    Host(&'a [u32]),
+    Slot(usize),
+}
+
+impl Ids<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Ids::Host(ids) => ids.len(),
+            Ids::Slot(n) => *n,
+        }
+    }
+}
+
 pub struct Workspace<B: Backend> {
     max_tokens: usize,
     x: B::Buffer,
@@ -656,6 +673,8 @@ pub struct Workspace<B: Backend> {
     twins: Option<Twins<B>>,
     last: B::Buffer,
     last_n: B::Buffer,
+    /// One slot: the id `argmax_into` selects, which `advance_from` embeds on the device.
+    next_id: B::Buffer,
     /// Final-normed hidden rows of the latest `verify` (`[VERIFY_MAX, hidden]`), which condition
     /// draft models.
     pub hidden: B::Buffer,
@@ -929,6 +948,7 @@ impl<B: Backend> Qwen35Text<B> {
             },
             last: b.alloc(c.hidden)?,
             last_n: b.alloc(c.hidden)?,
+            next_id: b.alloc(1)?,
             logits: b.alloc(c.vocab)?,
             hidden: b.alloc(VERIFY_MAX * c.hidden)?,
             logits_rows: b.alloc(VERIFY_MAX * c.vocab)?,
@@ -998,6 +1018,54 @@ impl<B: Backend> Qwen35Text<B> {
         self.advance_snap(b, s, ws, ids, positions, inserts, &mut [])
     }
 
+    /// [`Self::advance`] by the one token whose id is in the workspace's device slot (the one
+    /// [`Self::argmax_into`] last selected), so the step queues behind the previous one without
+    /// a host round trip. Its graph recording (one per session, like a decode step's) embeds
+    /// from that slot every run.
+    pub fn advance_from(&self, b: &B, s: &mut Session<B>, ws: &mut Workspace<B>) -> Result<()> {
+        if s.pos >= s.capacity {
+            return Err(Error::Config(format!(
+                "{} + 1 tokens exceed session capacity {}",
+                s.pos, s.capacity
+            )));
+        }
+        s.prepare_kv(b, s.pos, s.pos + 1)?;
+        let recording = s.spec.as_ref().is_some_and(|sp| sp.recording);
+        let shape = 1
+            | u64::from(recording) << 8
+            | u64::from(!ws.capture.is_empty()) << 9
+            | u64::from(ws.keep_rows) << 10
+            | 1 << 11;
+        let key = graph_key(GRAPH_ADVANCE, shape, s, Some(s.pos + 1));
+        b.graph(key, &mut || {
+            self.chunk(b, s, ws, Ids::Slot(1), 0, None, &[], &mut [])
+        })?;
+        ws.last_row = 0;
+        Ok(())
+    }
+
+    /// Greedy selection on the device: the best next id among the first `limit` goes to the
+    /// workspace's slot (for [`Self::advance_from`]) and a copy of it is queued to host fetch
+    /// slot `slot` (0..8), which [`Self::next_id`] returns. Queue the next step before fetching
+    /// and the device never waits for the host.
+    pub fn argmax_into(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        limit: usize,
+        slot: usize,
+    ) -> Result<()> {
+        self.head(b, ws)?;
+        let v = self.cfg.vocab;
+        b.argmax_to(&ws.logits, limit.min(v), &mut ws.next_id, 0)?;
+        b.fetch_u32_begin(&ws.next_id, 0, slot)
+    }
+
+    /// The id an [`Self::argmax_into`] with fetch slot `slot` selected (waits for that step).
+    pub fn next_id(&self, b: &B, ws: &Workspace<B>, slot: usize) -> Result<u32> {
+        b.fetch_u32(&ws.next_id, 0, slot)
+    }
+
     /// [`Self::advance`] that also fills each of `snaps` with the recurrent state at its `pos`
     /// (inside `s.pos ..= s.pos + ids.len()`), without splitting the chunk's projections there.
     #[allow(clippy::too_many_arguments)]
@@ -1044,7 +1112,7 @@ impl<B: Backend> Qwen35Text<B> {
             let kv = (t <= STATIC_MAX_TOKENS).then_some(s.pos + t);
             let key = graph_key(GRAPH_ADVANCE, shape, s, kv);
             b.graph(key, &mut || {
-                self.chunk(b, s, ws, ids, 0, None, &[], &mut [])
+                self.chunk(b, s, ws, Ids::Host(ids), 0, None, &[], &mut [])
             })?;
             ws.last_row = t - 1;
             return Ok(());
@@ -1055,7 +1123,7 @@ impl<B: Backend> Qwen35Text<B> {
         for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
             let base = i * ws.max_tokens;
             let pos = positions.map(|p| &p[base..base + chunk.len()]);
-            self.chunk(b, s, ws, chunk, base, pos, inserts, snaps)?;
+            self.chunk(b, s, ws, Ids::Host(chunk), base, pos, inserts, snaps)?;
             ws.last_row = chunk.len() - 1;
         }
         Ok(())
@@ -1068,7 +1136,7 @@ impl<B: Backend> Qwen35Text<B> {
         b: &B,
         s: &mut Session<B>,
         ws: &mut Workspace<B>,
-        ids: &[u32],
+        ids: Ids<'_>,
         base: usize,
         positions: Option<&[[u32; 3]]>,
         inserts: &[EmbedInsert<'_, B::Buffer>],
@@ -1088,7 +1156,10 @@ impl<B: Backend> Qwen35Text<B> {
         cuts.sort_unstable();
         cuts.dedup();
         let hd = c.hidden;
-        b.embed(ids, &w.view(&w.embed), &mut ws.x)?;
+        match ids {
+            Ids::Host(ids) => b.embed(ids, &w.view(&w.embed), &mut ws.x)?,
+            Ids::Slot(n) => b.embed_from(&ws.next_id, 0, n, &w.view(&w.embed), &mut ws.x)?,
+        }
         for ins in inserts {
             let (lo, hi) = (ins.token.max(base), (ins.token + ins.rows).min(base + t));
             if lo < hi {
@@ -1727,7 +1798,7 @@ impl<B: Backend> Qwen35Text<B> {
                 sp.tokens = t;
                 sp.recording = true;
             }
-            let r = self.chunk(b, s, ws, ids, 0, None, &[], &mut []);
+            let r = self.chunk(b, s, ws, Ids::Host(ids), 0, None, &[], &mut []);
             if let Some(sp) = s.spec.as_mut() {
                 sp.recording = false;
             }

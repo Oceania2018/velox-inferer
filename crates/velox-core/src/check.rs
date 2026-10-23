@@ -124,6 +124,26 @@ pub fn embed<B>(
     need("embed out", out, product(&[ids.len(), table.k])?)
 }
 
+/// `embed_from`: `count` ids at `ids[offset..]` (a buffer of `ids_slots`), the table and the
+/// output extent. The ids themselves are on the device: a backend treats one past the table as
+/// a row of zeros.
+pub fn embed_from<B>(
+    ids_slots: usize,
+    offset: usize,
+    count: usize,
+    table: &WeightView<'_, B>,
+    table_slots: usize,
+    out: usize,
+) -> Result<()> {
+    weight(table, table_slots)?;
+    need(
+        "embed_from ids",
+        ids_slots,
+        offset.checked_add(count).unwrap_or(usize::MAX),
+    )?;
+    need("embed_from out", out, product(&[count, table.k])?)
+}
+
 fn need(what: &str, have: usize, required: usize) -> Result<()> {
     if have < required {
         return Err(Error::Shape(format!(
