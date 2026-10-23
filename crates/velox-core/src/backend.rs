@@ -473,16 +473,18 @@ pub trait Backend {
     /// widest part that is not a whole destination) for column ranges.
     ///
     /// `xb`: `x`'s bf16 twin (see [`Self::bf16_twins`]) when the caller has one; backends may
-    /// read it for parts they round to bf16.
+    /// read it for parts they round to bf16. `xq`: `x`'s int8 twin and its layout (see
+    /// [`Self::int8_twin_layout`]); backends read it for parts of that layout.
     fn linears(
         &self,
         x: &Self::Buffer,
         xb: Option<&Self::Buffer>,
+        xq: Option<(&Self::Buffer, u32)>,
         dsts: &mut [LinearDst<'_, '_, '_, Self::Buffer>],
         scratch: &mut Self::Buffer,
         m: usize,
     ) -> Result<()> {
-        let _ = xb;
+        let _ = (xb, xq);
         linears_composed(self, x, dsts, scratch, m)
     }
 
@@ -574,6 +576,59 @@ pub trait Backend {
         _m: usize,
     ) -> Result<()> {
         Err(Error::Unsupported("linear_swiglu_twin".into()))
+    }
+    /// Int8 twins: a producer's output also written as the backend's int8 activation blob
+    /// (`ActQuant::Int8G256` rounding, in the backend's own layout) that its int8 linears read
+    /// directly, so a norm's output reaches them without a quantization pass. This returns the
+    /// layout code the int8 linear for `w` at `m` rows reads, when the producers below can write
+    /// it and [`Self::linear_act`] is `Int8G256` there; `None` otherwise.
+    fn int8_twin_layout(&self, _w: &WeightView<'_, Self::Buffer>, _m: usize) -> Option<u32> {
+        None
+    }
+    /// f32 slots (`alloc`) an int8 twin of `[m, k]` in `layout` takes; 0 when unsupported.
+    fn int8_twin_slots(&self, _m: usize, _k: usize, _layout: u32) -> usize {
+        0
+    }
+    /// [`Self::add_rms_norm`] that also writes `y`'s int8 twin into `yq` in `layout`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_rms_norm_q8(
+        &self,
+        _acc: &mut Self::Buffer,
+        _x: &Self::Buffer,
+        _weight: &Self::Buffer,
+        _y: &mut Self::Buffer,
+        _yq: &mut Self::Buffer,
+        _layout: u32,
+        _rows: usize,
+        _dim: usize,
+        _eps: f32,
+        _kind: NormKind,
+    ) -> Result<()> {
+        Err(Error::Unsupported("add_rms_norm_q8".into()))
+    }
+    /// `linear` from `x`'s int8 twin `xq`, written in `layout` (which must be
+    /// [`Self::int8_twin_layout`] of `w` at `m`).
+    fn linear_q8(
+        &self,
+        _xq: &Self::Buffer,
+        _layout: u32,
+        _w: &WeightView<'_, Self::Buffer>,
+        _y: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_q8".into()))
+    }
+    /// Fused [`Self::linear_swiglu`] from `x`'s int8 twin `xq` in `layout`.
+    fn linear_swiglu_q8(
+        &self,
+        _xq: &Self::Buffer,
+        _layout: u32,
+        _gate: &WeightView<'_, Self::Buffer>,
+        _up: &WeightView<'_, Self::Buffer>,
+        _out: &mut Self::Buffer,
+        _m: usize,
+    ) -> Result<()> {
+        Err(Error::Unsupported("linear_swiglu_q8".into()))
     }
     /// A SwiGLU FFN's projections: `out[r][i] = silu((x_r . gate_i)) * (x_r . up_i)` for `m` rows
     /// of `x`, where `gate` and `up` are views of the same width, format and K. Backends fuse it

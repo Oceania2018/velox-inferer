@@ -172,7 +172,7 @@ impl<B: Backend> Qwen35Text<B> {
             KvFormat::F32,
             (t, pos0),
             rope,
-            (false, false),
+            (super::HTwin::NONE, false),
         )?;
         b.add(&mut ws.x, &ws.y, t * hd)?;
         b.rms_norm(
@@ -184,7 +184,7 @@ impl<B: Backend> Qwen35Text<B> {
             c.eps,
             NormKind::Offset,
         )?;
-        self.mlp(b, ws, l, t, false)?;
+        self.mlp(b, ws, l, t, super::HTwin::NONE)?;
         b.add(&mut ws.x, &ws.y, t * hd)?;
         b.rms_norm(
             &ws.x,
