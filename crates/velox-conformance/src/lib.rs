@@ -1974,6 +1974,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.linear_swiglu(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false)?;
         s.linear(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m)?;
     }
+    // bf16 weights with few rows (GDN gate projections) at prefill widths: a full chunk, a row
+    // view spanning two 128-row blocks with ragged tokens, and K off the 32-value step.
+    s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 1030)?;
+    s.linear(WeightFormat::Bf16, 300, 1024, 40, 200, 100)?;
+    s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 40)?;
     Ok(s.results)
 }
 
