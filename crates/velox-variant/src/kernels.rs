@@ -380,17 +380,19 @@ const A16_FP8_BLOCK_M: usize = 64;
 
 /// Format code of the skinny kernel serving a weight at `m` tokens: NVFP4 (0) runs
 /// `velox_5060_linear_skinny16`, groupwise q4/q5/q8 (4/5/8) `velox_5060_linear_skinny_rs`. Single
-/// tokens stay on main's GEMV except for q5, which has no fast GEMV there.
+/// tokens: NVFP4 projections on the sliced-K kernel (measured [5120,6144] m=1 54 us vs 60 us
+/// GEMV; the 248k-row head stays on the GEMV, 1783 vs 1869 us), q5 on `gemv_format`'s GEMV,
+/// q4/q8 on main's (the sliced-K kernels lose at m=1: q4 [8192,5120] 82 vs 67 us, q5
+/// [12288,5120] 123 vs 114 us).
 fn skinny16_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     let max = if w.format.row_split().is_some() {
         ROWSPLIT_MIN_M - 1
     } else {
         SKINNY_MAX_M
     };
-    let min = if w.format == WeightFormat::Q5G64 {
-        1
-    } else {
-        2
+    let min = match w.format {
+        WeightFormat::Nvfp4 if w.rows <= 65536 => 1,
+        _ => 2,
     };
     if !(min..=max).contains(&m) {
         return None;
@@ -425,10 +427,15 @@ fn iq3_direct(m: usize) -> bool {
     m.min(SKINNY16_MAX_M) <= 8
 }
 
-/// bf16 weights with few rows (the GDN gate projections) past the skinny widths: the bf16
-/// tensor-core kernel. Qwen3.8 a/b ([96, 5120]) at 1024 tokens: 228 us exact f32 (portable) -> 64 us.
+/// bf16 weights with few rows (the GDN gate projections) past the skinny widths, and any bf16
+/// weight up to one 16-token block (the DFlash conv kernel projections, [1280, 5120]): the bf16
+/// tensor-core kernel. Qwen3.8 a/b ([96, 5120]) at 1024 tokens: 228 us exact f32 (portable) -> 64
+/// us; [1280, 5120] at 8 tokens: 57 -> 36 us.
 fn bf16_skinny(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
-    w.format == WeightFormat::Bf16 && m >= 2 && w.rows <= 256 && w.k % 32 == 0
+    w.format == WeightFormat::Bf16
+        && m >= 2
+        && (w.rows <= 256 || m <= SKINNY16_MAX_M)
+        && w.k % 32 == 0
 }
 
 /// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
