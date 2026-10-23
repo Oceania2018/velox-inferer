@@ -234,40 +234,51 @@ linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, i
     }
 }
 
-// Row-split (q4/q5/q6/q8) rows gathered a group per warp: a group's codes, high bits and scale are
-// three independent loads per lane, so a row costs a few memory round trips rather than several
-// per element (the table is often host-mapped, where every trip crosses PCIe).
+// Row-split (q4/q5/q6/q8) rows: a block stages its row's three byte ranges (codes, high plane,
+// scales; each contiguous) in shared memory with 16-byte loads, then decodes from there. The
+// table is often host-mapped, where the cost is per PCIe transaction: one round of wide loads per
+// row instead of several narrow ones per element.
 __global__ void embed_rs_kernel(const uint32_t* __restrict__ ids, WDesc d, long long row_begin, float* __restrict__ out) {
+    extern __shared__ __align__(16) uint8_t em_smem[];
     const int bits = d.format == VELOX_FMT_Q4 ? 4 : d.format == VELOX_FMT_Q5 ? 5 : d.format == VELOX_FMT_Q6 ? 6 : 8;
-    const int group = bits == 8 ? 32 : 64, epl = group / VELOX_WARP;  // elements per lane
-    const int hb = bits == 5 ? 1 : bits == 6 ? 2 : 0;                  // high-plane bits per element
-    const int high = hb * group / 8;                                   // high-plane bytes per group
+    const int group = bits == 8 ? 32 : 64;
+    const int hb = bits == 5 ? 1 : bits == 6 ? 2 : 0;  // high-plane bits per element
+    const int high = hb * group / 8;                   // high-plane bytes per group
     const long long gpr = (d.k + 127) / 128 * 128 / group;
     const long long groups = d.n * gpr;
     const long long high_off = align256(groups * 32), scale_off = high_off + align256(groups * high);
     const long long row = row_begin + ids[blockIdx.x];
-    const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP, warps = blockDim.x / VELOX_WARP;
-    const int row_groups = static_cast<int>((d.k + group - 1) / group);
+    const int rg = static_cast<int>((d.k + group - 1) / group);  // groups of this row
+    uint8_t* sc = em_smem;                                           // [rg * 32]
+    uint8_t* sh = em_smem + (rg * 32 + 15) / 16 * 16;                // [rg * high]
+    uint8_t* ss = sh + (rg * high + 15) / 16 * 16;                   // [rg * 2]
+    const uint8_t* codes = d.base + row * gpr * 32;
+    const uint8_t* hp = d.base + high_off + row * gpr * high;
+    const uint8_t* scp = d.base + scale_off + row * gpr * 2;
+    for (int i = threadIdx.x; i < rg * 2; i += blockDim.x)
+        reinterpret_cast<uint4*>(sc)[i] = reinterpret_cast<const uint4*>(codes)[i];
+    for (int i = threadIdx.x; i < rg * high / 8; i += blockDim.x)
+        reinterpret_cast<uint2*>(sh)[i] = reinterpret_cast<const uint2*>(hp)[i];
+    for (int i = threadIdx.x; i < rg; i += blockDim.x)
+        reinterpret_cast<uint16_t*>(ss)[i] = reinterpret_cast<const uint16_t*>(scp)[i];
+    __syncthreads();
     float* o = out + static_cast<long long>(blockIdx.x) * d.k;
-#pragma unroll 4
-    for (int g = warp; g < row_groups; g += warps) {
-        const long long gi = row * gpr + g;
-        const uint8_t code = d.base[gi * 32 + lane];
-        const uint8_t hi = hb > 0 ? d.base[high_off + gi * high + (lane * epl * hb) / 8] : 0;
-        const uint8_t* sp = d.base + scale_off + 2 * gi;
-        const float scale = __half2float(__ushort_as_half(static_cast<unsigned short>(sp[0] | (sp[1] << 8))));
-        for (int j = 0; j < epl; ++j) {
-            const int e = lane * epl + j;
-            const long long col = static_cast<long long>(g) * group + e;
-            if (col >= d.k) break;
-            uint32_t u = bits == 8 ? code : (j & 1) ? (code >> 4) : (code & 0xf);
-            for (int b = 0; b < hb; ++b) {
-                const int t = e * hb + b;  // bit index in the group's high plane
-                u |= static_cast<uint32_t>((hi >> (t % 8)) & 1) << (4 + b);
-            }
-            const int q = u >= (1u << (bits - 1)) ? static_cast<int>(u) - (1 << bits) : static_cast<int>(u);
-            o[col] = scale * static_cast<float>(q);
+    for (int e = threadIdx.x; e < d.k; e += blockDim.x) {
+        const int g = e / group, le = e % group;
+        uint32_t u;
+        if (bits == 8) {
+            u = sc[g * 32 + le];
+        } else {
+            const uint8_t byte = sc[g * 32 + le / 2];
+            u = (le & 1) ? (byte >> 4) : (byte & 0xf);
         }
+        for (int b = 0; b < hb; ++b) {
+            const int t = le * hb + b;
+            u |= static_cast<uint32_t>((sh[g * high + t / 8] >> (t % 8)) & 1) << (4 + b);
+        }
+        const int q = u >= (1u << (bits - 1)) ? static_cast<int>(u) - (1 << bits) : static_cast<int>(u);
+        const float scale = __half2float(__ushort_as_half(static_cast<unsigned short>(ss[2 * g] | (ss[2 * g + 1] << 8))));
+        o[e] = scale * static_cast<float>(q);
     }
 }
 
@@ -1430,8 +1441,13 @@ VELOX_API int velox_portable_embed(const uint32_t* ids, int count, const uint8_t
                                    long long k, long long row_begin, float* out) {
     if (count <= 0) return 0;
     if (format == VELOX_FMT_Q4 || format == VELOX_FMT_Q5 || format == VELOX_FMT_Q6 || format == VELOX_FMT_Q8) {
-        embed_rs_kernel<<<count, 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
-        return velox_launch_status();
+        const int group = format == VELOX_FMT_Q8 ? 32 : 64, high = format == VELOX_FMT_Q5 ? 8 : format == VELOX_FMT_Q6 ? 16 : 0;
+        const long long rg = (k + group - 1) / group;
+        const size_t smem = (rg * 32 + 15) / 16 * 16 + (rg * high + 15) / 16 * 16 + rg * 2;
+        if (smem <= 48 * 1024) {
+            embed_rs_kernel<<<count, 256, smem>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+            return velox_launch_status();
+        }
     }
     const unsigned slices = static_cast<unsigned>((k + 255) / 256 < 65535 ? (k + 255) / 256 : 65535);
     embed_kernel<<<dim3(count, slices), 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
