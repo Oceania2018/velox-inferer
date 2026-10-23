@@ -71,6 +71,31 @@ fn fetch<B: Backend>(b: &B, buf: &B::Buffer, len: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Tolerance of a SwiGLU output and of a GEMM on it: silu(gate) * up scales the gate's f32
+/// accumulation error by |up|, which `max_err` only normalizes by 1 + |out| (the twin cases at
+/// K = 5120 reach 2.6e-4, bit-identical to the f32-input path on the same data).
+const SWIGLU_TOL: f64 = 5e-4;
+
+/// Elements of the bf16 twin `twin` (u16 values packed in f32 slots) that differ from the
+/// round-to-nearest-even of `full`'s first `n` values.
+fn twin_mismatches<B: Backend>(
+    b: &B,
+    full: &B::Buffer,
+    twin: &B::Buffer,
+    n: usize,
+) -> Result<usize> {
+    let f = fetch(b, full, n)?;
+    let t = fetch(b, twin, n.div_ceil(2))?;
+    let bits = t.iter().flat_map(|v| {
+        let u = v.to_bits();
+        [(u & 0xffff) as u16, (u >> 16) as u16]
+    });
+    Ok(f.iter()
+        .zip(bits)
+        .filter(|&(&v, h)| velox_core::format::f32_to_bf16(v) != h)
+        .count())
+}
+
 /// A random valid encoding of a `[n, k]` matrix in `fmt` (finite codes, positive scales).
 pub fn random_weight(rng: &mut Rng, fmt: WeightFormat, n: usize, k: usize) -> Vec<u8> {
     let byte = |rng: &mut Rng| (rng.next_u64() >> 56) as u8;
@@ -458,6 +483,11 @@ impl<B: Backend> Suite<'_, B> {
             ("rms_norm_gated", &zd, &zb),
             ("sigmoid_mul", &sd, &sb),
         ];
+        for (what, full, twin) in produced {
+            let bad = twin_mismatches(self.b, full, twin, n)? as f32;
+            let name = format!("bf16 twin of {what} [{m}x{k}] (mismatches)");
+            self.record(name, None, &[bad], &[0.0], 0.0);
+        }
         for &(fmt, rows) in views {
             let bytes = random_weight(&mut self.rng, fmt, rows, k);
             let wd = self.b.upload_bytes(&bytes)?;
@@ -509,7 +539,10 @@ impl<B: Backend> Suite<'_, B> {
                     .linear_swiglu_twin(&yb, &gate, &up, &mut out, &mut outb, m)?;
                 let got = fetch(self.b, &out, m * width)?;
                 let name = format!("linear_swiglu_twin {} [{width}x2,{k}] m={m}", fmt.name());
-                self.record(name, Some(Op::Linear), &got, &g, 2e-4);
+                self.record(name, Some(Op::Linear), &got, &g, SWIGLU_TOL);
+                let bad = twin_mismatches(self.b, &out, &outb, m * width)? as f32;
+                let name = format!("bf16 twin of linear_swiglu [{m}x{width}] (mismatches)");
+                self.record(name, None, &[bad], &[0.0], 0.0);
                 // The output twin feeding the down projection.
                 let dbytes = random_weight(&mut self.rng, fmt, 64, width);
                 let dd = self.b.upload_bytes(&dbytes)?;
@@ -527,7 +560,7 @@ impl<B: Backend> Suite<'_, B> {
                         "linear_bf16 {} [64,{width}] m={m} from swiglu twin",
                         fmt.name()
                     );
-                    self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+                    self.record(name, Some(Op::Linear), &got, &want, SWIGLU_TOL);
                 }
             }
         }

@@ -201,8 +201,10 @@ const STATIC_MAX_TOKENS: usize = 15;
 
 /// Layers where a recorded step starts a new graph segment (see [`Backend::graph_break`]).
 /// Submission time grows with a segment's size and the GPU waits for the first one, so it holds
-/// one layer; each later segment is submitted while the GPU runs the ones before it.
-const GRAPH_SEGMENT_STARTS: [usize; 5] = [1, 4, 16, 32, 48];
+/// one layer; each later segment is submitted while the GPU runs the ones before it. Every
+/// boundary also idles the GPU between segments (~30 us under WSL2), so after the first few
+/// layers the rest is one segment: 12 layers of GPU time cover its submission.
+const GRAPH_SEGMENT_STARTS: [usize; 3] = [1, 4, 16];
 
 fn graph_key(kind: u64, shape: u64, s: &Session<impl Backend>, kv_len: Option<usize>) -> u64 {
     let mut key = kind | shape | (s.id & 0xffff) << 40;
