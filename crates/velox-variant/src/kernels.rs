@@ -2,8 +2,8 @@
 //! when the kernel reports the shape as unsupported.
 
 use velox_core::backend::{
-    linear_part_whole, ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, LinearDst,
-    NormKind, WeightView,
+    linear_part_whole, ActPolicy, ActQuant, AttnPrecision, AttnShape, ExpertBank, FullAttnShape,
+    LinearDst, NormKind, WeightView,
 };
 use velox_core::check::to_i32;
 use velox_core::{Error, KvFormat, Op, Result, WeightFormat};
@@ -822,6 +822,51 @@ impl Rtx5060Kernels {
     }
 }
 
+extern "C" {
+    fn velox_5060_moe_scratch(rows: i32, k: i32, width: i32, hidden: i32) -> i64;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_5060_moe_experts(
+        x: *const f32,
+        ids: *const f32,
+        wts: *const f32,
+        records: *const u8,
+        slots: *const u8,
+        map: *const f32,
+        record_bytes: i64,
+        slot_bytes: i64,
+        up_type: i32,
+        gate_off: i64,
+        up_off: i64,
+        down_type: i32,
+        down_off: i64,
+        width: i32,
+        hidden: i32,
+        rows: i32,
+        k: i32,
+        y: *mut f32,
+        scratch: *mut f32,
+    ) -> i32;
+}
+
+/// Most rows the decode MoE kernels take (decode and verify windows); prefill chunks run portable.
+const MOE_DECODE_MAX: usize = 16;
+
+/// (gate/up type, down type) of rtx5060_ggml.cu's MoE kernels for `bank` at `rows` rows: GGML
+/// experts of the served types or Q2_0, 8-bit activations allowed.
+fn moe_types(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> Option<(i32, i32)> {
+    let ty = |f: WeightFormat| match f {
+        WeightFormat::Ggml(t) if ggml_index(t) <= 9 => Some(ggml_index(t)),
+        _ => None,
+    };
+    if !(1..=MOE_DECODE_MAX).contains(&rows)
+        || !matches!(bank.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. })
+        || bank.gate.format != bank.up.format
+    {
+        return None;
+    }
+    Some((ty(bank.gate.format)?, ty(bank.down.format)?))
+}
+
 fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<()> {
     match r {
         Err(Error::Unsupported(_)) => fallback(),
@@ -837,6 +882,7 @@ impl CudaKernels for Rtx5060Kernels {
             Op::Attention,
             Op::AttentionFull,
             Op::LinearSwiglu,
+            Op::MoeExperts,
         ]
     }
 
@@ -862,6 +908,74 @@ impl CudaKernels for Rtx5060Kernels {
             "rtx5060 matmul",
         );
         or_fallback(r, || portable::matmul(x, w, y, m, n, k))
+    }
+
+    fn moe_scratch_len(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize, k: usize) -> usize {
+        let portable = portable::moe_scratch_len(bank, rows, k);
+        if moe_types(bank, rows).is_none() {
+            return portable;
+        }
+        // SAFETY: a pure size computation.
+        let bytes = unsafe {
+            velox_5060_moe_scratch(rows as i32, k as i32, bank.width() as i32, bank.hidden() as i32)
+        };
+        portable.max((bytes as usize).div_ceil(4))
+    }
+
+    fn moe_experts_act(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> ActQuant {
+        if moe_types(bank, rows).is_some() {
+            ActQuant::Int8G32
+        } else {
+            ActQuant::Exact
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &self,
+        x: &CudaBuffer,
+        ids: &CudaBuffer,
+        weights: &CudaBuffer,
+        bank: &ExpertBank<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        scratch: &mut CudaBuffer,
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        let Some((tu, td)) = moe_types(bank, rows) else {
+            return portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k);
+        };
+        // SAFETY: CudaBackend validated the bank and extents (check::moe_experts); the scratch
+        // holds moe_scratch_len slots; expert ids come from moe_route.
+        let r = status(
+            unsafe {
+                velox_5060_moe_experts(
+                    x.as_ptr(),
+                    ids.as_ptr(),
+                    weights.as_ptr(),
+                    bank.records.as_ptr().cast(),
+                    bank.slots.as_ptr().cast(),
+                    bank.map.as_ptr(),
+                    bank.record_bytes as i64,
+                    bank.slot_bytes as i64,
+                    tu,
+                    bank.gate.offset as i64,
+                    bank.up.offset as i64,
+                    td,
+                    bank.down.offset as i64,
+                    to_i32("width", bank.width())?,
+                    to_i32("hidden", bank.hidden())?,
+                    rows as i32,
+                    k as i32,
+                    y.as_mut_ptr(),
+                    scratch.as_mut_ptr(),
+                )
+            },
+            "rtx5060 moe_experts",
+        );
+        or_fallback(r, || {
+            portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+        })
     }
 
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {

@@ -18,7 +18,7 @@
 namespace {
 
 // velox_core::ggml::GgmlType::ALL order (main's VELOX_FMT_GGML_BASE + T).
-enum : int { kQ2K = 0, kQ4K, kIq1M, kIq2Xxs, kIq2Xs, kIq2S, kIq3Xxs, kIq3S, kIq4Xs };
+enum : int { kQ2K = 0, kQ4K, kIq1M, kIq2Xxs, kIq2Xs, kIq2S, kIq3Xxs, kIq3S, kIq4Xs, kQ2_0 };
 
 __host__ __device__ constexpr int block_bytes(int t) {
     return t == kQ2K      ? 84
@@ -29,6 +29,7 @@ __host__ __device__ constexpr int block_bytes(int t) {
            : t == kIq2S   ? 82
            : t == kIq3Xxs ? 98
            : t == kIq3S   ? 110
+           : t == kQ2_0   ? 18
                           : 136;
 }
 
@@ -37,7 +38,7 @@ __host__ __device__ constexpr int block_bytes(int t) {
 template <int T>
 struct Traits {
     static constexpr int G = (T == kQ2K || T == kIq2Xs || T == kIq2S) ? 2 : T == kIq1M ? 4 : 1;
-    static constexpr bool kOff = T == kQ2K || T == kQ4K || T == kIq1M;
+    static constexpr bool kOff = T == kQ2K || T == kQ4K || T == kIq1M || T == kQ2_0;
 };
 
 template <int T>
@@ -180,6 +181,21 @@ __device__ __forceinline__ Sub<T> decode(const uint8_t* __restrict__ x, int ib) 
             const uint32_t sb = x[34 + 4 * ib + l];
             r.w[2 * l] = signed4(static_cast<uint32_t>(g), sb & 0xf);
             r.w[2 * l + 1] = signed4(static_cast<uint32_t>(g >> 32), sb >> 4);
+        }
+    } else if constexpr (T == kQ2_0) {  // 64-value block: d | qs[16]; ib (0, 1) is a half
+        // value = d * q - d with 2-bit q, four consecutive values per byte: one byte per word.
+        const float d = f16_at(x);
+        r.s[0] = d;
+        r.o[0] = -d;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t two = u16_at(x + 2 + 8 * ib + 2 * i);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t b = (two >> (8 * h)) & 0xffu;
+                r.w[2 * i + h] = static_cast<int>((b & 0x03u) | ((b & 0x0cu) << 6) | ((b & 0x30u) << 12) |
+                                                  ((b & 0xc0u) << 18));
+            }
         }
     } else {  // IQ1_M: qs[32] | qh[16] | scales[8]
         const uint32_t s0 = u16_at(x + 48), s1 = u16_at(x + 50), s2 = u16_at(x + 52), s3 = u16_at(x + 54);
@@ -1431,4 +1447,203 @@ VELOX_API int velox_5060_linear_ggml_q8(const void* blob, int m, const uint8_t* 
         case kIq3S: return launch_pre2<kIq3S>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         default: return launch_pre2<kIq4Xs>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
     }
+}
+
+// ---- Routed experts at decode and verify widths (Backend::moe_experts) ----------------------
+//
+// Int8 activations per 32 values (ActQuant::Int8G32) for both the input and the SwiGLU product.
+// Gate and up run as one GEMV per (row, expert) pair, warp per R rows over the K sub-blocks; down
+// runs warp per 8 output rows of one token row, four lanes per output row, over that row's experts
+// in order, so the weighted sum is deterministic and a warp reads one contiguous run of each
+// expert's down rows (records may sit in mapped system RAM, where every PCIe transaction counts).
+namespace {
+
+struct MoeDesc {
+    const uint8_t* records;
+    const uint8_t* slots;
+    const float* map;  // i32 bits: slot of expert e, or -1
+    long long record_bytes, slot_bytes;
+    long long gate_off, up_off, down_off;
+    int width, hidden;
+};
+
+__device__ __forceinline__ const uint8_t* moe_record(const MoeDesc& d, int e) {
+    const int slot = static_cast<int>(__float_as_uint(__ldg(d.map + e)));
+    return slot >= 0 ? d.slots + static_cast<long long>(slot) * d.slot_bytes
+                     : d.records + static_cast<long long>(e) * d.record_bytes;
+}
+
+// 32-value sub-blocks per stored block.
+template <int T>
+__host__ __device__ constexpr int sub_per_block() {
+    return T == kQ2_0 ? 2 : 8;
+}
+
+// Warp per (row, sub-block): int8 codes and scale per 32 values, ActQuant::Int8G32 bit for bit.
+__global__ void moe_quant_kernel(const float* __restrict__ x, int n, int subs, int8_t* __restrict__ q,
+                                 float* __restrict__ d) {
+    const long long gi = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) / VELOX_WARP;
+    const int lane = threadIdx.x % VELOX_WARP;
+    if (gi >= static_cast<long long>(n) * subs) return;
+    const float v = x[gi * 32 + lane];
+    const float amax = velox_warp_max(fabsf(v));
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    q[gi * 32 + lane] = static_cast<int8_t>(__float2int_rn(v * inv));
+    if (lane == 0) d[gi] = amax / 127.0f;
+}
+
+constexpr int kMoeWarps = 4;
+constexpr int kMoeUpRows = 2;
+
+// h[p][i] = silu(gate_i . x) * (up_i . x) for pair p = row * k + j (expert ids[p]).
+template <int T>
+__global__ void __launch_bounds__(kMoeWarps* VELOX_WARP)
+    moe_gate_up_kernel(MoeDesc d, const float* __restrict__ ids, int k, const int8_t* __restrict__ xq,
+                       const float* __restrict__ xd, float* __restrict__ h) {
+    constexpr int R = kMoeUpRows, SPB = sub_per_block<T>(), BB = block_bytes(T);
+    const int p = blockIdx.y, lane = threadIdx.x % VELOX_WARP;
+    const int r0 = (blockIdx.x * kMoeWarps + threadIdx.x / VELOX_WARP) * R;
+    if (r0 >= d.width) return;
+    const int tok = p / k, subs = d.hidden / 32;
+    const uint8_t* rec = moe_record(d, static_cast<int>(__float_as_uint(ids[p])));
+    const long long row_bytes = static_cast<long long>(subs / SPB) * BB;
+    float ag[R] = {}, au[R] = {};
+    for (int u = lane; u < subs; u += VELOX_WARP) {
+        const int4* ap = reinterpret_cast<const int4*>(xq + (static_cast<long long>(tok) * subs + u) * 32);
+        const int4 a0 = __ldg(ap), a1 = __ldg(ap + 1);
+        const int a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+        const float dx = __ldg(xd + static_cast<long long>(tok) * subs + u);
+        const long long off = static_cast<long long>(u / SPB) * BB;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const long long row = min(r0 + r, d.width - 1) * row_bytes + off;
+            ag[r] += dx * sub_dot<T>(decode<T>(rec + d.gate_off + row, u % SPB), a);
+            au[r] += dx * sub_dot<T>(decode<T>(rec + d.up_off + row, u % SPB), a);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float g = velox_warp_sum(ag[r]), v = velox_warp_sum(au[r]);
+        if (lane == 0 && r0 + r < d.width)
+            h[static_cast<long long>(p) * d.width + r0 + r] = g / (1.0f + __expf(-g)) * v;
+    }
+}
+
+constexpr int kMoeDownRows = 8;  // per warp; 4 lanes each
+
+// y[tok][c] = sum_j w[p] * (down_c . h[p]) over the token's pairs p = tok * k + j in order.
+template <int T>
+__global__ void __launch_bounds__(kMoeWarps* VELOX_WARP)
+    moe_down_kernel(MoeDesc d, const float* __restrict__ ids, const float* __restrict__ wts, int k,
+                    const int8_t* __restrict__ hq, const float* __restrict__ hd, float* __restrict__ y) {
+    constexpr int SPB = sub_per_block<T>(), BB = block_bytes(T), L = VELOX_WARP / kMoeDownRows;
+    const int tok = blockIdx.y, lane = threadIdx.x % VELOX_WARP;
+    const int c = (blockIdx.x * kMoeWarps + threadIdx.x / VELOX_WARP) * kMoeDownRows + lane / L;
+    const int sl = lane % L, subs = d.width / 32;
+    const long long row_bytes = static_cast<long long>(subs / SPB) * BB;
+    const int cr = min(c, d.hidden - 1);
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const int p = tok * k + j;
+        const uint8_t* w = moe_record(d, static_cast<int>(__float_as_uint(ids[p]))) + d.down_off + cr * row_bytes;
+        float part = 0.0f;
+        for (int u = sl; u < subs; u += L) {
+            const int4* ap = reinterpret_cast<const int4*>(hq + (static_cast<long long>(p) * subs + u) * 32);
+            const int4 a0 = __ldg(ap), a1 = __ldg(ap + 1);
+            const int a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            part += __ldg(hd + static_cast<long long>(p) * subs + u) *
+                    sub_dot<T>(decode<T>(w + static_cast<long long>(u / SPB) * BB, u % SPB), a);
+        }
+        acc += __ldg(wts + p) * part;
+    }
+#pragma unroll
+    for (int o = L / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (sl == 0 && c < d.hidden) y[static_cast<long long>(tok) * d.hidden + c] = acc;
+}
+
+template <int T>
+int moe_up_launch(const MoeDesc& d, const float* ids, int pairs, int k, const int8_t* xq, const float* xd, float* h) {
+    const int per_block = kMoeWarps * kMoeUpRows;
+    const dim3 grid((d.width + per_block - 1) / per_block, pairs);
+    moe_gate_up_kernel<T><<<grid, kMoeWarps * VELOX_WARP>>>(d, ids, k, xq, xd, h);
+    return velox_launch_status();
+}
+
+template <int T>
+int moe_down_launch(const MoeDesc& d, const float* ids, const float* wts, int rows, int k, const int8_t* hq,
+                    const float* hd, float* y) {
+    const int per_block = kMoeWarps * kMoeDownRows;
+    const dim3 grid((d.hidden + per_block - 1) / per_block, rows);
+    moe_down_kernel<T><<<grid, kMoeWarps * VELOX_WARP>>>(d, ids, wts, k, hq, hd, y);
+    return velox_launch_status();
+}
+
+#define MOE_TYPES(F, ...)                             \
+    switch (type) {                                   \
+        case kQ2K: return F<kQ2K>(__VA_ARGS__);       \
+        case kQ4K: return F<kQ4K>(__VA_ARGS__);       \
+        case kIq1M: return F<kIq1M>(__VA_ARGS__);     \
+        case kIq2Xxs: return F<kIq2Xxs>(__VA_ARGS__); \
+        case kIq2Xs: return F<kIq2Xs>(__VA_ARGS__);   \
+        case kIq2S: return F<kIq2S>(__VA_ARGS__);     \
+        case kIq3Xxs: return F<kIq3Xxs>(__VA_ARGS__); \
+        case kIq3S: return F<kIq3S>(__VA_ARGS__);     \
+        case kIq4Xs: return F<kIq4Xs>(__VA_ARGS__);   \
+        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);     \
+        default: return VELOX_ERR_UNSUPPORTED;        \
+    }
+
+int moe_up_any(int type, const MoeDesc& d, const float* ids, int pairs, int k, const int8_t* xq, const float* xd,
+               float* h) {
+    MOE_TYPES(moe_up_launch, d, ids, pairs, k, xq, xd, h)
+}
+
+int moe_down_any(int type, const MoeDesc& d, const float* ids, const float* wts, int rows, int k, const int8_t* hq,
+                 const float* hd, float* y) {
+    MOE_TYPES(moe_down_launch, d, ids, wts, rows, k, hq, hd, y)
+}
+
+#undef MOE_TYPES
+
+// Values per stored block of `type`: the K granularity the kernels need.
+int block_values(int type) { return type == kQ2_0 ? 64 : 256; }
+
+// Region sizes of the scratch, each rounded to 64 bytes (int4 loads need 16-byte alignment).
+long long moe_round(long long bytes) { return (bytes + 63) / 64 * 64; }
+
+}  // namespace
+
+// Bytes of scratch velox_5060_moe_experts needs for `rows` rows of `k` experts.
+VELOX_API long long velox_5060_moe_scratch(int rows, int k, int width, int hidden) {
+    const long long xs = static_cast<long long>(rows) * hidden, hw = static_cast<long long>(rows) * k * width;
+    return moe_round(xs) + moe_round(4 * (xs / 32)) + moe_round(4 * hw) + moe_round(hw) + moe_round(4 * (hw / 32));
+}
+
+// Types are GgmlType::ALL positions; gate and up share one. VELOX_ERR_UNSUPPORTED for geometry
+// the kernels do not cover (the caller falls back to the portable kernels).
+VELOX_API int velox_5060_moe_experts(const float* x, const float* ids, const float* wts, const uint8_t* records,
+                                     const uint8_t* slots, const float* map, long long record_bytes,
+                                     long long slot_bytes, int up_type, long long gate_off, long long up_off,
+                                     int down_type, long long down_off, int width, int hidden, int rows, int k,
+                                     float* y, void* scratch) {
+    if (rows < 1 || k < 1 || up_type < 0 || up_type > kQ2_0 || down_type < 0 || down_type > kQ2_0 ||
+        hidden % block_values(up_type) != 0 || width % block_values(down_type) != 0 ||
+        reinterpret_cast<uintptr_t>(scratch) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    const MoeDesc d{records, slots, map, record_bytes, slot_bytes, gate_off, up_off, down_off, width, hidden};
+    const long long pairs = static_cast<long long>(rows) * k;
+    const long long xs = static_cast<long long>(rows) * hidden, hw = pairs * width;
+    uint8_t* p = static_cast<uint8_t*>(scratch);
+    int8_t* xq = reinterpret_cast<int8_t*>(p);
+    float* xd = reinterpret_cast<float*>(p += moe_round(xs));
+    float* h = reinterpret_cast<float*>(p += moe_round(4 * (xs / 32)));
+    int8_t* hq = reinterpret_cast<int8_t*>(p += moe_round(4 * hw));
+    float* hd = reinterpret_cast<float*>(p += moe_round(hw));
+    const int threads = 256;
+    moe_quant_kernel<<<static_cast<unsigned>((xs / 32 * VELOX_WARP + threads - 1) / threads), threads>>>(
+        x, rows, hidden / 32, xq, xd);
+    if (const int e = moe_up_any(up_type, d, ids, static_cast<int>(pairs), k, xq, xd, h)) return e;
+    moe_quant_kernel<<<static_cast<unsigned>((hw / 32 * VELOX_WARP + threads - 1) / threads), threads>>>(
+        h, static_cast<int>(pairs), width / 32, hq, hd);
+    return moe_down_any(down_type, d, ids, wts, rows, k, hq, hd, y);
 }
