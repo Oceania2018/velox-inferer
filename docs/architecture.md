@@ -84,8 +84,15 @@ MoE execution is not implemented yet: a MoE block returns `Error::Unsupported`, 
 serve` answers 501 for the architecture. It lands like any op, on main with a CPU reference,
 portable kernels, `CudaKernels` defaults and conformance cases (planned contract in
 [qwen3_5-text.md](qwen3_5-text.md#sparse-moe-qwen3_5moeforcausallm)); branches then tune the
-expert GEMMs. Models whose experts do not fit in VRAM (expert offload to system RAM) are out of
-scope for this design; 35B-A3B fits a 32 GB card.
+expert GEMMs.
+
+`Qwen4ExpForConditionalGeneration` (Qwen3.8-Flash-Next) is a separate model,
+`velox_models::qwen4_exp` ([qwen4_exp.md](qwen4_exp.md)): hyper-connection residual streams,
+QSA sparse attention and a per-layer n-gram embedding change the stack itself, not just the FFN.
+It runs MoE through `moe_route` / `moe_experts`, whose `ExpertBank` keeps every expert in
+system RAM the device reads directly and a shared pool of device slots for the most selected
+ones, so 35 GB of experts run on a 16 GB card. It loads llama.cpp GGUFs directly and is served
+by `velox generate --gguf`; the engine and `velox serve` still run Qwen3.5/3.8 only.
 
 ## Current scope and next steps
 
