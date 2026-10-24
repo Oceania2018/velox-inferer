@@ -1724,8 +1724,9 @@ impl<B: Backend> Qwen35Text<B> {
         if t > FUSE_MAX_TOKENS && b.fuses_swiglu(&gate, &up, t) {
             // Prefill on a backend that fuses this width: no scratch is touched.
             b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.mu)?;
-        } else if t <= FUSE_MAX_TOKENS && d.gate_up.is_some() {
-            // Decode and verify: the fused projection (ws.gu is the composed op's scratch).
+        } else if t <= FUSE_MAX_TOKENS && (d.gate_up.is_some() || b.fuses_swiglu(&gate, &up, t)) {
+            // Decode and verify: the fused projection (ws.gu is the composed op's scratch), from
+            // the concatenated gate_up weight or from separate parents the backend fuses (GGUF).
             b.linear_swiglu(&ws.h, &gate, &up, &mut ws.mg, t, &mut ws.gu)?;
         } else {
             b.linear(&ws.h, &gate, &mut ws.mg, t)?;
