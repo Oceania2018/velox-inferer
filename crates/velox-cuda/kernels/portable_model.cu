@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+#include "ggml_tables.cuh"
 #include "velox_common.cuh"
 
 // Weight formats; must match velox_cuda::portable::FORMAT_*.
@@ -17,6 +18,10 @@
 #define VELOX_FMT_Q6 6
 #define VELOX_FMT_Q8 7
 #define VELOX_FMT_IQ3_XXS 8
+// GGML block types: base + position in velox_core::ggml::GgmlType::ALL
+// (q2_k, q4_k, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs).
+#define VELOX_FMT_GGML_BASE 16
+#define VELOX_FMT_GGML_END 25
 
 namespace {
 
@@ -112,8 +117,125 @@ __device__ float iq3_xxs_at(const WDesc& d, long long row, long long col) {
     return (sign8 >> (j & 7)) & 1u ? -v : v;
 }
 
+// GGML super-blocks (ggml_block_v1): a row is k / 256 consecutive blocks of one type, as
+// velox_core::ggml documents; decoding follows ggml's dequantize_row_* operation for operation.
+// Block sizes are not multiples of 4, so multi-byte fields are assembled from bytes.
+__host__ __device__ __forceinline__ int ggml_block_bytes(int t) {
+    switch (t) {
+        case 0: return 84;
+        case 1: return 144;
+        case 2: return 56;
+        case 3: return 66;
+        case 4: return 74;
+        case 5: return 82;
+        case 6: return 98;
+        case 7: return 110;
+        default: return 136;
+    }
+}
+
+__device__ __forceinline__ float ggml_f16(const uint8_t* p) {
+    return __half2float(__ushort_as_half(static_cast<unsigned short>(p[0] | (p[1] << 8))));
+}
+__device__ __forceinline__ uint32_t ggml_u16(const uint8_t* p) { return p[0] | (static_cast<uint32_t>(p[1]) << 8); }
+__device__ __forceinline__ uint32_t ggml_u32(const uint8_t* p) {
+    return p[0] | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+__device__ __forceinline__ uint32_t ggml_byte(uint64_t e, int j) { return static_cast<uint32_t>(e >> (8 * j)) & 0xffu; }
+__device__ __forceinline__ float ggml_sign(uint32_t signs, int j) { return (signs >> j) & 1u ? -1.0f : 1.0f; }
+
+// Value v (0..255) of one super-block x of type T (VELOX_FMT_GGML_BASE + T).
+template <int T>
+__device__ __forceinline__ float ggml_value(const uint8_t* __restrict__ x, int v) {
+    const int ib = v / 32, j = v % 32, l = j / 8, jj = j % 8;
+    if (T == 0) {  // Q2_K: scales[16] | qs[64] | d | dmin
+        const int n = v / 128, w = v % 128, sh = 2 * (w / 32), h = (w % 32) / 16;
+        const uint32_t sc = x[n * 8 + (w / 32) * 2 + h];
+        const float dl = ggml_f16(x + 80) * static_cast<float>(sc & 0xf);
+        const float ml = ggml_f16(x + 82) * static_cast<float>(sc >> 4);
+        return dl * static_cast<float>((x[16 + 32 * n + (w % 32)] >> sh) & 3) - ml;
+    } else if (T == 1) {  // Q4_K: d | dmin | scales[12] | qs[128]
+        const int c = v / 64, hi = (v % 64) / 32, s = 2 * c + hi;
+        const uint8_t* q = x + 4;
+        uint32_t sc, m;
+        if (s < 4) {
+            sc = q[s] & 63, m = q[s + 4] & 63;
+        } else {
+            sc = (q[s + 4] & 0xf) | ((q[s - 4] >> 6) << 4);
+            m = (q[s + 4] >> 4) | ((q[s] >> 6) << 4);
+        }
+        const uint32_t b = x[16 + 32 * c + v % 32];
+        const float d1 = ggml_f16(x) * static_cast<float>(sc), m1 = ggml_f16(x + 2) * static_cast<float>(m);
+        return d1 * static_cast<float>(hi ? b >> 4 : b & 0xf) - m1;
+    } else if (T == 2) {  // IQ1_M: qs[32] | qh[16] | scales[8]
+        const uint32_t s0 = ggml_u16(x + 48), s1 = ggml_u16(x + 50), s2 = ggml_u16(x + 52), s3 = ggml_u16(x + 54);
+        const uint32_t dbits = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
+        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dbits)));
+        const uint32_t w = ggml_u16(x + 48 + 2 * (ib / 2));
+        const float dl = d * static_cast<float>(2 * ((w >> (6 * (ib % 2) + (l < 2 ? 0 : 3))) & 7) + 1);
+        const uint32_t qh = x[32 + 2 * ib + l / 2];
+        const uint32_t idx = x[4 * ib + l] | ((qh << (l % 2 ? 4 : 8)) & 0x700);
+        const float delta = qh & (l % 2 ? 0x80 : 0x08) ? -0.125f : 0.125f;
+        const float g = static_cast<float>(static_cast<int8_t>(ggml_byte(kIq1SGrid[idx], jj)));
+        return dl * (g + delta);
+    } else if (T == 3) {  // IQ2_XXS: d | per 32: 4 grid bytes, u32 of 4 x 7 sign bits + scale
+        const uint32_t a1 = ggml_u32(x + 6 + 8 * ib);
+        const float db = ggml_f16(x) * (0.5f + static_cast<float>(a1 >> 28)) * 0.25f;
+        const uint64_t grid = kIq2XxsGrid[x[2 + 8 * ib + l]];
+        return db * static_cast<float>(ggml_byte(grid, jj)) * ggml_sign(kKsignsIq2xs[(a1 >> (7 * l)) & 127], jj);
+    } else if (T == 4) {  // IQ2_XS: d | qs[32] u16 | scales[8]
+        const uint32_t s = x[66 + ib];
+        const float db = ggml_f16(x) * (0.5f + static_cast<float>(l < 2 ? s & 0xf : s >> 4)) * 0.25f;
+        const uint32_t q = ggml_u16(x + 2 + 2 * (4 * ib + l));
+        return db * static_cast<float>(ggml_byte(kIq2XsGrid[q & 511], jj)) * ggml_sign(kKsignsIq2xs[q >> 9], jj);
+    } else if (T == 5) {  // IQ2_S: d | qs[32] | signs[32] | qh[8] | scales[8]
+        const uint32_t s = x[74 + ib];
+        const float db = ggml_f16(x) * (0.5f + static_cast<float>(l < 2 ? s & 0xf : s >> 4)) * 0.25f;
+        const uint32_t idx = x[2 + 4 * ib + l] | ((static_cast<uint32_t>(x[66 + ib]) << (8 - 2 * l)) & 0x300);
+        return db * static_cast<float>(ggml_byte(kIq2SGrid[idx], jj)) * ggml_sign(x[34 + 4 * ib + l], jj);
+    } else if (T == 6) {  // IQ3_XXS: d | qs[64] | 8 u32 of 4 x 7 sign bits + scale
+        const uint32_t aux = ggml_u32(x + 66 + 4 * ib);
+        const float db = ggml_f16(x) * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
+        const uint32_t grid = kIq3XxsGrid[x[2 + 8 * ib + 2 * l + jj / 4]];
+        return db * static_cast<float>(ggml_byte(grid, jj % 4)) * ggml_sign(kKsignsIq2xs[(aux >> (7 * l)) & 127], jj);
+    } else if (T == 7) {  // IQ3_S: d | qs[64] | qh[8] | signs[32] | scales[4]
+        const uint32_t s = x[106 + ib / 2];
+        const float db = ggml_f16(x) * static_cast<float>(1 + 2 * (ib % 2 ? s >> 4 : s & 0xf));
+        const uint32_t qh = x[66 + ib];
+        const uint32_t idx = jj < 4 ? x[2 + 8 * ib + 2 * l] | ((qh << (8 - 2 * l)) & 256)
+                                    : x[3 + 8 * ib + 2 * l] | ((qh << (7 - 2 * l)) & 256);
+        return db * static_cast<float>(ggml_byte(kIq3SGrid[idx], jj % 4)) * ggml_sign(x[74 + 4 * ib + l], jj);
+    } else {  // IQ4_XS: d | scales_h u16 | scales_l[4] | qs[128]
+        const int ls = static_cast<int>((x[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                       (static_cast<int>((ggml_u16(x + 2) >> (2 * ib)) & 3) << 4);
+        const float dl = ggml_f16(x) * static_cast<float>(ls - 32);
+        const uint32_t b = x[8 + 16 * ib + j % 16];
+        return dl * static_cast<float>(kValuesIq4nl[j < 16 ? b & 0xf : b >> 4]);
+    }
+}
+
+__device__ float ggml_at(const WDesc& d, long long row, long long col) {
+    const int t = d.format - VELOX_FMT_GGML_BASE;
+    const long long bb = ggml_block_bytes(t);
+    const uint8_t* x = d.base + (row * (d.k / 256) + col / 256) * bb;
+    const int v = static_cast<int>(col % 256);
+    switch (t) {
+        case 0: return ggml_value<0>(x, v);
+        case 1: return ggml_value<1>(x, v);
+        case 2: return ggml_value<2>(x, v);
+        case 3: return ggml_value<3>(x, v);
+        case 4: return ggml_value<4>(x, v);
+        case 5: return ggml_value<5>(x, v);
+        case 6: return ggml_value<6>(x, v);
+        case 7: return ggml_value<7>(x, v);
+        default: return ggml_value<8>(x, v);
+    }
+}
+
 // Decoded W[row, col] of the parent matrix.
 __device__ float weight_at(const WDesc& d, long long row, long long col) {
+    if (d.format >= VELOX_FMT_GGML_BASE) return ggml_at(d, row, col);
     switch (d.format) {
         case VELOX_FMT_F32:
             return reinterpret_cast<const float*>(d.base)[row * d.k + col];
@@ -1315,6 +1437,71 @@ int launch_gemv_vec(const float* x, const WDesc& d, long long row_begin, int row
     return velox_launch_status();
 }
 
+// Small-m linear for GGML blocks: one warp per output row, each lane decoding whole 32-value
+// sub-blocks (one scale each) and applying them to all m rows, so each weight is read once.
+template <int T, int M>
+__global__ void __launch_bounds__(256)
+linear_gemv_ggml_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m,
+                        float* __restrict__ y) {
+    const int r = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    const int lane = threadIdx.x % VELOX_WARP;
+    if (r >= rows) return;
+    const long long k = w.k, subs = k / 32;
+    const uint8_t* row = w.base + (row_begin + r) * (k / 256) * ggml_block_bytes(T);
+    float acc[M];
+#pragma unroll
+    for (int i = 0; i < M; ++i) acc[i] = 0.0f;
+    for (long long u = lane; u < subs; u += VELOX_WARP) {
+        const uint8_t* blk = row + (u / 8) * ggml_block_bytes(T);
+        const int v0 = static_cast<int>(u % 8) * 32;
+        float wv[32];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) wv[j] = ggml_value<T>(blk, v0 + j);
+#pragma unroll
+        for (int i = 0; i < M; ++i) {
+            if (i >= m) break;
+            const float4* xp = reinterpret_cast<const float4*>(x + static_cast<size_t>(i) * k + u * 32);
+            float s = 0.0f;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const float4 t = __ldg(xp + q);
+                s += wv[4 * q] * t.x + wv[4 * q + 1] * t.y + wv[4 * q + 2] * t.z + wv[4 * q + 3] * t.w;
+            }
+            acc[i] += s;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < M; ++i) {
+        const float s = velox_warp_sum(acc[i]);
+        if (lane == 0 && i < m) y[static_cast<size_t>(i) * rows + r] = s;
+    }
+}
+
+template <int T>
+int launch_gemv_ggml_t(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
+    constexpr int kWarps = 8;
+    const dim3 grid((rows + kWarps - 1) / kWarps);
+    if (m == 1) linear_gemv_ggml_kernel<T, 1><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else if (m == 2) linear_gemv_ggml_kernel<T, 2><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else if (m <= 4) linear_gemv_ggml_kernel<T, 4><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else linear_gemv_ggml_kernel<T, 8><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    return velox_launch_status();
+}
+
+int launch_gemv_ggml(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
+    switch (d.format - VELOX_FMT_GGML_BASE) {
+        case 0: return launch_gemv_ggml_t<0>(x, d, row_begin, rows, m, y);
+        case 1: return launch_gemv_ggml_t<1>(x, d, row_begin, rows, m, y);
+        case 2: return launch_gemv_ggml_t<2>(x, d, row_begin, rows, m, y);
+        case 3: return launch_gemv_ggml_t<3>(x, d, row_begin, rows, m, y);
+        case 4: return launch_gemv_ggml_t<4>(x, d, row_begin, rows, m, y);
+        case 5: return launch_gemv_ggml_t<5>(x, d, row_begin, rows, m, y);
+        case 6: return launch_gemv_ggml_t<6>(x, d, row_begin, rows, m, y);
+        case 7: return launch_gemv_ggml_t<7>(x, d, row_begin, rows, m, y);
+        default: return launch_gemv_ggml_t<8>(x, d, row_begin, rows, m, y);
+    }
+}
+
 template <int FMT>
 int launch_gemv_vec_m(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
     if (m == 1) return launch_gemv_vec<FMT, 1>(x, d, row_begin, rows, m, y);
@@ -1405,6 +1592,8 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
         if (format == VELOX_FMT_BF16) return launch_gemv_vec_m<VELOX_FMT_BF16>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_Q4 && k % 32 == 0) return launch_gemv_vec_m<VELOX_FMT_Q4>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_Q8) return launch_gemv_vec_m<VELOX_FMT_Q8>(x, d, row_begin, rows, m, y);
+        if (format >= VELOX_FMT_GGML_BASE && format < VELOX_FMT_GGML_END)
+            return launch_gemv_ggml(x, d, row_begin, rows, m, y);
     }
     if (m <= kGemvMaxM && (format == VELOX_FMT_FP8_ROW_BF16 || format == VELOX_FMT_NVFP4)) {
         constexpr int kWarps = 8;

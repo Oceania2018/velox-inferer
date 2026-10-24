@@ -99,9 +99,11 @@ pub(crate) struct ContextStore<B: Backend> {
 /// Evicted state storage kept for reuse.
 const MAX_SPARE: usize = 4;
 
-/// Storage [`ContextStore::top_up`] keeps ready: two states (a chain head and an anchor) and
-/// 8K positions of KV pages.
-const RESERVE_STATES: usize = 2;
+/// Storage [`ContextStore::top_up`] keeps ready: states for a burst of new conversations (each
+/// stores one copied state; until the store fills, nothing is evicted to reuse) and 8K positions
+/// of KV pages. Two states left back-to-back fresh 1K prompts pinning 157 MB each on the request
+/// path under WSL (+110-270 ms prefill on the RTX 5090 Laptop). Counted in the store's budget.
+const RESERVE_STATES: usize = 6;
 const RESERVE_PAGES: usize = 32;
 /// States a background [`Pinner`] keeps ready: about one request's captures per lane pair.
 const PINNED_STATES: usize = 4;

@@ -5,6 +5,7 @@
 //! fly. The functions here are the reference decoders the CPU oracle and conformance use.
 
 use crate::error::{Error, Result};
+use crate::ggml::{GgmlType, GGML_BLOCK};
 
 /// Stored weight encodings velox executes. Each implies its storage layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,6 +29,9 @@ pub enum WeightFormat {
     /// `iq3_xxs` / `iq3_xxs_planar_v1`: llama.cpp IQ3_XXS (256-value blocks of grid codes, one
     /// binary16 scale per block), re-ordered by ninfer's converter. See [`iq3_xxs_at`].
     Iq3Xxs,
+    /// `ggml_<type>` / `ggml_block_v1`: llama.cpp super-blocks as GGUF stores them (see
+    /// [`crate::ggml`]).
+    Ggml(GgmlType),
 }
 
 /// Geometry of a `row_split_k128_v1` format: code bits, group size, base and high-bit bytes per
@@ -67,6 +71,9 @@ impl WeightFormat {
             ("q6_g64_fp16", "row_split_k128_v1") => Ok(WeightFormat::Q6G64),
             ("q8_g32_fp16", "row_split_k128_v1") => Ok(WeightFormat::Q8G32),
             ("iq3_xxs", "iq3_xxs_planar_v1") => Ok(WeightFormat::Iq3Xxs),
+            (f, "ggml_block_v1") if GgmlType::from_name(f).is_some() => {
+                Ok(WeightFormat::Ggml(GgmlType::from_name(f).unwrap()))
+            }
             _ => Err(Error::Unsupported(format!(
                 "weight format {format} / {layout}"
             ))),
@@ -84,6 +91,7 @@ impl WeightFormat {
             WeightFormat::Q6G64 => "q6_g64_fp16",
             WeightFormat::Q8G32 => "q8_g32_fp16",
             WeightFormat::Iq3Xxs => "iq3_xxs",
+            WeightFormat::Ggml(t) => t.name(),
         }
     }
 
@@ -123,6 +131,14 @@ impl WeightFormat {
                 "iq3_xxs needs K % 256 == 0, got [{n},{k}]"
             )));
         }
+        if let WeightFormat::Ggml(t) = self {
+            if !k.is_multiple_of(GGML_BLOCK) {
+                return Err(Error::Shape(format!(
+                    "{} needs K % 256 == 0, got [{n},{k}]",
+                    t.name()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -137,7 +153,20 @@ impl WeightFormat {
                 let blocks = n * (k / IQ3_XXS_BLOCK);
                 align256(blocks * IQ3_XXS_CODE_BYTES) + 2 * blocks
             }
+            WeightFormat::Ggml(t) => n * t.row_bytes(k),
             q => q.row_split().map_or(0, |r| r.planes(n, k).2),
+        }
+    }
+
+    /// Container layout name.
+    pub fn layout(&self) -> &'static str {
+        match self {
+            WeightFormat::F32 | WeightFormat::Bf16 => "contiguous_le_v1",
+            WeightFormat::Fp8RowBf16 => "row_scale_v1",
+            WeightFormat::Nvfp4 => "block_scale_k16_m128x4_v1",
+            WeightFormat::Iq3Xxs => "iq3_xxs_planar_v1",
+            WeightFormat::Ggml(_) => "ggml_block_v1",
+            _ => "row_split_k128_v1",
         }
     }
 }
@@ -340,6 +369,11 @@ pub fn decode_rows(
             payload.len()
         )));
     }
+    if let WeightFormat::Ggml(t) = fmt {
+        let mut out = Vec::with_capacity(rows * k);
+        crate::ggml::decode_rows_into(t, payload, k, row_begin, rows, &mut out);
+        return Ok(out);
+    }
     let mut out = Vec::with_capacity(rows * k);
     for r in row_begin..row_begin + rows {
         match fmt {
@@ -375,6 +409,7 @@ pub fn decode_rows(
                 }
             }
             WeightFormat::Iq3Xxs => out.extend((0..k).map(|c| iq3_xxs_at(payload, n, k, r, c))),
+            WeightFormat::Ggml(_) => unreachable!("decoded above"),
             q => {
                 let rs = q.row_split().expect("row-split format");
                 out.extend((0..k).map(|c| row_split_at(rs, payload, n, k, r, c)));

@@ -163,6 +163,13 @@ pub fn format_code(f: WeightFormat) -> i32 {
         WeightFormat::Q6G64 => 6,
         WeightFormat::Q8G32 => 7,
         WeightFormat::Iq3Xxs => 8,
+        // VELOX_FMT_GGML_BASE + the type's position in GgmlType::ALL.
+        WeightFormat::Ggml(t) => {
+            16 + velox_core::ggml::GgmlType::ALL
+                .iter()
+                .position(|&u| u == t)
+                .expect("listed type") as i32
+        }
     }
 }
 
@@ -1318,6 +1325,14 @@ extern "C" {
         accumulate: i32,
         block: i32,
     ) -> i32;
+    fn velox_portable_transpose_heads(
+        x: *const f32,
+        y: *mut f32,
+        rows: i64,
+        a: i32,
+        b: i32,
+        dim: i32,
+    ) -> i32;
     fn velox_portable_copy2d(
         src: *const f32,
         src_stride: i64,
@@ -1425,6 +1440,31 @@ pub fn dyn_conv(
             )
         },
         "portable dyn_conv",
+    )
+}
+
+pub fn transpose_heads(
+    x: &CudaBuffer,
+    y: &mut CudaBuffer,
+    rows: usize,
+    a: usize,
+    b: usize,
+    dim: usize,
+) -> Result<()> {
+    check::transpose_heads(x.len(), y.len(), rows, a, b, dim)?;
+    // SAFETY: both buffers hold rows * a * b * dim values (checked).
+    status(
+        unsafe {
+            velox_portable_transpose_heads(
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                rows as i64,
+                to_i32("a", a)?,
+                to_i32("b", b)?,
+                to_i32("dim", dim)?,
+            )
+        },
+        "portable transpose_heads",
     )
 }
 

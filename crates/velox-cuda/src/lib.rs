@@ -846,6 +846,18 @@ pub trait CudaKernels: Send + Sync {
         portable::copy2d(src, dst, shape)
     }
 
+    fn transpose_heads(
+        &self,
+        x: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        a: usize,
+        b: usize,
+        dim: usize,
+    ) -> Result<()> {
+        portable::transpose_heads(x, y, rows, a, b, dim)
+    }
+
     fn dyn_conv(
         &self,
         x: &CudaBuffer,
@@ -1638,6 +1650,21 @@ impl Backend for CudaBackend {
     fn copy2d(&self, src: &CudaBuffer, dst: &mut CudaBuffer, shape: Copy2dShape) -> Result<()> {
         check::copy2d(src.len, dst.len, &shape)?;
         self.staged("copy2d", || self.kernels.copy2d(src, dst, shape))
+    }
+
+    fn transpose_heads(
+        &self,
+        x: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        a: usize,
+        b: usize,
+        dim: usize,
+    ) -> Result<()> {
+        check::transpose_heads(x.len, y.len, rows, a, b, dim)?;
+        self.staged("transpose_heads", || {
+            self.kernels.transpose_heads(x, y, rows, a, b, dim)
+        })
     }
 
     fn dyn_conv(

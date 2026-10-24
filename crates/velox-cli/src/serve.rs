@@ -77,6 +77,9 @@ where
         // --force-tool-call on|off (default off): requests that offer tools answer with a tool
         // call only, as ninfer's tool-call grammar does.
         force_tool_call: a.get("force-tool-call").is_some_and(|v| v == "on"),
+        // --stream-content on|off (default on): streaming requests get their text as it is
+        // generated rather than with the tool call at the end.
+        stream_content: a.get("stream-content").is_none_or(|v| v != "off"),
         // --ctx-checkpoints N (ninfer's name): with the host store, superseded history points kept
         // per request chain (default 1, as ninfer is deployed; 0: unbounded); with
         // --ctx-checkpoint-store device, checkpoints per lane (default 8).

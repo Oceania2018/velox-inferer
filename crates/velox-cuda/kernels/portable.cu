@@ -993,6 +993,28 @@ VELOX_API int velox_portable_copy2d_param(const float* src, long long src_stride
     return velox_launch_status();
 }
 
+namespace {
+// y[r][j][g][:] = x[r][g][j][:] over heads of dim values: one thread per output value.
+__global__ void transpose_heads_kernel(const float* __restrict__ x, float* __restrict__ y, long long rows, int a, int b,
+                                       int dim) {
+    const long long row = static_cast<long long>(a) * b * dim, n = rows * row;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / row;
+        const int c = static_cast<int>(i % row), h = c / dim, e = c % dim;
+        const int j = h / a, g = h % a;
+        y[i] = x[r * row + (static_cast<long long>(g) * b + j) * dim + e];
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_transpose_heads(const float* x, float* y, long long rows, int a, int b, int dim) {
+    const long long n = rows * a * b * dim;
+    if (n == 0) return 0;
+    transpose_heads_kernel<<<velox_grid_1d(n, 256), 256>>>(x, y, rows, a, b, dim);
+    return velox_launch_status();
+}
+
 VELOX_API int velox_portable_copy2d(const float* src, long long src_stride, float* dst, long long dst_stride,
                                     long long rows, long long cols) {
     if (rows == 0 || cols == 0) return 0;

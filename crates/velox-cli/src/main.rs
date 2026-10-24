@@ -61,6 +61,9 @@ COMMANDS:
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
+  import-gguf             Qwen3.5/3.8 GGUF text weights + a donor artifact's config, tokenizer,
+                          vision tower and DFlash2 drafter -> .vi (GGML blocks kept as stored)
+      --gguf <path> --donor <.ninfer|.vi> --output <.vi>
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
@@ -74,6 +77,7 @@ COMMANDS:
       --chat-template <file> --max-context <n> (32768) --prefill-chunk <n> (512)
       --ctx-checkpoints <n> (8) --enable-thinking true|false (false)
       --force-tool-call on|off (off)  requests offering tools answer with a tool call only
+      --stream-content on|off (on)    streaming requests get their text as it is generated
       --kv-format <fmt>     attention KV cache storage: f32 | bf16 | fp8 | nvfp4 (f32)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
       --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
@@ -123,6 +127,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
+        Some("import-gguf") => weights::import_gguf(a),
         Some("generate") => generate::run(a),
         Some("serve") => serve::run(a),
         Some("prompt-debug") => prompt_debug::run(a),

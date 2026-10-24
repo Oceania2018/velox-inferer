@@ -1164,6 +1164,36 @@ pub trait Backend {
     fn device_in_use(&self) -> Option<usize> {
         self.mem_info().map(|(free, total)| total - free)
     }
+    /// Head transpose: each of `rows` rows holds `a * b` heads of `dim` values, and head
+    /// `g * b + j` of `x` becomes head `j * a + g` of `y` (`y[r][j][g] = x[r][g][j]`). GGUF
+    /// imports use it to put Gated DeltaNet outputs (value heads grouped by key head) into
+    /// llama.cpp's tiled value-head order. `y` must not alias `x`.
+    fn transpose_heads(
+        &self,
+        x: &Self::Buffer,
+        y: &mut Self::Buffer,
+        rows: usize,
+        a: usize,
+        b: usize,
+        dim: usize,
+    ) -> Result<()> {
+        crate::check::transpose_heads(self.len(x), self.len(y), rows, a, b, dim)?;
+        let row = a * b * dim;
+        for g in 0..a {
+            for j in 0..b {
+                let shape = Copy2dShape {
+                    rows,
+                    cols: dim,
+                    src_offset: (g * b + j) * dim,
+                    src_stride: row,
+                    dst_offset: (j * a + g) * dim,
+                    dst_stride: row,
+                };
+                self.copy2d(x, y, shape)?;
+            }
+        }
+        Ok(())
+    }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
     /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.
