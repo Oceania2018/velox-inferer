@@ -866,6 +866,7 @@ dependencies = [
  "velox-core",
  "velox-cpu",
  "velox-cuda",
+ "velox-models",
  "velox-variant",
 ]
 

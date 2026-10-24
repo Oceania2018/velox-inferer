@@ -43,9 +43,49 @@ impl Frontend {
     /// Loads tokenizer, generation config and chat template from the artifact. `template`
     /// overrides the stored chat template (ninfer's `--chat-template`).
     pub fn from_artifact(art: &Artifact, template: Option<String>) -> Result<Self> {
-        let tokenizer = Tokenizer::from_bytes(resource(art, "tokenizer.json")?)
+        let source = match template {
+            Some(t) => t,
+            None => String::from_utf8(resource(art, "chat_template.jinja")?)
+                .map_err(|_| Error::Config("chat template is not UTF-8".into()))?,
+        };
+        Self::from_parts(
+            &resource(art, "tokenizer.json")?,
+            &resource(art, "generation_config.json")?,
+            source,
+            vision_pixels(art)?,
+        )
+    }
+
+    /// Loads `tokenizer.json`, `generation_config.json` and `chat_template.jinja` (unless
+    /// `template` overrides it) from a Hugging Face model directory, for weights that come
+    /// without them (GGUF).
+    pub fn from_dir(dir: &std::path::Path, template: Option<String>) -> Result<Self> {
+        let read = |name: &str| {
+            std::fs::read(dir.join(name))
+                .map_err(|e| Error::Config(format!("{}: {e}", dir.join(name).display())))
+        };
+        let source = match template {
+            Some(t) => t,
+            None => String::from_utf8(read("chat_template.jinja")?)
+                .map_err(|_| Error::Config("chat template is not UTF-8".into()))?,
+        };
+        Self::from_parts(
+            &read("tokenizer.json")?,
+            &read("generation_config.json")?,
+            source,
+            None,
+        )
+    }
+
+    fn from_parts(
+        tokenizer: &[u8],
+        generation_config: &[u8],
+        source: String,
+        vision_pixels: Option<(u64, u64)>,
+    ) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(tokenizer)
             .map_err(|e| Error::Config(format!("tokenizer.json: {e}")))?;
-        let gen: Value = serde_json::from_slice(&resource(art, "generation_config.json")?)
+        let gen: Value = serde_json::from_slice(generation_config)
             .map_err(|e| Error::Config(format!("generation_config.json: {e}")))?;
         let eos = match &gen["eos_token_id"] {
             Value::Number(n) => vec![n.as_u64().unwrap_or(0) as u32],
@@ -60,13 +100,7 @@ impl Frontend {
                 ))
             }
         };
-        let source = match template {
-            Some(t) => t,
-            None => String::from_utf8(resource(art, "chat_template.jinja")?)
-                .map_err(|_| Error::Config("chat template is not UTF-8".into()))?,
-        };
         let public_vocab = tokenizer.get_vocab_size(true);
-        let vision_pixels = vision_pixels(art)?;
         Ok(Frontend {
             tokenizer,
             segments: Mutex::new(HashMap::new()),

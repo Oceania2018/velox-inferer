@@ -1,15 +1,13 @@
 //! llama.cpp (GGML) block-quantized weights, stored as GGUF stores them (`ggml_block_v1`).
 //!
-//! A row of a `[n, k]` matrix is `k / 256` consecutive super-blocks of one [`GgmlType`]; a parent
-//! is its rows back to back, so a payload is the GGUF tensor's bytes unchanged. Rows are
-//! independent, which lets an importer reorder them without touching any code.
+//! A row of a `[n, k]` matrix is `k / t.block_values()` consecutive blocks of one [`GgmlType`]
+//! (256-value super-blocks for the K-quants and i-quants, 32 or 64 values for the legacy-style
+//! types); a parent is its rows back to back, so a payload is the GGUF tensor's bytes unchanged.
+//! Rows are independent, which lets an importer reorder them without touching any code.
 //!
 //! [`decode_block`] follows ggml's `dequantize_row_*` (ggml-quants.c, MIT) operation for
 //! operation in f32, so the oracle and the kernels decode the same values. The lookup tables at
 //! the end are generated from ggml-common.h.
-
-/// Values per super-block, for every type here.
-pub const GGML_BLOCK: usize = 256;
 
 /// GGML block types velox executes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,10 +21,15 @@ pub enum GgmlType {
     Iq3Xxs,
     Iq3S,
     Iq4Xs,
+    Q2_0,
+    Iq4Nl,
+    Q6K,
+    Q8_0,
 }
 
 impl GgmlType {
-    pub const ALL: [GgmlType; 9] = [
+    /// Kernel format codes are positions here (`VELOX_FMT_GGML_BASE + i`): append new types.
+    pub const ALL: [GgmlType; 13] = [
         GgmlType::Q2K,
         GgmlType::Q4K,
         GgmlType::Iq1M,
@@ -36,6 +39,10 @@ impl GgmlType {
         GgmlType::Iq3Xxs,
         GgmlType::Iq3S,
         GgmlType::Iq4Xs,
+        GgmlType::Q2_0,
+        GgmlType::Iq4Nl,
+        GgmlType::Q6K,
+        GgmlType::Q8_0,
     ];
 
     /// Container format name (with layout `ggml_block_v1`).
@@ -50,6 +57,10 @@ impl GgmlType {
             GgmlType::Iq3Xxs => "ggml_iq3_xxs",
             GgmlType::Iq3S => "ggml_iq3_s",
             GgmlType::Iq4Xs => "ggml_iq4_xs",
+            GgmlType::Q2_0 => "ggml_q2_0",
+            GgmlType::Iq4Nl => "ggml_iq4_nl",
+            GgmlType::Q6K => "ggml_q6_k",
+            GgmlType::Q8_0 => "ggml_q8_0",
         }
     }
 
@@ -69,6 +80,10 @@ impl GgmlType {
             GgmlType::Iq2S => 22,
             GgmlType::Iq4Xs => 23,
             GgmlType::Iq1M => 29,
+            GgmlType::Q8_0 => 8,
+            GgmlType::Q6K => 14,
+            GgmlType::Iq4Nl => 20,
+            GgmlType::Q2_0 => 42,
         }
     }
 
@@ -76,7 +91,16 @@ impl GgmlType {
         Self::ALL.into_iter().find(|t| t.gguf_id() == id)
     }
 
-    /// Bytes per 256-value super-block.
+    /// Values per block.
+    pub fn block_values(self) -> usize {
+        match self {
+            GgmlType::Q2_0 => 64,
+            GgmlType::Iq4Nl | GgmlType::Q8_0 => 32,
+            _ => 256,
+        }
+    }
+
+    /// Bytes per block of [`GgmlType::block_values`] values.
     pub fn block_bytes(self) -> usize {
         match self {
             GgmlType::Q2K => 84,
@@ -88,12 +112,16 @@ impl GgmlType {
             GgmlType::Iq3Xxs => 98,
             GgmlType::Iq3S => 110,
             GgmlType::Iq4Xs => 136,
+            GgmlType::Q2_0 => 18,
+            GgmlType::Iq4Nl => 18,
+            GgmlType::Q6K => 210,
+            GgmlType::Q8_0 => 34,
         }
     }
 
-    /// Bytes of one row of `k` values (`k % 256 == 0`).
+    /// Bytes of one row of `k` values (`k` a multiple of [`GgmlType::block_values`]).
     pub fn row_bytes(self, k: usize) -> usize {
-        k / GGML_BLOCK * self.block_bytes()
+        k / self.block_values() * self.block_bytes()
     }
 }
 
@@ -134,9 +162,9 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     }
 }
 
-/// Decodes one super-block (`t.block_bytes()` bytes) into 256 values.
+/// Decodes one block (`t.block_bytes()` bytes) into `t.block_values()` values.
 pub fn decode_block(t: GgmlType, x: &[u8], y: &mut [f32]) {
-    let y = &mut y[..GGML_BLOCK];
+    let y = &mut y[..t.block_values()];
     let x = &x[..t.block_bytes()];
     match t {
         GgmlType::Q2K => {
@@ -324,6 +352,49 @@ pub fn decode_block(t: GgmlType, x: &[u8], y: &mut [f32]) {
                 }
             }
         }
+        GgmlType::Q2_0 => {
+            // d | qs[16]: 2 bits per value, codes 0..3 meaning -1, 0, +1, +2
+            let d = f16(x, 0);
+            for (j, v) in y.iter_mut().enumerate() {
+                let q = (x[2 + j / 4] >> (2 * (j % 4))) & 3;
+                *v = (i32::from(q) - 1) as f32 * d;
+            }
+        }
+        GgmlType::Iq4Nl => {
+            // d | qs[16]
+            let d = f16(x, 0);
+            for j in 0..16 {
+                y[j] = d * f32::from(KVALUES_IQ4NL[usize::from(x[2 + j] & 0xf)]);
+                y[j + 16] = d * f32::from(KVALUES_IQ4NL[usize::from(x[2 + j] >> 4)]);
+            }
+        }
+        GgmlType::Q6K => {
+            // ql[128] | qh[64] | scales[16] (i8) | d
+            let d = f16(x, 208);
+            for n in 0..2 {
+                let (ql, qh, scales) = (&x[64 * n..], &x[128 + 32 * n..], &x[192 + 8 * n..]);
+                let sc = |i: usize| f32::from(scales[i] as i8);
+                for l in 0..32 {
+                    let is = l / 16;
+                    let q1 = ((ql[l] & 0xf) | ((qh[l] & 3) << 4)) as i8 - 32;
+                    let q2 = ((ql[l + 32] & 0xf) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+                    let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+                    let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+                    let o = 128 * n + l;
+                    y[o] = d * sc(is) * f32::from(q1);
+                    y[o + 32] = d * sc(is + 2) * f32::from(q2);
+                    y[o + 64] = d * sc(is + 4) * f32::from(q3);
+                    y[o + 96] = d * sc(is + 6) * f32::from(q4);
+                }
+            }
+        }
+        GgmlType::Q8_0 => {
+            // d | qs[32] (i8)
+            let d = f16(x, 0);
+            for (j, v) in y.iter_mut().enumerate() {
+                *v = f32::from(x[2 + j] as i8) * d;
+            }
+        }
     }
 }
 
@@ -336,12 +407,12 @@ pub fn decode_rows_into(
     rows: usize,
     out: &mut Vec<f32>,
 ) {
-    let (rb, bb) = (t.row_bytes(k), t.block_bytes());
+    let (rb, bb, bv) = (t.row_bytes(k), t.block_bytes(), t.block_values());
     let start = out.len();
     out.resize(start + rows * k, 0.0);
     for (i, row) in out[start..].chunks_exact_mut(k).enumerate() {
         let bytes = &payload[(row_begin + i) * rb..(row_begin + i + 1) * rb];
-        for (b, vals) in row.as_chunks_mut::<GGML_BLOCK>().0.iter_mut().enumerate() {
+        for (b, vals) in row.chunks_exact_mut(bv).enumerate() {
             decode_block(t, &bytes[b * bb..(b + 1) * bb], vals);
         }
     }
@@ -353,6 +424,7 @@ pub fn scale_fields(t: GgmlType) -> &'static [usize] {
     match t {
         GgmlType::Q2K => &[80, 82],
         GgmlType::Q4K => &[0, 2],
+        GgmlType::Q6K => &[208],
         GgmlType::Iq1M => &[],
         _ => &[0],
     }
@@ -4338,13 +4410,13 @@ mod tests {
         }
     }
 
-    /// Two blocks of splitmix64 bytes (seed = position in the reference table) with sane scales,
-    /// generated exactly as the reference script does.
+    /// 512 values of splitmix64 block bytes (seed = position in the reference table) with sane
+    /// scales, generated exactly as the reference script does.
     fn blocks(t: GgmlType, seed: u64) -> Vec<u8> {
         let mut rng = SplitMix(seed);
-        let size = t.block_bytes();
-        let mut data: Vec<u8> = (0..2 * size).map(|_| rng.next() as u8).collect();
-        for b in 0..2 {
+        let (size, count) = (t.block_bytes(), 512 / t.block_values());
+        let mut data: Vec<u8> = (0..count * size).map(|_| rng.next() as u8).collect();
+        for b in 0..count {
             let block = &mut data[b * size..(b + 1) * size];
             let mut sane = || (((8 + rng.next() % 3) << 10) | (rng.next() % 1024)) as u16;
             for &off in scale_fields(t) {
@@ -4361,7 +4433,8 @@ mod tests {
         data
     }
 
-    // gguf-py `quants.dequantize` (llama.cpp df9beac) on the blocks above: sum, sum of |v|,
+    // gguf-py `quants.dequantize` (llama.cpp df9beac; gguf 0.19.0 for IQ4_NL, Q6_K, Q8_0) on the
+    // blocks above: sum, sum of |v|,
     // sum of (i + 1) v, then values at PICKS (as f32).
     const PICKS: [usize; 23] = [
         0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 77, 100, 127, 128, 130, 191, 200, 255, 256, 300, 383,
@@ -4369,7 +4442,7 @@ mod tests {
     ];
 
     #[allow(clippy::type_complexity)]
-    const REFERENCE: [(GgmlType, [f64; 3], [f32; 23]); 9] = [
+    const REFERENCE: [(GgmlType, [f64; 3], [f32; 23]); 13] = [
         (
             GgmlType::Q2K,
             [91.46250915527344, 139.38955688476562, 11687.497291564941],
@@ -4631,6 +4704,123 @@ mod tests {
                 1.117706298828125,
             ],
         ),
+        // gguf-py 0.19 lacks Q2_0: a port of llama.cpp's C dequantize_row_q2_0 (ggml-quants.c).
+        (
+            GgmlType::Q2_0,
+            [5.127159118652344, 11.536399841308594, 1245.9523849487305],
+            [
+                0.0,
+                0.03790283203125,
+                -0.018951416015625,
+                -0.018951416015625,
+                0.03790283203125,
+                0.0,
+                -0.018951416015625,
+                -0.018951416015625,
+                0.03790283203125,
+                0.0207366943359375,
+                0.0207366943359375,
+                0.0207366943359375,
+                0.041473388671875,
+                0.0,
+                0.00859832763671875,
+                0.0171966552734375,
+                0.06060791015625,
+                0.0,
+                -0.0268096923828125,
+                0.0,
+                0.00878143310546875,
+                0.0,
+                -0.026611328125,
+            ],
+        ),
+        (
+            GgmlType::Iq4Nl,
+            [-50.242942810058594, 624.015510559082, -12132.43537902832],
+            [
+                0.7022552490234375,
+                -1.2925567626953125,
+                0.2544403076171875,
+                -1.2925567626953125,
+                -0.4987030029296875,
+                -0.223907470703125,
+                -0.3562164306640625,
+                0.05413818359375,
+                6.11761474609375,
+                -0.6258392333984375,
+                -0.3369903564453125,
+                0.0229034423828125,
+                0.870330810546875,
+                0.3584442138671875,
+                0.3584442138671875,
+                1.7570037841796875,
+                -2.10662841796875,
+                -1.3070068359375,
+                -0.9625625610351562,
+                -1.2489547729492188,
+                1.7259674072265625,
+                0.5082778930664062,
+                -3.64239501953125,
+            ],
+        ),
+        (
+            GgmlType::Q6K,
+            [1336.4125671386719, 13266.142059326172, 361979.40939331055],
+            [
+                14.79736328125,
+                -3.57177734375,
+                -7.65380859375,
+                -1.0205078125,
+                -5.61279296875,
+                6.31439208984375,
+                -9.12078857421875,
+                112.510986328125,
+                25.6402587890625,
+                5.1025390625,
+                9.88616943359375,
+                13.011474609375,
+                20.09124755859375,
+                -27.808837890625,
+                -66.04598999023438,
+                -3.826904296875,
+                -7.0159912109375,
+                1.53076171875,
+                -71.4840087890625,
+                -71.158447265625,
+                32.649169921875,
+                4.06951904296875,
+                14.32470703125,
+            ],
+        ),
+        (
+            GgmlType::Q8_0,
+            [-8.290313720703125, 979.4631805419922, -2831.2493743896484],
+            [
+                -3.375244140625,
+                6.931304931640625,
+                0.904083251953125,
+                4.399871826171875,
+                -7.59429931640625,
+                -5.5450439453125,
+                -7.71484375,
+                -0.7238388061523438,
+                -0.8287429809570312,
+                2.2122955322265625,
+                -2.23297119140625,
+                -6.3043212890625,
+                6.36163330078125,
+                -1.9757080078125,
+                -5.6231689453125,
+                -4.056488037109375,
+                0.96368408203125,
+                -0.08697509765625,
+                -0.9400177001953125,
+                0.1908721923828125,
+                3.5068359375,
+                -1.476776123046875,
+                -2.802978515625,
+            ],
+        ),
     ];
 
     #[test]
@@ -4671,5 +4861,10 @@ mod tests {
         assert_eq!(GgmlType::Iq3S.block_bytes() * 8, 3 * 256 + 112);
         assert_eq!(GgmlType::Iq4Xs.block_bytes() * 8, 4 * 256 + 64);
         assert_eq!(GgmlType::Q4K.block_bytes() * 8, 4 * 256 + 128);
+        // Q6_K 6.5625, Q8_0 8.5, IQ4_NL 4.5, Q2_0 2.25.
+        assert_eq!(GgmlType::Q6K.block_bytes() * 8, 6 * 256 + 144);
+        assert_eq!(GgmlType::Q8_0.block_bytes() * 8, 8 * 32 + 16);
+        assert_eq!(GgmlType::Iq4Nl.block_bytes() * 8, 4 * 32 + 16);
+        assert_eq!(GgmlType::Q2_0.block_bytes() * 8, 2 * 64 + 16);
     }
 }

@@ -5,7 +5,7 @@
 //! fly. The functions here are the reference decoders the CPU oracle and conformance use.
 
 use crate::error::{Error, Result};
-use crate::ggml::{GgmlType, GGML_BLOCK};
+use crate::ggml::GgmlType;
 
 /// Stored weight encodings velox executes. Each implies its storage layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -132,10 +132,11 @@ impl WeightFormat {
             )));
         }
         if let WeightFormat::Ggml(t) = self {
-            if !k.is_multiple_of(GGML_BLOCK) {
+            if !k.is_multiple_of(t.block_values()) {
                 return Err(Error::Shape(format!(
-                    "{} needs K % 256 == 0, got [{n},{k}]",
-                    t.name()
+                    "{} needs K % {} == 0, got [{n},{k}]",
+                    t.name(),
+                    t.block_values()
                 )));
             }
         }

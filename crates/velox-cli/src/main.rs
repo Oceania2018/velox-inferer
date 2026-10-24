@@ -6,6 +6,7 @@ mod bench_verify;
 mod generate;
 mod profile;
 mod prompt_debug;
+mod qwen4;
 mod replay;
 mod select;
 mod serve;
@@ -70,6 +71,11 @@ COMMANDS:
       [--max-tokens 64] [--chunk 256] [--capacity 4096] [--mtp N | --dflash N] (speculative)
       [--kv-format f32|bf16|fp8|nvfp4] (attention KV cache storage, default f32)
       [--host-weights <list>|none] (matrices kept in system RAM, default text/token_embedding)
+      --gguf <first shard> --hf-dir <dir> (prompt | --prompts-file) instead of --artifact:
+                            Qwen4-Exp (Qwen3.8-Flash-Next) GGUFs; routed experts stay in system
+                            RAM with a device cache; tokenizer and chat template from <dir>
+      [--vram-margin-mib 768] (device memory left free after the expert slots)
+      [--expert-slots <n>] [--cache-interval 16] [--cache-moves 64] (decode cache updates)
   serve                  OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
