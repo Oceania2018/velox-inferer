@@ -579,7 +579,8 @@ fn q8_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
         return None;
     }
     if let WeightFormat::Ggml(t) = w.format {
-        return (m >= GGML_Q8_MIN_M && w.k % 1024 == 0).then(|| 16 + ggml_index(t));
+        return (ggml_served(t) && m >= GGML_Q8_MIN_M && w.k % 1024 == 0)
+            .then(|| 16 + ggml_index(t));
     }
     match w.format {
         WeightFormat::Iq3Xxs if m >= IQ3_Q8_MIN_M => Some(3),
@@ -682,6 +683,12 @@ fn gdn_step(qkv: &CudaBuffer, s: &velox_core::backend::GdnShape) -> bool {
 /// path's format 16 + type); below, the per-32 kernels of `ggml_mmvq`.
 const GGML_Q8_MIN_M: usize = 17;
 
+/// Types rtx5060_ggml.cu decodes: the first nine of `GgmlType::ALL` (q2_k .. iq4_xs). Later
+/// types (q2_0, iq4_nl, q6_k, q8_0) run the portable kernels.
+fn ggml_served(t: velox_core::ggml::GgmlType) -> bool {
+    ggml_index(t) < 9
+}
+
 fn ggml_index(t: velox_core::ggml::GgmlType) -> i32 {
     velox_core::ggml::GgmlType::ALL
         .iter()
@@ -697,7 +704,8 @@ fn ggml_mmvq(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     let WeightFormat::Ggml(t) = w.format else {
         return None;
     };
-    if !(1..GGML_Q8_MIN_M).contains(&m)
+    if !ggml_served(t)
+        || !(1..GGML_Q8_MIN_M).contains(&m)
         || w.k % 1024 != 0
         || !matches!(w.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. })
     {
