@@ -2504,6 +2504,23 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.linear_swiglu(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false)?;
         s.linear(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m)?;
     }
+    // IQ3_XXS under AllowA8 at decode and verify widths (kernel sets may run int8 decode kernels):
+    // ragged token tiles, a row view starting mid-tile, separate SwiGLU parents, the MLP's own K,
+    // and int8 twins of a norm's output.
+    for m in [2, 5, 8, 16] {
+        s.linear_act(WeightFormat::Iq3Xxs, 160, 768, 16, 128, m, a8)?;
+        s.linear_swiglu_with(WeightFormat::Iq3Xxs, 512, 40, 0, m, false, false, a8)?;
+    }
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 768, 24, 8, 13, false, true, a8)?;
+    for m in [1, 8, 16] {
+        s.linear_swiglu_with(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false, a8)?;
+        s.linear_act(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m, a8)?;
+    }
+    {
+        use WeightFormat::Iq3Xxs;
+        s.twins_q8(8, 5120, &[(Iq3Xxs, 32)], Some((Iq3Xxs, 256)))?;
+        s.twins_q8(16, 17408, &[(Iq3Xxs, 32)], None)?;
+    }
     // A4 at batched-verify widths (several lanes' windows: 17..64 tokens), wide and narrow K
     // stages, row views starting one scale tile in.
     s.linear_act(WeightFormat::Nvfp4, 512, 2048, 128, 384, 24, a4)?;
