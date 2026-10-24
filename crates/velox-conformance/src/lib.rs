@@ -3213,6 +3213,13 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         },
         9,
     )?;
+    // Qwen3.8-Flash-Next's bf16 projections at their real shapes (hyper-connection low rank,
+    // injection, router + shared gate, GDN gates, PLE) at decode, verify and prefill widths.
+    for (n, k) in [(320, 10240), (10240, 320), (4, 10240), (513, 2560), (96, 2560), (10240, 2560)] {
+        for m in [1, 8, 70] {
+            s.linear(WeightFormat::Bf16, n, k, 0, n, m)?;
+        }
+    }
     let stack = qwen4::qwen4_stack(b, &mut s.rng)?;
     s.results.extend(stack);
     Ok(s.results)
