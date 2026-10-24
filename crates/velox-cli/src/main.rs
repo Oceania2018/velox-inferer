@@ -61,6 +61,9 @@ COMMANDS:
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
+  import-gguf             Qwen3.5/3.8 GGUF text weights + a donor artifact's config, tokenizer,
+                          vision tower and DFlash2 drafter -> .vi (GGML blocks kept as stored)
+      --gguf <path> --donor <.ninfer|.vi> --output <.vi>
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
@@ -124,6 +127,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
+        Some("import-gguf") => weights::import_gguf(a),
         Some("generate") => generate::run(a),
         Some("serve") => serve::run(a),
         Some("prompt-debug") => prompt_debug::run(a),

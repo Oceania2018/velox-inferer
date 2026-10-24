@@ -153,6 +153,34 @@ pub fn random_weight(rng: &mut Rng, fmt: WeightFormat, n: usize, k: usize) -> Ve
             }
             p
         }
+        WeightFormat::Ggml(t) => {
+            // Random code bytes are legal for every type; binary16 scales 2^-9 .. 2^-6 with random
+            // mantissas keep weights of order 1e-2 .. 1.
+            let size = t.block_bytes();
+            let mut p = vec![0u8; n * t.row_bytes(k)];
+            for block in p.chunks_exact_mut(size) {
+                let (bytes, scales): (Vec<u8>, Vec<u16>) = (
+                    (0..size).map(|_| byte(rng)).collect(),
+                    (0..3)
+                        .map(|_| ((6 + rng.next_u64() % 4) << 10 | (rng.next_u64() % 1024)) as u16)
+                        .collect(),
+                );
+                let (mut bi, mut si) = (0, 0);
+                velox_core::ggml::random_block(
+                    t,
+                    block,
+                    || {
+                        bi += 1;
+                        bytes[bi - 1]
+                    },
+                    || {
+                        si += 1;
+                        scales[si - 1]
+                    },
+                );
+            }
+            p
+        }
         q => {
             let rs = q.row_split().expect("row-split format");
             let codes = random_codes(rng, rs, n, k);
@@ -1459,6 +1487,25 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn transpose_heads(&mut self, rows: usize, a: usize, b: usize, dim: usize) -> Result<()> {
+        let n = rows * a * b * dim;
+        let x = self.rng.vec(n, 1.0);
+        let mut want = vec![0.0; n];
+        CpuBackend.transpose_heads(&x, &mut want, rows, a, b, dim)?;
+        let xd = self.b.upload(&x)?;
+        let mut yd = self.b.alloc(n)?;
+        self.b.transpose_heads(&xd, &mut yd, rows, a, b, dim)?;
+        let got = fetch(self.b, &yd, n)?;
+        self.record(
+            format!("transpose_heads rows {rows} [{a}x{b}] dim {dim}"),
+            None,
+            &got,
+            &want,
+            0.0,
+        );
+        Ok(())
+    }
+
     /// Two calls (prefill chunk, then one token) so the rolling state is exercised.
     fn conv1d(&mut self, channels: usize, width: usize, chunks: [usize; 2]) -> Result<()> {
         let w = self.rng.vec(width * channels, 0.5);
@@ -2554,6 +2601,37 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.twins_q8(100, 1024, &[(Q4G64, 96), (Q5G64, 80)], None)?;
         s.twins_q8(1030, 512, &[(Q5G64, 64), (Iq3Xxs, 32)], None)?;
     }
+    // GGML blocks (GGUF imports): decode, a verify window over an odd row view, the tiled path,
+    // embedding rows and a fused SwiGLU over separate parents, for every type.
+    for t in velox_core::ggml::GgmlType::ALL {
+        let f = WeightFormat::Ggml(t);
+        s.linear(f, 96, 512, 0, 96, 1)?;
+        s.linear(f, 130, 768, 3, 100, 8)?;
+        s.linear(f, 200, 256, 17, 150, 33)?;
+        s.embed(f, 12, 512, &[11, 0, 5])?;
+        s.linear_swiglu(f, 512, 24, 0, 2, false, true)?;
+    }
+    // The dense MLP's own K (gate/up 5120, down 17408) at decode and verify widths.
+    s.linear(
+        WeightFormat::Ggml(velox_core::ggml::GgmlType::Iq3S),
+        64,
+        5120,
+        0,
+        64,
+        8,
+    )?;
+    s.linear(
+        WeightFormat::Ggml(velox_core::ggml::GgmlType::Iq4Xs),
+        64,
+        17408,
+        0,
+        64,
+        1,
+    )?;
+    // Gated DeltaNet outputs into llama.cpp's tiled value-head order (16 key heads x 3).
+    s.transpose_heads(1, 16, 3, 128)?;
+    s.transpose_heads(37, 16, 3, 128)?;
+    s.transpose_heads(5, 2, 3, 7)?;
     Ok(s.results)
 }
 

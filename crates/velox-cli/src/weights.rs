@@ -128,6 +128,30 @@ fn print_uses(art: &Artifact) -> Result<()> {
     Ok(())
 }
 
+pub fn import_gguf(a: &Args) -> Result<ExitCode> {
+    let (gguf, donor) = (
+        Path::new(required(a, "gguf")?),
+        Path::new(required(a, "donor")?),
+    );
+    let output = Path::new(required(a, "output")?);
+    let t0 = std::time::Instant::now();
+    let r = velox_models::qwen3_5::gguf::import(gguf, donor, output, &mut |line| {
+        eprintln!("[import] {line}")
+    })?;
+    println!("text weights from the GGUF ({:.2} GB):", gb(r.text_bytes));
+    for (format, objects, bytes) in &r.text_formats {
+        println!("  {format:<14} {objects:>4} objects {:>7.2} GB", gb(*bytes));
+    }
+    println!(
+        "wrote {} ({:.2} GB, {:.2} GB from the donor) in {:.1}s; structure ok",
+        output.display(),
+        gb(r.payload_bytes),
+        gb(r.donor_bytes),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn convert(a: &Args) -> Result<ExitCode> {
     let src = open(required(a, "input")?)?;
     let output = Path::new(required(a, "output")?);

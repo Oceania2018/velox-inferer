@@ -4,6 +4,7 @@
 
 mod config;
 mod dflash;
+pub mod gguf;
 mod mtp;
 mod paging;
 mod vision;
@@ -643,6 +644,18 @@ impl Ids<'_> {
             Ids::Slot(n) => *n,
         }
     }
+}
+
+/// Puts the GDN outputs of `t` tokens (`ws.o`, value heads grouped by key head) into the tiled
+/// order of the gate rows and output-projection columns, when the artifact stores those tiled
+/// ([`TextConfig::gdn_v_tiled`]). `ws.conv_out` is free once the recurrence has run.
+fn tile_v_heads<B: Backend>(b: &B, c: &TextConfig, ws: &mut Workspace<B>, t: usize) -> Result<()> {
+    if !c.gdn_v_tiled {
+        return Ok(());
+    }
+    let per = c.gdn_v_heads / c.gdn_k_heads;
+    b.transpose_heads(&ws.o, &mut ws.conv_out, t, c.gdn_k_heads, per, c.gdn_v_dim)?;
+    b.copy(&ws.conv_out, 0, &mut ws.o, 0, t * c.gdn_v())
 }
 
 pub struct Workspace<B: Backend> {
@@ -1329,6 +1342,7 @@ impl<B: Backend> Qwen35Text<B> {
                         }
                         row0 = end;
                     }
+                    tile_v_heads(b, c, ws, t)?;
                     // z = silu(z) * plain_rmsnorm(o)
                     let rows = t * c.gdn_v_heads;
                     match ws.twins.as_mut().filter(|_| b.takes_bf16(&w.view(out), t)) {
@@ -2519,6 +2533,7 @@ impl<B: Backend> Qwen35Text<B> {
                         let ow = c.gdn_v();
                         b.copy(&bw.o, 0, &mut ws.o, tp * ow, v * ow)?;
                     }
+                    tile_v_heads(b, c, ws, t)?;
                     b.rms_norm_gated(
                         &ws.o,
                         w.param(*norm),

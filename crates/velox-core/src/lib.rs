@@ -9,6 +9,7 @@ pub mod backend;
 pub mod check;
 pub mod error;
 pub mod format;
+pub mod ggml;
 pub mod kv;
 pub mod model;
 pub mod op;
