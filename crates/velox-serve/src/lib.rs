@@ -431,13 +431,26 @@ impl Server {
         Ok(req)
     }
 
+    /// Counts a rejected or failed generation and logs it: the reply goes only to the client.
+    /// Messages carry counts and limits, never prompt text.
+    fn count_error(&self, e: &ApiError, t_req: Instant) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[error] {} {} after {:.1} ms: {}",
+            e.status,
+            e.code,
+            t_req.elapsed().as_secs_f64() * 1e3,
+            e.message
+        );
+    }
+
     fn chat(&self, w: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
         let t_req = Instant::now();
         self.requests.fetch_add(1, Ordering::Relaxed);
         let req = match self.validate(body) {
             Ok(r) => r,
             Err(e) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.count_error(&e, t_req);
                 return respond_json(w, e.status, &e.body());
             }
         };
@@ -504,7 +517,7 @@ impl Server {
         let outcome = match result {
             Ok(o) => o,
             Err(e) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.count_error(&e, t_req);
                 if headers_sent {
                     sse(w, &e.body())?;
                     return w.write_all(b"0\r\n\r\n");

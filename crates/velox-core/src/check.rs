@@ -367,6 +367,20 @@ pub fn copy2d(src: usize, dst: usize, s: &Copy2dShape) -> Result<()> {
     need("copy2d dst", dst, end(s.dst_offset, s.dst_stride)?)
 }
 
+/// `transpose_heads`: `rows` rows of `a * b` heads of `dim` values in both buffers.
+pub fn transpose_heads(
+    x: usize,
+    y: usize,
+    rows: usize,
+    a: usize,
+    b: usize,
+    dim: usize,
+) -> Result<()> {
+    let n = product(&[rows, a, b, dim])?;
+    need("transpose_heads x", x, n)?;
+    need("transpose_heads y", y, n)
+}
+
 pub fn dyn_conv(x: usize, base: usize, delta: usize, out: usize, s: &DynConvShape) -> Result<()> {
     if s.block != 0 && s.rows % s.block != 0 {
         return Err(Error::Shape(format!(

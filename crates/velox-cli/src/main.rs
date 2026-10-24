@@ -43,7 +43,7 @@ COMMANDS:
       --prefill <n>         prefill chunk to time (default 128)
       --iters <n>           timed iterations (default 20)
   bench-linear            Time one linear at a model shape with random stored weights
-      --format <name>       nvfp4 | fp8 | bf16 | q4 | q8 | iq3 ... (default nvfp4)
+      --format <name>       nvfp4 | fp8 | bf16 | q4 | q8 | iq3 | ggml_<type> ... (default nvfp4)
       --n <rows> --k <cols> default 17408 x 5120 (Qwen3.8 MLP gate)
       --m <list>            token counts, comma separated (default 1,4,16,128,512)
       --act <a16|a8|a4>     activation policy (default a16); --divisor <f> for a4 (default 500)
@@ -61,6 +61,9 @@ COMMANDS:
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
+  import-gguf             Qwen3.5/3.8 GGUF text weights + a donor artifact's config, tokenizer,
+                          vision tower and DFlash2 drafter -> .vi (GGML blocks kept as stored)
+      --gguf <path> --donor <.ninfer|.vi> --output <.vi>
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
@@ -124,6 +127,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
+        Some("import-gguf") => weights::import_gguf(a),
         Some("generate") => generate::run(a),
         Some("serve") => serve::run(a),
         Some("prompt-debug") => prompt_debug::run(a),
@@ -323,7 +327,10 @@ fn bench_linear(a: &Args) -> Result<ExitCode> {
         "q6" => WeightFormat::Q6G64,
         "q8" => WeightFormat::Q8G32,
         "iq3" => WeightFormat::Iq3Xxs,
-        other => return Err(Error::Config(format!("unknown --format {other}"))),
+        other => match velox_core::ggml::GgmlType::from_name(other) {
+            Some(t) => WeightFormat::Ggml(t),
+            None => return Err(Error::Config(format!("unknown --format {other}"))),
+        },
     };
     let act = match a.get("act").unwrap_or("a16") {
         "a16" => ActPolicy::A16Only,
