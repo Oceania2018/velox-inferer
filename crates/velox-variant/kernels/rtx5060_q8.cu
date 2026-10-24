@@ -490,8 +490,204 @@ int launch_iq3(const Iq3Args& p) {
     return velox_launch_status();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Decode widths (1..16 tokens): register-direct int8 kernel, the layout of velox_5060_linear_iq3
+// _direct (W warps split K, one 16-row MMA tile per block, NT 8-token tiles, no block barrier but
+// the final K reduction) with the int8 operands of iq3_q8_kernel. The signed grid bytes come from
+// the 1 KB packed grid and the sign nibble in registers: the prefill kernel's 16 KB signed table
+// would be loaded by every one of the thousands of small blocks.
+
+// int8x4 of grid entry `raw` with the bytes whose bit is set in `nib` negated (magnitudes <= 62:
+// ~v + 1 never carries into the next byte).
+__device__ __forceinline__ uint32_t signed_entry(uint32_t raw, uint32_t nib) {
+    const uint32_t ones = (nib * 0x00204081u) & 0x01010101u;
+    return (raw ^ (ones * 0xffu)) + ones;
+}
+
+template <int W, int NT, int KB, bool PAIR>
+__global__ void __launch_bounds__(W * 32) iq3_q8_direct_kernel(Iq3Args p) {
+    const int k = KB ? KB * 256 : p.k;
+    const int blocks = k / 256;
+    __shared__ uint32_t grid[256];
+    __shared__ float4 partial[W > 1 ? W * NT * 32 : 1];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, gid = lane >> 2, q = lane & 3;
+    constexpr int kTileRows = PAIR ? 8 : 16;
+    const int r0 = blockIdx.x * kTileRows;
+
+    const uint8_t* row_codes[2];
+    const __half* row_d[2];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+        const bool up = PAIR && e == 1;
+        const int o = PAIR ? r0 + gid : r0 + gid + 8 * e;
+        const int oc = o < p.rows ? o : 0;  // rows past the view: output dropped
+        const uint8_t* base = up ? p.w2 : p.w;
+        const long long n = up ? p.parent_rows2 : p.parent_rows;
+        const long long row = (up ? p.row_begin2 : p.row_begin) + oc;
+        row_codes[e] = base + row * blocks * kBlockCode;
+        row_d[e] = reinterpret_cast<const __half*>(base + (n * blocks * kBlockCode + 255) / 256 * 256) + row * blocks;
+    }
+    struct Raw {
+        uint4 index;
+        uint2 signs;
+        float d;
+    };
+    auto load = [&](int b, Raw (&raw)[2]) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const uint8_t* base = row_codes[e] + b * kBlockCode;
+            raw[e].index = __ldg(reinterpret_cast<const uint4*>(base + q * 16));
+            raw[e].signs = __ldg(reinterpret_cast<const uint2*>(base + kIndexBytes + q * 8));
+            raw[e].d = 0.25f * __half2float(__ldg(row_d[e] + b));
+        }
+    };
+    // This lane's token per tile (B operand column gid) and the tokens of its outputs (2q, 2q+1).
+    const int8_t* xrow[NT];
+    bool valid[NT];
+#pragma unroll
+    for (int ni = 0; ni < NT; ++ni) {
+        const int t = ni * 8 + gid;
+        valid[ni] = t < p.m;
+        xrow[ni] = p.xq + static_cast<long long>(valid[ni] ? t : 0) * k + q * 8;
+    }
+
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) grid[i] = kGrid[i];
+    Raw cur[2], next[2];
+    if (warp < blocks) load(warp, cur);
+    __syncthreads();
+
+    float acc[NT][4];
+#pragma unroll
+    for (int ni = 0; ni < NT; ++ni) acc[ni][0] = acc[ni][1] = acc[ni][2] = acc[ni][3] = 0.0f;
+
+    auto step = [&](int b) {
+        const bool more = b + W < blocks;
+        if (more) load(b + W, next);
+        // Activations of all 8 sub-blocks first (8 bytes per lane each: values 8q..8q+7).
+        uint2 xr[8][NT];
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni)
+                xr[s][ni] = valid[ni] ? __ldg(reinterpret_cast<const uint2*>(xrow[ni] + b * 256 + s * 32)) : make_uint2(0u, 0u);
+        uint32_t scales[2];
+        uint64_t signs[2];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const uint32_t own = cur[e].signs.y >> 24;
+            uint32_t s = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) s |= __shfl_sync(0xffffffffu, own, (lane & ~3) | j) << (8 * j);
+            scales[e] = s;
+            signs[e] = (static_cast<uint64_t>(cur[e].signs.y) << 32) | cur[e].signs.x;
+        }
+        int iacc[NT][4];
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni) iacc[ni][0] = iacc[ni][1] = iacc[ni][2] = iacc[ni][3] = 0;
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            uint32_t a[4];
+            int f[2];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const uint32_t word = s < 2 ? cur[e].index.x : s < 4 ? cur[e].index.y : s < 6 ? cur[e].index.z : cur[e].index.w;
+                const uint32_t pair = word >> (16 * (s & 1));
+                const uint32_t sg = sign8(static_cast<uint32_t>(signs[e] >> (7 * s)) & 127u);
+                a[e] = signed_entry(grid[pair & 0xffu], sg & 15u);
+                a[e + 2] = signed_entry(grid[(pair >> 8) & 0xffu], sg >> 4);
+                f[e] = 1 + 2 * static_cast<int>((scales[e] >> (4 * s)) & 15u);
+            }
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                mma_s8(c0, c1, c2, c3, a[0], a[1], a[2], a[3], xr[s][ni].x, xr[s][ni].y);
+                iacc[ni][0] += c0 * f[0], iacc[ni][1] += c1 * f[0];
+                iacc[ni][2] += c2 * f[1], iacc[ni][3] += c3 * f[1];
+            }
+        }
+        // Token scales of this lane's outputs (tokens 2q, 2q+1 of each tile).
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni) {
+            const int t = ni * 8 + 2 * q;
+            const float* sxb = p.sx + static_cast<long long>(b) * p.stride + t;
+            const float x0 = sxb[0], x1 = sxb[1];
+            acc[ni][0] = fmaf(static_cast<float>(iacc[ni][0]), cur[0].d * x0, acc[ni][0]);
+            acc[ni][1] = fmaf(static_cast<float>(iacc[ni][1]), cur[0].d * x1, acc[ni][1]);
+            acc[ni][2] = fmaf(static_cast<float>(iacc[ni][2]), cur[1].d * x0, acc[ni][2]);
+            acc[ni][3] = fmaf(static_cast<float>(iacc[ni][3]), cur[1].d * x1, acc[ni][3]);
+        }
+        if (more) cur[0] = next[0], cur[1] = next[1];
+    };
+#pragma unroll 1
+    for (int b = warp; b < blocks; b += W) step(b);
+
+    float c[NT][4];
+    if (W > 1) {
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni)
+            partial[(warp * NT + ni) * 32 + lane] = make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]);
+        __syncthreads();
+        if (warp != 0) return;
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni) {
+            c[ni][0] = c[ni][1] = c[ni][2] = c[ni][3] = 0.0f;
+#pragma unroll
+            for (int wi = 0; wi < W; ++wi) {
+                const float4 v = partial[(wi * NT + ni) * 32 + lane];
+                c[ni][0] += v.x, c[ni][1] += v.y, c[ni][2] += v.z, c[ni][3] += v.w;
+            }
+        }
+    } else {
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) c[ni][j] = acc[ni][j];
+    }
+    // c0, c1: row gid, tokens 2q, 2q+1; c2, c3: row gid + 8 (PAIR: the matching up row).
+#pragma unroll
+    for (int ni = 0; ni < NT; ++ni) {
+        const int t = ni * 8 + 2 * q;
+        if (PAIR) {
+            const int o = r0 + gid;
+            if (o >= p.rows) continue;
+            if (t < p.m) p.y[static_cast<long long>(t) * p.ldy + o] = c[ni][0] / (1.0f + expf(-c[ni][0])) * c[ni][2];
+            if (t + 1 < p.m)
+                p.y[static_cast<long long>(t + 1) * p.ldy + o] = c[ni][1] / (1.0f + expf(-c[ni][1])) * c[ni][3];
+        } else {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int o = r0 + gid + 8 * e;
+                if (o >= p.rows) continue;
+                if (t < p.m) p.y[static_cast<long long>(t) * p.ldy + o] = c[ni][2 * e];
+                if (t + 1 < p.m) p.y[static_cast<long long>(t + 1) * p.ldy + o] = c[ni][2 * e + 1];
+            }
+        }
+    }
+}
+
+template <int W, int NT, bool PAIR>
+int launch_iq3_direct(const Iq3Args& p) {
+    const unsigned grid = static_cast<unsigned>((p.rows + (PAIR ? 8 : 16) - 1) / (PAIR ? 8 : 16));
+    if (p.k == 5120) iq3_q8_direct_kernel<W, NT, 20, PAIR><<<grid, W * 32>>>(p);
+    else if (p.k == 17408) iq3_q8_direct_kernel<W, NT, 68, PAIR><<<grid, W * 32>>>(p);
+    else iq3_q8_direct_kernel<W, NT, 0, PAIR><<<grid, W * 32>>>(p);
+    return velox_launch_status();
+}
+
 // ninfer's choice on this card: 64 rows x 64 tokens (4 warps, two CTAs per SM) below 1024 tokens,
-// 128 x 128 (8 warps) from there.
+// 128 x 128 (8 warps) from there. Decode widths: the register-direct kernel above, 2 warps over
+// K for short rows (gate/up, K = 5120) and 4 for long ones (down, 17408). Measured, verify at 16k
+// keys, one sequence / 2 x 8 rows per round: 1 + 4 warps 31.6 / 36.1 ms, 2 + 2 26.9 / 34.3,
+// 2 + 4 26.6 / 34.4, 4 + 4 26.8 / 34.5 (bf16 kernels: 28.3 / 37.6).
+template <bool PAIR>
+int pick_iq3(const Iq3Args& p) {
+    if (p.m >= 1024) return launch_iq3<1, 16, 8, 1, PAIR>(p);
+    if (p.m > 16) return launch_iq3<1, 8, 4, 2, PAIR>(p);
+    const bool long_rows = p.k / 256 > 32;
+    if (p.m > 8) return long_rows ? launch_iq3_direct<4, 2, PAIR>(p) : launch_iq3_direct<2, 2, PAIR>(p);
+    return long_rows ? launch_iq3_direct<4, 1, PAIR>(p) : launch_iq3_direct<2, 1, PAIR>(p);
+}
+
 template <bool PAIR>
 int run_iq3(const float* x, Iq3Args p) {
     if (p.m < 1 || p.rows <= 0 || p.k % 256 != 0 || reinterpret_cast<uintptr_t>(p.w) % 16 != 0 ||
@@ -500,7 +696,7 @@ int run_iq3(const float* x, Iq3Args p) {
     Act a;
     if (const int e = quantize(x, p.m, p.k, 0, a)) return e;
     p.xq = a.xq, p.sx = a.sx, p.stride = a.stride;
-    return p.m >= 1024 ? launch_iq3<1, 16, 8, 1, PAIR>(p) : launch_iq3<1, 8, 4, 2, PAIR>(p);
+    return pick_iq3<PAIR>(p);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -780,7 +976,7 @@ VELOX_API int velox_5060_linear_iq3_q8_from(const void* blob, int m, const uint8
     p.w = p.w2 = w;
     p.parent_rows = p.parent_rows2 = parent_rows;
     p.row_begin = p.row_begin2 = row_begin;
-    return m >= 1024 ? launch_iq3<1, 16, 8, 1, false>(p) : launch_iq3<1, 8, 4, 2, false>(p);
+    return pick_iq3<false>(p);
 }
 
 VELOX_API int velox_5060_linear_rs_q8_from(const void* blob, int m, const uint8_t* w, long long parent_rows,
@@ -807,7 +1003,7 @@ VELOX_API int velox_5060_linear_swiglu_iq3_q8_from(const void* blob, int m, cons
     p.m = m, p.k = static_cast<int>(k), p.rows = rows, p.y = out, p.ldy = rows;
     p.w = w, p.parent_rows = parent_rows, p.row_begin = gate_begin;
     p.w2 = up_w, p.parent_rows2 = up_parent_rows, p.row_begin2 = up_begin;
-    return m >= 1024 ? launch_iq3<1, 16, 8, 1, true>(p) : launch_iq3<1, 8, 4, 2, true>(p);
+    return pick_iq3<true>(p);
 }
 
 // Quantizes x [m, k] (ActQuant::Int8G256) in `layout` (0: IQ3_XXS, 1: q4/q5) for the _pre GEMMs
@@ -833,7 +1029,7 @@ VELOX_API int velox_5060_linear_iq3_q8_pre(int m, const uint8_t* w, long long pa
     p.w = p.w2 = w;
     p.parent_rows = p.parent_rows2 = parent_rows;
     p.row_begin = p.row_begin2 = row_begin;
-    return m >= 1024 ? launch_iq3<1, 16, 8, 1, false>(p) : launch_iq3<1, 8, 4, 2, false>(p);
+    return pick_iq3<false>(p);
 }
 
 VELOX_API int velox_5060_linear_rs_q8_pre(int m, const uint8_t* w, long long parent_rows, long long k,

@@ -530,9 +530,12 @@ fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     w.format == WeightFormat::Iq3Xxs && m >= 1
 }
 
-/// Prefill on int8 tensor cores (ActQuant::Int8G256, ninfer's int8 path and thresholds on this
-/// card): IQ3_XXS from this many tokens, q4/q5 from `RS_Q8_MIN_M`.
-const IQ3_Q8_MIN_M: usize = 33;
+/// Int8 tensor cores (ActQuant::Int8G256, ninfer's int8 prefill path): IQ3_XXS from this many
+/// tokens, q4/q5 from `RS_Q8_MIN_M`. IQ3_XXS also verifies on them (2..16 tokens, a register-direct
+/// int8 kernel): its codes are exact int8, so the dequantization and the activation traffic both
+/// halve against the bf16 kernel (verify at 16k keys: 28.3 -> 26.6 ms per round, 2 x 8 rows 37.6 ->
+/// 34.4 ms). Single tokens stay on the bf16 GEMV.
+const IQ3_Q8_MIN_M: usize = 2;
 const RS_Q8_MIN_M: usize = 64;
 
 /// Format code of the int8 prefill kernel serving `w` at `m` tokens (3: IQ3_XXS, 4/5: q4/q5), when
