@@ -501,8 +501,10 @@ impl Server {
         });
         // Counted before the stream-error check: a client that hung up still cost the prefill.
         if let Ok(o) = &result {
-            self.prompt_tokens.fetch_add(o.prompt_tokens, Ordering::Relaxed);
-            self.cached_tokens.fetch_add(o.cached_tokens, Ordering::Relaxed);
+            self.prompt_tokens
+                .fetch_add(o.prompt_tokens, Ordering::Relaxed);
+            self.cached_tokens
+                .fetch_add(o.cached_tokens, Ordering::Relaxed);
             let mut l = self.latency.lock().unwrap();
             if let Some(t) = o.first_token.or(first_delta) {
                 l.ttft.observe(t.duration_since(t_req).as_secs_f64());

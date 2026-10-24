@@ -340,6 +340,11 @@ pub enum ActQuant {
     /// `rint(x * (127 / amax))` as int8 (the int8 tensor-core prefill paths). Needs `k % 256 == 0`;
     /// an 8-bit activation, so [`ActPolicy::AllowA8`] permits it.
     Int8G256,
+    /// Per row and 32-value group: `scale = amax / 127`, codes `rint(x * (127 / amax))` as int8,
+    /// no bf16 rounding first: llama.cpp's q8_1 activations, which its GGML block kernels (and the
+    /// GGUF quantizations' published evaluations) use. Needs `k % 32 == 0`; [`ActPolicy::AllowA8`]
+    /// permits it.
+    Int8G32,
 }
 
 /// The operand precision of an attention kernel (`attention`, `attention_full`). Like

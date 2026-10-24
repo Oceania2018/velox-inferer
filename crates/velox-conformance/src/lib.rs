@@ -56,9 +56,10 @@ pub fn max_err(got: &[f32], want: &[f32]) -> f64 {
 fn permitted(act: ActQuant, policy: ActPolicy) -> bool {
     match (act, policy) {
         (ActQuant::Exact | ActQuant::Bf16, _) => true,
-        (ActQuant::Fp8Row | ActQuant::Int8G256, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. }) => {
-            true
-        }
+        (
+            ActQuant::Fp8Row | ActQuant::Int8G256 | ActQuant::Int8G32,
+            ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. },
+        ) => true,
         (ActQuant::Nvfp4 { divisor: a }, ActPolicy::AllowA4 { divisor: b }) => a == b,
         _ => false,
     }
@@ -337,6 +338,7 @@ impl<B: Backend> Suite<'_, B> {
             ActQuant::Nvfp4 { .. } => " a4",
             ActQuant::Bf16 => " bf16",
             ActQuant::Int8G256 => " i8",
+            ActQuant::Int8G32 => " i8g32",
         };
         let name = format!(
             "linear {} [{n},{k}] rows {begin}+{rows} m={m}{tag}",
@@ -819,6 +821,7 @@ impl<B: Backend> Suite<'_, B> {
             ActQuant::Nvfp4 { .. } => " a4",
             ActQuant::Bf16 => " bf16",
             ActQuant::Int8G256 => " i8",
+            ActQuant::Int8G32 => " i8g32",
         };
         let layout = if split {
             " split"
@@ -2607,6 +2610,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         let f = WeightFormat::Ggml(t);
         s.linear(f, 96, 512, 0, 96, 1)?;
         s.linear(f, 130, 768, 3, 100, 8)?;
+        s.linear(f, 72, 512, 0, 72, 16)?;
         s.linear(f, 200, 256, 17, 150, 33)?;
         s.embed(f, 12, 512, &[11, 0, 5])?;
         s.linear_swiglu(f, 512, 24, 0, 2, false, true)?;

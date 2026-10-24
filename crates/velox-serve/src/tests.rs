@@ -78,11 +78,15 @@ fn models_health_metrics() {
     }
     let (_, metrics) = http(port, "GET", "/metrics", "");
     assert!(
-        metrics.lines().any(|l| l == "velox_prompt_tokens_total 200"),
+        metrics
+            .lines()
+            .any(|l| l == "velox_prompt_tokens_total 200"),
         "{metrics}"
     );
     assert!(
-        metrics.lines().any(|l| l == "velox_prompt_tokens_cached_total 120"),
+        metrics
+            .lines()
+            .any(|l| l == "velox_prompt_tokens_cached_total 120"),
         "{metrics}"
     );
     // The engine's 300 ms queue wait lands between the 0.25 and 0.5 bounds.
