@@ -352,10 +352,16 @@ pub fn normalize_request(req: &Value) -> Result<Normalized, ApiError> {
                     .filter_map(|p| p.get("text").and_then(Value::as_str))
                     .collect(),
             ),
+            // Named by type only: the server logs error messages, and the value is request data.
             Some(other) => {
+                let kind = match other {
+                    Value::Bool(_) => "a boolean",
+                    Value::Number(_) => "a number",
+                    _ => "an object",
+                };
                 return Err(ApiError::invalid(format!(
-                    "unsupported message content {other}"
-                )))
+                    "message content must be a string or an array of parts, not {kind}"
+                )));
             }
         };
         out.insert("content".into(), content);
