@@ -14,7 +14,9 @@ use velox_core::backend::{
     AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, LinearDst, LinearPart,
     NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
-use velox_core::{CopySpec, Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
+use velox_core::{
+    CopySpec, Error, KvFormat, KvStoreShape, Result, StateFormat, GRAPH_KV_BUCKET, GRAPH_STATIC,
+};
 
 pub use config::{
     FfnConfig, LayerKind, MoeConfig, TextConfig, DENSE_ARCHITECTURE, MOE_ARCHITECTURE,
@@ -322,13 +324,17 @@ impl<B: Backend> BatchWorkspace<B> {
 
 /// The recurrent (GDN) state of a session after `pos` tokens. Attention KV needs no copy: rows
 /// below `pos` are never rewritten, so restoring a checkpoint only rewinds the position and the
-/// recurrent state.
+/// recurrent state. The `S` matrices are stored in [`Self::format`] (packed for context-store
+/// entries, see [`StateFormat`]); the convolution rows are always f32.
 pub struct Checkpoint<B: Backend> {
     pub pos: usize,
     pub rope_delta: i64,
     conv: Vec<B::Buffer>,
     ssm: Vec<B::Buffer>,
     host: bool,
+    format: StateFormat,
+    /// Values of one layer's `S` (what its packed buffer represents).
+    ssm_len: usize,
 }
 
 impl<B: Backend> Checkpoint<B> {
@@ -337,16 +343,60 @@ impl<B: Backend> Checkpoint<B> {
         self.host
     }
 
-    /// Copies this checkpoint into `dst` (storage of the same session shape).
+    pub fn format(&self) -> StateFormat {
+        self.format
+    }
+
+    /// Copies this checkpoint into `dst` (storage of the same session shape, in any format; a
+    /// packed `dst` is encoded, an f32 one decoded).
     pub fn copy_into(&self, b: &B, dst: &mut Checkpoint<B>) -> Result<()> {
-        copy_all(
-            b,
-            self.conv.iter().chain(&self.ssm),
-            dst.conv.iter_mut().chain(dst.ssm.iter_mut()),
-        )?;
+        if self.format == dst.format {
+            copy_all(
+                b,
+                self.conv.iter().chain(&self.ssm),
+                dst.conv.iter_mut().chain(dst.ssm.iter_mut()),
+            )?;
+        } else {
+            copy_all(b, self.conv.iter(), dst.conv.iter_mut())?;
+            for (s, d) in self.ssm.iter().zip(dst.ssm.iter_mut()) {
+                convert_state(b, s, self.format, d, dst.format, self.ssm_len)?;
+            }
+        }
         dst.pos = self.pos;
         dst.rope_delta = self.rope_delta;
         Ok(())
+    }
+
+    /// Writes GDN layer `gi`'s live state (f32 `conv` and `ssm`) into this checkpoint.
+    fn put_layer(&mut self, b: &B, gi: usize, conv: &B::Buffer, ssm: &B::Buffer) -> Result<()> {
+        b.copy(conv, 0, &mut self.conv[gi], 0, b.len(conv))?;
+        convert_state(
+            b,
+            ssm,
+            StateFormat::F32,
+            &mut self.ssm[gi],
+            self.format,
+            self.ssm_len,
+        )
+    }
+}
+
+/// Copies one layer's `S` from `src` (in `from`) to `dst` (in `to`), encoding or decoding.
+fn convert_state<B: Backend>(
+    b: &B,
+    src: &B::Buffer,
+    from: StateFormat,
+    dst: &mut B::Buffer,
+    to: StateFormat,
+    n: usize,
+) -> Result<()> {
+    match (from, to) {
+        _ if from == to => b.copy(src, 0, dst, 0, b.len(src)),
+        (StateFormat::F32, _) => b.state_pack(src, dst, n, to),
+        (_, StateFormat::F32) => b.state_unpack(src, dst, n, from),
+        _ => Err(Error::Unsupported(format!(
+            "recurrent state conversion {from} -> {to}"
+        ))),
     }
 }
 
@@ -490,25 +540,34 @@ impl<B: Backend> Session<B> {
         self.blank_checkpoint_in(b, pos, false)
     }
 
-    /// [`Self::blank_checkpoint`] in system RAM ([`Backend::alloc_host`]) when `host`: no device
-    /// memory per checkpoint, at the cost of PCIe copies when one is taken or restored.
-    /// Lengths of a checkpoint's buffers (see [`Self::host_checkpoint_from`]).
-    pub fn state_lens(&self, b: &B) -> Vec<usize> {
+    /// Values of one GDN layer's `S`.
+    fn ssm_len(&self, b: &B) -> usize {
+        self.ssm.first().map_or(0, |s| b.len(s))
+    }
+
+    /// Lengths of the buffers of a checkpoint in `fmt` (see [`Self::host_checkpoint_from`]).
+    pub fn state_lens(&self, b: &B, fmt: StateFormat) -> Vec<usize> {
         self.conv
             .iter()
-            .chain(&self.ssm)
             .map(|s| b.len(s))
+            .chain(self.ssm.iter().map(|s| fmt.slots(b.len(s))))
             .collect()
     }
 
-    /// A system-RAM checkpoint over `bufs` (from [`Backend::alloc_host`], one per
+    /// A system-RAM checkpoint in `fmt` over `bufs` (from [`Backend::alloc_host`], one per
     /// [`Self::state_lens`] entry).
-    pub fn host_checkpoint_from(&self, bufs: Vec<B::Buffer>) -> Result<Checkpoint<B>> {
-        if bufs.len() != self.conv.len() + self.ssm.len() {
+    pub fn host_checkpoint_from(
+        &self,
+        b: &B,
+        bufs: Vec<B::Buffer>,
+        fmt: StateFormat,
+    ) -> Result<Checkpoint<B>> {
+        let lens = self.state_lens(b, fmt);
+        if bufs.len() != lens.len() || bufs.iter().zip(&lens).any(|(x, &n)| b.len(x) < n) {
             return Err(Error::Shape(format!(
-                "checkpoint of {} buffers (state has {})",
+                "checkpoint of {} buffers does not fit a {fmt} state of {} buffers",
                 bufs.len(),
-                self.conv.len() + self.ssm.len()
+                lens.len()
             )));
         }
         let mut conv = bufs;
@@ -519,53 +578,86 @@ impl<B: Backend> Session<B> {
             conv,
             ssm,
             host: true,
+            format: fmt,
+            ssm_len: self.ssm_len(b),
         })
     }
 
+    /// [`Self::blank_checkpoint`] in system RAM ([`Backend::alloc_host`]) when `host`: no device
+    /// memory per checkpoint, at the cost of PCIe copies when one is taken or restored.
     pub fn blank_checkpoint_in(&self, b: &B, pos: usize, host: bool) -> Result<Checkpoint<B>> {
-        let like = |bufs: &[B::Buffer]| -> Result<Vec<B::Buffer>> {
-            bufs.iter()
-                .map(|s| {
-                    if host {
-                        b.alloc_host(b.len(s))
-                    } else {
-                        b.alloc(b.len(s))
-                    }
-                })
-                .collect()
+        self.blank_checkpoint_as(b, pos, host, StateFormat::F32)
+    }
+
+    /// [`Self::blank_checkpoint_in`] with the `S` matrices stored in `fmt`.
+    pub fn blank_checkpoint_as(
+        &self,
+        b: &B,
+        pos: usize,
+        host: bool,
+        fmt: StateFormat,
+    ) -> Result<Checkpoint<B>> {
+        let alloc = |n: usize| {
+            if host {
+                b.alloc_host(n)
+            } else {
+                b.alloc(n)
+            }
         };
+        let mut bufs = Vec::with_capacity(self.conv.len() + self.ssm.len());
+        for n in self.state_lens(b, fmt) {
+            bufs.push(alloc(n)?);
+        }
+        let mut conv = bufs;
+        let ssm = conv.split_off(self.conv.len());
         Ok(Checkpoint {
             pos,
             rope_delta: self.rope_delta,
-            conv: like(&self.conv)?,
-            ssm: like(&self.ssm)?,
+            conv,
+            ssm,
             host,
+            format: fmt,
+            ssm_len: self.ssm_len(b),
         })
     }
 
-    /// Copies the current recurrent state into `cp` (reused storage) and stamps its position.
+    /// Copies the current recurrent state into `cp` (reused storage, encoded when packed) and
+    /// stamps its position.
     pub fn snapshot_into(&self, b: &B, cp: &mut Checkpoint<B>) -> Result<()> {
-        copy_all(
-            b,
-            self.conv.iter().chain(&self.ssm),
-            cp.conv.iter_mut().chain(cp.ssm.iter_mut()),
-        )?;
+        if cp.format == StateFormat::F32 {
+            copy_all(
+                b,
+                self.conv.iter().chain(&self.ssm),
+                cp.conv.iter_mut().chain(cp.ssm.iter_mut()),
+            )?;
+        } else {
+            for gi in 0..self.ssm.len() {
+                cp.put_layer(b, gi, &self.conv[gi], &self.ssm[gi])?;
+            }
+        }
         cp.pos = self.pos;
         cp.rope_delta = self.rope_delta;
         Ok(())
     }
 
     /// Rewinds to `cp`, which must have been taken from this session (or a session with the
-    /// same token prefix up to `cp.pos`).
+    /// same token prefix up to `cp.pos`). A packed checkpoint is decoded.
     pub fn restore(&mut self, b: &B, cp: &Checkpoint<B>) -> Result<()> {
         if cp.pos > self.capacity {
             return Err(Error::Config("checkpoint beyond session capacity".into()));
         }
-        copy_all(
-            b,
-            cp.conv.iter().chain(&cp.ssm),
-            self.conv.iter_mut().chain(self.ssm.iter_mut()),
-        )?;
+        if cp.format == StateFormat::F32 {
+            copy_all(
+                b,
+                cp.conv.iter().chain(&cp.ssm),
+                self.conv.iter_mut().chain(self.ssm.iter_mut()),
+            )?;
+        } else {
+            copy_all(b, cp.conv.iter(), self.conv.iter_mut())?;
+            for (s, d) in cp.ssm.iter().zip(self.ssm.iter_mut()) {
+                convert_state(b, s, cp.format, d, StateFormat::F32, cp.ssm_len)?;
+            }
+        }
         self.pos = cp.pos;
         self.rope_delta = cp.rope_delta;
         Ok(())
@@ -1337,8 +1429,7 @@ impl<B: Backend> Qwen35Text<B> {
                             }
                         }
                         for cp in snaps.iter_mut().filter(|cp| cp.pos == pos0 + end) {
-                            b.copy(&s_conv[gi], 0, &mut cp.conv[gi], 0, b.len(&s_conv[gi]))?;
-                            b.copy(&s_ssm[gi], 0, &mut cp.ssm[gi], 0, b.len(&s_ssm[gi]))?;
+                            cp.put_layer(b, gi, &s_conv[gi], &s_ssm[gi])?;
                         }
                         row0 = end;
                     }
@@ -2482,8 +2573,7 @@ impl<B: Backend> Qwen35Text<B> {
                                 gs,
                             )?;
                             for cp in p.snaps.iter_mut().filter(|cp| cp.pos == pos0 + end) {
-                                b.copy(&s_conv[gi], 0, &mut cp.conv[gi], 0, b.len(&s_conv[gi]))?;
-                                b.copy(&s_ssm[gi], 0, &mut cp.ssm[gi], 0, b.len(&s_ssm[gi]))?;
+                                cp.put_layer(b, gi, &s_conv[gi], &s_ssm[gi])?;
                             }
                             row0 = end;
                         }

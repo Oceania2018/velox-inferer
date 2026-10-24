@@ -876,3 +876,128 @@ VELOX_API int velox_portable_kv_load(const unsigned char* k_cache, const unsigne
         default: return VELOX_ERR_UNSUPPORTED;
     }
 }
+
+// ---- recurrent-state checkpoints: `state_pack` / `state_unpack` ----
+// Formats and their exact encoding are specified in velox-core/src/state.rs; these are bit-exact
+// with `state::pack` / `state::unpack`. Either side may be mapped host memory (a context-store
+// checkpoint): the kernels then read or write system RAM over PCIe directly. n is a multiple of
+// 128 (one row of an S[h] matrix); each thread handles 4 consecutive values.
+
+#define VELOX_STATE_F32 0
+#define VELOX_STATE_BF16 1
+#define VELOX_STATE_NVFP4 2
+
+namespace {
+
+__device__ __forceinline__ long long state_tid() { return blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; }
+__device__ __forceinline__ long long state_stride() { return static_cast<long long>(gridDim.x) * blockDim.x; }
+
+__global__ void state_copy_kernel(const float4* __restrict__ src, float4* __restrict__ dst, long long quads) {
+    for (long long q = state_tid(); q < quads; q += state_stride()) dst[q] = src[q];
+}
+
+__global__ void state_pack_bf16_kernel(const float4* __restrict__ src, uint2* __restrict__ dst, long long quads) {
+    for (long long q = state_tid(); q < quads; q += state_stride()) {
+        const float4 x = src[q];
+        dst[q] = make_uint2(static_cast<unsigned>(kv_f32_to_bf16(x.x)) | static_cast<unsigned>(kv_f32_to_bf16(x.y)) << 16,
+                            static_cast<unsigned>(kv_f32_to_bf16(x.z)) | static_cast<unsigned>(kv_f32_to_bf16(x.w)) << 16);
+    }
+}
+
+__global__ void state_unpack_bf16_kernel(const uint2* __restrict__ src, float4* __restrict__ dst, long long quads) {
+    for (long long q = state_tid(); q < quads; q += state_stride()) {
+        const uint2 w = src[q];
+        dst[q] = make_float4(kv_bf16_to_f32(w.x & 0xffffu), kv_bf16_to_f32(w.x >> 16), kv_bf16_to_f32(w.y & 0xffffu),
+                             kv_bf16_to_f32(w.y >> 16));
+    }
+}
+
+// One warp per row of 128: lane l holds values 4l .. 4l + 3, so a group of 16 is 4 lanes.
+__global__ void state_pack_nvfp4_kernel(const float* __restrict__ src, unsigned char* __restrict__ dst, long long n) {
+    const long long rows = n / 128;
+    unsigned short* codes = reinterpret_cast<unsigned short*>(dst);
+    unsigned char* scales = dst + n / 2;
+    float* divs = reinterpret_cast<float*>(dst + n / 2 + n / 16);
+    const int lane = threadIdx.x % VELOX_WARP;
+    for (long long r = state_tid() / VELOX_WARP; r < rows; r += state_stride() / VELOX_WARP) {
+        const float4 x = reinterpret_cast<const float4*>(src + r * 128)[lane];
+        const float a = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w)));
+        float ga = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+        ga = fmaxf(ga, __shfl_xor_sync(0xffffffffu, ga, 2));
+        const float amax = velox_warp_max(a);
+        float d = amax > 0.0f ? __fdiv_rn(2688.0f, amax) : 0.0f;
+        if (!isfinite(d)) d = 0.0f;
+        const unsigned sc = kv_f32_to_e4m3(__fdiv_rn(__fmul_rn(d, ga), 6.0f));
+        const float s = kv_e4m3_to_f32(sc);
+        const float v[4] = {x.x, x.y, x.z, x.w};
+        unsigned packed = 0;
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const unsigned c = s == 0.0f ? 0u : kv_f32_to_e2m1(__fdiv_rn(__fmul_rn(v[p], d), s));
+            packed |= c << (4 * p);
+        }
+        codes[r * 32 + lane] = static_cast<unsigned short>(packed);  // 32 code words (64 bytes) per row
+        if (lane % 4 == 0) scales[r * 8 + lane / 4] = static_cast<unsigned char>(sc);
+        if (lane == 0) divs[r] = d;
+    }
+}
+
+__global__ void state_unpack_nvfp4_kernel(const unsigned char* __restrict__ src, float4* __restrict__ dst, long long n) {
+    const unsigned short* codes = reinterpret_cast<const unsigned short*>(src);
+    const unsigned char* scales = src + n / 2;
+    const float* divs = reinterpret_cast<const float*>(src + n / 2 + n / 16);
+    for (long long q = state_tid(); q < n / 4; q += state_stride()) {
+        const float d = divs[q / 32];
+        const float s = kv_e4m3_to_f32(scales[q / 4]);
+        const unsigned w = codes[q];
+        float v[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p)
+            v[p] = (d == 0.0f || s == 0.0f) ? 0.0f
+                                            : __fdiv_rn(__fmul_rn(kv_e2m1_to_f32((w >> (4 * p)) & 15u), s), d);
+        dst[q] = make_float4(v[0], v[1], v[2], v[3]);
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_state_pack(const float* src, unsigned char* dst, long long n, int format) {
+    if (n <= 0) return 0;
+    if (n % 128 != 0) return VELOX_ERR_UNSUPPORTED;
+    const long long quads = n / 4;
+    switch (format) {
+        case VELOX_STATE_F32:
+            state_copy_kernel<<<velox_grid_1d(quads, 256), 256>>>(reinterpret_cast<const float4*>(src),
+                                                                  reinterpret_cast<float4*>(dst), quads);
+            break;
+        case VELOX_STATE_BF16:
+            state_pack_bf16_kernel<<<velox_grid_1d(quads, 256), 256>>>(reinterpret_cast<const float4*>(src),
+                                                                       reinterpret_cast<uint2*>(dst), quads);
+            break;
+        case VELOX_STATE_NVFP4:
+            state_pack_nvfp4_kernel<<<velox_grid_1d(n / 128 * VELOX_WARP, 256), 256>>>(src, dst, n);
+            break;
+        default: return VELOX_ERR_UNSUPPORTED;
+    }
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_state_unpack(const unsigned char* src, float* dst, long long n, int format) {
+    if (n <= 0) return 0;
+    if (n % 128 != 0) return VELOX_ERR_UNSUPPORTED;
+    const long long quads = n / 4;
+    switch (format) {
+        case VELOX_STATE_F32:
+            state_copy_kernel<<<velox_grid_1d(quads, 256), 256>>>(reinterpret_cast<const float4*>(src),
+                                                                  reinterpret_cast<float4*>(dst), quads);
+            break;
+        case VELOX_STATE_BF16:
+            state_unpack_bf16_kernel<<<velox_grid_1d(quads, 256), 256>>>(reinterpret_cast<const uint2*>(src),
+                                                                         reinterpret_cast<float4*>(dst), quads);
+            break;
+        case VELOX_STATE_NVFP4:
+            state_unpack_nvfp4_kernel<<<velox_grid_1d(quads, 256), 256>>>(src, reinterpret_cast<float4*>(dst), n);
+            break;
+        default: return VELOX_ERR_UNSUPPORTED;
+    }
+    return velox_launch_status();
+}

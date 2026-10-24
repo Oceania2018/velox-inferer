@@ -17,7 +17,8 @@ use velox_core::quant::{
     quantize_activations, round_attention_inputs, round_full_attention_inputs,
 };
 use velox_core::rng::Rng;
-use velox_core::{ModelSpec, Op, Result};
+use velox_core::state::STATE_ROW;
+use velox_core::{ModelSpec, Op, Result, StateFormat};
 use velox_cpu::CpuBackend;
 
 #[derive(Clone, Debug)]
@@ -1189,6 +1190,64 @@ impl<B: Backend> Suite<'_, B> {
         let name =
             format!("kv_store {format} t={tokens} kv_heads={kv_heads} d={head_dim} pos0={pos0}");
         self.record(name, Some(Op::KvStore), &got, &want, 0.0);
+        Ok(())
+    }
+
+    /// `state_pack` and `state_unpack` of `n` values, bit-exact against the oracle. With `host`
+    /// the packed side is system-RAM storage, as context-store checkpoints are.
+    fn state_codec(&mut self, fmt: StateFormat, n: usize, host: bool) -> Result<()> {
+        // Rows of very different magnitudes (GDN heads decay at different rates), a zero row, a
+        // row too small for a finite divisor and an outlier.
+        let mut x = self.rng.vec(n, 1.0);
+        for (r, row) in x.chunks_mut(STATE_ROW).enumerate() {
+            let mag = [1e-4f32, 1.0, 50.0, 0.0, 1e-38][r % 5];
+            row.iter_mut().for_each(|v| *v *= mag);
+        }
+        x[(STATE_ROW + 3) % n] = 300.0;
+        let slots = fmt.slots(n);
+        let mut want = vec![0.0; slots];
+        CpuBackend.state_pack(&x, &mut want, n, fmt)?;
+        let xd = self.b.upload(&x)?;
+        let mut packed = if host {
+            self.b.alloc_host(slots)?
+        } else {
+            self.b.alloc(slots)?
+        };
+        self.b.state_pack(&xd, &mut packed, n, fmt)?;
+        // Packed bytes compared as byte values (raw slots may hold NaN patterns).
+        let bytes = |s: &[f32]| -> Vec<f32> {
+            s.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .map(f32::from)
+                .collect()
+        };
+        let got = fetch(self.b, &packed, slots)?;
+        let side = if host { "host" } else { "device" };
+        self.record(
+            format!("state_pack {fmt} n={n} {side}"),
+            Some(Op::StatePack),
+            &bytes(&got),
+            &bytes(&want),
+            0.0,
+        );
+        let mut back = vec![0.0; n];
+        CpuBackend.state_unpack(&want, &mut back, n, fmt)?;
+        let raw: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let src = if host {
+            self.b.upload_bytes_host(&raw)?
+        } else {
+            self.b.upload_bytes(&raw)?
+        };
+        let mut yd = self.b.alloc(n)?;
+        self.b.state_unpack(&src, &mut yd, n, fmt)?;
+        let got = fetch(self.b, &yd, n)?;
+        self.record(
+            format!("state_unpack {fmt} n={n} {side}"),
+            Some(Op::StateUnpack),
+            &got,
+            &back,
+            0.0,
+        );
         Ok(())
     }
 
@@ -2392,6 +2451,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     ] {
         s.kv_load(f, 4, 256, 0, 300)?;
         s.kv_load(f, 2, 64, 17, 5)?;
+    }
+    for f in StateFormat::ALL {
+        s.state_codec(f, 128, false)?;
+        // One 27B GDN layer (48 heads of 128 x 128), and a host-side store copy of a smaller one.
+        s.state_codec(f, 48 * 128 * 128, false)?;
+        s.state_codec(f, 16 * 128 * 128, true)?;
     }
     let attn = |tokens, heads, kv_heads, head_dim, pos0, kv| AttnShape {
         tokens,

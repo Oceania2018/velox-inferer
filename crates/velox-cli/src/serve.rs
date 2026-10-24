@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use velox_core::{Backend, Error, KvFormat, Result};
+use velox_core::{Backend, Error, KvFormat, Result, StateFormat};
 use velox_engine::{EngineConfig, QwenEngine};
 use velox_frontend::Frontend;
 use velox_models::qwen3_5::{DFlashModel, Qwen35Text, Qwen35Vision, TextConfig, TextWeights};
@@ -119,6 +119,9 @@ where
         graph_budget: a.parse::<usize>("graph-mib", 256)? << 20,
         // --ctx-lrfu-lambda F: LRFU decay per request of that store (0: LRU).
         lrfu_lambda: a.parse("ctx-lrfu-lambda", 0.1)?,
+        // --host-state-dtype f32|bf16|nvfp4 (ninfer's name and default: bf16): storage of the
+        // recurrent states the context store keeps; lanes always run on f32 state.
+        host_state_format: StateFormat::parse(a.get("host-state-dtype").unwrap_or("bf16"))?,
         // --disk-context-mib N (default 0: off) and --disk-context-dir DIR: NVMe tier below RAM.
         disk_context_bytes: a.parse::<u64>("disk-context-mib", 0)? << 20,
         disk_context_dir: match a.get("disk-context-dir") {

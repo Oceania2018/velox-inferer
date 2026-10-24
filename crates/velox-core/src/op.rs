@@ -39,6 +39,8 @@ pub enum Op {
     LinearSwiglu,
     EmbedFrom,
     ArgmaxTo,
+    StatePack,
+    StateUnpack,
 }
 
 impl Op {
@@ -75,6 +77,8 @@ impl Op {
         Op::LinearSwiglu,
         Op::EmbedFrom,
         Op::ArgmaxTo,
+        Op::StatePack,
+        Op::StateUnpack,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -111,6 +115,8 @@ impl Op {
             Op::LinearSwiglu => "linear_swiglu",
             Op::EmbedFrom => "embed_from",
             Op::ArgmaxTo => "argmax_to",
+            Op::StatePack => "state_pack",
+            Op::StateUnpack => "state_unpack",
         }
     }
 }
