@@ -820,6 +820,22 @@ VELOX_API int velox_5060_q8_quantize(const float* x, int m, long long k, int lay
     return quantize(x, m, static_cast<int>(k), layout, a);
 }
 
+// The int8 activations other files' GEMMs read: the last velox_5060_q8_quantize when `blob` is
+// null (it must match m, k and layout), else a caller blob of velox_5060_q8_act_bytes (an int8
+// twin). xq [m, k] int8, sx [k / 256][stride] f32.
+VELOX_API int velox_5060_q8_view(const void* blob, int m, long long k, int layout, const int8_t** xq,
+                                 const float** sx, int* stride) {
+    if (blob == nullptr) {
+        if (g_last.m != m || g_last.k != k || g_last.layout != layout) return VELOX_ERR_UNSUPPORTED;
+        *xq = g_last.a.xq, *sx = g_last.a.sx, *stride = g_last.a.stride;
+        return 0;
+    }
+    if (k % 256 != 0 || k > (1ll << 30)) return VELOX_ERR_UNSUPPORTED;
+    const Act a = act_of(blob, m, static_cast<int>(k));
+    *xq = a.xq, *sx = a.sx, *stride = a.stride;
+    return 0;
+}
+
 // velox_5060_linear_iq3_q8 / _rs_q8 on the last velox_5060_q8_quantize (same m, k and the
 // format's layout), writing y[t * ldy + r]. VELOX_ERR_UNSUPPORTED when the quantization differs.
 VELOX_API int velox_5060_linear_iq3_q8_pre(int m, const uint8_t* w, long long parent_rows, long long k,
