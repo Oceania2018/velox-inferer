@@ -65,13 +65,23 @@ __constant__ uint32_t kGrid[256] = {
 #define IQ3_DIRECT_LONG_BLOCKS 32
 #endif
 
+// IQ3_RAW_GRID: look up the packed 4-byte grid entry and widen it in registers (bf16 128 + v minus
+// 128, exact), instead of the pre-widened 8-byte entry plus a sign-mask table. Both kernels run at
+// the L1/shared-memory pipe's limit (ncu, verify m=8: 95% busy, half the shared wavefronts bank
+// conflicts from the random grid indices) with the issue slots 60% idle.
+#ifndef IQ3_RAW_GRID
+#define IQ3_RAW_GRID 1
+#endif
+
 struct Tables {
     uint2 grid[256];      // bf16x2 magnitudes (0,1) and (2,3) of every grid entry
     uint2 sign_mask[16];  // bf16 sign masks of a 4-bit nibble: bits (0,1) -> .x, (2,3) -> .y
+    uint32_t raw[256];    // the packed grid (IQ3_RAW_GRID)
 
     __device__ __forceinline__ void load() {
         for (int i = threadIdx.x; i < 256; i += blockDim.x) {
             const uint32_t g = kGrid[i];
+            raw[i] = g;
             uint32_t b[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) b[j] = __float_as_uint(static_cast<float>((g >> (8 * j)) & 0xffu)) >> 16;
@@ -256,6 +266,26 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
                     const uint32_t s8 = s7 | ((__popc(s7) & 1u) << 7);
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
+                        if constexpr (kShort && IQ3_RAW_GRID) {
+                            // (128 + v) as bf16 is 0x43 << 8 | v; with the sign applied to both it
+                            // and the 128 it is offset by, the difference is exactly +-v. Short rows
+                            // only: the long-row kernel is issue-bound with ALU sign masks already
+                            // (down m=16 79 -> 91 us with this).
+                            const uint32_t raw = tables.raw[(pair >> (8 * h)) & 0xffu];
+                            const uint32_t n = s8 >> (4 * h);
+                            const uint32_t m0 = ((n & 1u) << 15) | ((n & 2u) << 30);
+                            const uint32_t m1 = ((n & 4u) << 13) | ((n & 8u) << 28);
+                            const uint32_t w0 = __byte_perm(raw, 0x43u, 0x4140) ^ m0;
+                            const uint32_t w1 = __byte_perm(raw, 0x43u, 0x4342) ^ m1;
+                            const uint32_t c0 = 0x43004300u ^ m0, c1 = 0x43004300u ^ m1;
+                            const __nv_bfloat162 d0 = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&w0),
+                                                              *reinterpret_cast<const __nv_bfloat162*>(&c0));
+                            const __nv_bfloat162 d1 = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&w1),
+                                                              *reinterpret_cast<const __nv_bfloat162*>(&c1));
+                            f[mi][e][h] = make_uint2(*reinterpret_cast<const uint32_t*>(&d0),
+                                                     *reinterpret_cast<const uint32_t*>(&d1));
+                            continue;
+                        }
                         const uint2 g = tables.grid[(pair >> (8 * h)) & 0xffu];
                         // bf16 sign bits of the nibble's four values: a table lookup for short
                         // rows, ALU ops for long ones (8 warps, unrolled: bound by the shared-memory
@@ -383,6 +413,7 @@ __global__ void to_bf16(const float* __restrict__ x, long long n, __nv_bfloat16*
 }
 
 VeloxScratch g_x;
+
 
 template <int W, int MT, int NT, int KB, typename XT, bool PAIR>
 int launch_kb(const XT* x, const uint8_t* w, long long n, int k, long long rb, int rows, int m, float* y, Up up) {

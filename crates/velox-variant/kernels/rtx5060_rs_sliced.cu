@@ -2,12 +2,14 @@
 // sliced-K tensor-core kernel.
 //
 // Adapted from ninfer's q5_a16_sliced_k_mma_kernel (src/ops/linear/q5/q5_a16_sliced_k_mma.cuh,
-// Apache-2.0), which ninfer selects on this card for the DFlash2 verify width. A block owns 16
-// weight rows; its four warps each own one 64-value group of every 256-value K tile, staged through
-// two cp.async stages (codes, q5 high bits, FP16 scales and the bf16 activations of the tile).
-// Weights are the A operand of mma.m16n8k16, tokens the B operand (ldmatrix from a swizzled
-// activation tile). Integer codes are bf16-exact; each group's scale is applied to its f32
-// partial. The warps' partial sums meet in shared memory at the end.
+// Apache-2.0), which ninfer selects on this card for the DFlash2 verify width. A block owns RT
+// 16-row tiles of weight rows; its four warps each own one 64-value group of every 256-value K
+// tile, staged through two cp.async stages (codes, q5 high bits, FP16 scales and the bf16
+// activations of the tile). Weights are the A operand of mma.m16n8k16, tokens the B operand
+// (ldmatrix from a swizzled activation tile, reused by the block's RT row tiles: every block
+// stages the whole activation tile, so more rows per block means less L2 traffic per weight byte).
+// Integer codes are bf16-exact; each group's scale is applied to its f32 partial. The warps'
+// partial sums meet in shared memory at the end.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -18,17 +20,23 @@ namespace {
 
 enum Fmt { kQ4 = 4, kQ5 = 5 };
 
-constexpr int kR = 16, kW = 4, kS = 2, kThreads = kW * 32;
+constexpr int kW = 4, kS = 2, kThreads = kW * 32;
 
-template <int T>
+// Staged rows are padded by 16 bytes so the 8 rows a warp reads at once (lane gid) fall in
+// distinct banks: unpadded, the 128-byte code rows all hit the same four banks (75% of the shared
+// accesses were bank conflicts, q4 [8192, 5120] m=8).
+constexpr int kCodeRow = kW * 32 + 16, kHighRow = kW * 8 + 16;
+
+template <int T, int RT>
 union Smem {
+    static constexpr int R = 16 * RT;
     struct {
-        alignas(16) uint8_t codes[kS][kR][kW][32];
-        alignas(16) uint8_t high[kS][kR][kW][8];
-        alignas(16) uint16_t scales[kS][kR][kW];
+        alignas(16) uint8_t codes[kS][R][kCodeRow];
+        alignas(16) uint8_t high[kS][R][kHighRow];
+        alignas(16) uint16_t scales[kS][R][kW];
         alignas(16) __nv_bfloat16 x[kS][kW][T][64];
     } st;
-    float4 partial[kW][T / 8][32];
+    float4 partial[kW][RT][T / 8][32];
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -79,17 +87,20 @@ __device__ __forceinline__ uint32_t pair_of(uint32_t code, uint32_t high8, int b
     return biased_pair(((code & 0xfu) | ((hb & 1u) << 4)) ^ 16u, ((code >> 4) | ((hb & 2u) << 3)) ^ 16u, 0x43104310u);
 }
 
-template <int F, int T, int GPR>
-__global__ void __launch_bounds__(kThreads, 6)
+// Blocks per SM the launch bounds ask for: fewer as the block's staged rows grow.
+__host__ __device__ constexpr int min_blocks(int rt) { return rt == 1 ? 6 : rt == 2 ? 4 : 3; }
+
+template <int F, int T, int GPR, int RT>
+__global__ void __launch_bounds__(kThreads, min_blocks(RT))
 rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows,
                  int k_rt, int kp_rt, long long view_begin, int rows, int m, float* __restrict__ y,
                  long long ldy) {
-    constexpr int NT = T / 8;
-    __shared__ Smem<T> sm;
+    constexpr int NT = T / 8, R = 16 * RT;
+    __shared__ Smem<T, RT> sm;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, lid = lane & 3;
     const int kp = GPR ? GPR * 64 : kp_rt, k = GPR ? kp : k_rt;
     const int gpr = kp / 64, groups = (k + 63) / 64, tiles = (groups + kW - 1) / kW;
-    const int r0 = blockIdx.x * kR;
+    const int r0 = blockIdx.x * R;
     const long long n_groups = parent_rows * gpr;
     const uint8_t* codes = w;
     const uint8_t* high = w + (n_groups * 32 + 255) / 256 * 256;
@@ -97,17 +108,17 @@ rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict_
 
     auto stage = [&](int slot, int tile) {
         const int g0 = tile * kW;
-        for (int item = tid; item < kR * kW * 2; item += kThreads) {
+        for (int item = tid; item < R * kW * 2; item += kThreads) {
             const int half = item & 1, g = (item >> 1) % kW, r = item / (kW * 2);
             const bool ok = r0 + r < rows && g0 + g < groups;
             const long long gi = ok ? (view_begin + r0 + r) * gpr + g0 + g : 0;
-            cp_async<16>(&sm.st.codes[slot][r][g][half * 16], codes + gi * 32 + half * 16, ok);
+            cp_async<16>(&sm.st.codes[slot][r][g * 32 + half * 16], codes + gi * 32 + half * 16, ok);
         }
-        for (int item = tid; item < kR * (kW / 2); item += kThreads) {
+        for (int item = tid; item < R * (kW / 2); item += kThreads) {
             const int r = item / (kW / 2), g = (item % (kW / 2)) * 2;
             const bool ok = r0 + r < rows && g0 + g < groups;
             const long long gi = ok ? (view_begin + r0 + r) * gpr + g0 + g : 0;
-            if (F == kQ5) cp_async<16>(&sm.st.high[slot][r][g][0], high + gi * 8, ok);
+            if (F == kQ5) cp_async<16>(&sm.st.high[slot][r][g * 8], high + gi * 8, ok);
             // A row's scale pair (groups g, g+1) is 4-byte aligned: gpr and g0 + g are even.
             cp_async<4>(&sm.st.scales[slot][r][g], scales + gi * 2, ok);
         }
@@ -121,9 +132,11 @@ rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict_
         cp_commit();
     };
 
-    float acc[NT][4];
+    float acc[RT][NT][4];
 #pragma unroll
-    for (int ni = 0; ni < NT; ++ni) acc[ni][0] = acc[ni][1] = acc[ni][2] = acc[ni][3] = 0.0f;
+    for (int ri = 0; ri < RT; ++ri)
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni) acc[ri][ni][0] = acc[ri][ni][1] = acc[ri][ni][2] = acc[ri][ni][3] = 0.0f;
 #pragma unroll
     for (int slot = 0; slot < kS; ++slot) {
         if (slot < tiles) stage(slot, slot);
@@ -135,43 +148,68 @@ rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict_
         const int slot = tile % kS;
         cp_wait<kS - 1>();
         __syncthreads();
-        float part[NT][4];
+        float part[RT][NT][4];
 #pragma unroll
-        for (int ni = 0; ni < NT; ++ni) part[ni][0] = part[ni][1] = part[ni][2] = part[ni][3] = 0.0f;
-        const uint8_t* c_top = sm.st.codes[slot][gid][warp];
-        const uint8_t* c_bot = sm.st.codes[slot][gid + 8][warp];
-        uint32_t h_top[2] = {0u, 0u}, h_bot[2] = {0u, 0u};
-        if (F == kQ5) {
-            const uint2 a = *reinterpret_cast<const uint2*>(sm.st.high[slot][gid][warp]);
-            const uint2 b = *reinterpret_cast<const uint2*>(sm.st.high[slot][gid + 8][warp]);
-            h_top[0] = a.x, h_top[1] = a.y, h_bot[0] = b.x, h_bot[1] = b.y;
+        for (int ri = 0; ri < RT; ++ri)
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) part[ri][ni][0] = part[ri][ni][1] = part[ri][ni][2] = part[ri][ni][3] = 0.0f;
+        // The group's 32 code bytes of rows gid and gid + 8 as words (two 16-byte loads each), and
+        // its q5 high bits.
+        uint32_t c_top[RT][8], c_bot[RT][8], h_top[RT][2], h_bot[RT][2];
+#pragma unroll
+        for (int ri = 0; ri < RT; ++ri) {
+            const uint4* t4 = reinterpret_cast<const uint4*>(&sm.st.codes[slot][ri * 16 + gid][warp * 32]);
+            const uint4* b4 = reinterpret_cast<const uint4*>(&sm.st.codes[slot][ri * 16 + gid + 8][warp * 32]);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint4 t = t4[h], b = b4[h];
+                c_top[ri][4 * h] = t.x, c_top[ri][4 * h + 1] = t.y, c_top[ri][4 * h + 2] = t.z, c_top[ri][4 * h + 3] = t.w;
+                c_bot[ri][4 * h] = b.x, c_bot[ri][4 * h + 1] = b.y, c_bot[ri][4 * h + 2] = b.z, c_bot[ri][4 * h + 3] = b.w;
+            }
+            h_top[ri][0] = h_top[ri][1] = h_bot[ri][0] = h_bot[ri][1] = 0u;
+            if (F == kQ5) {
+                const uint2 a = *reinterpret_cast<const uint2*>(&sm.st.high[slot][ri * 16 + gid][warp * 8]);
+                const uint2 b = *reinterpret_cast<const uint2*>(&sm.st.high[slot][ri * 16 + gid + 8][warp * 8]);
+                h_top[ri][0] = a.x, h_top[ri][1] = a.y, h_bot[ri][0] = b.x, h_bot[ri][1] = b.y;
+            }
         }
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
             // k16 step ks: MMA k-index 2 lid + {0,1} is value 16 ks + 2 lid + {0,1} (code byte
             // 8 ks + lid), k-index 2 lid + 8 + {0,1} is byte 8 ks + 4 + lid.
             const int b0 = ks * 8 + lid, b1 = b0 + 4;
-            const uint32_t a0 = pair_of<F>(c_top[b0], (h_top[b0 >> 4] >> (8 * ((b0 >> 2) & 3))) & 0xffu, b0);
-            const uint32_t a1 = pair_of<F>(c_bot[b0], (h_bot[b0 >> 4] >> (8 * ((b0 >> 2) & 3))) & 0xffu, b0);
-            const uint32_t a2 = pair_of<F>(c_top[b1], (h_top[b1 >> 4] >> (8 * ((b1 >> 2) & 3))) & 0xffu, b1);
-            const uint32_t a3 = pair_of<F>(c_bot[b1], (h_bot[b1 >> 4] >> (8 * ((b1 >> 2) & 3))) & 0xffu, b1);
+            uint32_t a[RT][4];
+#pragma unroll
+            for (int ri = 0; ri < RT; ++ri) {
+                // Byte b0 is byte lid of word 2 ks, b1 byte lid of word 2 ks + 1.
+                const uint32_t t0 = (c_top[ri][2 * ks] >> (8 * lid)) & 0xffu, t1 = (c_top[ri][2 * ks + 1] >> (8 * lid)) & 0xffu;
+                const uint32_t u0 = (c_bot[ri][2 * ks] >> (8 * lid)) & 0xffu, u1 = (c_bot[ri][2 * ks + 1] >> (8 * lid)) & 0xffu;
+                a[ri][0] = pair_of<F>(t0, (h_top[ri][b0 >> 4] >> (8 * ((b0 >> 2) & 3))) & 0xffu, b0);
+                a[ri][1] = pair_of<F>(u0, (h_bot[ri][b0 >> 4] >> (8 * ((b0 >> 2) & 3))) & 0xffu, b0);
+                a[ri][2] = pair_of<F>(t1, (h_top[ri][b1 >> 4] >> (8 * ((b1 >> 2) & 3))) & 0xffu, b1);
+                a[ri][3] = pair_of<F>(u1, (h_bot[ri][b1 >> 4] >> (8 * ((b1 >> 2) & 3))) & 0xffu, b1);
+            }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int br = ni * 8 + (lane & 7), bk = ks * 16 + ((lane >> 3) & 1) * 8;
                 uint32_t x0, x1;
                 ldsm_x2(x0, x1, &sm.st.x[slot][warp][br][swz(br, bk)]);
-                mma_bf16(part[ni], a0, a1, a2, a3, x0, x1);
+#pragma unroll
+                for (int ri = 0; ri < RT; ++ri) mma_bf16(part[ri][ni], a[ri][0], a[ri][1], a[ri][2], a[ri][3], x0, x1);
             }
         }
         const bool live = tile * kW + warp < groups;
-        const float top = live ? __half2float(__ushort_as_half(sm.st.scales[slot][gid][warp])) : 0.0f;
-        const float bot = live ? __half2float(__ushort_as_half(sm.st.scales[slot][gid + 8][warp])) : 0.0f;
 #pragma unroll
-        for (int ni = 0; ni < NT; ++ni) {
-            acc[ni][0] = fmaf(part[ni][0], top, acc[ni][0]);
-            acc[ni][1] = fmaf(part[ni][1], top, acc[ni][1]);
-            acc[ni][2] = fmaf(part[ni][2], bot, acc[ni][2]);
-            acc[ni][3] = fmaf(part[ni][3], bot, acc[ni][3]);
+        for (int ri = 0; ri < RT; ++ri) {
+            const float top = live ? __half2float(__ushort_as_half(sm.st.scales[slot][ri * 16 + gid][warp])) : 0.0f;
+            const float bot = live ? __half2float(__ushort_as_half(sm.st.scales[slot][ri * 16 + gid + 8][warp])) : 0.0f;
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                acc[ri][ni][0] = fmaf(part[ri][ni][0], top, acc[ri][ni][0]);
+                acc[ri][ni][1] = fmaf(part[ri][ni][1], top, acc[ri][ni][1]);
+                acc[ri][ni][2] = fmaf(part[ri][ni][2], bot, acc[ri][ni][2]);
+                acc[ri][ni][3] = fmaf(part[ri][ni][3], bot, acc[ri][ni][3]);
+            }
         }
         if (tile + kS < tiles) {
             __syncthreads();  // the stage is reused
@@ -183,26 +221,33 @@ rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict_
     cp_wait<0>();
     __syncthreads();
 #pragma unroll
-    for (int ni = 0; ni < NT; ++ni) sm.partial[warp][ni][lane] = make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]);
+    for (int ri = 0; ri < RT; ++ri)
+#pragma unroll
+        for (int ni = 0; ni < NT; ++ni)
+            sm.partial[warp][ri][ni][lane] = make_float4(acc[ri][ni][0], acc[ri][ni][1], acc[ri][ni][2], acc[ri][ni][3]);
     __syncthreads();
-    if (warp != 0) return;
+    // Warp ri (mod kW) reduces and stores row tiles ri, ri + kW, ...
 #pragma unroll
-    for (int ni = 0; ni < NT; ++ni) {
-        float4 s = sm.partial[0][ni][lane];
+    for (int ri = 0; ri < RT; ++ri) {
+        if (ri % kW != warp) continue;
 #pragma unroll
-        for (int wi = 1; wi < kW; ++wi) {
-            const float4 v = sm.partial[wi][ni][lane];
-            s.x += v.x, s.y += v.y, s.z += v.z, s.w += v.w;
-        }
-        // x, y: row gid, tokens 2 lid, 2 lid + 1; z, w: row gid + 8.
-        const int ra = r0 + gid, rb = ra + 8, t = ni * 8 + 2 * lid;
-        if (ra < rows) {
-            if (t < m) y[static_cast<long long>(t) * ldy + ra] = s.x;
-            if (t + 1 < m) y[static_cast<long long>(t + 1) * ldy + ra] = s.y;
-        }
-        if (rb < rows) {
-            if (t < m) y[static_cast<long long>(t) * ldy + rb] = s.z;
-            if (t + 1 < m) y[static_cast<long long>(t + 1) * ldy + rb] = s.w;
+        for (int ni = 0; ni < NT; ++ni) {
+            float4 s = sm.partial[0][ri][ni][lane];
+#pragma unroll
+            for (int wi = 1; wi < kW; ++wi) {
+                const float4 v = sm.partial[wi][ri][ni][lane];
+                s.x += v.x, s.y += v.y, s.z += v.z, s.w += v.w;
+            }
+            // x, y: row gid, tokens 2 lid, 2 lid + 1; z, w: row gid + 8.
+            const int ra = r0 + ri * 16 + gid, rb = ra + 8, t = ni * 8 + 2 * lid;
+            if (ra < rows) {
+                if (t < m) y[static_cast<long long>(t) * ldy + ra] = s.x;
+                if (t + 1 < m) y[static_cast<long long>(t + 1) * ldy + ra] = s.y;
+            }
+            if (rb < rows) {
+                if (t < m) y[static_cast<long long>(t) * ldy + rb] = s.z;
+                if (t + 1 < m) y[static_cast<long long>(t + 1) * ldy + rb] = s.w;
+            }
         }
     }
 }
@@ -220,29 +265,38 @@ __global__ void to_bf16_pad(const float* __restrict__ x, int m, int k, int kp, _
 
 VeloxScratch g_x;
 
-template <int F, int T, int GPR>
+template <int F, int T, int GPR, int RT>
 int launch(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, long long rb, int rows, int m,
            float* y, long long ldy) {
-    rs_sliced_kernel<F, T, GPR><<<(rows + kR - 1) / kR, kThreads>>>(x, w, n, k, kp, rb, rows, m, y, ldy);
+    constexpr int R = 16 * RT;
+    rs_sliced_kernel<F, T, GPR, RT><<<(rows + R - 1) / R, kThreads>>>(x, w, n, k, kp, rb, rows, m, y, ldy);
     return velox_launch_status();
 }
 
-template <int F, int T>
+template <int F, int T, int RT>
 int launch_k(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, long long rb, int rows, int m,
              float* y, long long ldy) {
     // The model's input widths as compile-time constants (the tile loop unrolls).
-    if (k == 5120 && kp == 5120) return launch<F, T, 80>(x, w, n, k, kp, rb, rows, m, y, ldy);
-    if (k == 6144 && kp == 6144) return launch<F, T, 96>(x, w, n, k, kp, rb, rows, m, y, ldy);
-    return launch<F, T, 0>(x, w, n, k, kp, rb, rows, m, y, ldy);
+    if (k == 5120 && kp == 5120) return launch<F, T, 80, RT>(x, w, n, k, kp, rb, rows, m, y, ldy);
+    if (k == 6144 && kp == 6144) return launch<F, T, 96, RT>(x, w, n, k, kp, rb, rows, m, y, ldy);
+    return launch<F, T, 0, RT>(x, w, n, k, kp, rb, rows, m, y, ldy);
+}
+
+// Up to 8 tokens one row tile per block, 16 tokens two (measured, verify at 16k keys: batched
+// 2 x 8 rows 38.4 -> 37.7 ms per round; one sequence slower with two).
+template <int F, int T>
+int launch_rt(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, long long rb, int rows, int m,
+              float* y, long long ldy) {
+    return launch_k<F, T, T == 16 ? 2 : 1>(x, w, n, k, kp, rb, rows, m, y, ldy);
 }
 
 int run(const __nv_bfloat16* xb, int m, const uint8_t* w, long long parent_rows, int ki, int kp, long long row_begin,
         int rows, int format, float* y, long long ldy) {
     if (format == kQ5)
-        return m <= 8 ? launch_k<kQ5, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy)
-                      : launch_k<kQ5, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy);
-    return m <= 8 ? launch_k<kQ4, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy)
-                  : launch_k<kQ4, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy);
+        return m <= 8 ? launch_rt<kQ5, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy)
+                      : launch_rt<kQ5, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy);
+    return m <= 8 ? launch_rt<kQ4, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy)
+                  : launch_rt<kQ4, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy);
 }
 
 VeloxScratch g_shared;
