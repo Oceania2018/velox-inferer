@@ -3153,6 +3153,13 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.moe_experts(Ggml(Iq2S), Ggml(Q4K), 12, 256, 512, 130, 4, a8)?;
         // Odd widths (partial tiles everywhere) and bf16 records.
         s.moe_experts(Bf16, Bf16, 7, 40, 70, 5, 3, ActPolicy::A16Only)?;
+        // Qwen3.8-Flash-Next IQ2_XS geometry: IQ2_S / IQ2_XXS / IQ1_M gate and up, Q2_0 down,
+        // at decode, verify and prefill widths.
+        use velox_core::ggml::GgmlType::{Iq1M, Q2_0};
+        s.moe_experts(Ggml(Iq2S), Ggml(Q2_0), 24, 640, 2560, 1, 10, a8)?;
+        s.moe_experts(Ggml(Iq2Xxs), Ggml(Q2_0), 24, 640, 2560, 8, 10, a8)?;
+        s.moe_experts(Ggml(Iq1M), Ggml(Q2_0), 24, 640, 2560, 3, 10, a8)?;
+        s.moe_experts(Ggml(Iq2S), Ggml(Q2_0), 24, 640, 2560, 40, 10, a8)?;
     }
     for (block0, blocks, ratio, dim, rot) in
         [(0, 1, 4, 128, 64), (5, 70, 4, 128, 64), (2, 9, 3, 40, 40)]
