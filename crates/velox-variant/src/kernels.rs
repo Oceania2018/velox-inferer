@@ -115,6 +115,17 @@ extern "C" {
         bits: i32,
         y: *mut f32,
     ) -> i32;
+    fn velox_5090_linear_ggml(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        row_begin: i64,
+        rows: i32,
+        k: i64,
+        ggml_type: i32,
+        y: *mut f32,
+    ) -> i32;
     fn velox_5090_linear_a8(
         x: *const f32,
         m: i32,
@@ -165,6 +176,20 @@ const SKINNY16_MAX_M: usize = 16;
 /// skinny kernel in blocks of 16 rows up to this many rows, rather than the exact portable path.
 /// Groupwise-integer weights hand over to the row-split kernel at `ROWSPLIT_MIN_M`.
 const SKINNY_MAX_M: usize = 96;
+
+/// GGML block weights (GGUF imports) up to this many tokens take the bf16 tensor-core kernel that
+/// streams them once per 64 tokens (decode, speculative verify, batched verify).
+const GGML_MAX_M: usize = 64;
+
+/// The bf16 tensor-core kernel's type code for GGML block weights at `m` tokens.
+fn ggml_type(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
+    match w.format {
+        WeightFormat::Ggml(t) if (1..=GGML_MAX_M).contains(&m) && w.k % 1024 == 0 => {
+            velox_core::ggml::GgmlType::ALL.iter().position(|&u| u == t).map(|i| i as i32)
+        }
+        _ => None,
+    }
+}
 
 /// Skinny FP8 row-scaled linears (speculative verify, drafts) take the one-kernel bf16-activation
 /// path: no activation quantizer or split-K pass, and bf16 activations (finer than E4M3).
@@ -317,6 +342,9 @@ impl CudaKernels for Rtx5090Kernels {
     }
 
     fn linear_act(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> ActQuant {
+        if ggml_type(w, m).is_some() {
+            return ActQuant::Bf16;
+        }
         if m >= ROWSPLIT_MIN_M && w.format.row_split().is_some() {
             return ActQuant::Bf16;
         }
@@ -414,6 +442,14 @@ impl CudaKernels for Rtx5090Kernels {
                 "rtx5090 linear a8",
             ),
             ActQuant::Bf16 => {
+                if let Some(t) = ggml_type(w, m) {
+                    // SAFETY: extents validated by CudaBackend (check::linear); the kernel reads rows
+                    // [row_begin, row_begin + rows) of the parent and writes y [m, rows].
+                    return status(
+                        unsafe { velox_5090_linear_ggml(x.as_ptr(), mi, wp, pr, rb, rows, k, t, y.as_mut_ptr()) },
+                        "rtx5090 linear ggml",
+                    );
+                }
                 if a16_fp8(w, m) {
                     // The kernel takes up to 64 rows; larger m runs in blocks (activations [m, k],
                     // outputs [m, rows]).
