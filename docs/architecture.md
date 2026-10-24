@@ -65,6 +65,17 @@ the query and the output instead of the rows. The oracle decodes caches to f32 a
 reference, so every format is checked against the same f64 attention. Models choose the format
 per session (`velox serve --kv-format`); the default stays `f32`.
 
+### Recurrent-state checkpoint formats
+
+Context-store entries keep the GDN `S` matrices in `velox_core::StateFormat` (`f32`, `bf16`,
+`nvfp4`, following ninfer's `--host-state-dtype`; `velox serve --host-state-dtype`, default
+`bf16`); lanes always run on f32 state. A `Checkpoint` records its format: `state_pack` encodes
+when a snapshot is written (straight into pinned system RAM, the store's storage) and
+`state_unpack` decodes on restore, both bit-exact with `state::pack` / `state::unpack`. A 27B
+state is 157 MB in f32, 81 MB in bf16 and 28 MB in nvfp4 (per-row f32 divisor, E4M3 scale per
+16 values). `velox generate --state-quant bf16,nvfp4` measures what a format costs a resumed
+generation against the exact state.
+
 ## Dense and MoE models
 
 `Qwen3_5ForCausalLM` (Qwen3.6/3.8-27B) and `Qwen3_5MoeForCausalLM` (Qwen3.6-35B-A3B) share the

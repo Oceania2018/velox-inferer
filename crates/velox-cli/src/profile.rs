@@ -11,7 +11,7 @@ use velox_core::backend::{
     DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, LinearDst, NormKind,
     RopePosShape, RopeShape, WeightView,
 };
-use velox_core::{DeviceProfile, Op, Result};
+use velox_core::{DeviceProfile, Op, Result, StateFormat};
 
 pub struct Profiled<B: Backend> {
     pub inner: B,
@@ -464,6 +464,24 @@ impl<B: Backend> Backend for Profiled<B> {
         s: KvStoreShape,
     ) -> Result<()> {
         self.time("kv_load", || self.inner.kv_load(kc, vc, k, v, s))
+    }
+    fn state_pack(
+        &self,
+        src: &B::Buffer,
+        dst: &mut B::Buffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()> {
+        self.time("state_pack", || self.inner.state_pack(src, dst, n, fmt))
+    }
+    fn state_unpack(
+        &self,
+        src: &B::Buffer,
+        dst: &mut B::Buffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()> {
+        self.time("state_unpack", || self.inner.state_unpack(src, dst, n, fmt))
     }
     fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_precision(s)

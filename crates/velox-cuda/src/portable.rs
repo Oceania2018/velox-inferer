@@ -7,7 +7,7 @@ use velox_core::backend::{
 };
 use velox_core::check::{self, to_i32};
 use velox_core::kv::{hadamard_norm, KvFormat};
-use velox_core::{Result, WeightFormat, GRAPH_KV_BUCKET};
+use velox_core::{Result, StateFormat, WeightFormat, GRAPH_KV_BUCKET};
 
 use crate::{dtod, graph_mode, stage, status, CudaBuffer, GraphMode};
 
@@ -685,6 +685,8 @@ extern "C" {
         params: *const i64,
         kv_grid: i32,
     ) -> i32;
+    fn velox_portable_state_pack(src: *const f32, dst: *mut u8, n: i64, format: i32) -> i32;
+    fn velox_portable_state_unpack(src: *const u8, dst: *mut f32, n: i64, format: i32) -> i32;
     fn velox_portable_kv_load(
         k_cache: *const u8,
         v_cache: *const u8,
@@ -1535,6 +1537,58 @@ pub fn kv_bucket(kv_len: usize) -> usize {
 /// otherwise the bucket of `kv_len`.
 pub fn kv_grid(kv_len: usize) -> usize {
     kv_bucket(kv_len).max(crate::static_kv_bucket().unwrap_or(0))
+}
+
+fn state_format_code(f: StateFormat) -> i32 {
+    match f {
+        StateFormat::F32 => 0,
+        StateFormat::Bf16 => 1,
+        StateFormat::Nvfp4 => 2,
+    }
+}
+
+/// Packs an f32 recurrent state; see `Backend::state_pack`. `dst` may be mapped host memory.
+pub fn state_pack(
+    src: &CudaBuffer,
+    dst: &mut CudaBuffer,
+    n: usize,
+    fmt: StateFormat,
+) -> Result<()> {
+    check::state_pack(src.len(), dst.len(), n, fmt)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_state_pack(
+                src.as_ptr(),
+                dst.as_mut_ptr().cast(),
+                n as i64,
+                state_format_code(fmt),
+            )
+        },
+        "portable state_pack",
+    )
+}
+
+/// Unpacks a recurrent state to f32; see `Backend::state_unpack`. `src` may be mapped host memory.
+pub fn state_unpack(
+    src: &CudaBuffer,
+    dst: &mut CudaBuffer,
+    n: usize,
+    fmt: StateFormat,
+) -> Result<()> {
+    check::state_unpack(src.len(), dst.len(), n, fmt)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_state_unpack(
+                src.as_ptr().cast(),
+                dst.as_mut_ptr(),
+                n as i64,
+                state_format_code(fmt),
+            )
+        },
+        "portable state_unpack",
+    )
 }
 
 /// Decodes cache rows to the f32 rows they represent; see `Backend::kv_load`.

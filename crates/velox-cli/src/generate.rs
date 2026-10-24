@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use serde_json::json;
-use velox_core::{Backend, Error, KvFormat, Result};
+use velox_core::{Backend, Error, KvFormat, Result, StateFormat};
 use velox_frontend::Frontend;
 use velox_models::qwen3_5::{Qwen35Text, TextConfig, TextWeights};
 use velox_weights::Artifact;
@@ -110,8 +110,23 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
     );
     let model = Qwen35Text::new(cfg, w);
     let mut ws = model.workspace(b, chunk)?;
+    // --state-quant f32,bf16,...: formats compared by `state_quant` (f32 first: the noise floor).
+    let state_formats = match a.get("state-quant") {
+        Some(list) => {
+            let mut v = vec![StateFormat::F32];
+            for f in list.split(',') {
+                let f = StateFormat::parse(f.trim())?;
+                if !v.contains(&f) {
+                    v.push(f);
+                }
+            }
+            Some(v)
+        }
+        None => None,
+    };
+    let mut state_rows: Vec<StateQuantRow> = Vec::new();
 
-    for input in inputs {
+    for (n, input) in inputs.into_iter().enumerate() {
         let (prompt, ids) = match input {
             Input::Prompt(p) => {
                 let text = fe.template.render(
@@ -161,6 +176,23 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
                 &fe,
                 on_phase,
             )?;
+            continue;
+        }
+        if let Some(formats) = &state_formats {
+            let tail: usize = a.parse("split-tail", 256)?;
+            state_rows.extend(state_quant(
+                b,
+                &model,
+                &mut session,
+                &mut ws,
+                &ids,
+                max_tokens,
+                formats,
+                tail,
+                fe.public_vocab,
+                &|t| fe.is_eos(t),
+                n,
+            )?);
             continue;
         }
         if a.get("spec-check").is_some() {
@@ -233,7 +265,185 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             println!("text      {text:?}");
         }
     }
+    if let Some(formats) = &state_formats {
+        state_quant_summary(formats, &state_rows);
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One prompt's result for one format of `--state-quant`.
+struct StateQuantRow {
+    format: StateFormat,
+    /// Relative L2 error of the stored recurrent state.
+    state_err: f64,
+    steps: usize,
+    /// First step whose greedy token differs from the exact run's (a greedy run diverges there).
+    first_mismatch: Option<usize>,
+    mismatches: usize,
+    /// Largest and summed |logit difference| of the exact run's token over the steps.
+    max_dlogit: f32,
+    sum_dlogit: f64,
+    bytes: usize,
+}
+
+/// `--state-quant f1,f2,..`: the cost of keeping a checkpoint's recurrent state in a lossy format
+/// (see `StateFormat`). Prefills all but the last `tail` prompt tokens, snapshots the state to
+/// system RAM, then for each format stores it packed (as the context store does), restores it, feeds the rest of the
+/// prompt and decodes `steps` tokens teacher-forced on the exact run's greedy tokens. `f32` runs
+/// the exact state again: its differences are the run-to-run noise floor. Prints one JSON line
+/// per format.
+#[allow(clippy::too_many_arguments)]
+fn state_quant<B: Backend>(
+    b: &B,
+    model: &Qwen35Text<B>,
+    s: &mut velox_models::qwen3_5::Session<B>,
+    ws: &mut velox_models::qwen3_5::Workspace<B>,
+    ids: &[u32],
+    steps: usize,
+    formats: &[StateFormat],
+    tail: usize,
+    limit: usize,
+    is_eos: &dyn Fn(u32) -> bool,
+    prompt: usize,
+) -> Result<Vec<StateQuantRow>> {
+    const TOP: usize = 8;
+    if ids.len() < 2 || steps == 0 {
+        return Err(Error::Config(
+            "--state-quant needs prompts of 2+ tokens and --max-tokens 1+".into(),
+        ));
+    }
+    let split = ids.len().saturating_sub(tail).clamp(1, ids.len() - 1);
+    model.advance(b, s, ws, &ids[..split], None, &[])?;
+    let exact = s.checkpoint_in(b, true)?;
+    // Candidates after the prompt and after each fed token: free-running when `force` is None,
+    // else fed `force` (which then also bounds the steps).
+    let run = |s: &mut velox_models::qwen3_5::Session<B>,
+               ws: &mut velox_models::qwen3_5::Workspace<B>,
+               cp: &velox_models::qwen3_5::Checkpoint<B>,
+               force: Option<&[u32]>|
+     -> Result<Vec<Vec<(u32, f32)>>> {
+        s.restore(b, cp)?;
+        model.advance(b, s, ws, &ids[split..], None, &[])?;
+        let mut rows = vec![model.candidates(b, ws, TOP, limit)?];
+        let n = force.map_or(steps, <[u32]>::len);
+        for i in 1..n {
+            let t = match force {
+                Some(f) => f[i - 1],
+                None => rows[i - 1][0].0,
+            };
+            if force.is_none() && is_eos(t) {
+                break;
+            }
+            model.advance(b, s, ws, &[t], None, &[])?;
+            rows.push(model.candidates(b, ws, TOP, limit)?);
+        }
+        Ok(rows)
+    };
+    let reference = run(s, ws, &exact, None)?;
+    let tokens: Vec<u32> = reference.iter().map(|r| r[0].0).collect();
+    let mut out = Vec::new();
+    for &format in formats {
+        // Stored as the context store would (packed in system RAM), restored by unpacking.
+        let mut cp = s.blank_checkpoint_as(b, exact.pos, true, format)?;
+        exact.copy_into(b, &mut cp)?;
+        let mut decoded = s.blank_checkpoint_in(b, exact.pos, true)?;
+        cp.copy_into(b, &mut decoded)?;
+        let state_err = rel_err(b, &exact, &decoded)?;
+        let rows = run(s, ws, &cp, Some(&tokens))?;
+        let mut r = StateQuantRow {
+            format,
+            state_err,
+            steps: rows.len(),
+            first_mismatch: None,
+            mismatches: 0,
+            max_dlogit: 0.0,
+            sum_dlogit: 0.0,
+            bytes: cp.bytes(b),
+        };
+        for (i, (got, want)) in rows.iter().zip(&reference).enumerate() {
+            if got[0].0 != want[0].0 {
+                r.mismatches += 1;
+                r.first_mismatch.get_or_insert(i);
+            }
+            // The exact token's logit; past the top candidates, bounded by the last one shown.
+            let logit = got
+                .iter()
+                .find(|c| c.0 == want[0].0)
+                .unwrap_or(&got[got.len() - 1])
+                .1;
+            let d = (logit - want[0].1).abs();
+            r.max_dlogit = r.max_dlogit.max(d);
+            r.sum_dlogit += f64::from(d);
+        }
+        // The exact run's margin at the divergence: near-ties diverge from any perturbation.
+        let margin = r
+            .first_mismatch
+            .map(|i| reference[i][0].1 - reference[i][1].1);
+        println!(
+            "{}",
+            json!({"prompt": prompt, "prompt_tokens": ids.len(), "split": split,
+                   "format": format.name(), "state_rel_err": r.state_err,
+                   "state_mb": r.bytes as f64 / 1e6, "steps": r.steps,
+                   "first_mismatch": r.first_mismatch, "mismatches": r.mismatches,
+                   "margin_at_mismatch": margin, "max_dlogit": r.max_dlogit,
+                   "mean_dlogit": r.sum_dlogit / r.steps as f64})
+        );
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// Relative L2 difference of two checkpoints' states (`got` against `want`).
+fn rel_err<B: Backend>(
+    b: &B,
+    want: &velox_models::qwen3_5::Checkpoint<B>,
+    got: &velox_models::qwen3_5::Checkpoint<B>,
+) -> Result<f64> {
+    b.synchronize()?;
+    let (mut err, mut norm) = (0f64, 0f64);
+    for (w, g) in want.buffers().zip(got.buffers()) {
+        let (mut x, mut y) = (vec![0f32; b.len(w)], vec![0f32; b.len(g)]);
+        b.download(w, &mut x)?;
+        b.download(g, &mut y)?;
+        for (p, q) in x.iter().zip(&y) {
+            err += f64::from(p - q).powi(2);
+            norm += f64::from(*p).powi(2);
+        }
+    }
+    Ok(if norm > 0.0 { (err / norm).sqrt() } else { 0.0 })
+}
+
+/// Per-format totals of `--state-quant` over every prompt (stderr, after the JSON lines).
+fn state_quant_summary(formats: &[StateFormat], rows: &[StateQuantRow]) {
+    eprintln!(
+        "\nformat   state MB  rel err   diverged  first mismatch  mismatched steps  max |dlogit|  mean |dlogit|"
+    );
+    for &f in formats {
+        let rs: Vec<&StateQuantRow> = rows.iter().filter(|r| r.format == f).collect();
+        if rs.is_empty() {
+            continue;
+        }
+        let mut firsts: Vec<usize> = rs.iter().filter_map(|r| r.first_mismatch).collect();
+        firsts.sort_unstable();
+        let steps: usize = rs.iter().map(|r| r.steps).sum();
+        let first = match firsts.get(firsts.len() / 2) {
+            Some(m) => format!("median {m}"),
+            None => "-".to_string(),
+        };
+        eprintln!(
+            "{:<8} {:>8.1}  {:>8.2e}  {:>3}/{:<4}  {:>14}  {:>7}/{:<8}  {:>12.3}  {:>13.4}",
+            f.name(),
+            rs[0].bytes as f64 / 1e6,
+            rs.iter().map(|r| r.state_err).sum::<f64>() / rs.len() as f64,
+            firsts.len(),
+            rs.len(),
+            first,
+            rs.iter().map(|r| r.mismatches).sum::<usize>(),
+            steps,
+            rs.iter().map(|r| r.max_dlogit).fold(0f32, f32::max),
+            rs.iter().map(|r| r.sum_dlogit).sum::<f64>() / steps.max(1) as f64
+        );
+    }
 }
 
 /// `--spec-check`: speculative verify/commit must reproduce sequential decoding. Decodes greedily

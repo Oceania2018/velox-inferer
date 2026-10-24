@@ -24,6 +24,7 @@
 //! An optional NVMe tier ([`DiskTier`]) keeps copies of evicted entries that can still be
 //! resumed.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
@@ -37,7 +38,7 @@ enum Src<'a, B: Backend> {
 }
 
 use velox_core::backend::HostAlloc;
-use velox_core::{Backend, Error as CoreError};
+use velox_core::{Backend, Error as CoreError, StateFormat};
 use velox_models::qwen3_5::{
     Checkpoint, DFlashModel, DFlashState, DraftContext, KvSegment, Session, KV_PAGE_ROWS,
 };
@@ -94,6 +95,11 @@ pub(crate) struct ContextStore<B: Backend> {
     lambda: f64,
     now: u64,
     next_id: u64,
+    /// Storage format of entries' recurrent states (ninfer `--host-state-dtype`); spare states are
+    /// kept in it too.
+    format: StateFormat,
+    /// [`Self::bytes`] while `entries` is unchanged (cleared at every change).
+    held: Cell<Option<usize>>,
 }
 
 /// Evicted state storage kept for reuse.
@@ -151,8 +157,9 @@ where
 }
 
 impl<B: Backend> ContextStore<B> {
-    /// A store of at most `budget` bytes ranking entries by LRFU with decay `lambda` per request.
-    pub fn new(budget: usize, lambda: f64, disk: Option<DiskTier>) -> Self {
+    /// A store of at most `budget` bytes ranking entries by LRFU with decay `lambda` per request,
+    /// keeping recurrent states in `format`.
+    pub fn new(budget: usize, lambda: f64, disk: Option<DiskTier>, format: StateFormat) -> Self {
         ContextStore {
             pinner: None,
             disk,
@@ -166,6 +173,8 @@ impl<B: Backend> ContextStore<B> {
             lambda: lambda.max(0.0),
             now: 0,
             next_id: 1,
+            format,
+            held: Cell::new(None),
         }
     }
 
@@ -220,7 +229,7 @@ impl<B: Backend> ContextStore<B> {
         let pos = rkeys.len();
         let mut state = match self.spare.pop() {
             Some(s) => s,
-            None => session.blank_checkpoint_in(b, pos, true)?,
+            None => session.blank_checkpoint_as(b, pos, true, self.format)?,
         };
         let mut kv = Vec::with_capacity(segs.len());
         let (pool, page_len) = (&mut self.pages, session.kv_page_len());
@@ -281,6 +290,7 @@ impl<B: Backend> ContextStore<B> {
         }
         let id = self.next_id;
         self.next_id += 1;
+        self.held.set(None);
         self.entries.push(Entry {
             id,
             keys: rkeys,
@@ -322,7 +332,8 @@ impl<B: Backend> ContextStore<B> {
             return Ok(false);
         }
         if self.spare.len() < RESERVE_STATES {
-            self.spare.push(session.blank_checkpoint_in(b, 0, true)?);
+            self.spare
+                .push(session.blank_checkpoint_as(b, 0, true, self.format)?);
             return Ok(true);
         }
         if self.pages.len() < RESERVE_PAGES {
@@ -360,7 +371,7 @@ impl<B: Backend> ContextStore<B> {
                 }
             };
             match kind {
-                Pin::State => match session.host_checkpoint_from(bufs) {
+                Pin::State => match session.host_checkpoint_from(b, bufs, self.format) {
                     Ok(cp) => self.spare.push(cp),
                     Err(e) => eprintln!("context store: {e}"),
                 },
@@ -374,7 +385,7 @@ impl<B: Backend> ContextStore<B> {
         let Some(p) = self.pinner.as_ref() else {
             return;
         };
-        let state_lens = session.state_lens(b);
+        let state_lens = session.state_lens(b, self.format);
         let state_bytes: usize = state_lens.iter().sum::<usize>() * 4;
         let page_len = session.kv_page_len();
         const PAGES_PER_PIN: usize = 4;
@@ -488,6 +499,7 @@ impl<B: Backend> ContextStore<B> {
                 .collect();
             for i in dead.into_iter().rev() {
                 let e = self.entries.swap_remove(i);
+                self.held.set(None);
                 self.release(e);
             }
         }
@@ -551,6 +563,7 @@ impl<B: Backend> ContextStore<B> {
         old.sort_unstable();
         for i in old.into_iter().rev() {
             let e = self.entries.swap_remove(i);
+            self.held.set(None);
             self.release(e);
         }
     }
@@ -684,7 +697,7 @@ impl<B: Backend> ContextStore<B> {
         let t_draft = t0.elapsed();
         let mut how = "taken";
         let state = match cp {
-            Src::Own(c) if c.on_host() => c,
+            Src::Own(c) if c.on_host() && c.format() == self.format => c,
             cp => {
                 how = if self.spare.is_empty() {
                     "pinned"
@@ -693,7 +706,7 @@ impl<B: Backend> ContextStore<B> {
                 };
                 let mut state = match self.spare.pop() {
                     Some(s) => s,
-                    None => session.blank_checkpoint_in(b, pos, true)?,
+                    None => session.blank_checkpoint_as(b, pos, true, self.format)?,
                 };
                 match cp {
                     Src::Copy(c) => c.copy_into(b, &mut state)?,
@@ -734,24 +747,35 @@ impl<B: Backend> ContextStore<B> {
                 }
             }
         }
+        self.held.set(None);
         self.entries.push(e);
         self.evict(b, id)?;
         if debug {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
-                "[store] insert {pos}: kv {:.1} ms ({fresh} pages, {pinned} pinned), draft {:.1}, state {:.1} ({}), evict {:.1} ms",
+                "[store] insert {pos}: kv {:.1} ms ({fresh} pages, {pinned} pinned), draft {:.1}, state {:.1} ({how}, {}), evict {:.1} ms",
                 ms(t_kv),
                 ms(t_draft - t_kv),
                 ms(t_state - t_draft),
-                how,
+                self.format,
                 ms(t0.elapsed() - t_state)
             );
         }
         Ok(id)
     }
 
-    /// Bytes held: states plus distinct KV segments.
+    /// Bytes held: states plus distinct KV segments. Cached until the entries change: the
+    /// scheduler asks every step, and a recount walks every page of every entry.
     pub fn bytes(&self, b: &B) -> usize {
+        if let Some(n) = self.held.get() {
+            return n;
+        }
+        let n = self.count_bytes(b);
+        self.held.set(Some(n));
+        n
+    }
+
+    fn count_bytes(&self, b: &B) -> usize {
         let mut seen = HashSet::new();
         let mut total = 0;
         for e in &self.entries {
@@ -793,6 +817,7 @@ impl<B: Backend> ContextStore<B> {
                 synced = true;
             }
             let e = self.entries.swap_remove(i);
+            self.held.set(None);
             if let Some(e) = self.spill(b, e) {
                 self.release(e);
             }

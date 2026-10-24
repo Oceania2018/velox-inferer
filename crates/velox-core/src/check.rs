@@ -346,6 +346,18 @@ pub fn kv_store(
     need("kv_store v_cache", v_cache, cache)
 }
 
+/// `state_pack`: `n` f32 values (whole rows) into a packed state of `fmt`.
+pub fn state_pack(src: usize, dst: usize, n: usize, fmt: crate::StateFormat) -> Result<()> {
+    fmt.check_len(n)?;
+    need("state_pack src", src, n)?;
+    need("state_pack dst", dst, fmt.slots(n))
+}
+
+/// `state_unpack` reads what `state_pack` writes.
+pub fn state_unpack(src: usize, dst: usize, n: usize, fmt: crate::StateFormat) -> Result<()> {
+    state_pack(dst, src, n, fmt)
+}
+
 /// `kv_load` reads what `kv_store` writes: the same extents.
 pub fn kv_load(k_cache: usize, v_cache: usize, k: usize, v: usize, s: &KvStoreShape) -> Result<()> {
     kv_store(k, v, k_cache, v_cache, s)

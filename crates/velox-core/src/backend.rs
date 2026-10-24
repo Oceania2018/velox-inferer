@@ -11,6 +11,7 @@ use crate::format::WeightFormat;
 use crate::kv::KvFormat;
 use crate::op::Op;
 use crate::profile::DeviceProfile;
+use crate::state::StateFormat;
 
 /// [`Backend::alloc_host`] callable from any thread: pinning system RAM is slow (about 1 ms per
 /// MiB), so a background thread can prepare it while the device works.
@@ -1028,6 +1029,25 @@ pub trait Backend {
         k: &mut Self::Buffer,
         v: &mut Self::Buffer,
         shape: KvStoreShape,
+    ) -> Result<()>;
+    /// Encodes `n` values of the f32 recurrent state `src` into `dst` in `fmt`'s packed layout
+    /// (see [`crate::StateFormat`]; bit-exact with `velox_core::state::pack`). `dst` may be
+    /// storage from [`Self::alloc_host`]: a checkpoint is written straight to system RAM.
+    fn state_pack(
+        &self,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()>;
+    /// Decodes a packed state of `n` values (`src`, possibly host storage) into the f32 values it
+    /// represents (bit-exact with `velox_core::state::unpack`).
+    fn state_unpack(
+        &self,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        n: usize,
+        fmt: StateFormat,
     ) -> Result<()>;
     /// The operand precision `attention` uses for this shape. For a quantized cache the rounding
     /// applies to the rows the cache represents.
