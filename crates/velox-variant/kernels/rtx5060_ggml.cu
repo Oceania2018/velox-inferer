@@ -551,6 +551,20 @@ __device__ __forceinline__ void mma_k32(int (&c)[4], int a0, int a1, int a2, int
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ void mma_f16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                        uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t half2_bits(int lo, int hi) {
+    const __half2 h = __halves2half2(__int2half_rn(lo), __int2half_rn(hi));
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
 __device__ __forceinline__ void mma_k16(int (&c)[4], int a0, int a1, int b0) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
@@ -1176,7 +1190,14 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
     constexpr bool kOff = T == kQ2K || T == kQ4K;
     __shared__ __align__(16) int8_t act[2][kQ2Tokens * kQ2S];
     __shared__ float sxs[2][kQ2Tokens];
-    __shared__ __align__(16) int xs[kOff ? kQ2Tokens : 1][16];
+    // Each warp's 16 rows of the super-block, copied from the 4-byte aligned address at or below it
+    // (blocks are 2-byte aligned; row ends are 4-byte aligned, so the copy stays inside the row).
+    // Odd word stride: the 8 rows a decode load touches hit 8 banks.
+    constexpr int kWW = (BB + 2 + 3) / 4 | 1;
+    __shared__ uint32_t wst[kQ2Warps][2][16][kWW];
+    // Code sums per (token, 16 values) as f16 (exact: |sum| <= 2032), row stride 9 words: the B
+    // operand of the minimum term's f16 mma.
+    __shared__ __align__(16) __half xs[kOff ? kQ2Tokens : 1][18];
     __shared__ uint32_t sg[Grid<T>::kWords];
     __shared__ uint8_t sks[128];
     if constexpr (Grid<T>::kWords > 1) {
@@ -1189,8 +1210,8 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     const int t0 = blockIdx.x * kQ2Tokens;
     const int r0 = blockIdx.y * (16 * kQ2Warps) + warp * 16;
-    const uint8_t* ra = w + (row_begin + min(r0 + g, rows - 1)) * row_bytes;
-    const uint8_t* rb = w + (row_begin + min(r0 + g + 8, rows - 1)) * row_bytes;
+    const uint8_t* tile = w + (row_begin + r0) * row_bytes;
+    const int last = rows - 1 - r0;
     const int b_row = (lane & 7) + ((lane >> 4) << 3), b_col = ((lane >> 3) & 1) << 4;
     const int blocks = k / 256;
     auto stage = [&](int buf, int kb) {
@@ -1198,6 +1219,15 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
             const int r = i >> 4, c = i & 15;
             const int tok = min(t0 + r, m - 1);
             cp_async16(&act[buf][r * kQ2S + c * 16], xq + static_cast<long long>(tok) * k + kb * 256 + c * 16);
+        }
+        // This warp's rows (one commit group with the activations).
+        const long long boff = static_cast<long long>(kb) * BB;
+        const int words = static_cast<int>(((boff & 3) + BB + 3) / 4);
+        const uint8_t* src = tile + (boff & ~3ll);
+        for (int e = lane; e < 16 * words; e += VELOX_WARP) {
+            const int r = e / words, c = e % words;
+            cp_async4(&wst[warp][buf][r][c],
+                      src + static_cast<uint32_t>(min(r, last)) * static_cast<uint32_t>(row_bytes) + 4u * c);
         }
         cp_async_commit();
         if (threadIdx.x < kQ2Tokens)
@@ -1220,18 +1250,21 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
                 int z = __dp4a(v.x, 0x01010101, 0);
                 z = __dp4a(v.y, 0x01010101, z);
                 z = __dp4a(v.z, 0x01010101, z);
-                xs[r][h] = __dp4a(v.w, 0x01010101, z);
+                xs[r][h] = __int2half_rn(__dp4a(v.w, 0x01010101, z));
             }
             __syncthreads();
         }
-        const uint8_t* xa = ra + static_cast<long long>(kb) * BB;
-        const uint8_t* xb = rb + static_cast<long long>(kb) * BB;
+        const int off = static_cast<int>((static_cast<long long>(kb) * BB) & 3);
+        const uint8_t* xa = reinterpret_cast<const uint8_t*>(wst[warp][cur][g]) + off;
+        const uint8_t* xb = reinterpret_cast<const uint8_t*>(wst[warp][cur][g + 8]) + off;
         int ia[NT][4];
 #pragma unroll
         for (int n = 0; n < NT; ++n) ia[n][0] = ia[n][1] = ia[n][2] = ia[n][3] = 0;
-        // Minima per (row, 16 values) of this super-block: the offset term sum_h mn * xs is
-        // independent of the products, so it is formed once per super-block in the epilogue.
-        int mina[kOff ? 16 : 1], minb[kOff ? 16 : 1];
+        // The minimum term sum_h mn[row][h] * xs[token][h] over the super-block's 16 halves is a
+        // 16 x 16 x 8 product per token tile: one f16 mma (exact: mins <= 63, sums <= 2032, f32
+        // accumulation). Lane (g, t) holds the A operand's halves 2t, 2t + 1 (sub-block t) and
+        // 8 + 2t, 9 + 2t (sub-block 4 + t) of rows g, g + 8.
+        uint32_t ma[4] = {0u, 0u, 0u, 0u};
         float2 dma, dmb;
 #pragma unroll kPreSbUnroll
         for (int sb = 0; sb < 8; ++sb) {
@@ -1247,8 +1280,8 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
             int_scales<T>(xa, sb, sca, mna, dma);
             int_scales<T>(xb, sb, scb, mnb, dmb);
             if constexpr (kOff) {
-                mina[2 * sb] = mna[0], mina[2 * sb + 1] = mna[1];
-                minb[2 * sb] = mnb[0], minb[2 * sb + 1] = mnb[1];
+                if (sb == t) ma[0] = half2_bits(mna[0], mna[1]), ma[1] = half2_bits(mnb[0], mnb[1]);
+                if (sb == t + 4) ma[2] = half2_bits(mna[0], mna[1]), ma[3] = half2_bits(mnb[0], mnb[1]);
             }
 #pragma unroll
             for (int np = 0; np < NT / 2; ++np) {
@@ -1279,26 +1312,24 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
         }
         // Super-block epilogue: d per row (rows g, g + 8), the activation scale per token.
 #pragma unroll
-        for (int n = 0; n < NT; ++n)
+        for (int n = 0; n < NT; ++n) {
+            float off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if constexpr (kOff) {
+                const uint32_t* xr = reinterpret_cast<const uint32_t*>(xs[n * 8 + g]);
+                mma_f16(off, ma[0], ma[1], ma[2], ma[3], xr[t], xr[4 + t]);
+            }
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
                 const float a = sxs[cur][n * 8 + 2 * t + q];
                 float va = dma.x * static_cast<float>(ia[n][q]), vb = dmb.x * static_cast<float>(ia[n][2 + q]);
                 if constexpr (kOff) {
-                    const int4* z4 = reinterpret_cast<const int4*>(xs[n * 8 + 2 * t + q]);
-                    int oa = 0, ob = 0;
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        const int4 z = z4[i];
-                        oa += mina[4 * i] * z.x + mina[4 * i + 1] * z.y + mina[4 * i + 2] * z.z + mina[4 * i + 3] * z.w;
-                        ob += minb[4 * i] * z.x + minb[4 * i + 1] * z.y + minb[4 * i + 2] * z.z + minb[4 * i + 3] * z.w;
-                    }
-                    va += dma.y * static_cast<float>(oa);
-                    vb += dmb.y * static_cast<float>(ob);
+                    va += dma.y * off[q];
+                    vb += dmb.y * off[2 + q];
                 }
                 acc[n][q] += a * va;
                 acc[n][2 + q] += a * vb;
             }
+        }
         __syncthreads();  // every warp is done with this stage before it is refilled
     }
 #pragma unroll
