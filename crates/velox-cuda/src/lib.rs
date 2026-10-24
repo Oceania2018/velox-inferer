@@ -10,8 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
-    Copy2dShape, CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind,
-    KvStoreShape, LinearDst, NormKind, RopePosShape, RopeShape, WeightView, GRAPH_STATIC,
+    Copy2dShape, CopySpec, DilatedConvShape, DynConvShape, ExpertBank, FullAttnShape,
+    GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape, LinearDst, MoeRouteShape,
+    NormKind, QsaPoolShape, QsaSelectShape, RopePosShape, RopeShape, RowGateShape, WeightView,
+    GRAPH_STATIC,
 };
 use velox_core::{
     check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, VariantInfo,
@@ -57,6 +59,7 @@ mod ffi {
         pub fn velox_cuda_free(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_htod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_dtoh(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
+        pub fn velox_cuda_htod_async(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_stage(src: *const c_void, bytes: usize, dev: *mut *mut c_void) -> i32;
         pub fn velox_cuda_event_create(e: *mut *mut c_void) -> i32;
         pub fn velox_cuda_event_record(e: *mut c_void) -> i32;
@@ -882,6 +885,151 @@ pub trait CudaKernels: Send + Sync {
     ) -> Result<()> {
         portable::attention_block(q, k_ctx, v_ctx, k_blk, v_blk, out, shape)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_groups(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        portable::rms_norm_groups(x, weight, y, rows, groups, dim, eps)
+    }
+
+    fn silu(&self, x: &mut CudaBuffer, len: usize) -> Result<()> {
+        portable::silu(x, len)
+    }
+
+    fn hc_mix(
+        &self,
+        xn: &CudaBuffer,
+        gate: &CudaBuffer,
+        out: &mut CudaBuffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()> {
+        portable::hc_mix(xn, gate, out, rows, streams, dim)
+    }
+
+    fn hc_combine(
+        &self,
+        res: &mut CudaBuffer,
+        y: &CudaBuffer,
+        inject: &CudaBuffer,
+        shape: HcCombineShape,
+    ) -> Result<()> {
+        portable::hc_combine(res, y, inject, shape)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gate(
+        &self,
+        key_n: &CudaBuffer,
+        q_n: &CudaBuffer,
+        value: &CudaBuffer,
+        out: &mut CudaBuffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()> {
+        portable::ple_gate(key_n, q_n, value, out, rows, streams, dim)
+    }
+
+    fn conv1d_dilated_silu(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        state: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        shape: DilatedConvShape,
+    ) -> Result<()> {
+        portable::conv1d_dilated_silu(x, weight, state, out, shape)
+    }
+
+    fn sigmoid_scale_rows(
+        &self,
+        x: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        shape: RowGateShape,
+    ) -> Result<()> {
+        portable::sigmoid_scale_rows(x, gate, shape)
+    }
+
+    fn moe_route(
+        &self,
+        logits: &CudaBuffer,
+        ids: &mut CudaBuffer,
+        weights: &mut CudaBuffer,
+        counts: Option<&mut CudaBuffer>,
+        shape: MoeRouteShape,
+    ) -> Result<()> {
+        portable::moe_route(logits, ids, weights, counts, shape)
+    }
+
+    /// See [`Backend::moe_scratch_len`]; an override must cover its own kernels' needs.
+    fn moe_scratch_len(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize, k: usize) -> usize {
+        portable::moe_scratch_len(bank, rows, k)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &self,
+        x: &CudaBuffer,
+        ids: &CudaBuffer,
+        weights: &CudaBuffer,
+        bank: &ExpertBank<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        scratch: &mut CudaBuffer,
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+    }
+
+    /// See [`Backend::moe_experts_act`].
+    fn moe_experts_act(&self, _bank: &ExpertBank<'_, CudaBuffer>, _rows: usize) -> ActQuant {
+        ActQuant::Exact
+    }
+
+    fn qsa_pool(
+        &self,
+        raw: &CudaBuffer,
+        weight: &CudaBuffer,
+        pooled: &mut CudaBuffer,
+        shape: QsaPoolShape,
+    ) -> Result<()> {
+        portable::qsa_pool(raw, weight, pooled, shape)
+    }
+
+    fn qsa_select(
+        &self,
+        q: &CudaBuffer,
+        pooled: &CudaBuffer,
+        sel: &mut CudaBuffer,
+        scratch: &mut CudaBuffer,
+        shape: QsaSelectShape,
+    ) -> Result<()> {
+        portable::qsa_select(q, pooled, sel, scratch, shape)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sparse(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        sel: &CudaBuffer,
+        sel_len: usize,
+        out: &mut CudaBuffer,
+        shape: AttnShape,
+    ) -> Result<()> {
+        portable::attention_sparse(q, k, v, sel, sel_len, out, shape)
+    }
 }
 
 /// Every op on the portable kernels; the CUDA kernel set of the generic variant on main.
@@ -1697,6 +1845,214 @@ impl Backend for CudaBackend {
         self.staged("attention block", || {
             self.kernels
                 .attention_block(q, k_ctx, v_ctx, k_blk, v_blk, out, shape)
+        })
+    }
+
+    fn write_at(&self, dst: &mut CudaBuffer, offset: usize, data: &[f32]) -> Result<()> {
+        check::copy(data.len(), 0, dst.len, offset, data.len())?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: the destination range was validated; the driver stages pageable sources before
+        // returning, so `data` may be reused right away.
+        status(
+            unsafe {
+                ffi::velox_cuda_htod_async(
+                    dst.ptr.add(offset).cast(),
+                    data.as_ptr().cast(),
+                    data.len() * 4,
+                )
+            },
+            "write_at",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_groups(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        check::rms_norm_groups(x.len, weight.len, y.len, rows, groups, dim)?;
+        self.timed("rms_norm_groups", || {
+            self.kernels
+                .rms_norm_groups(x, weight, y, rows, groups, dim, eps)
+        })
+    }
+
+    fn silu(&self, x: &mut CudaBuffer, len: usize) -> Result<()> {
+        check::elementwise("silu", &[x.len], len)?;
+        self.timed("silu", || self.kernels.silu(x, len))
+    }
+
+    fn hc_mix(
+        &self,
+        xn: &CudaBuffer,
+        gate: &CudaBuffer,
+        out: &mut CudaBuffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()> {
+        check::hc_mix(xn.len, gate.len, out.len, rows, streams, dim)?;
+        self.timed("hc_mix", || {
+            self.kernels.hc_mix(xn, gate, out, rows, streams, dim)
+        })
+    }
+
+    fn hc_combine(
+        &self,
+        res: &mut CudaBuffer,
+        y: &CudaBuffer,
+        inject: &CudaBuffer,
+        shape: HcCombineShape,
+    ) -> Result<()> {
+        check::hc_combine(res.len, y.len, inject.len, &shape)?;
+        self.timed("hc_combine", || {
+            self.kernels.hc_combine(res, y, inject, shape)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gate(
+        &self,
+        key_n: &CudaBuffer,
+        q_n: &CudaBuffer,
+        value: &CudaBuffer,
+        out: &mut CudaBuffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()> {
+        check::ple_gate(key_n.len, q_n.len, value.len, out.len, rows, streams, dim)?;
+        self.timed("ple_gate", || {
+            self.kernels
+                .ple_gate(key_n, q_n, value, out, rows, streams, dim)
+        })
+    }
+
+    fn conv1d_dilated_silu(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        state: &mut CudaBuffer,
+        out: &mut CudaBuffer,
+        shape: DilatedConvShape,
+    ) -> Result<()> {
+        check::conv1d_dilated(x.len, weight.len, state.len, out.len, &shape)?;
+        self.timed("conv1d_dilated_silu", || {
+            self.kernels
+                .conv1d_dilated_silu(x, weight, state, out, shape)
+        })
+    }
+
+    fn sigmoid_scale_rows(
+        &self,
+        x: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        shape: RowGateShape,
+    ) -> Result<()> {
+        check::row_gate(x.len, gate.len, &shape)?;
+        self.timed("sigmoid_scale_rows", || {
+            self.kernels.sigmoid_scale_rows(x, gate, shape)
+        })
+    }
+
+    fn moe_route(
+        &self,
+        logits: &CudaBuffer,
+        ids: &mut CudaBuffer,
+        weights: &mut CudaBuffer,
+        counts: Option<&mut CudaBuffer>,
+        shape: MoeRouteShape,
+    ) -> Result<()> {
+        check::moe_route(
+            logits.len,
+            ids.len,
+            weights.len,
+            counts.as_ref().map(|c| c.len),
+            &shape,
+        )?;
+        self.timed("moe_route", || {
+            self.kernels.moe_route(logits, ids, weights, counts, shape)
+        })
+    }
+
+    fn moe_scratch_len(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize, k: usize) -> usize {
+        self.kernels.moe_scratch_len(bank, rows, k)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &self,
+        x: &CudaBuffer,
+        ids: &CudaBuffer,
+        weights: &CudaBuffer,
+        bank: &ExpertBank<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        scratch: &mut CudaBuffer,
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        let bufs = (bank.records.len, bank.slots.len, bank.map.len);
+        check::moe_experts(x.len, ids.len, weights.len, bank, bufs, y.len, rows, k)?;
+        self.timed("moe_experts", || {
+            self.kernels
+                .moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+        })
+    }
+
+    fn moe_experts_act(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> ActQuant {
+        self.kernels.moe_experts_act(bank, rows)
+    }
+
+    fn qsa_pool(
+        &self,
+        raw: &CudaBuffer,
+        weight: &CudaBuffer,
+        pooled: &mut CudaBuffer,
+        shape: QsaPoolShape,
+    ) -> Result<()> {
+        check::qsa_pool(raw.len, weight.len, pooled.len, &shape)?;
+        self.timed("qsa_pool", || {
+            self.kernels.qsa_pool(raw, weight, pooled, shape)
+        })
+    }
+
+    fn qsa_select(
+        &self,
+        q: &CudaBuffer,
+        pooled: &CudaBuffer,
+        sel: &mut CudaBuffer,
+        scratch: &mut CudaBuffer,
+        shape: QsaSelectShape,
+    ) -> Result<()> {
+        check::qsa_select(q.len, pooled.len, sel.len, scratch.len, &shape)?;
+        self.timed("qsa_select", || {
+            self.kernels.qsa_select(q, pooled, sel, scratch, shape)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sparse(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        sel: &CudaBuffer,
+        sel_len: usize,
+        out: &mut CudaBuffer,
+        shape: AttnShape,
+    ) -> Result<()> {
+        check::attention_sparse(q.len, k.len, v.len, sel.len, sel_len, out.len, &shape)?;
+        self.timed("attention_sparse", || {
+            self.kernels
+                .attention_sparse(q, k, v, sel, sel_len, out, shape)
         })
     }
 

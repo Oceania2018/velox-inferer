@@ -2,12 +2,14 @@
 //! tuned kernels do not cover. Each wrapper re-validates, so it is safe to call directly.
 
 use velox_core::backend::{
-    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnReplayLayer,
-    GdnShape, GeluKind, KvStoreShape, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank,
+    ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape,
+    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
+    RowGateShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
 use velox_core::kv::{hadamard_norm, KvFormat};
-use velox_core::{Result, WeightFormat, GRAPH_KV_BUCKET};
+use velox_core::{Error, Result, WeightFormat, GRAPH_KV_BUCKET};
 
 use crate::{dtod, graph_mode, stage, status, CudaBuffer, GraphMode};
 
@@ -1563,5 +1565,524 @@ pub fn kv_load(
             )
         },
         "portable kv_load",
+    )
+}
+
+extern "C" {
+    fn velox_portable_rms_norm_groups(
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        rows: i32,
+        groups: i32,
+        dim: i32,
+        eps: f32,
+    ) -> i32;
+    fn velox_portable_silu(x: *mut f32, len: i64) -> i32;
+    fn velox_portable_hc_mix(
+        xn: *const f32,
+        gate: *const f32,
+        out: *mut f32,
+        rows: i64,
+        streams: i32,
+        dim: i32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_hc_combine(
+        res: *mut f32,
+        y: *const f32,
+        inj: *const f32,
+        rows: i64,
+        streams: i32,
+        dim: i32,
+        ld: i32,
+        col: i32,
+    ) -> i32;
+    fn velox_portable_ple_gate(
+        key: *const f32,
+        q: *const f32,
+        value: *const f32,
+        out: *mut f32,
+        rows: i32,
+        streams: i32,
+        dim: i32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_conv1d_dilated(
+        x: *const f32,
+        w: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        tokens: i32,
+        channels: i32,
+        width: i32,
+        dil: i32,
+    ) -> i32;
+    fn velox_portable_sigmoid_scale_rows(
+        x: *mut f32,
+        gate: *const f32,
+        rows: i64,
+        dim: i32,
+        goff: i64,
+        gstride: i64,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_moe_route(
+        logits: *const f32,
+        ids: *mut f32,
+        wts: *mut f32,
+        counts: *mut f32,
+        rows: i32,
+        row_len: i32,
+        experts: i32,
+        k: i32,
+    ) -> i32;
+    fn velox_portable_moe_scratch(experts: i32, pairs: i32, width: i32, hidden: i32) -> i64;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_moe_experts(
+        x: *const f32,
+        ids: *const f32,
+        w: *const f32,
+        records: *const u8,
+        slots: *const u8,
+        map: *const f32,
+        record_bytes: i64,
+        experts: i32,
+        gate_fmt: i32,
+        gate_off: i64,
+        up_fmt: i32,
+        up_off: i64,
+        down_fmt: i32,
+        down_off: i64,
+        width: i32,
+        hidden: i32,
+        rows: i32,
+        k: i32,
+        y: *mut f32,
+        scratch: *mut f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_qsa_pool(
+        raw: *const f32,
+        w: *const f32,
+        pooled: *mut f32,
+        block0: i32,
+        blocks: i32,
+        ratio: i32,
+        dim: i32,
+        rotary: i32,
+        theta: f32,
+        eps: f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_qsa_select(
+        q: *const f32,
+        pooled: *const f32,
+        sel: *mut f32,
+        scratch: *mut f32,
+        tokens: i32,
+        heads: i32,
+        dim: i32,
+        pos0: i32,
+        ratio: i32,
+        budget: i32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_attention_sparse(
+        q: *const f32,
+        k: *const u8,
+        v: *const u8,
+        sel: *const f32,
+        sel_len: i32,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        format: i32,
+        norm: f32,
+    ) -> i32;
+}
+
+/// Ops whose per-call host values (positions, block ranges) are not staged for graph replay.
+fn outside_graphs(what: &str) -> Result<()> {
+    if graph_mode() != GraphMode::None {
+        return Err(Error::Unsupported(format!(
+            "{what} inside a recorded graph step"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_groups(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    y: &mut CudaBuffer,
+    rows: usize,
+    groups: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<()> {
+    check::rms_norm_groups(x.len(), weight.len(), y.len(), rows, groups, dim)?;
+    to_i32("rows * groups", rows * groups)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_rms_norm_groups(
+                x.as_ptr(),
+                weight.as_ptr(),
+                y.as_mut_ptr(),
+                to_i32("rows", rows)?,
+                to_i32("groups", groups)?,
+                to_i32("dim", dim)?,
+                eps,
+            )
+        },
+        "portable rms_norm_groups",
+    )
+}
+
+pub fn silu(x: &mut CudaBuffer, len: usize) -> Result<()> {
+    check::elementwise("silu", &[x.len()], len)?;
+    // SAFETY: buffer extent validated above.
+    status(
+        unsafe { velox_portable_silu(x.as_mut_ptr(), len as i64) },
+        "portable silu",
+    )
+}
+
+pub fn hc_mix(
+    xn: &CudaBuffer,
+    gate: &CudaBuffer,
+    out: &mut CudaBuffer,
+    rows: usize,
+    streams: usize,
+    dim: usize,
+) -> Result<()> {
+    check::hc_mix(xn.len(), gate.len(), out.len(), rows, streams, dim)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_hc_mix(
+                xn.as_ptr(),
+                gate.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                to_i32("streams", streams)?,
+                to_i32("dim", dim)?,
+            )
+        },
+        "portable hc_mix",
+    )
+}
+
+pub fn hc_combine(
+    res: &mut CudaBuffer,
+    y: &CudaBuffer,
+    inject: &CudaBuffer,
+    s: HcCombineShape,
+) -> Result<()> {
+    check::hc_combine(res.len(), y.len(), inject.len(), &s)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_hc_combine(
+                res.as_mut_ptr(),
+                y.as_ptr(),
+                inject.as_ptr(),
+                s.rows as i64,
+                to_i32("streams", s.streams)?,
+                to_i32("dim", s.dim)?,
+                to_i32("inject_ld", s.inject_ld)?,
+                to_i32("inject_col", s.inject_col)?,
+            )
+        },
+        "portable hc_combine",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ple_gate(
+    key_n: &CudaBuffer,
+    q_n: &CudaBuffer,
+    value: &CudaBuffer,
+    out: &mut CudaBuffer,
+    rows: usize,
+    streams: usize,
+    dim: usize,
+) -> Result<()> {
+    check::ple_gate(
+        key_n.len(),
+        q_n.len(),
+        value.len(),
+        out.len(),
+        rows,
+        streams,
+        dim,
+    )?;
+    to_i32("rows * streams", rows * streams)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_ple_gate(
+                key_n.as_ptr(),
+                q_n.as_ptr(),
+                value.as_ptr(),
+                out.as_mut_ptr(),
+                to_i32("rows", rows)?,
+                to_i32("streams", streams)?,
+                to_i32("dim", dim)?,
+            )
+        },
+        "portable ple_gate",
+    )
+}
+
+pub fn conv1d_dilated_silu(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    state: &mut CudaBuffer,
+    out: &mut CudaBuffer,
+    s: DilatedConvShape,
+) -> Result<()> {
+    check::conv1d_dilated(x.len(), weight.len(), state.len(), out.len(), &s)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_conv1d_dilated(
+                x.as_ptr(),
+                weight.as_ptr(),
+                state.as_mut_ptr(),
+                out.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("channels", s.channels)?,
+                to_i32("width", s.width)?,
+                to_i32("dilation", s.dilation)?,
+            )
+        },
+        "portable conv1d_dilated_silu",
+    )
+}
+
+pub fn sigmoid_scale_rows(x: &mut CudaBuffer, gate: &CudaBuffer, s: RowGateShape) -> Result<()> {
+    check::row_gate(x.len(), gate.len(), &s)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_sigmoid_scale_rows(
+                x.as_mut_ptr(),
+                gate.as_ptr(),
+                s.rows as i64,
+                to_i32("dim", s.dim)?,
+                s.gate_offset as i64,
+                s.gate_stride as i64,
+            )
+        },
+        "portable sigmoid_scale_rows",
+    )
+}
+
+pub fn moe_route(
+    logits: &CudaBuffer,
+    ids: &mut CudaBuffer,
+    weights: &mut CudaBuffer,
+    counts: Option<&mut CudaBuffer>,
+    s: MoeRouteShape,
+) -> Result<()> {
+    check::moe_route(
+        logits.len(),
+        ids.len(),
+        weights.len(),
+        counts.as_ref().map(|c| c.len()),
+        &s,
+    )?;
+    let counts = counts.map_or(std::ptr::null_mut(), |c| c.as_mut_ptr());
+    // SAFETY: buffer extents validated above; counts is null or holds `experts` slots.
+    status(
+        unsafe {
+            velox_portable_moe_route(
+                logits.as_ptr(),
+                ids.as_mut_ptr(),
+                weights.as_mut_ptr(),
+                counts,
+                to_i32("rows", s.rows)?,
+                to_i32("row_len", s.row_len)?,
+                to_i32("experts", s.experts)?,
+                to_i32("k", s.k)?,
+            )
+        },
+        "portable moe_route",
+    )
+}
+
+/// f32 slots of scratch [`moe_experts`] needs.
+pub fn moe_scratch_len(bank: &ExpertBank<'_, CudaBuffer>, rows: usize, k: usize) -> usize {
+    // SAFETY: a pure size computation.
+    let n = unsafe {
+        velox_portable_moe_scratch(
+            bank.experts as i32,
+            (rows * k) as i32,
+            bank.width() as i32,
+            bank.hidden() as i32,
+        )
+    };
+    n.max(1) as usize
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts(
+    x: &CudaBuffer,
+    ids: &CudaBuffer,
+    weights: &CudaBuffer,
+    bank: &ExpertBank<'_, CudaBuffer>,
+    y: &mut CudaBuffer,
+    scratch: &mut CudaBuffer,
+    rows: usize,
+    k: usize,
+) -> Result<()> {
+    let bufs = (bank.records.len(), bank.slots.len(), bank.map.len());
+    check::moe_experts(
+        x.len(),
+        ids.len(),
+        weights.len(),
+        bank,
+        bufs,
+        y.len(),
+        rows,
+        k,
+    )?;
+    to_i32("rows * k", rows * k)?;
+    let need = moe_scratch_len(bank, rows, k);
+    if scratch.len() < need {
+        return Err(Error::Shape(format!(
+            "moe_experts scratch: buffer has {} elements, needs {need}",
+            scratch.len()
+        )));
+    }
+    let off = |m: &ExpertMatrix| m.offset as i64;
+    // SAFETY: extents validated above; expert ids past the bank are skipped by the kernels.
+    status(
+        unsafe {
+            velox_portable_moe_experts(
+                x.as_ptr(),
+                ids.as_ptr(),
+                weights.as_ptr(),
+                bank.records.as_ptr().cast(),
+                bank.slots.as_ptr().cast(),
+                bank.map.as_ptr(),
+                bank.record_bytes as i64,
+                to_i32("experts", bank.experts)?,
+                format_code(bank.gate.format),
+                off(&bank.gate),
+                format_code(bank.up.format),
+                off(&bank.up),
+                format_code(bank.down.format),
+                off(&bank.down),
+                to_i32("width", bank.width())?,
+                to_i32("hidden", bank.hidden())?,
+                rows as i32,
+                k as i32,
+                y.as_mut_ptr(),
+                scratch.as_mut_ptr(),
+            )
+        },
+        "portable moe_experts",
+    )
+}
+
+pub fn qsa_pool(
+    raw: &CudaBuffer,
+    weight: &CudaBuffer,
+    pooled: &mut CudaBuffer,
+    s: QsaPoolShape,
+) -> Result<()> {
+    check::qsa_pool(raw.len(), weight.len(), pooled.len(), &s)?;
+    outside_graphs("qsa_pool")?;
+    to_i32("pooled positions", (s.block0 + s.blocks) * s.ratio)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_qsa_pool(
+                raw.as_ptr(),
+                weight.as_ptr(),
+                pooled.as_mut_ptr(),
+                s.block0 as i32,
+                to_i32("blocks", s.blocks)?,
+                to_i32("ratio", s.ratio)?,
+                to_i32("dim", s.dim)?,
+                to_i32("rotary_dim", s.rotary_dim)?,
+                s.theta,
+                s.eps,
+            )
+        },
+        "portable qsa_pool",
+    )
+}
+
+pub fn qsa_select(
+    q: &CudaBuffer,
+    pooled: &CudaBuffer,
+    sel: &mut CudaBuffer,
+    scratch: &mut CudaBuffer,
+    s: QsaSelectShape,
+) -> Result<()> {
+    check::qsa_select(q.len(), pooled.len(), sel.len(), scratch.len(), &s)?;
+    outside_graphs("qsa_select")?;
+    to_i32("positions", s.pos0 + s.tokens)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_qsa_select(
+                q.as_ptr(),
+                pooled.as_ptr(),
+                sel.as_mut_ptr(),
+                scratch.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("heads", s.heads)?,
+                to_i32("dim", s.dim)?,
+                s.pos0 as i32,
+                to_i32("ratio", s.ratio)?,
+                to_i32("budget", s.budget)?,
+            )
+        },
+        "portable qsa_select",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_sparse(
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    sel: &CudaBuffer,
+    sel_len: usize,
+    out: &mut CudaBuffer,
+    s: AttnShape,
+) -> Result<()> {
+    check::attention_sparse(q.len(), k.len(), v.len(), sel.len(), sel_len, out.len(), &s)?;
+    outside_graphs("attention_sparse")?;
+    to_i32("kv_len", s.kv_len())?;
+    // SAFETY: buffer extents validated above; selected positions index rows below kv_len.
+    status(
+        unsafe {
+            velox_portable_attention_sparse(
+                q.as_ptr(),
+                k.as_ptr().cast(),
+                v.as_ptr().cast(),
+                sel.as_ptr(),
+                to_i32("sel_len", sel_len)?,
+                out.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("heads", s.heads)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                s.scale(),
+                kv_format_code(s.kv),
+                hadamard_norm(s.head_dim),
+            )
+        },
+        "portable attention_sparse",
     )
 }

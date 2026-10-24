@@ -2,8 +2,9 @@
 //! fails identically on CPU, CUDA and future backends instead of reading out of bounds.
 
 use crate::backend::{
-    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnShape,
-    KvStoreShape, RopePosShape, RopeShape, WeightView,
+    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank,
+    FullAttnShape, GdnShape, HcCombineShape, KvStoreShape, MoeRouteShape, QsaPoolShape,
+    QsaSelectShape, RopePosShape, RopeShape, RowGateShape, WeightView,
 };
 use crate::error::{Error, Result};
 use crate::kv::KvFormat;
@@ -491,6 +492,273 @@ pub fn swiglu(
 
 /// Largest k supported by `top_k` (sampling needs a few dozen candidates at most).
 pub const TOP_K_MAX: usize = 256;
+
+pub fn rms_norm_groups(
+    x: usize,
+    weight: usize,
+    y: usize,
+    rows: usize,
+    groups: usize,
+    dim: usize,
+) -> Result<()> {
+    if rows == 0 || groups == 0 || dim == 0 {
+        return Err(Error::Shape(format!(
+            "rms_norm_groups dims must be non-zero: rows={rows} groups={groups} dim={dim}"
+        )));
+    }
+    let total = product(&[rows, groups, dim])?;
+    need("rms_norm_groups x", x, total)?;
+    need("rms_norm_groups weight", weight, product(&[groups, dim])?)?;
+    need("rms_norm_groups y", y, total)
+}
+
+/// Rows of `streams` streams of `dim`: the shared extent rules of the hyper-connection ops.
+fn streams(what: &str, rows: usize, streams: usize, dim: usize) -> Result<usize> {
+    if rows == 0 || streams == 0 || dim == 0 {
+        return Err(Error::Shape(format!(
+            "{what} dims must be non-zero: rows={rows} streams={streams} dim={dim}"
+        )));
+    }
+    product(&[rows, streams, dim])
+}
+
+pub fn hc_mix(xn: usize, gate: usize, out: usize, rows: usize, s: usize, dim: usize) -> Result<()> {
+    let wide = streams("hc_mix", rows, s, dim)?;
+    need("hc_mix xn", xn, wide)?;
+    need("hc_mix gate", gate, wide)?;
+    need("hc_mix out", out, product(&[rows, dim])?)
+}
+
+pub fn hc_combine(res: usize, y: usize, inject: usize, s: &HcCombineShape) -> Result<()> {
+    let wide = streams("hc_combine", s.rows, s.streams, s.dim)?;
+    if s.inject_col + s.streams > s.inject_ld {
+        return Err(Error::Shape(format!(
+            "hc_combine: inject columns {}+{} past its row of {}",
+            s.inject_col, s.streams, s.inject_ld
+        )));
+    }
+    need("hc_combine res", res, wide)?;
+    need("hc_combine y", y, product(&[s.rows, s.dim])?)?;
+    need(
+        "hc_combine inject",
+        inject,
+        product(&[s.rows - 1, s.inject_ld])? + s.inject_col + s.streams,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ple_gate(
+    key_n: usize,
+    q_n: usize,
+    value: usize,
+    out: usize,
+    rows: usize,
+    s: usize,
+    dim: usize,
+) -> Result<()> {
+    let wide = streams("ple_gate", rows, s, dim)?;
+    need("ple_gate key_n", key_n, wide)?;
+    need("ple_gate q_n", q_n, wide)?;
+    need("ple_gate value", value, product(&[rows, dim])?)?;
+    need("ple_gate out", out, wide)
+}
+
+pub fn conv1d_dilated(
+    x: usize,
+    weight: usize,
+    state: usize,
+    out: usize,
+    s: &DilatedConvShape,
+) -> Result<()> {
+    if s.tokens == 0 || s.channels == 0 || s.width < 2 || s.dilation == 0 {
+        return Err(Error::Shape(format!(
+            "conv1d_dilated needs tokens, channels, dilation > 0 and width >= 2: {s:?}"
+        )));
+    }
+    let rows = product(&[s.tokens, s.channels])?;
+    need("conv1d_dilated x", x, rows)?;
+    need(
+        "conv1d_dilated weight",
+        weight,
+        product(&[s.width, s.channels])?,
+    )?;
+    need(
+        "conv1d_dilated state",
+        state,
+        product(&[s.state_rows(), s.channels])?,
+    )?;
+    need("conv1d_dilated out", out, rows)
+}
+
+pub fn row_gate(x: usize, gate: usize, s: &RowGateShape) -> Result<()> {
+    if s.rows == 0 || s.dim == 0 {
+        return Err(Error::Shape(format!(
+            "sigmoid_scale_rows dims must be non-zero: {s:?}"
+        )));
+    }
+    need("sigmoid_scale_rows x", x, product(&[s.rows, s.dim])?)?;
+    need(
+        "sigmoid_scale_rows gate",
+        gate,
+        product(&[s.rows - 1, s.gate_stride])? + s.gate_offset + 1,
+    )
+}
+
+/// Largest top-k `moe_route` serves (kernels keep the selection in registers).
+pub const MOE_K_MAX: usize = 32;
+
+pub fn moe_route(
+    logits: usize,
+    ids: usize,
+    weights: usize,
+    counts: Option<usize>,
+    s: &MoeRouteShape,
+) -> Result<()> {
+    if s.rows == 0 || s.k == 0 || s.k > MOE_K_MAX || s.k > s.experts || s.experts > s.row_len {
+        return Err(Error::Shape(format!(
+            "moe_route needs 0 < k <= min(experts, {MOE_K_MAX}) and experts <= row_len: {s:?}"
+        )));
+    }
+    need("moe_route logits", logits, product(&[s.rows, s.row_len])?)?;
+    need("moe_route ids", ids, product(&[s.rows, s.k])?)?;
+    need("moe_route weights", weights, product(&[s.rows, s.k])?)?;
+    if let Some(c) = counts {
+        need("moe_route counts", c, s.experts)?;
+    }
+    Ok(())
+}
+
+/// An expert bank's geometry against its buffers (`records`, `slots`, `map` in f32 slots).
+pub fn expert_bank<B>(
+    bank: &ExpertBank<'_, B>,
+    records: usize,
+    slots: usize,
+    map: usize,
+) -> Result<()> {
+    let (w, h) = (bank.width(), bank.hidden());
+    let parts = [
+        ("gate", &bank.gate, w, h),
+        ("up", &bank.up, w, h),
+        ("down", &bank.down, h, w),
+    ];
+    for (name, m, rows, k) in parts {
+        if (m.rows, m.k) != (rows, k) {
+            return Err(Error::Shape(format!(
+                "expert {name} is [{},{}], expected [{rows},{k}]",
+                m.rows, m.k
+            )));
+        }
+        m.format.check_shape(m.rows, m.k)?;
+        let end = m.offset + m.format.payload_bytes(m.rows, m.k);
+        if end > bank.record_bytes {
+            return Err(Error::Shape(format!(
+                "expert {name} ends at byte {end}, past the {}-byte record",
+                bank.record_bytes
+            )));
+        }
+    }
+    if bank.experts == 0 || !bank.record_bytes.is_multiple_of(16) {
+        return Err(Error::Shape(format!(
+            "expert bank needs experts > 0 and 16-byte records, got {} x {}",
+            bank.experts, bank.record_bytes
+        )));
+    }
+    need(
+        "expert records",
+        records,
+        product(&[bank.experts, bank.record_bytes])? / 4,
+    )?;
+    need(
+        "expert slots",
+        slots,
+        product(&[bank.slot_count, bank.record_bytes])? / 4,
+    )?;
+    need("expert map", map, bank.experts)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts<B>(
+    x: usize,
+    ids: usize,
+    weights: usize,
+    bank: &ExpertBank<'_, B>,
+    bank_bufs: (usize, usize, usize),
+    y: usize,
+    rows: usize,
+    k: usize,
+) -> Result<()> {
+    if rows == 0 || k == 0 || k > MOE_K_MAX {
+        return Err(Error::Shape(format!(
+            "moe_experts needs rows > 0 and 0 < k <= {MOE_K_MAX}: rows={rows} k={k}"
+        )));
+    }
+    expert_bank(bank, bank_bufs.0, bank_bufs.1, bank_bufs.2)?;
+    let wide = product(&[rows, bank.hidden()])?;
+    need("moe_experts x", x, wide)?;
+    need("moe_experts ids", ids, product(&[rows, k])?)?;
+    need("moe_experts weights", weights, product(&[rows, k])?)?;
+    need("moe_experts y", y, wide)
+}
+
+pub fn qsa_pool(raw: usize, weight: usize, pooled: usize, s: &QsaPoolShape) -> Result<()> {
+    if s.blocks == 0 || s.ratio == 0 || s.dim == 0 {
+        return Err(Error::Shape(format!(
+            "qsa_pool dims must be non-zero: {s:?}"
+        )));
+    }
+    if s.rotary_dim > s.dim || !s.rotary_dim.is_multiple_of(2) {
+        return Err(Error::Shape(format!(
+            "qsa_pool rotary_dim must be even and <= dim: {s:?}"
+        )));
+    }
+    let end = s.block0 + s.blocks;
+    need("qsa_pool raw", raw, product(&[end, s.ratio, s.dim])?)?;
+    need("qsa_pool weight", weight, s.dim)?;
+    need("qsa_pool pooled", pooled, product(&[end, s.dim])?)
+}
+
+pub fn qsa_select(
+    q: usize,
+    pooled: usize,
+    sel: usize,
+    scratch: usize,
+    s: &QsaSelectShape,
+) -> Result<()> {
+    if s.tokens == 0 || s.heads == 0 || s.dim == 0 || s.ratio == 0 {
+        return Err(Error::Shape(format!(
+            "qsa_select dims must be non-zero: {s:?}"
+        )));
+    }
+    if s.budget == 0 || !s.budget.is_multiple_of(s.ratio) {
+        return Err(Error::Shape(format!(
+            "qsa_select budget must be a non-zero multiple of the ratio: {s:?}"
+        )));
+    }
+    let blocks = s.complete_blocks(s.tokens - 1);
+    need("qsa_select q", q, product(&[s.tokens, s.heads, s.dim])?)?;
+    need("qsa_select pooled", pooled, product(&[blocks, s.dim])?)?;
+    need("qsa_select sel", sel, product(&[s.tokens, s.sel_len()])?)?;
+    need("qsa_select scratch", scratch, product(&[s.tokens, blocks])?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_sparse(
+    q: usize,
+    k: usize,
+    v: usize,
+    sel: usize,
+    sel_len: usize,
+    out: usize,
+    s: &AttnShape,
+) -> Result<()> {
+    attention(q, k, v, out, s)?;
+    if sel_len == 0 {
+        return Err(Error::Shape(
+            "attention_sparse sel_len must be non-zero".into(),
+        ));
+    }
+    need("attention_sparse sel", sel, product(&[s.tokens, sel_len])?)
+}
 
 pub fn top_k(x: usize, rows: usize, row_len: usize, limit: usize, k: usize) -> Result<()> {
     if limit > row_len || k == 0 || k > TOP_K_MAX {

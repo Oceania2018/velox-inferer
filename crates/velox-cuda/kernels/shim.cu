@@ -224,6 +224,11 @@ VELOX_API int velox_cuda_htod(void* dst, const void* src, size_t bytes) {
     return static_cast<int>(cudaMemcpy(dst, src, bytes, cudaMemcpyDefault));
 }
 
+// Stream-ordered upload from (pageable) host memory: the driver stages the source before returning.
+VELOX_API int velox_cuda_htod_async(void* dst, const void* src, size_t bytes) {
+    return static_cast<int>(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, 0));
+}
+
 VELOX_API int velox_cuda_dtoh(void* dst, const void* src, size_t bytes) {
     return static_cast<int>(cudaMemcpy(dst, src, bytes, cudaMemcpyDefault));
 }

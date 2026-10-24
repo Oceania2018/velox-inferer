@@ -296,6 +296,153 @@ impl GdnShape {
     }
 }
 
+/// Causal depthwise convolution with dilation, then SiLU, over `tokens` rows of `channels`:
+/// with `u = [state; x]` (`state` holds the previous `(width - 1) * dilation` input rows, oldest
+/// first), `out[t, c] = silu(Σ_j weight[j, c] · u[t + j·dilation, c])`; tap `width - 1` is the
+/// current token. `state` is updated to the last `(width - 1) * dilation` rows of `u`. `weight`
+/// is `[width, channels]` f32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DilatedConvShape {
+    pub tokens: usize,
+    pub channels: usize,
+    pub width: usize,
+    pub dilation: usize,
+}
+
+impl DilatedConvShape {
+    /// Rows of state: the inputs the next call still reads.
+    pub fn state_rows(&self) -> usize {
+        (self.width - 1) * self.dilation
+    }
+}
+
+/// Hyper-connection write-back ([`Backend::hc_combine`]): `rows` rows of `streams` residual
+/// streams of `dim`; the injection logits of row `r` are `inject[r * inject_ld + inject_col ..]
+/// [.. streams]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HcCombineShape {
+    pub rows: usize,
+    pub streams: usize,
+    pub dim: usize,
+    pub inject_ld: usize,
+    pub inject_col: usize,
+}
+
+/// `x[r][..dim] *= sigmoid(gate[gate_offset + r * gate_stride])` for `rows` rows of `x`
+/// (`[rows, dim]`): one scalar gate per row, e.g. a column of a wider projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowGateShape {
+    pub rows: usize,
+    pub dim: usize,
+    pub gate_offset: usize,
+    pub gate_stride: usize,
+}
+
+/// MoE routing ([`Backend::moe_route`]) of `rows` rows of router logits (`[rows, row_len]`; the
+/// first `experts` columns are the experts', later columns belong to other heads of the same
+/// projection): softmax over the experts, the `k` most probable (ties to the lower id), their
+/// probabilities renormalised to sum to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeRouteShape {
+    pub rows: usize,
+    pub row_len: usize,
+    pub experts: usize,
+    pub k: usize,
+}
+
+/// One projection of an expert record: a `[rows, k]` matrix in `format` whose encoded payload
+/// starts `offset` bytes into the record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpertMatrix {
+    pub format: WeightFormat,
+    pub offset: usize,
+    pub rows: usize,
+    pub k: usize,
+}
+
+/// The routed experts of one MoE layer, each a record of `record_bytes` holding its gate and up
+/// (`[width, hidden]`) and down (`[hidden, width]`) projections.
+///
+/// `records` holds every expert (expert `e` at byte `e * record_bytes`), usually in system RAM
+/// the device reads directly ([`Backend::alloc_host`]). `slots` holds device-resident copies (slot
+/// `i` at byte `i * record_bytes`), and `map` (`[experts]`, i32 bits in f32 slots) names each
+/// expert's slot, or -1 when only `records` has it. A slot is an exact copy of its record, so
+/// placement never changes results.
+pub struct ExpertBank<'a, Buf> {
+    pub records: &'a Buf,
+    pub slots: &'a Buf,
+    pub map: &'a Buf,
+    pub experts: usize,
+    /// Slots in `slots` (0: no device copies).
+    pub slot_count: usize,
+    pub record_bytes: usize,
+    pub gate: ExpertMatrix,
+    pub up: ExpertMatrix,
+    pub down: ExpertMatrix,
+    pub act: ActPolicy,
+}
+
+impl<Buf> ExpertBank<'_, Buf> {
+    /// Expert width (`gate.rows`).
+    pub fn width(&self) -> usize {
+        self.gate.rows
+    }
+
+    /// Model width (`gate.k`).
+    pub fn hidden(&self) -> usize {
+        self.gate.k
+    }
+}
+
+/// Pooled index keys of the QSA indexer ([`Backend::qsa_pool`]) for blocks `block0 .. block0 +
+/// blocks`: block `b` is the mean of raw keys `b·ratio .. (b + 1)·ratio` (rows of `[positions,
+/// dim]`), plain-RMS-normalised with `weight`, then rotated rotate-half over its first
+/// `rotary_dim` dims at position `b·ratio` (pair `i` by `theta^(-2i/rotary_dim)`), into row `b` of
+/// the pooled cache.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QsaPoolShape {
+    pub block0: usize,
+    pub blocks: usize,
+    pub ratio: usize,
+    pub dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f32,
+    pub eps: f32,
+}
+
+/// QSA token selection ([`Backend::qsa_select`]) for `tokens` queries at positions `pos0 + t`,
+/// each `[heads, dim]` (normalised and rotated). Query `t` sees `nc = (pos0 + t + 1) / ratio`
+/// complete blocks; block `b < nc` scores `Σ_h relu(q[t,h] · pooled[b]) / sqrt(dim)`. Its
+/// selection is the members of the `min(budget / ratio, nc)` best blocks (ties to the lower
+/// block) and the tail `nc·ratio ..= pos0 + t`, as ascending positions padded with -1 to
+/// [`Self::sel_len`] (i32 bits in f32 slots).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QsaSelectShape {
+    pub tokens: usize,
+    pub heads: usize,
+    pub dim: usize,
+    pub pos0: usize,
+    pub ratio: usize,
+    pub budget: usize,
+}
+
+impl QsaSelectShape {
+    /// Entries per query: the budget plus the longest tail.
+    pub fn sel_len(&self) -> usize {
+        self.budget + self.ratio - 1
+    }
+
+    /// Complete blocks query `t` sees.
+    pub fn complete_blocks(&self, t: usize) -> usize {
+        (self.pos0 + t + 1) / self.ratio
+    }
+
+    /// Whether every query selects every position it sees (dense causal attention).
+    pub fn dense(&self) -> bool {
+        self.complete_blocks(self.tokens - 1) <= self.budget / self.ratio
+    }
+}
+
 /// The lowest activation precision a weight's use permits (artifact `uses[].activation_policy`).
 /// The model author decides this per projection; a kernel may round activations no further.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1201,6 +1348,157 @@ pub trait Backend {
     }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
+    /// Writes host values into `dst[offset ..][.. data.len()]` in stream order with queued work
+    /// (work queued before reads the old values, work queued after the new ones); `data` may be
+    /// reused as soon as this returns.
+    fn write_at(&self, dst: &mut Self::Buffer, offset: usize, data: &[f32]) -> Result<()> {
+        let src = self.upload(data)?;
+        self.copy(&src, 0, dst, offset, data.len())?;
+        // The copy reads `src`, which drops here: wait for it.
+        self.synchronize()
+    }
+    /// Plain RMS norm of `groups` consecutive groups of `dim` per row, each with its own slice of
+    /// `weight` (`[groups, dim]`): `y[r][g] = x[r][g] * rsqrt(mean(x[r][g]²) + eps) * weight[g]`
+    /// for `x`, `y` of `[rows, groups * dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_groups(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        y: &mut Self::Buffer,
+        rows: usize,
+        groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()>;
+    /// `x[i] = silu(x[i])` for the first `len` elements.
+    fn silu(&self, x: &mut Self::Buffer, len: usize) -> Result<()>;
+    /// Hyper-connection mix: `out[r][d] = (1 / streams) Σ_s xn[r][s][d] · sigmoid(gate[r][s][d])`
+    /// for `xn`, `gate` of `[rows, streams, dim]` and `out` of `[rows, dim]`.
+    fn hc_mix(
+        &self,
+        xn: &Self::Buffer,
+        gate: &Self::Buffer,
+        out: &mut Self::Buffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()>;
+    /// Hyper-connection write-back: `res[r][s][d] += y[r][d] · 2 sigmoid(inject[r·ld + col + s])`
+    /// for `res` of `[rows, streams, dim]` and `y` of `[rows, dim]`; see [`HcCombineShape`].
+    fn hc_combine(
+        &self,
+        res: &mut Self::Buffer,
+        y: &Self::Buffer,
+        inject: &Self::Buffer,
+        shape: HcCombineShape,
+    ) -> Result<()>;
+    /// PLE gate: with `g = (key_n[r][s] · q_n[r][s]) / sqrt(dim)`,
+    /// `out[r][s] = value[r] · sigmoid(sign(g) sqrt(max(|g|, 1e-6)))` for `key_n`, `q_n`, `out` of
+    /// `[rows, streams, dim]` and `value` of `[rows, dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gate(
+        &self,
+        key_n: &Self::Buffer,
+        q_n: &Self::Buffer,
+        value: &Self::Buffer,
+        out: &mut Self::Buffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()>;
+    /// Dilated causal depthwise convolution + SiLU with a rolling state; see
+    /// [`DilatedConvShape`].
+    fn conv1d_dilated_silu(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        state: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: DilatedConvShape,
+    ) -> Result<()>;
+    /// One sigmoid gate per row; see [`RowGateShape`].
+    fn sigmoid_scale_rows(
+        &self,
+        x: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        shape: RowGateShape,
+    ) -> Result<()>;
+    /// MoE routing on the device (see [`MoeRouteShape`]): `ids[r][j]` (u32 bits in f32 slots) and
+    /// `weights[r][j]` for `j < k`, in descending probability. With `counts` (`[experts]`),
+    /// `counts[e] += 1` for every selection of expert `e`.
+    fn moe_route(
+        &self,
+        logits: &Self::Buffer,
+        ids: &mut Self::Buffer,
+        weights: &mut Self::Buffer,
+        counts: Option<&mut Self::Buffer>,
+        shape: MoeRouteShape,
+    ) -> Result<()>;
+    /// f32 slots of `scratch` [`Self::moe_experts`] needs for `rows` rows of `k` experts (at
+    /// least 1).
+    fn moe_scratch_len(
+        &self,
+        _bank: &ExpertBank<'_, Self::Buffer>,
+        _rows: usize,
+        _k: usize,
+    ) -> usize {
+        1
+    }
+    /// The routed experts' sum: `y[r] = Σ_j weights[r][j] · down_e(silu(gate_e · x[r]) ·
+    /// (up_e · x[r]))` with `e = ids[r][j]` (as [`Self::moe_route`] writes them), for `x`, `y` of
+    /// `[rows, hidden]`. Projections round their inputs as [`Self::moe_experts_act`] reports.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &self,
+        x: &Self::Buffer,
+        ids: &Self::Buffer,
+        weights: &Self::Buffer,
+        bank: &ExpertBank<'_, Self::Buffer>,
+        y: &mut Self::Buffer,
+        scratch: &mut Self::Buffer,
+        rows: usize,
+        k: usize,
+    ) -> Result<()>;
+    /// How `moe_experts` rounds the inputs of every expert projection (`x` for gate and up, the
+    /// SwiGLU product for down) at `rows` rows: `Exact`, or a rounding `bank.act` permits.
+    fn moe_experts_act(&self, _bank: &ExpertBank<'_, Self::Buffer>, _rows: usize) -> ActQuant {
+        ActQuant::Exact
+    }
+    /// QSA pooled keys of completed blocks; see [`QsaPoolShape`]. `raw` is `[positions, dim]`,
+    /// `pooled` is `[blocks, dim]`, `weight` is `[dim]`.
+    fn qsa_pool(
+        &self,
+        raw: &Self::Buffer,
+        weight: &Self::Buffer,
+        pooled: &mut Self::Buffer,
+        shape: QsaPoolShape,
+    ) -> Result<()>;
+    /// QSA selection; see [`QsaSelectShape`]. `q` is `[tokens, heads, dim]`, `pooled` holds at
+    /// least the complete blocks of the last query, `sel` is `[tokens, sel_len]` and `scratch`
+    /// at least `tokens * complete_blocks(tokens - 1)` slots.
+    fn qsa_select(
+        &self,
+        q: &Self::Buffer,
+        pooled: &Self::Buffer,
+        sel: &mut Self::Buffer,
+        scratch: &mut Self::Buffer,
+        shape: QsaSelectShape,
+    ) -> Result<()>;
+    /// [`Self::attention`] in which token `t` attends only to the cache positions listed in
+    /// `sel[t·sel_len ..][.. sel_len]` (i32 bits; negative entries are skipped), each below
+    /// `pos0 + t + 1`. Rounds its operands as [`Self::attention_precision`] reports for `shape`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sparse(
+        &self,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        sel: &Self::Buffer,
+        sel_len: usize,
+        out: &mut Self::Buffer,
+        shape: AttnShape,
+    ) -> Result<()>;
     /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.
     fn dyn_conv(
         &self,

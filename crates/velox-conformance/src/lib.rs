@@ -7,10 +7,12 @@
 
 use velox_core::backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
-    CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape,
-    LinearDst, LinearPart, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    CopySpec, DilatedConvShape, DynConvShape, ExpertBank, ExpertMatrix, FullAttnShape,
+    GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape, LinearDst, LinearPart,
+    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
+    RowGateShape, WeightView,
 };
-use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
+use velox_core::format::{align256, decode_rows, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::kv::{decode_cache, encode_cache, KvFormat};
 use velox_core::model::{HostLayer, Stack};
 use velox_core::quant::{
@@ -1828,6 +1830,420 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn rms_norm_groups(&mut self, rows: usize, groups: usize, dim: usize) -> Result<()> {
+        let n = rows * groups * dim;
+        let (x, w) = (self.rng.vec(n, 2.0), self.rng.vec(groups * dim, 1.5));
+        let mut want = vec![0.0; n];
+        CpuBackend.rms_norm_groups(&x, &w, &mut want, rows, groups, dim, 1e-6)?;
+        let (xd, wd) = (self.b.upload(&x)?, self.b.upload(&w)?);
+        let mut yd = self.b.alloc(n)?;
+        self.b
+            .rms_norm_groups(&xd, &wd, &mut yd, rows, groups, dim, 1e-6)?;
+        let got = fetch(self.b, &yd, n)?;
+        let name = format!("rms_norm_groups {rows}x{groups}x{dim}");
+        self.record(name, Some(Op::RmsNormGroups), &got, &want, 1e-5);
+        Ok(())
+    }
+
+    /// The hyper-connection elementwise ops: `silu`, `hc_mix`, `hc_combine` (injection logits
+    /// read from a column range of a wider row), `ple_gate`, `sigmoid_scale_rows`.
+    fn hyper_connections(&mut self, rows: usize, streams: usize, dim: usize) -> Result<()> {
+        let wide = rows * streams * dim;
+        let tag = format!("{rows}x{streams}x{dim}");
+        // silu over a length that is not a multiple of any block size.
+        let x = self.rng.vec(wide + 3, 6.0);
+        let mut want = x.clone();
+        CpuBackend.silu(&mut want, wide + 3)?;
+        let mut xd = self.b.upload(&x)?;
+        self.b.silu(&mut xd, wide + 3)?;
+        let got = fetch(self.b, &xd, wide + 3)?;
+        self.record(
+            format!("silu {}", wide + 3),
+            Some(Op::Silu),
+            &got,
+            &want,
+            1e-6,
+        );
+
+        let (xn, gate) = (self.rng.vec(wide, 2.0), self.rng.vec(wide, 4.0));
+        let mut want = vec![0.0; rows * dim];
+        CpuBackend.hc_mix(&xn, &gate, &mut want, rows, streams, dim)?;
+        let (xnd, gd) = (self.b.upload(&xn)?, self.b.upload(&gate)?);
+        let mut od = self.b.alloc(rows * dim)?;
+        self.b.hc_mix(&xnd, &gd, &mut od, rows, streams, dim)?;
+        let got = fetch(self.b, &od, rows * dim)?;
+        self.record(format!("hc_mix {tag}"), Some(Op::HcMix), &got, &want, 1e-5);
+
+        let ld = streams + 5;
+        let s = HcCombineShape {
+            rows,
+            streams,
+            dim,
+            inject_ld: ld,
+            inject_col: 3,
+        };
+        let (res0, y, inj) = (
+            self.rng.vec(wide, 2.0),
+            self.rng.vec(rows * dim, 1.0),
+            self.rng.vec(rows * ld, 3.0),
+        );
+        let mut want = res0.clone();
+        CpuBackend.hc_combine(&mut want, &y, &inj, s)?;
+        let mut rd = self.b.upload(&res0)?;
+        let (yd, id) = (self.b.upload(&y)?, self.b.upload(&inj)?);
+        self.b.hc_combine(&mut rd, &yd, &id, s)?;
+        let got = fetch(self.b, &rd, wide)?;
+        self.record(
+            format!("hc_combine {tag}"),
+            Some(Op::HcCombine),
+            &got,
+            &want,
+            1e-5,
+        );
+
+        let (key, q, value) = (
+            self.rng.vec(wide, 1.5),
+            self.rng.vec(wide, 1.5),
+            self.rng.vec(rows * dim, 1.0),
+        );
+        let mut want = vec![0.0; wide];
+        CpuBackend.ple_gate(&key, &q, &value, &mut want, rows, streams, dim)?;
+        let (kd, qd, vd) = (
+            self.b.upload(&key)?,
+            self.b.upload(&q)?,
+            self.b.upload(&value)?,
+        );
+        let mut od = self.b.alloc(wide)?;
+        self.b
+            .ple_gate(&kd, &qd, &vd, &mut od, rows, streams, dim)?;
+        let got = fetch(self.b, &od, wide)?;
+        self.record(
+            format!("ple_gate {tag}"),
+            Some(Op::PleGate),
+            &got,
+            &want,
+            1e-5,
+        );
+
+        // One gate per row from column 2 of a [rows, 7] projection.
+        let s = RowGateShape {
+            rows,
+            dim,
+            gate_offset: 2,
+            gate_stride: 7,
+        };
+        let (x, g) = (self.rng.vec(rows * dim, 2.0), self.rng.vec(rows * 7, 4.0));
+        let mut want = x.clone();
+        CpuBackend.sigmoid_scale_rows(&mut want, &g, s)?;
+        let mut xd = self.b.upload(&x)?;
+        let gd = self.b.upload(&g)?;
+        self.b.sigmoid_scale_rows(&mut xd, &gd, s)?;
+        let got = fetch(self.b, &xd, rows * dim)?;
+        let name = format!("sigmoid_scale_rows {rows}x{dim}");
+        self.record(name, Some(Op::SigmoidScaleRows), &got, &want, 1e-6);
+        Ok(())
+    }
+
+    /// Two calls so the dilated history carries over; outputs and final state are compared.
+    fn conv1d_dilated(
+        &mut self,
+        channels: usize,
+        width: usize,
+        dilation: usize,
+        chunks: [usize; 2],
+    ) -> Result<()> {
+        let hist = (width - 1) * dilation;
+        let w = self.rng.vec(width * channels, 0.5);
+        let state0 = self.rng.vec(hist * channels, 1.0);
+        let (wd, mut sd) = (self.b.upload(&w)?, self.b.upload(&state0)?);
+        let mut sc = state0;
+        for (i, tokens) in chunks.into_iter().enumerate() {
+            let s = DilatedConvShape {
+                tokens,
+                channels,
+                width,
+                dilation,
+            };
+            let x = self.rng.vec(tokens * channels, 1.0);
+            let mut want = vec![0.0; tokens * channels];
+            CpuBackend.conv1d_dilated_silu(&x, &w, &mut sc, &mut want, s)?;
+            let xd = self.b.upload(&x)?;
+            let mut od = self.b.alloc(tokens * channels)?;
+            self.b.conv1d_dilated_silu(&xd, &wd, &mut sd, &mut od, s)?;
+            let mut got = fetch(self.b, &od, tokens * channels)?;
+            got.extend(fetch(self.b, &sd, hist * channels)?);
+            want.extend_from_slice(&sc);
+            let name = format!(
+                "conv1d_dilated_silu c={channels} w={width} dil={dilation} call {i} ({tokens} tokens) + state"
+            );
+            self.record(name, Some(Op::Conv1dDilatedSilu), &got, &want, 1e-5);
+        }
+        Ok(())
+    }
+
+    /// `moe_route` with counts: ids, weights and the counts compared (ids as numbers).
+    fn moe_route(&mut self, rows: usize, row_len: usize, experts: usize, k: usize) -> Result<()> {
+        let s = MoeRouteShape {
+            rows,
+            row_len,
+            experts,
+            k,
+        };
+        let logits = self.rng.vec(rows * row_len, 4.0);
+        let counts0 = vec![1.0f32; experts];
+        let (mut ids, mut w, mut counts) =
+            (vec![0.0; rows * k], vec![0.0; rows * k], counts0.clone());
+        CpuBackend.moe_route(&logits, &mut ids, &mut w, Some(&mut counts), s)?;
+        let ld = self.b.upload(&logits)?;
+        let (mut idd, mut wd) = (self.b.alloc(rows * k)?, self.b.alloc(rows * k)?);
+        let mut cd = self.b.upload(&counts0)?;
+        self.b.moe_route(&ld, &mut idd, &mut wd, Some(&mut cd), s)?;
+        let as_num = |v: Vec<f32>| -> Vec<f32> { v.iter().map(|x| x.to_bits() as f32).collect() };
+        let mut got = as_num(fetch(self.b, &idd, rows * k)?);
+        got.extend(fetch(self.b, &wd, rows * k)?);
+        got.extend(fetch(self.b, &cd, experts)?);
+        let mut want = as_num(ids);
+        want.extend(w);
+        want.extend(counts);
+        let name = format!("moe_route {rows}x{row_len} experts={experts} k={k} + counts");
+        self.record(name, Some(Op::MoeRoute), &got, &want, 1e-6);
+        Ok(())
+    }
+
+    /// `moe_experts` over a random bank: `gate_fmt` for gate and up, `down_fmt` for down, some
+    /// experts resident in slots (mapped in a shuffled order), the rest read from records.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &mut self,
+        gate_fmt: WeightFormat,
+        down_fmt: WeightFormat,
+        experts: usize,
+        width: usize,
+        hidden: usize,
+        rows: usize,
+        k: usize,
+        policy: ActPolicy,
+    ) -> Result<()> {
+        let gb = gate_fmt.payload_bytes(width, hidden);
+        let db = down_fmt.payload_bytes(hidden, width);
+        let record_bytes = (2 * gb + db).div_ceil(16) * 16;
+        let mut records = vec![0u8; experts * record_bytes];
+        for rec in records.chunks_exact_mut(record_bytes) {
+            rec[..gb].copy_from_slice(&random_weight(&mut self.rng, gate_fmt, width, hidden));
+            rec[gb..2 * gb].copy_from_slice(&random_weight(&mut self.rng, gate_fmt, width, hidden));
+            rec[2 * gb..2 * gb + db].copy_from_slice(&random_weight(
+                &mut self.rng,
+                down_fmt,
+                hidden,
+                width,
+            ));
+        }
+        // Every third expert gets a slot, in reverse order.
+        let resident: Vec<usize> = (0..experts).filter(|e| e % 3 == 1).rev().collect();
+        let mut slots = vec![0u8; resident.len().max(1) * record_bytes];
+        let mut map = vec![f32::from_bits(-1i32 as u32); experts];
+        for (i, &e) in resident.iter().enumerate() {
+            slots[i * record_bytes..(i + 1) * record_bytes]
+                .copy_from_slice(&records[e * record_bytes..(e + 1) * record_bytes]);
+            map[e] = f32::from_bits(i as u32);
+        }
+        // k distinct experts per row (5 is coprime to every bank size used).
+        let mut ids = Vec::with_capacity(rows * k);
+        let mut weights = Vec::with_capacity(rows * k);
+        for r in 0..rows {
+            let start = (r * 7 + (self.rng.next_u64() % experts as u64) as usize) % experts;
+            let w: Vec<f32> = (0..k).map(|_| self.rng.uniform().abs() + 0.1).collect();
+            let sum: f32 = w.iter().sum();
+            for (j, wj) in w.into_iter().enumerate() {
+                ids.push(f32::from_bits(((start + 5 * j) % experts) as u32));
+                weights.push(wj / sum);
+            }
+        }
+        // Small inputs keep both chained products of order one, where the metric is meaningful.
+        let x = self.rng.vec(rows * hidden, 0.1);
+        let mat = |format, offset, rows, k| ExpertMatrix {
+            format,
+            offset,
+            rows,
+            k,
+        };
+        let (gate, up, down) = (
+            mat(gate_fmt, 0, width, hidden),
+            mat(gate_fmt, gb, width, hidden),
+            mat(down_fmt, 2 * gb, hidden, width),
+        );
+        let (rd, sd, md) = (
+            self.b.upload_bytes_host(&records)?,
+            self.b.upload_bytes(&slots)?,
+            self.b.upload(&map)?,
+        );
+        let bank = ExpertBank {
+            records: &rd,
+            slots: &sd,
+            map: &md,
+            experts,
+            slot_count: resident.len(),
+            record_bytes,
+            gate,
+            up,
+            down,
+            act: policy,
+        };
+        let act = self.b.moe_experts_act(&bank, rows);
+        let want = moe_reference(
+            &records,
+            record_bytes,
+            (gate, up, down),
+            &ids,
+            &weights,
+            &x,
+            k,
+            act,
+        )?;
+        let (xd, idd, wd) = (
+            self.b.upload(&x)?,
+            self.b.upload(&ids)?,
+            self.b.upload(&weights)?,
+        );
+        let mut yd = self.b.alloc(rows * hidden)?;
+        let mut scratch = self.b.alloc(self.b.moe_scratch_len(&bank, rows, k))?;
+        self.b
+            .moe_experts(&xd, &idd, &wd, &bank, &mut yd, &mut scratch, rows, k)?;
+        let got = fetch(self.b, &yd, rows * hidden)?;
+        let name = format!(
+            "moe_experts {}/{} experts={experts} [{width},{hidden}] rows={rows} k={k}{}",
+            gate_fmt.name(),
+            down_fmt.name(),
+            if act == ActQuant::Exact {
+                ""
+            } else {
+                " (rounded)"
+            }
+        );
+        if permitted(act, policy) {
+            self.record(name, Some(Op::MoeExperts), &got, &want, 5e-4);
+        } else {
+            let name = name + " (rounding not permitted)";
+            self.record(name, Some(Op::MoeExperts), &[f32::NAN], &[0.0], 0.0);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_pool(
+        &mut self,
+        block0: usize,
+        blocks: usize,
+        ratio: usize,
+        dim: usize,
+        rotary_dim: usize,
+    ) -> Result<()> {
+        let s = QsaPoolShape {
+            block0,
+            blocks,
+            ratio,
+            dim,
+            rotary_dim,
+            theta: 1e7,
+            eps: 1e-6,
+        };
+        let end = block0 + blocks;
+        let raw = self.rng.vec(end * ratio * dim, 2.0);
+        let w = self.rng.vec(dim, 1.5);
+        let pooled0 = self.rng.vec(end * dim, 1.0);
+        let mut want = pooled0.clone();
+        CpuBackend.qsa_pool(&raw, &w, &mut want, s)?;
+        let (rd, wd) = (self.b.upload(&raw)?, self.b.upload(&w)?);
+        let mut pd = self.b.upload(&pooled0)?;
+        self.b.qsa_pool(&rd, &wd, &mut pd, s)?;
+        let got = fetch(self.b, &pd, end * dim)?;
+        let name =
+            format!("qsa_pool blocks {block0}+{blocks} ratio={ratio} dim={dim} rot={rotary_dim}");
+        self.record(name, Some(Op::QsaPool), &got, &want, 1e-5);
+        Ok(())
+    }
+
+    fn qsa_select(&mut self, s: QsaSelectShape) -> Result<()> {
+        let blocks = s.complete_blocks(s.tokens - 1);
+        let q = self.rng.vec(s.tokens * s.heads * s.dim, 1.0);
+        let pooled = self.rng.vec(blocks.max(1) * s.dim, 1.0);
+        let len = s.tokens * s.sel_len();
+        let mut want = vec![0.0; len];
+        let mut scratch = vec![0.0; (s.tokens * blocks).max(1)];
+        CpuBackend.qsa_select(&q, &pooled, &mut want, &mut scratch, s)?;
+        let (qd, pd) = (self.b.upload(&q)?, self.b.upload(&pooled)?);
+        let mut sd = self.b.alloc(len)?;
+        let mut scd = self.b.alloc((s.tokens * blocks).max(1))?;
+        self.b.qsa_select(&qd, &pd, &mut sd, &mut scd, s)?;
+        let as_num =
+            |v: Vec<f32>| -> Vec<f32> { v.iter().map(|x| x.to_bits() as i32 as f32).collect() };
+        let got = as_num(fetch(self.b, &sd, len)?);
+        let name = format!(
+            "qsa_select t={} h={} d={} pos0={} ratio={} budget={}",
+            s.tokens, s.heads, s.dim, s.pos0, s.ratio, s.budget
+        );
+        self.record(name, Some(Op::QsaSelect), &got, &as_num(want), 0.0);
+        Ok(())
+    }
+
+    /// `attention_sparse` over a cache in `s.kv`, each token selecting a random subset of the
+    /// positions it sees (in shuffled order, -1 entries mixed in).
+    fn attention_sparse(&mut self, s: AttnShape, sel_len: usize) -> Result<()> {
+        let d = s.head_dim;
+        let q_len = s.tokens * s.heads * d;
+        let rows = (s.kv_len() + 3) * s.kv_heads;
+        let q = self.rng.vec(q_len, 2.0);
+        let kb = encode_cache(s.kv, &self.rng.vec(rows * d, 2.0), d, false);
+        let vb = encode_cache(s.kv, &self.rng.vec(rows * d, 1.0), d, true);
+        let mut sel = Vec::with_capacity(s.tokens * sel_len);
+        for t in 0..s.tokens {
+            let visible = s.pos0 + t + 1;
+            let mut row: Vec<i32> = (0..visible as i32)
+                .filter(|_| !self.rng.next_u64().is_multiple_of(3))
+                .take(sel_len - 1)
+                .collect();
+            row.push(visible as i32 - 1);
+            row.dedup();
+            row.resize(sel_len, -1);
+            row.rotate_left(t % sel_len);
+            sel.extend(row.into_iter().map(|p| f32::from_bits(p as u32)));
+        }
+        let (mut kr, mut vr) = (
+            decode_cache(s.kv, &kb, rows, d, false),
+            decode_cache(s.kv, &vb, rows, d, true),
+        );
+        let f32_shape = AttnShape {
+            kv: KvFormat::F32,
+            ..s
+        };
+        let precision = self.b.attention_precision(s);
+        let mut qr = q.clone();
+        round_attention_inputs(&mut qr, &mut kr, &mut vr, f32_shape, precision);
+        let mut want = vec![0.0; q_len];
+        CpuBackend.attention_sparse(&qr, &kr, &vr, &sel, sel_len, &mut want, f32_shape)?;
+        let (qd, kd, vd, sd) = (
+            self.b.upload(&q)?,
+            self.b.upload_bytes(&kb)?,
+            self.b.upload_bytes(&vb)?,
+            self.b.upload(&sel)?,
+        );
+        let mut od = self.b.alloc(q_len)?;
+        self.b
+            .attention_sparse(&qd, &kd, &vd, &sd, sel_len, &mut od, s)?;
+        let got = fetch(self.b, &od, q_len)?;
+        let (tag, tol) = match precision {
+            AttnPrecision::Exact => ("", 2e-4),
+            AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+            AttnPrecision::F16 => (" f16", 2e-3),
+        };
+        let name = format!(
+            "attention_sparse {} t={} h={}/{} d={} pos0={} sel={sel_len}{tag}",
+            s.kv, s.tokens, s.heads, s.kv_heads, s.head_dim, s.pos0
+        );
+        self.record(name, Some(Op::AttentionSparse), &got, &want, tol);
+        Ok(())
+    }
+
     /// `add_rms_norm`: the updated residual and the normed rows.
     fn add_rms_norm(&mut self, rows: usize, dim: usize, kind: NormKind) -> Result<()> {
         let n = rows * dim;
@@ -1990,6 +2406,57 @@ impl<B: Backend> Suite<'_, B> {
         }
         Ok(())
     }
+}
+
+/// The routed experts' sum with every projection input rounded as `act` (x for gate and up, the
+/// SwiGLU product for down), exact products otherwise: the oracle `moe_experts` is checked against.
+#[allow(clippy::too_many_arguments)]
+fn moe_reference(
+    records: &[u8],
+    record_bytes: usize,
+    (gate, up, down): (ExpertMatrix, ExpertMatrix, ExpertMatrix),
+    ids: &[f32],
+    weights: &[f32],
+    x: &[f32],
+    k: usize,
+    act: ActQuant,
+) -> Result<Vec<f32>> {
+    let (hidden, width) = (gate.k, gate.rows);
+    let rows = x.len() / hidden;
+    let dot = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&p, &q)| f64::from(p) * f64::from(q))
+            .sum()
+    };
+    let mut y = vec![0.0f32; rows * hidden];
+    for r in 0..rows {
+        let mut xq = x[r * hidden..(r + 1) * hidden].to_vec();
+        quantize_activations(&mut xq, hidden, act);
+        let mut acc = vec![0f64; hidden];
+        for j in 0..k {
+            let e = ids[r * k + j].to_bits() as usize;
+            let rec = &records[e * record_bytes..(e + 1) * record_bytes];
+            let dec =
+                |m: &ExpertMatrix| decode_rows(m.format, &rec[m.offset..], m.rows, m.k, 0, m.rows);
+            let (g, u, dn) = (dec(&gate)?, dec(&up)?, dec(&down)?);
+            let mut h: Vec<f32> = (0..width)
+                .map(|i| {
+                    let a = dot(&xq, &g[i * hidden..(i + 1) * hidden]);
+                    (a / (1.0 + (-a).exp()) * dot(&xq, &u[i * hidden..(i + 1) * hidden])) as f32
+                })
+                .collect();
+            quantize_activations(&mut h, width, act);
+            let w = f64::from(weights[r * k + j]);
+            for (c, a) in acc.iter_mut().enumerate() {
+                *a += w * dot(&h, &dn[c * width..(c + 1) * width]);
+            }
+        }
+        for (c, a) in acc.into_iter().enumerate() {
+            y[r * hidden + c] = a as f32;
+        }
+    }
+    Ok(y)
 }
 
 pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
@@ -2636,6 +3103,91 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.transpose_heads(1, 16, 3, 128)?;
     s.transpose_heads(37, 16, 3, 128)?;
     s.transpose_heads(5, 2, 3, 7)?;
+    // Qwen4-Exp (docs/qwen4_exp.md): hyper-connection streams (decode, prefill, odd widths),
+    // PLE's dilated convolution across two calls, MoE routing and experts, the QSA indexer.
+    s.rms_norm_groups(1, 4, 2560)?;
+    s.rms_norm_groups(37, 4, 2560)?;
+    s.rms_norm_groups(5, 3, 70)?;
+    s.hyper_connections(1, 4, 2560)?;
+    s.hyper_connections(33, 4, 512)?;
+    s.hyper_connections(3, 3, 70)?;
+    s.conv1d_dilated(10240, 4, 3, [1, 1])?;
+    s.conv1d_dilated(96, 4, 3, [17, 2])?;
+    s.conv1d_dilated(33, 3, 2, [1, 5])?;
+    s.moe_route(1, 513, 512, 10)?;
+    s.moe_route(70, 513, 512, 10)?;
+    s.moe_route(9, 40, 37, 32)?;
+    s.moe_route(3, 16, 16, 1)?;
+    {
+        use velox_core::ggml::GgmlType::{Iq2S, Iq2Xxs, Q4K};
+        use WeightFormat::{Bf16, Ggml};
+        let a8 = ActPolicy::AllowA8;
+        // Decode, a verify window and a prefill chunk where experts take several 64-row tiles.
+        s.moe_experts(Ggml(Iq2S), Ggml(Q4K), 24, 512, 256, 1, 10, a8)?;
+        s.moe_experts(Ggml(Iq2Xxs), Ggml(Q4K), 24, 512, 256, 8, 6, a8)?;
+        s.moe_experts(Ggml(Iq2S), Ggml(Q4K), 12, 256, 512, 130, 4, a8)?;
+        // Odd widths (partial tiles everywhere) and bf16 records.
+        s.moe_experts(Bf16, Bf16, 7, 40, 70, 5, 3, ActPolicy::A16Only)?;
+    }
+    for (block0, blocks, ratio, dim, rot) in
+        [(0, 1, 4, 128, 64), (5, 70, 4, 128, 64), (2, 9, 3, 40, 40)]
+    {
+        s.qsa_pool(block0, blocks, ratio, dim, rot)?;
+    }
+    for (tokens, pos0, budget) in [
+        // Dense (every block fits the budget), a decode past the budget, a prefill crossing it.
+        (5, 0, 64),
+        (1, 900, 256),
+        (40, 230, 128),
+        (3, 2100, 2048),
+    ] {
+        let sh = QsaSelectShape {
+            tokens,
+            heads: 4,
+            dim: 128,
+            pos0,
+            ratio: 4,
+            budget,
+        };
+        s.qsa_select(sh)?;
+    }
+    s.qsa_select(QsaSelectShape {
+        tokens: 7,
+        heads: 3,
+        dim: 40,
+        pos0: 61,
+        ratio: 3,
+        budget: 30,
+    })?;
+    for kv in [
+        KvFormat::F32,
+        KvFormat::Bf16,
+        KvFormat::Fp8,
+        KvFormat::Nvfp4,
+    ] {
+        for (tokens, pos0, sel_len) in [(1, 300, 67), (9, 40, 23)] {
+            let sh = AttnShape {
+                tokens,
+                heads: 24,
+                kv_heads: 2,
+                head_dim: 256,
+                pos0,
+                kv,
+            };
+            s.attention_sparse(sh, sel_len)?;
+        }
+    }
+    s.attention_sparse(
+        AttnShape {
+            tokens: 4,
+            heads: 6,
+            kv_heads: 3,
+            head_dim: 40,
+            pos0: 17,
+            kv: KvFormat::F32,
+        },
+        9,
+    )?;
     Ok(s.results)
 }
 

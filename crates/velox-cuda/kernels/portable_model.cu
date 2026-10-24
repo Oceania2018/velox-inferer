@@ -1914,3 +1914,218 @@ VELOX_API int velox_portable_rope_positions(float* x, const uint32_t* pos, int t
                                                                        theta, axes, layout);
     return velox_launch_status();
 }
+
+// ---- MoE experts (Backend::moe_experts) ----
+//
+// Pairs p = r * k + j (row r, its j-th expert) are grouped by expert with a counting sort, then each
+// expert runs tiled GEMMs over its gathered rows, so its weights are read once per 64 rows whether
+// they sit in a device slot or in mapped system RAM. Every pair writes its own scratch row and the
+// final sum runs over j in order, so results do not depend on the grouping order.
+namespace {
+
+struct ExpertDesc {
+    const uint8_t* records;
+    const uint8_t* slots;
+    const float* map;  // i32 bits: slot of expert e, or -1
+    long long record_bytes;
+    int gate_fmt, up_fmt, down_fmt;
+    long long gate_off, up_off, down_off;
+    int width, hidden;
+};
+
+__device__ __forceinline__ const uint8_t* expert_record(const ExpertDesc& d, int e) {
+    const int slot = static_cast<int>(__float_as_uint(d.map[e]));
+    return slot >= 0 ? d.slots + static_cast<long long>(slot) * d.record_bytes
+                     : d.records + static_cast<long long>(e) * d.record_bytes;
+}
+
+__global__ void moe_count_kernel(const float* __restrict__ ids, int pairs, int experts, int* __restrict__ counts) {
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < pairs; p += gridDim.x * blockDim.x) {
+        const unsigned e = __float_as_uint(ids[p]);
+        if (e < static_cast<unsigned>(experts)) atomicAdd(counts + e, 1);
+    }
+}
+
+// Single thread: offsets[e] = sum of counts below e; cursors reset.
+__global__ void moe_scan_kernel(const int* __restrict__ counts, int* __restrict__ offsets, int* __restrict__ cursor,
+                                int experts) {
+    if (threadIdx.x != 0) return;
+    int acc = 0;
+    for (int e = 0; e < experts; ++e) {
+        offsets[e] = acc;
+        cursor[e] = 0;
+        acc += counts[e];
+    }
+    offsets[experts] = acc;
+}
+
+__global__ void moe_fill_kernel(const float* __restrict__ ids, int pairs, int experts, const int* __restrict__ offsets,
+                                int* __restrict__ cursor, int* __restrict__ list) {
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < pairs; p += gridDim.x * blockDim.x) {
+        const unsigned e = __float_as_uint(ids[p]);
+        if (e < static_cast<unsigned>(experts)) list[offsets[e] + atomicAdd(cursor + e, 1)] = p;
+    }
+}
+
+// Gate and up of expert blockIdx.y for output rows [64 blockIdx.x, +64) over its pairs, 64 at a time:
+// h[p][i] = silu(gate_i . x[p / k]) * (up_i . x[p / k]).
+__global__ void __launch_bounds__(256)
+moe_up_kernel(const float* __restrict__ x, ExpertDesc d, const int* __restrict__ offsets,
+              const int* __restrict__ list, int k, float* __restrict__ h) {
+    const int e = blockIdx.y;
+    const int begin = offsets[e], count = offsets[e + 1] - begin;
+    if (count == 0) return;
+    const uint8_t* rec = expert_record(d, e);
+    const WDesc wg{rec + d.gate_off, d.gate_fmt, d.width, d.hidden};
+    const WDesc wu{rec + d.up_off, d.up_fmt, d.width, d.hidden};
+    __shared__ float Xs[kTileK][kTile + 4];
+    __shared__ float Gs[kTileK][kTile + 4];
+    __shared__ float Us[kTileK][kTile + 4];
+    const int t = threadIdx.x, n0 = blockIdx.x * kTile;
+    const int lr = t / 4, lk = (t % 4) * 4;
+    const int ty = t / 16, tx = t % 16;
+    for (int p0 = 0; p0 < count; p0 += kTile) {
+        float ag[4][4] = {}, au[4][4] = {};
+        const int xp = p0 + lr < count ? list[begin + p0 + lr] : -1;
+        for (long long k0 = 0; k0 < d.hidden; k0 += kTileK) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const long long kk = k0 + lk + i;
+                const int wn = n0 + lr;
+                const bool kin = kk < d.hidden;
+                Xs[lk + i][lr] = (xp >= 0 && kin) ? x[static_cast<size_t>(xp / k) * d.hidden + kk] : 0.0f;
+                Gs[lk + i][lr] = (wn < d.width && kin) ? weight_at(wg, wn, kk) : 0.0f;
+                Us[lk + i][lr] = (wn < d.width && kin) ? weight_at(wu, wn, kk) : 0.0f;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int kk = 0; kk < kTileK; ++kk) {
+                float a[4], g[4], u[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    a[i] = Xs[kk][ty * 4 + i];
+                    g[i] = Gs[kk][tx * 4 + i];
+                    u[i] = Us[kk][tx * 4 + i];
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        ag[i][j] += a[i] * g[j];
+                        au[i][j] += a[i] * u[j];
+                    }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (p0 + ty * 4 + i >= count) continue;
+            const int p = list[begin + p0 + ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = n0 + tx * 4 + j;
+                if (c < d.width) {
+                    const float g = ag[i][j];
+                    h[static_cast<size_t>(p) * d.width + c] = g / (1.0f + expf(-g)) * au[i][j];
+                }
+            }
+        }
+    }
+}
+
+// Down of expert blockIdx.y for output columns [64 blockIdx.x, +64): o[p][c] = down_c . h[p].
+__global__ void __launch_bounds__(256)
+moe_down_kernel(const float* __restrict__ h, ExpertDesc d, const int* __restrict__ offsets,
+                const int* __restrict__ list, float* __restrict__ o) {
+    const int e = blockIdx.y;
+    const int begin = offsets[e], count = offsets[e + 1] - begin;
+    if (count == 0) return;
+    const WDesc wd{expert_record(d, e) + d.down_off, d.down_fmt, d.hidden, d.width};
+    __shared__ float Xs[kTileK][kTile + 4];
+    __shared__ float Ws[kTileK][kTile + 4];
+    const int t = threadIdx.x, n0 = blockIdx.x * kTile;
+    const int lr = t / 4, lk = (t % 4) * 4;
+    const int ty = t / 16, tx = t % 16;
+    for (int p0 = 0; p0 < count; p0 += kTile) {
+        float acc[4][4] = {};
+        const int xp = p0 + lr < count ? list[begin + p0 + lr] : -1;
+        for (long long k0 = 0; k0 < d.width; k0 += kTileK) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const long long kk = k0 + lk + i;
+                const int wn = n0 + lr;
+                const bool kin = kk < d.width;
+                Xs[lk + i][lr] = (xp >= 0 && kin) ? h[static_cast<size_t>(xp) * d.width + kk] : 0.0f;
+                Ws[lk + i][lr] = (wn < d.hidden && kin) ? weight_at(wd, wn, kk) : 0.0f;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int kk = 0; kk < kTileK; ++kk) {
+                float a[4], b[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    a[i] = Xs[kk][ty * 4 + i];
+                    b[i] = Ws[kk][tx * 4 + i];
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (p0 + ty * 4 + i >= count) continue;
+            const int p = list[begin + p0 + ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = n0 + tx * 4 + j;
+                if (c < d.hidden) o[static_cast<size_t>(p) * d.hidden + c] = acc[i][j];
+            }
+        }
+    }
+}
+
+__global__ void moe_combine_kernel(const float* __restrict__ o, const float* __restrict__ w, int rows, int k,
+                                   int hidden, float* __restrict__ y) {
+    const long long n = static_cast<long long>(rows) * hidden;
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / hidden, c = i % hidden;
+        float acc = 0.0f;
+        for (int j = 0; j < k; ++j) acc += w[r * k + j] * o[(r * k + j) * hidden + c];
+        y[i] = acc;
+    }
+}
+
+}  // namespace
+
+// f32 slots of scratch velox_portable_moe_experts needs.
+VELOX_API long long velox_portable_moe_scratch(int experts, int pairs, int width, int hidden) {
+    return 3LL * experts + 1 + pairs + static_cast<long long>(pairs) * (width + hidden);
+}
+
+VELOX_API int velox_portable_moe_experts(const float* x, const float* ids, const float* w, const uint8_t* records,
+                                         const uint8_t* slots, const float* map, long long record_bytes, int experts,
+                                         int gate_fmt, long long gate_off, int up_fmt, long long up_off, int down_fmt,
+                                         long long down_off, int width, int hidden, int rows, int k, float* y,
+                                         float* scratch) {
+    const int pairs = rows * k;
+    int* counts = reinterpret_cast<int*>(scratch);
+    int* offsets = counts + experts;
+    int* cursor = offsets + experts + 1;
+    int* list = cursor + experts;
+    float* h = scratch + 3LL * experts + 1 + pairs;
+    float* o = h + static_cast<size_t>(pairs) * width;
+    if (cudaError_t e = cudaMemsetAsync(counts, 0, sizeof(int) * experts, 0)) return static_cast<int>(e);
+    moe_count_kernel<<<velox_grid_1d(pairs, 256), 256>>>(ids, pairs, experts, counts);
+    moe_scan_kernel<<<1, 32>>>(counts, offsets, cursor, experts);
+    moe_fill_kernel<<<velox_grid_1d(pairs, 256), 256>>>(ids, pairs, experts, offsets, cursor, list);
+    const ExpertDesc d{records, slots, map, record_bytes, gate_fmt, up_fmt, down_fmt, gate_off, up_off, down_off,
+                       width, hidden};
+    moe_up_kernel<<<dim3((width + kTile - 1) / kTile, experts), 256>>>(x, d, offsets, list, k, h);
+    moe_down_kernel<<<dim3((hidden + kTile - 1) / kTile, experts), 256>>>(h, d, offsets, list, o);
+    moe_combine_kernel<<<velox_grid_1d(static_cast<long long>(rows) * hidden, 256), 256>>>(o, w, rows, k, hidden, y);
+    return velox_launch_status();
+}
