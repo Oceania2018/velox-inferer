@@ -3082,6 +3082,25 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.embed(f, 12, 512, &[11, 0, 5])?;
         s.linear_swiglu(f, 512, 24, 0, 2, false, true)?;
     }
+    // Blocks of 64 / 32 values: K a multiple of the block but not of 256, odd row views, decode,
+    // verify and tiled widths.
+    {
+        use velox_core::ggml::GgmlType::{Iq4Nl, Q2_0, Q8_0};
+        for (t, k) in [
+            (Q2_0, 640),
+            (Q2_0, 64),
+            (Iq4Nl, 160),
+            (Iq4Nl, 32),
+            (Q8_0, 96),
+        ] {
+            let f = WeightFormat::Ggml(t);
+            s.linear(f, 37, k, 5, 29, 1)?;
+            s.linear(f, 41, k, 3, 33, 8)?;
+            s.linear(f, 45, k, 7, 31, 20)?;
+            s.embed(f, 9, k, &[8, 0, 3])?;
+            s.linear_swiglu(f, k, 7, 0, 3, false, true)?;
+        }
+    }
     // The dense MLP's own K (gate/up 5120, down 17408) at decode and verify widths.
     s.linear(
         WeightFormat::Ggml(velox_core::ggml::GgmlType::Iq3S),
