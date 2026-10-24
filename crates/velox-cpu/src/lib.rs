@@ -940,12 +940,12 @@ impl Backend for CpuBackend {
         let (hidden, width) = (bank.hidden(), bank.width());
         let decode = |e: usize, m: &ExpertMatrix| -> Result<Vec<f32>> {
             let slot = bank.map[e].to_bits() as i32;
-            let (src, i) = if slot >= 0 {
-                (bank.slots, slot as usize)
+            let (src, at) = if slot >= 0 {
+                (bank.slots, slot as usize * bank.slot_bytes)
             } else {
-                (bank.records, e)
+                (bank.records, e * bank.record_bytes)
             };
-            let record = &as_bytes(src)[i * bank.record_bytes..][..bank.record_bytes];
+            let record = &as_bytes(src)[at..][..bank.record_bytes];
             decode_rows(m.format, &record[m.offset..], m.rows, m.k, 0, m.rows)
         };
         for r in 0..rows {

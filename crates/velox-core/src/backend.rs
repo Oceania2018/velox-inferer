@@ -365,9 +365,9 @@ pub struct ExpertMatrix {
 ///
 /// `records` holds every expert (expert `e` at byte `e * record_bytes`), usually in system RAM
 /// the device reads directly ([`Backend::alloc_host`]). `slots` holds device-resident copies (slot
-/// `i` at byte `i * record_bytes`), and `map` (`[experts]`, i32 bits in f32 slots) names each
-/// expert's slot, or -1 when only `records` has it. A slot is an exact copy of its record, so
-/// placement never changes results.
+/// `i` at byte `i * slot_bytes`; several layers' banks may share one pool of slots), and `map`
+/// (`[experts]`, i32 bits in f32 slots) names each expert's slot, or -1 when only `records` has
+/// it. A slot starts with an exact copy of its record, so placement never changes results.
 pub struct ExpertBank<'a, Buf> {
     pub records: &'a Buf,
     pub slots: &'a Buf,
@@ -375,6 +375,8 @@ pub struct ExpertBank<'a, Buf> {
     pub experts: usize,
     /// Slots in `slots` (0: no device copies).
     pub slot_count: usize,
+    /// Stride of `slots`: at least `record_bytes`, a multiple of 16.
+    pub slot_bytes: usize,
     pub record_bytes: usize,
     pub gate: ExpertMatrix,
     pub up: ExpertMatrix,

@@ -1965,7 +1965,7 @@ struct ExpertDesc {
     const uint8_t* records;
     const uint8_t* slots;
     const float* map;  // i32 bits: slot of expert e, or -1
-    long long record_bytes;
+    long long record_bytes, slot_bytes;
     int gate_fmt, up_fmt, down_fmt;
     long long gate_off, up_off, down_off;
     int width, hidden;
@@ -1973,7 +1973,7 @@ struct ExpertDesc {
 
 __device__ __forceinline__ const uint8_t* expert_record(const ExpertDesc& d, int e) {
     const int slot = static_cast<int>(__float_as_uint(d.map[e]));
-    return slot >= 0 ? d.slots + static_cast<long long>(slot) * d.record_bytes
+    return slot >= 0 ? d.slots + static_cast<long long>(slot) * d.slot_bytes
                      : d.records + static_cast<long long>(e) * d.record_bytes;
 }
 
@@ -2145,7 +2145,8 @@ VELOX_API long long velox_portable_moe_scratch(int experts, int pairs, int width
 }
 
 VELOX_API int velox_portable_moe_experts(const float* x, const float* ids, const float* w, const uint8_t* records,
-                                         const uint8_t* slots, const float* map, long long record_bytes, int experts,
+                                         const uint8_t* slots, const float* map, long long record_bytes,
+                                         long long slot_bytes, int experts,
                                          int gate_fmt, long long gate_off, int up_fmt, long long up_off, int down_fmt,
                                          long long down_off, int width, int hidden, int rows, int k, float* y,
                                          float* scratch) {
@@ -2160,8 +2161,8 @@ VELOX_API int velox_portable_moe_experts(const float* x, const float* ids, const
     moe_count_kernel<<<velox_grid_1d(pairs, 256), 256>>>(ids, pairs, experts, counts);
     moe_scan_kernel<<<1, 32>>>(counts, offsets, cursor, experts);
     moe_fill_kernel<<<velox_grid_1d(pairs, 256), 256>>>(ids, pairs, experts, offsets, cursor, list);
-    const ExpertDesc d{records, slots, map, record_bytes, gate_fmt, up_fmt, down_fmt, gate_off, up_off, down_off,
-                       width, hidden};
+    const ExpertDesc d{records, slots,  map,     record_bytes, slot_bytes, gate_fmt, up_fmt,
+                       down_fmt, gate_off, up_off, down_off, width,      hidden};
     moe_up_kernel<<<dim3((width + kTile - 1) / kTile, experts), 256>>>(x, d, offsets, list, k, h);
     moe_down_kernel<<<dim3((hidden + kTile - 1) / kTile, experts), 256>>>(h, d, offsets, list, o);
     moe_combine_kernel<<<velox_grid_1d(static_cast<long long>(rows) * hidden, 256), 256>>>(o, w, rows, k, hidden, y);

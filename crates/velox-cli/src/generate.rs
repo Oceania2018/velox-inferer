@@ -38,6 +38,9 @@ enum Input {
 }
 
 fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Result<ExitCode> {
+    if a.get("gguf").is_some() {
+        return crate::qwen4::generate(b, a, on_phase);
+    }
     let path = a
         .get("artifact")
         .ok_or_else(|| Error::Config("--artifact is required".into()))?;

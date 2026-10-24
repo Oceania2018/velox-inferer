@@ -657,10 +657,15 @@ pub fn expert_bank<B>(
             )));
         }
     }
-    if bank.experts == 0 || !bank.record_bytes.is_multiple_of(16) {
+    if bank.experts == 0
+        || !bank.record_bytes.is_multiple_of(16)
+        || !bank.slot_bytes.is_multiple_of(16)
+        || bank.slot_bytes < bank.record_bytes
+    {
         return Err(Error::Shape(format!(
-            "expert bank needs experts > 0 and 16-byte records, got {} x {}",
-            bank.experts, bank.record_bytes
+            "expert bank needs experts > 0, 16-byte records and slots at least a record: \
+             {} x {} bytes, slots of {}",
+            bank.experts, bank.record_bytes, bank.slot_bytes
         )));
     }
     need(
@@ -671,7 +676,7 @@ pub fn expert_bank<B>(
     need(
         "expert slots",
         slots,
-        product(&[bank.slot_count, bank.record_bytes])? / 4,
+        product(&[bank.slot_count, bank.slot_bytes])? / 4,
     )?;
     need("expert map", map, bank.experts)
 }

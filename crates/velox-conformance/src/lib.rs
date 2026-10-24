@@ -22,6 +22,8 @@ use velox_core::rng::Rng;
 use velox_core::{ModelSpec, Op, Result};
 use velox_cpu::CpuBackend;
 
+mod qwen4;
+
 #[derive(Clone, Debug)]
 pub struct CaseResult {
     pub name: String,
@@ -2040,10 +2042,12 @@ impl<B: Backend> Suite<'_, B> {
         }
         // Every third expert gets a slot, in reverse order.
         let resident: Vec<usize> = (0..experts).filter(|e| e % 3 == 1).rev().collect();
-        let mut slots = vec![0u8; resident.len().max(1) * record_bytes];
+        // Slots a little wider than records, as a pool shared by banks of several sizes is.
+        let slot_bytes = record_bytes + 48;
+        let mut slots = vec![0u8; resident.len().max(1) * slot_bytes];
         let mut map = vec![f32::from_bits(-1i32 as u32); experts];
         for (i, &e) in resident.iter().enumerate() {
-            slots[i * record_bytes..(i + 1) * record_bytes]
+            slots[i * slot_bytes..i * slot_bytes + record_bytes]
                 .copy_from_slice(&records[e * record_bytes..(e + 1) * record_bytes]);
             map[e] = f32::from_bits(i as u32);
         }
@@ -2083,6 +2087,7 @@ impl<B: Backend> Suite<'_, B> {
             map: &md,
             experts,
             slot_count: resident.len(),
+            slot_bytes,
             record_bytes,
             gate,
             up,
@@ -2159,7 +2164,8 @@ impl<B: Backend> Suite<'_, B> {
         let got = fetch(self.b, &pd, end * dim)?;
         let name =
             format!("qsa_pool blocks {block0}+{blocks} ratio={ratio} dim={dim} rot={rotary_dim}");
-        self.record(name, Some(Op::QsaPool), &got, &want, 1e-5);
+        // Normalised values of a few units rotated by f32 angles of up to ~300 rad.
+        self.record(name, Some(Op::QsaPool), &got, &want, 5e-5);
         Ok(())
     }
 
@@ -3207,6 +3213,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         },
         9,
     )?;
+    let stack = qwen4::qwen4_stack(b, &mut s.rng)?;
+    s.results.extend(stack);
     Ok(s.results)
 }
 
