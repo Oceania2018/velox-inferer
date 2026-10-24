@@ -301,11 +301,19 @@ pub fn qwen4_stack<B: Backend>(b: &B, rng: &mut Rng) -> Result<Vec<CaseResult>> 
         md.forward(b, &mut sd, &mut wd, &mut cd, part)?;
         let want = logits(&cpu, &mc, &wc)?;
         let got = logits(b, &md, &wd)?;
+        // Relative L2 error of the logits: kernels that round activations as their ops report
+        // (bf16, int8) drift by ~1e-2 through a random model, which the per-op cases check
+        // exactly; a wrong layer or state is O(1).
+        let (num, den) = got.iter().zip(&want).fold((0f64, 0f64), |(n, d), (&g, &w)| {
+            let e = f64::from(g) - f64::from(w);
+            (n + e * e, d + f64::from(w) * f64::from(w))
+        });
+        let rel = if num.is_nan() { f64::INFINITY } else { (num / den.max(1e-30)).sqrt() };
         out.push(CaseResult {
-            name: format!("qwen4 synthetic step {step} ({n} tokens at {pos})"),
+            name: format!("qwen4 synthetic step {step} ({n} tokens at {pos}), relative L2"),
             op: None,
-            max_err: max_err(&got, &want),
-            tol: 5e-3,
+            max_err: rel,
+            tol: 3e-2,
         });
         pos += n;
         cd.update(b, &md.w, if step % 2 == 0 { usize::MAX } else { 3 })?;
