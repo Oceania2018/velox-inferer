@@ -11,7 +11,7 @@ use velox_core::backend::Copy2dShape;
 use velox_core::{Backend, Error, HcCombineShape, KvFormat, NormKind, Result};
 
 use super::load::MtpWeights;
-use super::{lin, ExpertCache, LayerState, Qwen4Exp, Workspace};
+use super::{lin, static_key, ExpertCache, LayerState, Qwen4Exp, Workspace, GRAPH_MTP};
 
 pub struct Mtp<B: Backend> {
     pub w: MtpWeights<B>,
@@ -91,6 +91,25 @@ impl<B: Backend> Qwen4Exp<B> {
                 ms.rows, ms.capacity
             )));
         }
+        // Decode-sized entries on dense attention replay one recording per row count.
+        match static_key(c, GRAPH_MTP, pos0, t) {
+            Some(key) => b.graph(key, &mut || self.mtp_step(b, m, ms, ws, pos0, ids)),
+            None => self.mtp_step(b, m, ms, ws, pos0, ids),
+        }
+    }
+
+    /// The device work of [`Self::mtp_forward`] (no host waits: it may be recorded).
+    fn mtp_step(
+        &self,
+        b: &B,
+        m: &mut Mtp<B>,
+        ms: &mut MtpSession<B>,
+        ws: &mut Workspace<B>,
+        pos0: usize,
+        ids: &[u32],
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let t = ids.len();
         let (h, st, wide, eps) = (c.hidden, c.streams, c.wide(), c.eps);
         b.copy(&ws.r, 0, &mut ms.h, 0, t * wide)?;
         // r_s = fc_h(norm_s(h_s)) over the t * streams rows, plus fc_e(norm(embed(x))) per stream.

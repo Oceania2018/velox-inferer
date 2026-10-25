@@ -191,12 +191,13 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
                 accepted += 1;
                 model.commit(b, &mut session, &window, 2)?;
                 next = best[1];
-                if fe.is_eos(d) || out.len() + 1 >= max_tokens {
-                    out.push(d);
-                    next = d;
+                if fe.is_eos(d) {
                     break;
                 }
                 out.push(d);
+                if out.len() >= max_tokens {
+                    break;
+                }
                 vec![d, next]
             } else {
                 model.commit(b, &mut session, &window, 1)?;
