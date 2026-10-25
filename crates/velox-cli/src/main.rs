@@ -49,6 +49,10 @@ COMMANDS:
       --m <list>            token counts, comma separated (default 1,4,16,128,512)
       --act <a16|a8|a4>     activation policy (default a16); --divisor <f> for a4 (default 500)
       --iters <n>           timed iterations (default 20)
+  bench-moe               Time moe_experts over a bank of random experts in system RAM, a share
+                          of each row's experts in device slots (Qwen3.8-Flash-Next geometry)
+      --gate <ggml_type> (ggml_iq2_s) --down <ggml_type> (ggml_q2_0) --experts 512 --width 640
+      --hidden 2560 --k 10 --rows <list> (1,4,16,128) --resident <list> (0,0.5,1) --iters 64
   bench-gdn               Time one gated_delta_net at a model head geometry with random inputs
       --k-heads <n> --v-heads <n> --k-dim <n> --v-dim <n>  default 16/48 heads, 128/128 (Qwen3.8)
       --tokens <list>       token counts, comma separated (default 1,8,64,512)
@@ -129,6 +133,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench") => bench_cmd(a),
         Some("bench-linear") => bench_linear(a),
         Some("bench-gdn") => bench_gdn(a),
+        Some("bench-moe") => bench_moe(a),
         Some("bench-attn") => bench_attn(a),
         Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
@@ -366,6 +371,42 @@ fn bench_linear(a: &Args) -> Result<ExitCode> {
         Selected::Cpu(b) => bench::run_linear(b, &cfg)?,
         #[cfg(feature = "cuda")]
         Selected::Cuda(b) => bench::run_linear(b, &cfg)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn bench_moe(a: &Args) -> Result<ExitCode> {
+    use velox_core::{Error, WeightFormat};
+    let fmt = |key: &str, default: &str| -> Result<WeightFormat> {
+        let name = a.get(key).unwrap_or(default);
+        velox_core::ggml::GgmlType::from_name(name)
+            .map(WeightFormat::Ggml)
+            .ok_or_else(|| Error::Config(format!("unknown --{key} {name} (ggml_<type>)")))
+    };
+    let list = |key: &str, default: &str| -> Result<Vec<f64>> {
+        a.get(key)
+            .unwrap_or(default)
+            .split(',')
+            .map(|s| s.trim().parse::<f64>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::Config(format!("--{key} takes comma-separated numbers")))
+    };
+    let cfg = bench::MoeConfig {
+        gate: fmt("gate", "ggml_iq2_s")?,
+        down: fmt("down", "ggml_q2_0")?,
+        experts: a.parse("experts", 512)?,
+        width: a.parse("width", 640)?,
+        hidden: a.parse("hidden", 2560)?,
+        k: a.parse("k", 10)?,
+        rows: list("rows", "1,4,16,128")?.into_iter().map(|v| v as usize).collect(),
+        resident: list("resident", "0,0.5,1")?,
+        iters: a.parse("iters", 64)?,
+    };
+    let sel = select::backend(a)?;
+    match &sel {
+        Selected::Cpu(b) => bench::run_moe(b, &cfg)?,
+        #[cfg(feature = "cuda")]
+        Selected::Cuda(b) => bench::run_moe(b, &cfg)?,
     }
     Ok(ExitCode::SUCCESS)
 }
