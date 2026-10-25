@@ -119,8 +119,58 @@ __global__ void sigmoid_scale_rows_kernel(float* __restrict__ x, const float* __
 
 constexpr int kMoeKMax = 32;
 
+// Lane l holds logits l, l + 32, ... of its row in registers (PER <= 32 per lane) and a mask of
+// the selected ones. Each of the k rounds is a register scan and a warp argmax (ties to the lower
+// id).
+template <int PER>
 __global__ void moe_route_kernel(const float* __restrict__ logits, float* __restrict__ ids, float* __restrict__ wts,
                                  float* __restrict__ counts, int rows, int row_len, int experts, int k) {
+    const int r = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    const int lane = threadIdx.x % VELOX_WARP;
+    if (r >= rows) return;
+    const float* row = logits + static_cast<size_t>(r) * row_len;
+    float v[PER];
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int e = lane + i * VELOX_WARP;
+        const float x = e < experts ? row[e] : -INFINITY;
+        v[i] = x != x ? -INFINITY : x;  // NaN ranks below every number
+    }
+    unsigned taken = 0;  // bit i: this lane's expert lane + 32 i is selected (or past `experts`)
+#pragma unroll
+    for (int i = 0; i < PER; ++i)
+        if (lane + i * VELOX_WARP >= experts) taken |= 1u << i;
+    int sel[kMoeKMax];
+    float val[kMoeKMax];
+    for (int j = 0; j < k; ++j) {
+        float best = -INFINITY;
+        int best_i = -1;
+#pragma unroll
+        for (int i = 0; i < PER; ++i)  // ascending i: ties keep the lower id
+            if (!(taken >> i & 1u) && (best_i < 0 || v[i] > best)) best = v[i], best_i = i;
+        int best_id = best_i < 0 ? 0x7fffffff : lane + best_i * VELOX_WARP;
+        for (int o = VELOX_WARP / 2; o > 0; o >>= 1) {
+            const float ob = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, best_id, o);
+            if (ob > best || (ob == best && oi < best_id)) best = ob, best_id = oi;
+        }
+        sel[j] = best_id;
+        val[j] = best;
+        if (best_id % VELOX_WARP == lane) taken |= 1u << (best_id / VELOX_WARP);
+    }
+    if (lane != 0) return;
+    float sum = 0.0f;
+    for (int j = 0; j < k; ++j) sum += expf(val[j] - val[0]);
+    for (int j = 0; j < k; ++j) {
+        ids[static_cast<size_t>(r) * k + j] = __uint_as_float(static_cast<unsigned>(sel[j]));
+        wts[static_cast<size_t>(r) * k + j] = expf(val[j] - val[0]) / sum;
+        if (counts != nullptr) atomicAdd(counts + sel[j], 1.0f);
+    }
+}
+
+// Larger expert counts: logits re-read from memory each round.
+__global__ void moe_route_wide_kernel(const float* __restrict__ logits, float* __restrict__ ids, float* __restrict__ wts,
+                                      float* __restrict__ counts, int rows, int row_len, int experts, int k) {
     const int r = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
     const int lane = threadIdx.x % VELOX_WARP;
     if (r >= rows) return;
@@ -134,7 +184,6 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, float* __rest
             bool taken = false;
             for (int i = 0; i < j; ++i) taken |= sel[i] == e;
             const float v = row[e];
-            // NaN ranks below every number.
             const float key = v != v ? -INFINITY : v;
             if (!taken && (key > best || (key == best && e < best_id))) {
                 best = key;
@@ -362,8 +411,13 @@ VELOX_API int velox_portable_moe_route(const float* logits, float* ids, float* w
                                        int row_len, int experts, int k) {
     if (k > kMoeKMax) return VELOX_ERR_UNSUPPORTED;
     const int warps = 4;
-    moe_route_kernel<<<(rows + warps - 1) / warps, warps * VELOX_WARP>>>(logits, ids, wts, counts, rows, row_len,
-                                                                       experts, k);
+    const unsigned grid = (rows + warps - 1) / warps;
+    if (experts <= 16 * VELOX_WARP)
+        moe_route_kernel<16><<<grid, warps * VELOX_WARP>>>(logits, ids, wts, counts, rows, row_len, experts, k);
+    else if (experts <= 32 * VELOX_WARP)
+        moe_route_kernel<32><<<grid, warps * VELOX_WARP>>>(logits, ids, wts, counts, rows, row_len, experts, k);
+    else
+        moe_route_wide_kernel<<<grid, warps * VELOX_WARP>>>(logits, ids, wts, counts, rows, row_len, experts, k);
     return velox_launch_status();
 }
 
