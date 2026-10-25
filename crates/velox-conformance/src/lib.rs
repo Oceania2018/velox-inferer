@@ -3227,6 +3227,15 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             s.linear(WeightFormat::Bf16, n, k, 0, n, m)?;
         }
     }
+    // GGML projections with K = 2560 (not a multiple of 1024) at decode widths under A8.
+    {
+        use velox_core::ggml::GgmlType::{Iq3S, Iq4Xs, Q4K};
+        for t in [Iq4Xs, Q4K, Iq3S] {
+            for m in [1, 3, 8] {
+                s.linear_act(WeightFormat::Ggml(t), 96, 2560, 0, 96, m, ActPolicy::AllowA8)?;
+            }
+        }
+    }
     let stack = qwen4::qwen4_stack(b, &mut s.rng)?;
     s.results.extend(stack);
     Ok(s.results)
