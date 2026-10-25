@@ -537,7 +537,7 @@ pub(crate) fn enable_experts<B: Backend>(
     let policy = ExpertPolicy {
         interval: a.parse("cache-interval", ExpertPolicy::default().interval)?,
         moves: a.parse("cache-moves", ExpertPolicy::default().moves)?,
-        reads: a.parse("cache-score-reads", 0u8)? != 0,
+        reads: a.parse("cache-score-reads", u8::from(ExpertPolicy::default().reads))? != 0,
         ..ExpertPolicy::default()
     };
     model.enable_experts(b, slots, policy)?;
