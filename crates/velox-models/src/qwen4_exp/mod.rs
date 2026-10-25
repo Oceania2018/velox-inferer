@@ -105,7 +105,7 @@ pub struct Workspace<B: Backend> {
 pub struct Qwen4Exp<B: Backend> {
     pub cfg: Qwen4Config,
     pub w: Qwen4Weights<B>,
-    /// Threads reading PLE table rows.
+    /// Threads reading PLE table rows (random reads of a file of tens of GB: queue depth wins).
     pub ple_threads: usize,
 }
 
@@ -118,7 +118,7 @@ impl<B: Backend> Qwen4Exp<B> {
         Qwen4Exp {
             cfg,
             w,
-            ple_threads: 8,
+            ple_threads: 32,
         }
     }
 

@@ -69,7 +69,8 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
         t0.elapsed().as_secs_f64()
     );
     let (layers, experts, slot_bytes) = (cfg.layers.len(), cfg.experts, w.max_record_bytes());
-    let model = Qwen4Exp::new(cfg, w);
+    let mut model = Qwen4Exp::new(cfg, w);
+    model.ple_threads = a.parse("ple-threads", model.ple_threads)?;
     let mut session = model.session(b, capacity, kv_format)?;
     let mut ws = {
         let probe = ExpertCache::new(b, layers, experts, slot_bytes, 0)?;
