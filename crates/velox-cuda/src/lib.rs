@@ -1853,6 +1853,22 @@ impl Backend for CudaBackend {
         if data.is_empty() {
             return Ok(());
         }
+        if graph_mode() != GraphMode::None {
+            // Inside a step: the values go to the step's staging region (a replay refreshes them
+            // there) and a recorded copy moves them.
+            // SAFETY: an f32 slice viewed as its bytes.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+            let src = stage(bytes)?;
+            if graph_mode() == GraphMode::Replay {
+                return Ok(());
+            }
+            // SAFETY: the destination range was validated; src holds data.len() * 4 bytes.
+            return status(
+                unsafe { ffi::velox_cuda_dtod(dst.ptr.add(offset).cast(), src, data.len() * 4) },
+                "write_at (staged)",
+            );
+        }
         // SAFETY: the destination range was validated; the driver stages pageable sources before
         // returning, so `data` may be reused right away.
         status(
