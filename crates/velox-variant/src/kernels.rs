@@ -907,6 +907,68 @@ extern "C" {
 /// kernels grouped by expert.
 const MOE_DECODE_MAX: usize = 16;
 
+extern "C" {
+    fn velox_5060_moe_nvfp4_scratch(
+        rows: i32,
+        k: i32,
+        width: i32,
+        hidden: i32,
+        experts: i32,
+        mode: i32,
+    ) -> i64;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_5060_moe_nvfp4(
+        x: *const f32,
+        ids: *const f32,
+        wts: *const f32,
+        records: *const u8,
+        slots: *const u8,
+        map: *const f32,
+        record_bytes: i64,
+        slot_bytes: i64,
+        gate_off: i64,
+        up_off: i64,
+        down_off: i64,
+        width: i32,
+        hidden: i32,
+        rows: i32,
+        k: i32,
+        experts: i32,
+        mode: i32,
+        y: *mut f32,
+        scratch: *mut f32,
+    ) -> i32;
+}
+
+/// Most rows rtx5060_moe_nvfp4.cu's GEMV kernels (exact activations) take; larger chunks run
+/// grouped by expert on tensor cores (bf16 activations).
+const MOE_NVFP4_DECODE_MAX: usize = 16;
+
+/// rtx5060_moe_nvfp4.cu's mode for `rows`: 0 a GEMV per routed pair (decode), 1 the GEMVs per
+/// expert over its pairs (verify windows: an expert chosen by several rows is read once), 2
+/// grouped on tensor cores (prefill).
+fn moe_nvfp4_mode(rows: usize) -> i32 {
+    match rows {
+        0 | 1 => 0,
+        r if r <= MOE_NVFP4_DECODE_MAX => 1,
+        _ => 2,
+    }
+}
+
+/// Whether rtx5060_moe_nvfp4.cu covers `bank`: NVFP4 gate, up and down (any activation policy:
+/// the kernels keep activations exact or round them to bf16), within the launcher's limits so
+/// moe_experts_act never reports a rounding the portable fallback would not apply.
+fn moe_nvfp4(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> bool {
+    let nv = |m: &velox_core::ExpertMatrix| m.format == WeightFormat::Nvfp4 && m.offset % 4 == 0;
+    rows > 0
+        && nv(&bank.gate)
+        && nv(&bank.up)
+        && nv(&bank.down)
+        && bank.record_bytes % 16 == 0
+        && bank.slot_bytes % 16 == 0
+        && bank.experts <= 6144
+}
+
 /// (gate/up type, down type) of rtx5060_ggml.cu's MoE kernels for `bank` at `rows` rows: GGML
 /// experts of the served types, Q2_0 or IQ4_NL, 8-bit activations allowed.
 fn moe_types(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> Option<(i32, i32)> {
@@ -975,6 +1037,20 @@ impl CudaKernels for Rtx5060Kernels {
 
     fn moe_scratch_len(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize, k: usize) -> usize {
         let portable = portable::moe_scratch_len(bank, rows, k);
+        if moe_nvfp4(bank, rows) {
+            // SAFETY: a pure size computation.
+            let bytes = unsafe {
+                velox_5060_moe_nvfp4_scratch(
+                    rows as i32,
+                    k as i32,
+                    bank.width() as i32,
+                    bank.hidden() as i32,
+                    bank.experts as i32,
+                    moe_nvfp4_mode(rows),
+                )
+            };
+            return portable.max((bytes as usize).div_ceil(4));
+        }
         if moe_types(bank, rows).is_none() {
             return portable;
         }
@@ -993,6 +1069,8 @@ impl CudaKernels for Rtx5060Kernels {
     fn moe_experts_act(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> ActQuant {
         if moe_types(bank, rows).is_some() {
             ActQuant::Int8G32
+        } else if moe_nvfp4(bank, rows) && moe_nvfp4_mode(rows) == 2 {
+            ActQuant::Bf16
         } else {
             ActQuant::Exact
         }
@@ -1010,6 +1088,39 @@ impl CudaKernels for Rtx5060Kernels {
         rows: usize,
         k: usize,
     ) -> Result<()> {
+        if moe_nvfp4(bank, rows) {
+            // SAFETY: CudaBackend validated the bank and extents (check::moe_experts); the scratch
+            // holds moe_scratch_len slots for this row count; expert ids past the bank are skipped.
+            let r = status(
+                unsafe {
+                    velox_5060_moe_nvfp4(
+                        x.as_ptr(),
+                        ids.as_ptr(),
+                        weights.as_ptr(),
+                        bank.records.as_ptr().cast(),
+                        bank.slots.as_ptr().cast(),
+                        bank.map.as_ptr(),
+                        bank.record_bytes as i64,
+                        bank.slot_bytes as i64,
+                        bank.gate.offset as i64,
+                        bank.up.offset as i64,
+                        bank.down.offset as i64,
+                        to_i32("width", bank.width())?,
+                        to_i32("hidden", bank.hidden())?,
+                        to_i32("rows", rows)?,
+                        to_i32("k", k)?,
+                        to_i32("experts", bank.experts)?,
+                        moe_nvfp4_mode(rows),
+                        y.as_mut_ptr(),
+                        scratch.as_mut_ptr(),
+                    )
+                },
+                "rtx5060 moe_experts (nvfp4)",
+            );
+            return or_fallback(r, || {
+                portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+            });
+        }
         let Some((tu, td)) = moe_types(bank, rows) else {
             return portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k);
         };
