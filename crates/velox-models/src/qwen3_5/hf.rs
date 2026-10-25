@@ -201,6 +201,17 @@ impl SafeTensors {
         self.tensors.get(name)
     }
 
+    /// Adds `other`'s tensors under `prefix` + name (a draft model beside the target).
+    pub fn merge(&mut self, other: SafeTensors, prefix: &str) {
+        let base = self.files.len();
+        self.paths.extend(other.paths);
+        self.files.extend(other.files);
+        for (name, mut t) in other.tensors {
+            t.file += base;
+            self.tensors.insert(format!("{prefix}{name}"), t);
+        }
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.tensors.keys()
     }
@@ -1071,10 +1082,32 @@ fn text_prefix(st: &SafeTensors) -> Result<&'static str> {
 /// Writes `out` from the HF checkpoint in `dir`: text stack, MTP head (when present) and the
 /// tokenizer, chat template and generation config. `progress` gets a line per written gigabyte.
 pub fn import(dir: &Path, out: &Path, progress: &mut dyn FnMut(&str)) -> Result<ImportReport> {
+    import_with(dir, out, None, progress)
+}
+
+/// Tensor-name prefix of the DFlash2 drafter's checkpoint inside the merged tensor set.
+const DFLASH: &str = "dflash::";
+
+/// [`import`], adding the DFlash2 drafter checkpoint in `dflash` (a `DFlash2DraftModel`
+/// conditioned on this target) as the `dflash2` component when given.
+pub fn import_with(
+    dir: &Path,
+    out: &Path,
+    dflash: Option<&Path>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<ImportReport> {
     let hf_cfg = read_json(&dir.join("config.json"))?;
     let cfg_json = text_config(&hf_cfg)?;
     let c = TextConfig::from_json(&cfg_json)?;
-    let st = SafeTensors::open_dir(dir)?;
+    let mut st = SafeTensors::open_dir(dir)?;
+    let dflash_cfg = match dflash {
+        Some(d) => {
+            let v = read_json(&d.join("config.json"))?;
+            st.merge(SafeTensors::open_dir(d)?, DFLASH);
+            Some(v)
+        }
+        None => None,
+    };
     let mut b = Builder::new(&st);
     let pre = text_prefix(&st)?;
 
@@ -1141,6 +1174,10 @@ pub fn import(dir: &Path, out: &Path, progress: &mut dyn FnMut(&str)) -> Result<
         )?;
     }
 
+    if let Some(v) = &dflash_cfg {
+        dflash2(&mut b, &c, v)?;
+    }
+
     // Resources (text). The vision tower (`model.visual.*`, a `vision` component with
     // `preprocessor_config.json`) would be added here.
     let mut resources = Map::new();
@@ -1181,6 +1218,9 @@ pub fn import(dir: &Path, out: &Path, progress: &mut dyn FnMut(&str)) -> Result<
         "text".into(),
         json!({ "config": cfg_json, "resources": resources }),
     );
+    if let Some(v) = dflash_cfg {
+        components.insert("dflash2".into(), json!({ "config": v }));
+    }
     let report_counts = (objects.len(), bindings.len(), uses.len());
     let mut d = Map::new();
     d.insert("components".into(), Value::Object(components));
@@ -1344,3 +1384,114 @@ fn read_piece(
 
 #[cfg(test)]
 mod tests;
+
+/// The DFlash2 drafter (`dflash2/`): HF `DFlash2DraftModel` names to velox's bindings. All BF16
+/// as stored; norms are plain multipliers (Qwen3 RMSNorm). The context key / value projections
+/// share the block's key / value rows.
+fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value) -> Result<()> {
+    let dc = super::dflash::DFlashConfig::from_json(v)?;
+    let h = c.hidden as u64;
+    if dc.target_layers.iter().any(|&l| l >= c.layers.len()) {
+        return Err(Error::Config(format!(
+            "dflash2 target layers {:?} past the target's {} layers",
+            dc.target_layers,
+            c.layers.len()
+        )));
+    }
+    let t = |s: &str| format!("{DFLASH}{s}");
+    let one = |b: &mut Builder<'_>, name: &str, binding: &str, rows: u64| {
+        b.stacked(
+            &name.to_string(),
+            &[RowSrc::all(name.to_string())],
+            &[(binding, 0, rows)],
+        )
+    };
+    one(b, &t("fc.weight"), "dflash2/feature_projection", h)?;
+    check_k(
+        b,
+        "dflash2/feature_projection",
+        h * dc.target_layers.len() as u64,
+    )?;
+    b.vector("dflash2/context_norm", &t("hidden_norm.weight"), c.hidden)?;
+    b.vector("dflash2/final_norm", &t("norm.weight"), c.hidden)?;
+    let (qd, kvd) = (
+        (dc.heads * dc.head_dim) as u64,
+        (dc.kv_heads * dc.head_dim) as u64,
+    );
+    let (inter, groups) = (dc.intermediate as u64, h / dc.conv_group as u64);
+    for i in 0..dc.layers {
+        let l = |s: &str| t(&format!("layers.{i}.{s}"));
+        let q = |s: &str| format!("dflash2/layers/{i}/{s}");
+        b.vector(&q("input_norm"), &l("input_layernorm.weight"), c.hidden)?;
+        b.vector(
+            &q("post_attention_norm"),
+            &l("post_attention_layernorm.weight"),
+            c.hidden,
+        )?;
+        b.vector(
+            &q("attention/query_norm"),
+            &l("self_attn.q_norm.weight"),
+            dc.head_dim,
+        )?;
+        b.vector(
+            &q("attention/key_norm"),
+            &l("self_attn.k_norm.weight"),
+            dc.head_dim,
+        )?;
+        b.stacked(
+            &l("self_attn.qkv"),
+            &[
+                RowSrc::all(l("self_attn.q_proj.weight")),
+                RowSrc::all(l("self_attn.k_proj.weight")),
+                RowSrc::all(l("self_attn.v_proj.weight")),
+            ],
+            &[
+                (&q("attention/query"), 0, qd),
+                (&q("attention/key"), qd, kvd),
+                (&q("attention/value"), qd + kvd, kvd),
+                (&q("attention/context_key"), qd, kvd),
+                (&q("attention/context_value"), qd + kvd, kvd),
+            ],
+        )?;
+        one(b, &l("self_attn.o_proj.weight"), &q("attention/output"), h)?;
+        b.stacked(
+            &l("mlp.gate_up"),
+            &[
+                RowSrc::all(l("mlp.gate_proj.weight")),
+                RowSrc::all(l("mlp.up_proj.weight")),
+            ],
+            &[(&q("mlp/gate"), 0, inter), (&q("mlp/up"), inter, inter)],
+        )?;
+        one(b, &l("mlp.down_proj.weight"), &q("mlp/down"), h)?;
+        for conv in ["attention_conv", "mlp_conv"] {
+            b.vector(
+                &q(&format!("{conv}/base_kernel")),
+                &l(&format!("{conv}.base_kernel")),
+                4 * c.hidden,
+            )?;
+            one(
+                b,
+                &l(&format!("{conv}.kernel_projection.weight")),
+                &q(&format!("{conv}/kernel_projection")),
+                4 * groups,
+            )?;
+        }
+    }
+    let rank = dc.rank as u64;
+    one(
+        b,
+        &t("candidate_selector.hidden_projection.weight"),
+        "dflash2/candidate_selector/hidden_projection",
+        rank,
+    )?;
+    let vocab = c.vocab as u64;
+    for book in ["predecessor_codebook", "successor_codebook"] {
+        one(
+            b,
+            &t(&format!("candidate_selector.{book}")),
+            &format!("dflash2/candidate_selector/{book}"),
+            vocab,
+        )?;
+    }
+    Ok(())
+}

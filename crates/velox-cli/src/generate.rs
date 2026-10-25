@@ -113,7 +113,13 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
     );
     let mut model = Qwen35Text::new(cfg, w);
     let mut ws = model.workspace(b, chunk)?;
-    enable_experts(b, &mut model, a, 1536)?;
+    // A DFlash2 drafter is loaded per prompt after this: keep its weights' room free too.
+    let drafter_mib = if a.get("dflash").is_some() {
+        component_bytes(&art, "dflash2/") >> 20
+    } else {
+        0
+    };
+    enable_experts(b, &mut model, a, 1536 + drafter_mib as usize)?;
 
     let report_experts = |model: &Qwen35Text<B>| {
         if let Some(r) = model.expert_report() {
@@ -542,4 +548,26 @@ pub(crate) fn enable_experts<B: Backend>(
         100.0 * slots as f64 / total.max(1) as f64,
     );
     Ok(())
+}
+
+/// Bytes of the objects bound under `prefix` (each object once).
+fn component_bytes(art: &Artifact, prefix: &str) -> u64 {
+    let mut ids = std::collections::BTreeSet::new();
+    for (name, b) in art.directory["bindings"].as_object().into_iter().flatten() {
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if let Some(id) = b["object"].as_str() {
+            ids.insert(id.to_string());
+        }
+        for p in b["parts"].as_array().into_iter().flatten() {
+            if let Some(id) = p["object"].as_str() {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids.iter()
+        .filter_map(|id| art.object(id))
+        .map(|o| o.bytes)
+        .sum()
 }

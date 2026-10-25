@@ -156,8 +156,11 @@ pub fn import_hf(a: &Args) -> Result<ExitCode> {
     let dir = Path::new(required(a, "hf-dir")?);
     let output = Path::new(required(a, "output")?);
     let t0 = std::time::Instant::now();
-    let r =
-        velox_models::qwen3_5::hf::import(dir, output, &mut |line| eprintln!("[import] {line}"))?;
+    // `--dflash <dir>`: a DFlash2 drafter checkpoint for this target, as the dflash2 component.
+    let dflash = a.get("dflash").map(Path::new);
+    let r = velox_models::qwen3_5::hf::import_with(dir, output, dflash, &mut |line| {
+        eprintln!("[import] {line}")
+    })?;
     for (format, objects, bytes) in &r.formats {
         println!("  {format:<22} {objects:>6} objects {:>7.2} GB", gb(*bytes));
     }
