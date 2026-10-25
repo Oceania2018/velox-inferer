@@ -76,7 +76,8 @@ __global__ void ple_gate_kernel(const float* __restrict__ key, const float* __re
 // out[t][c] = silu(sum_j w[j][c] u[t + j dil][c]) with u = [state; x].
 __global__ void conv1d_dilated_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                       const float* __restrict__ state, float* __restrict__ out, int tokens,
-                                      int channels, int width, int dil) {
+                                      int channels, int width, int dil, const long long* __restrict__ pp) {
+    if (pp != nullptr) state = reinterpret_cast<const float*>(pp[0]);
     const long long n = static_cast<long long>(tokens) * channels;
     const int hist = (width - 1) * dil;
     for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < n;
@@ -95,7 +96,8 @@ __global__ void conv1d_dilated_kernel(const float* __restrict__ x, const float* 
 
 // New state row i is row tokens + i of u = [state; x]; ascending i only reads rows not yet written.
 __global__ void conv1d_dilated_state_kernel(const float* __restrict__ x, float* __restrict__ state, int tokens,
-                                            int channels, int hist) {
+                                            int channels, int hist, const long long* __restrict__ pp) {
+    if (pp != nullptr) state = reinterpret_cast<float*>(pp[0]);
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     for (int i = 0; i < hist; ++i) {
@@ -163,9 +165,15 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, float* __rest
 // ---- QSA pooling: one block per block row; dim <= 1024 ----
 
 __global__ void qsa_pool_kernel(const float* __restrict__ raw, const float* __restrict__ w, float* __restrict__ pooled,
-                                int block0, int ratio, int dim, int rotary, float theta, float eps) {
+                                int block0, int ratio, int dim, int rotary, float theta, float eps,
+                                const long long* __restrict__ pp) {
     __shared__ float scratch[VELOX_WARP];
     extern __shared__ float v[];
+    if (pp != nullptr) {
+        block0 = static_cast<int>(pp[0]);
+        raw = reinterpret_cast<const float*>(pp[1]);
+        pooled = reinterpret_cast<float*>(pp[2]);
+    }
     const int b = block0 + blockIdx.x, c = threadIdx.x;
     float mean = 0.0f;
     if (c < dim) {
@@ -333,12 +341,14 @@ VELOX_API int velox_portable_ple_gate(const float* key, const float* q, const fl
     return velox_launch_status();
 }
 
+// params: null, or device [state] staged by a graph step (a recording serves any session).
 VELOX_API int velox_portable_conv1d_dilated(const float* x, const float* w, float* state, float* out, int tokens,
-                                            int channels, int width, int dil) {
+                                            int channels, int width, int dil, const long long* params) {
     const long long n = static_cast<long long>(tokens) * channels;
-    conv1d_dilated_kernel<<<velox_grid_1d(n, 256), 256>>>(x, w, state, out, tokens, channels, width, dil);
+    conv1d_dilated_kernel<<<velox_grid_1d(n, 256), 256>>>(x, w, state, out, tokens, channels, width, dil, params);
     if (const int e = velox_launch_status()) return e;
-    conv1d_dilated_state_kernel<<<(channels + 255) / 256, 256>>>(x, state, tokens, channels, (width - 1) * dil);
+    conv1d_dilated_state_kernel<<<(channels + 255) / 256, 256>>>(x, state, tokens, channels, (width - 1) * dil,
+                                                                  params);
     return velox_launch_status();
 }
 
@@ -357,11 +367,13 @@ VELOX_API int velox_portable_moe_route(const float* logits, float* ids, float* w
     return velox_launch_status();
 }
 
+// params: null, or device [block0, raw, pooled] staged by a graph step.
 VELOX_API int velox_portable_qsa_pool(const float* raw, const float* w, float* pooled, int block0, int blocks, int ratio,
-                                      int dim, int rotary, float theta, float eps) {
+                                      int dim, int rotary, float theta, float eps, const long long* params) {
     if (dim > 1024) return VELOX_ERR_UNSUPPORTED;
     const int threads = (dim + VELOX_WARP - 1) / VELOX_WARP * VELOX_WARP;
-    qsa_pool_kernel<<<blocks, threads, dim * sizeof(float)>>>(raw, w, pooled, block0, ratio, dim, rotary, theta, eps);
+    qsa_pool_kernel<<<blocks, threads, dim * sizeof(float)>>>(raw, w, pooled, block0, ratio, dim, rotary, theta, eps,
+                                                               params);
     return velox_launch_status();
 }
 

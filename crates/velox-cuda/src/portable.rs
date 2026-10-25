@@ -1617,6 +1617,7 @@ extern "C" {
         channels: i32,
         width: i32,
         dil: i32,
+        params: *const i64,
     ) -> i32;
     fn velox_portable_sigmoid_scale_rows(
         x: *mut f32,
@@ -1674,6 +1675,7 @@ extern "C" {
         rotary: i32,
         theta: f32,
         eps: f32,
+        params: *const i64,
     ) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn velox_portable_qsa_select(
@@ -1849,6 +1851,10 @@ pub fn conv1d_dilated_silu(
     s: DilatedConvShape,
 ) -> Result<()> {
     check::conv1d_dilated(x.len(), weight.len(), state.len(), out.len(), &s)?;
+    // Graph steps stage the state: a recording serves any session.
+    let Some(params) = graph_params(&[state.as_ptr() as i64])? else {
+        return Ok(());
+    };
     // SAFETY: buffer extents validated above.
     status(
         unsafe {
@@ -1861,6 +1867,7 @@ pub fn conv1d_dilated_silu(
                 to_i32("channels", s.channels)?,
                 to_i32("width", s.width)?,
                 to_i32("dilation", s.dilation)?,
+                params,
             )
         },
         "portable conv1d_dilated_silu",
@@ -2001,8 +2008,16 @@ pub fn qsa_pool(
     s: QsaPoolShape,
 ) -> Result<()> {
     check::qsa_pool(raw.len(), weight.len(), pooled.len(), &s)?;
-    outside_graphs("qsa_pool")?;
     to_i32("pooled positions", (s.block0 + s.blocks) * s.ratio)?;
+    // Graph steps stage the first block and the caches (the block count is the step's shape).
+    let Some(params) = graph_params(&[
+        s.block0 as i64,
+        raw.as_ptr() as i64,
+        pooled.as_ptr() as i64,
+    ])?
+    else {
+        return Ok(());
+    };
     // SAFETY: buffer extents validated above.
     status(
         unsafe {
@@ -2017,6 +2032,7 @@ pub fn qsa_pool(
                 to_i32("rotary_dim", s.rotary_dim)?,
                 s.theta,
                 s.eps,
+                params,
             )
         },
         "portable qsa_pool",

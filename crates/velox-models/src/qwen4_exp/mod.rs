@@ -18,8 +18,11 @@ pub use ple::{hash_rows, PleTable};
 use velox_core::{
     AttnShape, Backend, ConvShape, DilatedConvShape, Error, GdnShape, HcCombineShape, KvFormat,
     KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, Result, RopeShape,
-    RowGateShape,
+    RowGateShape, GRAPH_KV_BUCKET, GRAPH_STATIC,
 };
+
+/// Graph key kind of single-token decode steps.
+const GRAPH_DECODE: u64 = 1 << 16;
 
 use load::{GdnWeights, HcWeights, Mat, Mixer, MoeWeights, PleWeights, QsaWeights};
 
@@ -248,6 +251,61 @@ impl<B: Backend> Qwen4Exp<B> {
                 s.capacity
             )));
         }
+        // PLE rows are read on the host before the step: nothing in it waits for the host.
+        let ple_e = match (&c.ple, &self.w.ple_table) {
+            (Some(_), Some(table)) => {
+                let rows = table.rows(&s.history, ids);
+                Some(table.embed(&rows, self.ple_threads)?)
+            }
+            _ => None,
+        };
+        let pos0 = s.pos;
+        let dense = QsaSelectShape {
+            tokens: t,
+            heads: c.qsa_heads,
+            dim: c.qsa_dim,
+            pos0,
+            ratio: c.qsa_ratio,
+            budget: c.qsa_budget,
+        }
+        .dense();
+        if t == 1 && dense {
+            // A decode step on dense attention is the same work every time but for the position
+            // (staged by the ops) and whether it completes a QSA block: one recorded graph per
+            // KV bucket and block flag.
+            let pool = (pos0 + 1) % c.qsa_ratio == 0;
+            let key = GRAPH_STATIC
+                | GRAPH_DECODE
+                | u64::from(pool)
+                | ((pos0 + 1).div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
+            let mut step = || self.step(b, s, ws, cache, ids, ple_e.as_deref());
+            b.graph(key, &mut step)?;
+        } else {
+            self.step(b, s, ws, cache, ids, ple_e.as_deref())?;
+        }
+        s.pos += t;
+        if let Some(p) = &c.ple {
+            s.history.extend_from_slice(ids);
+            let keep = p.ngram - 1;
+            if s.history.len() > keep {
+                s.history.drain(..s.history.len() - keep);
+            }
+        }
+        Ok(())
+    }
+
+    /// The device work of a step of `ids` at `s.pos` (no host waits: it may be recorded).
+    fn step(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        cache: &mut ExpertCache<B>,
+        ids: &[u32],
+        ple_e: Option<&[f32]>,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let t = ids.len();
         let (h, st, wide) = (c.hidden, c.streams, c.wide());
         // The residual starts as `streams` copies of the embedding.
         b.embed(ids, &self.w.embedding.view(), &mut ws.y)?;
@@ -265,14 +323,6 @@ impl<B: Backend> Qwen4Exp<B> {
                 },
             )?;
         }
-        // PLE rows are read on the host while nothing depends on them yet.
-        let ple_e = match (&c.ple, &self.w.ple_table) {
-            (Some(_), Some(table)) => {
-                let rows = table.rows(&s.history, ids);
-                Some(table.embed(&rows, self.ple_threads)?)
-            }
-            _ => None,
-        };
         let combine = HcCombineShape {
             rows: t,
             streams: st,
@@ -281,7 +331,7 @@ impl<B: Backend> Qwen4Exp<B> {
             inject_col: 0,
         };
         for (li, layer) in self.w.layers.iter().enumerate() {
-            if let (Some(pw), Some(e)) = (&layer.ple, &ple_e) {
+            if let (Some(pw), Some(e)) = (&layer.ple, ple_e) {
                 b.write_at(&mut ws.ple_e, 0, e)?;
                 self.ple(b, pw, s, ws, t)?;
             }
@@ -308,16 +358,7 @@ impl<B: Backend> Qwen4Exp<B> {
         b.silu(&mut ws.lo, c.hc_rank)?;
         lin(b, &ws.lo, &hc.up, &mut ws.gate, 1)?;
         b.hc_mix(&ws.xn, &ws.gate, &mut ws.mixed, 1, st, h)?;
-        lin(b, &ws.mixed, &self.w.output, &mut ws.logits, 1)?;
-        s.pos += t;
-        if let Some(p) = &c.ple {
-            s.history.extend_from_slice(ids);
-            let keep = p.ngram - 1;
-            if s.history.len() > keep {
-                s.history.drain(..s.history.len() - keep);
-            }
-        }
-        Ok(())
+        lin(b, &ws.mixed, &self.w.output, &mut ws.logits, 1)
     }
 
     /// The last step's logits.
