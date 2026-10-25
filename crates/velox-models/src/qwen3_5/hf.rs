@@ -1195,8 +1195,15 @@ pub fn import_with(
         dflash2(&mut b, &c, v, dflash_nvfp4)?;
     }
 
-    // Resources (text). The vision tower (`model.visual.*`, a `vision` component with
-    // `preprocessor_config.json`) would be added here.
+    // The vision tower (`model.visual.*`) when the checkpoint has one.
+    let vision = match hf_cfg.get("vision_config") {
+        Some(vc) if b.has("model.visual.patch_embed.proj.weight") => {
+            Some(vision_tower(&mut b, dir, vc)?)
+        }
+        _ => None,
+    };
+
+    // Resources (text).
     let mut resources = Map::new();
     for (role, bytes) in text_resources(dir)? {
         let mut e = Map::new();
@@ -1237,6 +1244,9 @@ pub fn import_with(
     );
     if let Some(v) = dflash_cfg {
         components.insert("dflash2".into(), json!({ "config": v }));
+    }
+    if let Some(v) = vision {
+        components.insert("vision".into(), v);
     }
     let report_counts = (objects.len(), bindings.len(), uses.len());
     let mut d = Map::new();
@@ -1537,4 +1547,193 @@ fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value, nvfp4: bool) -> Resul
         )?;
     }
     Ok(())
+}
+
+/// The vision tower `model.visual.*` (Qwen3-VL ViT and merger) as velox's `vision/` bindings, all
+/// BF16 as stored, and the `vision` component (its config, the text component it feeds and the
+/// preprocessor resources). Returns the component.
+fn vision_tower(b: &mut Builder<'_>, dir: &Path, vc: &Value) -> Result<Value> {
+    let u = |k: &str| -> Result<u64> {
+        vc.get(k)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::Config(format!("vision_config.{k} missing")))
+    };
+    let (depth, h, inter) = (u("depth")?, u("hidden_size")?, u("intermediate_size")?);
+    let (patch, temporal, out) = (
+        u("patch_size")?,
+        u("temporal_patch_size")?,
+        u("out_hidden_size")?,
+    );
+    let merged = h * u("spatial_merge_size")?.pow(2);
+    let v = |s: &str| format!("model.visual.{s}");
+    // A tensor's bytes as a BF16 object of `shape` (a reshape: the data is already contiguous).
+    let raw = |b: &mut Builder<'_>, name: &str, shape: Value, binding: &str| -> Result<()> {
+        let t = b.get(name)?;
+        if t.dtype != "BF16" {
+            return Err(Error::Unsupported(format!(
+                "{name}: {} is not BF16",
+                t.dtype
+            )));
+        }
+        let piece = Piece::File {
+            file: t.file,
+            at: t.at,
+            len: t.bytes,
+        };
+        let id = b.push(
+            format!("hf/{name}"),
+            tensor_entry(shape, "bf16", "contiguous_le_v1"),
+            vec![piece],
+        );
+        b.bindings.insert(binding.into(), json!({ "object": id }));
+        Ok(())
+    };
+    // A 1-D BF16 tensor bound as consecutive element ranges.
+    let split = |b: &mut Builder<'_>, name: &str, parts: &[(&str, u64)]| -> Result<()> {
+        let t = b.get(name)?;
+        let n: u64 = parts.iter().map(|p| p.1).sum();
+        if t.dtype != "BF16" || t.shape != [n] {
+            return Err(Error::Config(format!(
+                "{name}: {} {:?}, expected BF16 [{n}]",
+                t.dtype, t.shape
+            )));
+        }
+        let piece = Piece::File {
+            file: t.file,
+            at: t.at,
+            len: t.bytes,
+        };
+        let id = b.push(
+            format!("hf/{name}"),
+            tensor_entry(json!([n]), "bf16", "contiguous_le_v1"),
+            vec![piece],
+        );
+        let mut at = 0;
+        for &(binding, len) in parts {
+            b.bindings.insert(
+                binding.into(),
+                json!({ "parts": [{ "object": id, "range": [at, at + len] }] }),
+            );
+            at += len;
+        }
+        Ok(())
+    };
+    let one = |b: &mut Builder<'_>, name: &str, binding: &str, rows: u64| {
+        b.stacked(
+            name,
+            &[RowSrc::all(name.to_string())],
+            &[(binding, 0, rows)],
+        )
+    };
+    raw(
+        b,
+        &v("patch_embed.proj.weight"),
+        json!([h, 3 * temporal * patch * patch]),
+        "vision/patch_embedding",
+    )?;
+    b.vector(
+        "vision/patch_embedding_bias",
+        &v("patch_embed.proj.bias"),
+        h as usize,
+    )?;
+    raw(
+        b,
+        &v("pos_embed.weight"),
+        json!([u("num_position_embeddings")?, h]),
+        "vision/position_embedding",
+    )?;
+    for i in 0..depth {
+        let l = |s: &str| v(&format!("blocks.{i}.{s}"));
+        let q = |s: &str| format!("vision/layers/{i}/{s}");
+        b.stacked(
+            &l("attn.qkv.weight"),
+            &[RowSrc::all(l("attn.qkv.weight"))],
+            &[
+                (&q("attention/query"), 0, h),
+                (&q("attention/key"), h, h),
+                (&q("attention/value"), 2 * h, h),
+            ],
+        )?;
+        split(
+            b,
+            &l("attn.qkv.bias"),
+            &[
+                (&q("attention/query_bias"), h),
+                (&q("attention/key_bias"), h),
+                (&q("attention/value_bias"), h),
+            ],
+        )?;
+        one(b, &l("attn.proj.weight"), &q("attention/output"), h)?;
+        b.vector(
+            &q("attention/output_bias"),
+            &l("attn.proj.bias"),
+            h as usize,
+        )?;
+        one(b, &l("mlp.linear_fc1.weight"), &q("mlp/fc1"), inter)?;
+        b.vector(
+            &q("mlp/fc1_bias"),
+            &l("mlp.linear_fc1.bias"),
+            inter as usize,
+        )?;
+        one(b, &l("mlp.linear_fc2.weight"), &q("mlp/fc2"), h)?;
+        b.vector(&q("mlp/fc2_bias"), &l("mlp.linear_fc2.bias"), h as usize)?;
+        for n in ["norm1", "norm2"] {
+            b.vector(
+                &q(&format!("{n}_weight")),
+                &l(&format!("{n}.weight")),
+                h as usize,
+            )?;
+            b.vector(
+                &q(&format!("{n}_bias")),
+                &l(&format!("{n}.bias")),
+                h as usize,
+            )?;
+        }
+    }
+    b.vector(
+        "vision/merger/norm_weight",
+        &v("merger.norm.weight"),
+        h as usize,
+    )?;
+    b.vector(
+        "vision/merger/norm_bias",
+        &v("merger.norm.bias"),
+        h as usize,
+    )?;
+    one(
+        b,
+        &v("merger.linear_fc1.weight"),
+        "vision/merger/fc1",
+        merged,
+    )?;
+    b.vector(
+        "vision/merger/fc1_bias",
+        &v("merger.linear_fc1.bias"),
+        merged as usize,
+    )?;
+    one(b, &v("merger.linear_fc2.weight"), "vision/merger/fc2", out)?;
+    b.vector(
+        "vision/merger/fc2_bias",
+        &v("merger.linear_fc2.bias"),
+        out as usize,
+    )?;
+
+    let mut resources = Map::new();
+    for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|e| ioerr(&path, e))?;
+        let mut e = Map::new();
+        e.insert("kind".into(), "resource".into());
+        e.insert("encoding".into(), "raw_bytes_v1".into());
+        let id = b.push(
+            format!("resource/vision/{name}"),
+            e,
+            vec![Piece::Data(bytes)],
+        );
+        resources.insert(name.into(), id.into());
+    }
+    Ok(json!({ "config": vc, "target": "text", "resources": resources }))
 }
