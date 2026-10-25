@@ -401,7 +401,10 @@ fn bench_moe(a: &Args) -> Result<ExitCode> {
         width: a.parse("width", 640)?,
         hidden: a.parse("hidden", 2560)?,
         k: a.parse("k", 10)?,
-        rows: list("rows", "1,4,16,128")?.into_iter().map(|v| v as usize).collect(),
+        rows: list("rows", "1,4,16,128")?
+            .into_iter()
+            .map(|v| v as usize)
+            .collect(),
         resident: list("resident", "0,0.5,1")?,
         iters: a.parse("iters", 64)?,
     };

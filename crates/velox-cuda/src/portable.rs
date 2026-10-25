@@ -2010,11 +2010,8 @@ pub fn qsa_pool(
     check::qsa_pool(raw.len(), weight.len(), pooled.len(), &s)?;
     to_i32("pooled positions", (s.block0 + s.blocks) * s.ratio)?;
     // Graph steps stage the first block and the caches (the block count is the step's shape).
-    let Some(params) = graph_params(&[
-        s.block0 as i64,
-        raw.as_ptr() as i64,
-        pooled.as_ptr() as i64,
-    ])?
+    let Some(params) =
+        graph_params(&[s.block0 as i64, raw.as_ptr() as i64, pooled.as_ptr() as i64])?
     else {
         return Ok(());
     };
