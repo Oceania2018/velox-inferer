@@ -27,8 +27,37 @@ use velox_core::{
 /// Most rows of a speculative window (`verify`).
 pub const VERIFY_MAX: usize = 4;
 
-/// Graph key kind of single-token decode steps.
+/// Graph key kinds of single-token decode steps, verify windows and MTP entries (the latter two
+/// with the row count in bits 1..8).
 const GRAPH_DECODE: u64 = 1 << 16;
+const GRAPH_VERIFY: u64 = 1 << 17;
+const GRAPH_MTP: u64 = 1 << 18;
+
+/// The static graph key of a `t`-row step of `kind` at `pos0` when its attention is dense (one
+/// recording per KV bucket and whether the step completes a QSA block), or `None`.
+fn static_key(c: &Qwen4Config, kind: u64, pos0: usize, t: usize) -> Option<u64> {
+    let dense = QsaSelectShape {
+        tokens: t,
+        heads: c.qsa_heads,
+        dim: c.qsa_dim,
+        pos0,
+        ratio: c.qsa_ratio,
+        budget: c.qsa_budget,
+    }
+    .dense();
+    if !dense || t > VERIFY_MAX {
+        return None;
+    }
+    let pool = (pos0 + t) / c.qsa_ratio > pos0 / c.qsa_ratio;
+    let rows = if kind == GRAPH_DECODE { 0 } else { (t as u64) << 1 };
+    Some(
+        GRAPH_STATIC
+            | kind
+            | rows
+            | u64::from(pool)
+            | ((pos0 + t).div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24,
+    )
+}
 
 use load::{GdnWeights, HcWeights, Mat, Mixer, MoeWeights, PleWeights, QsaWeights};
 
@@ -333,29 +362,14 @@ impl<B: Backend> Qwen4Exp<B> {
             }
             _ => None,
         };
-        let pos0 = s.pos;
-        let dense = QsaSelectShape {
-            tokens: t,
-            heads: c.qsa_heads,
-            dim: c.qsa_dim,
-            pos0,
-            ratio: c.qsa_ratio,
-            budget: c.qsa_budget,
-        }
-        .dense();
-        if t == 1 && dense {
-            // A decode step on dense attention is the same work every time but for the position
-            // (staged by the ops) and whether it completes a QSA block: one recorded graph per
-            // KV bucket and block flag.
-            let pool = (pos0 + 1) % c.qsa_ratio == 0;
-            let key = GRAPH_STATIC
-                | GRAPH_DECODE
-                | u64::from(pool)
-                | ((pos0 + 1).div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
-            let mut step = || self.step(b, s, ws, cache, ids, ple_e.as_deref(), false);
-            b.graph(key, &mut step)?;
-        } else {
-            self.step(b, s, ws, cache, ids, ple_e.as_deref(), false)?;
+        // A decode step on dense attention is the same work every time but for the position
+        // (staged by the ops) and whether it completes a QSA block.
+        match static_key(c, GRAPH_DECODE, s.pos, t).filter(|_| t == 1) {
+            Some(key) => {
+                let mut step = || self.step(b, s, ws, cache, ids, ple_e.as_deref(), false);
+                b.graph(key, &mut step)?;
+            }
+            None => self.step(b, s, ws, cache, ids, ple_e.as_deref(), false)?,
         }
         s.pos += t;
         if let Some(p) = &c.ple {
@@ -395,7 +409,13 @@ impl<B: Backend> Qwen4Exp<B> {
             }
             _ => None,
         };
-        self.step(b, s, ws, cache, ids, ple_e.as_deref(), true)?;
+        match static_key(c, GRAPH_VERIFY, s.pos, t) {
+            Some(key) => {
+                let mut step = || self.step(b, s, ws, cache, ids, ple_e.as_deref(), true);
+                b.graph(key, &mut step)?;
+            }
+            None => self.step(b, s, ws, cache, ids, ple_e.as_deref(), true)?,
+        }
         let sp = s.spec.as_mut().expect("ensured above");
         sp.pos0 = s.pos;
         sp.tokens = t;
