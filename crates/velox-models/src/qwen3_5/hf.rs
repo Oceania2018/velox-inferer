@@ -365,27 +365,41 @@ impl<'a> Builder<'a> {
         rows: u64,
         binding: &str,
     ) -> Result<()> {
-        let t = self.get(weight)?;
-        let (_, k) = t.matrix();
-        if t.dtype != "BF16" {
-            return Err(Error::Unsupported(format!(
-                "{weight}: {} is not BF16",
-                t.dtype
-            )));
+        self.nvfp4_stack(id, &[(weight, r0, rows)], &[(binding, 0, rows)])
+    }
+
+    /// Row ranges `(weight, r0, rows)` of BF16 tensors stacked and encoded as one `nvfp4` object
+    /// `id` (one divisor for the stack), bound as `parts` (A16).
+    fn nvfp4_stack(&mut self, id: &str, srcs: &[(&str, u64, u64)], parts: &[Part]) -> Result<()> {
+        let mut x: Vec<f32> = Vec::new();
+        let mut k0 = None;
+        for &(weight, r0, rows) in srcs {
+            let t = self.get(weight)?;
+            let (_, k) = t.matrix();
+            if t.dtype != "BF16" || *k0.get_or_insert(k) != k {
+                return Err(Error::Unsupported(format!(
+                    "{weight}: {} [.., {k}] does not stack as BF16 with {id}",
+                    t.dtype
+                )));
+            }
+            let mut raw = vec![0u8; (rows * k * 2) as usize];
+            self.st.read_at(t.file, t.at + r0 * k * 2, &mut raw)?;
+            x.extend(
+                raw.chunks_exact(2)
+                    .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))),
+            );
         }
-        let mut raw = vec![0u8; (rows * k * 2) as usize];
-        self.st.read_at(t.file, t.at + r0 * k * 2, &mut raw)?;
-        let x: Vec<f32> = raw
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-        let payload = encode_nvfp4(&x, rows as usize, k as usize);
+        let k = k0.unwrap_or(0);
+        let n = x.len() as u64 / k.max(1);
+        let payload = encode_nvfp4(&x, n as usize, k as usize);
         let id = self.push(
             format!("hf/{id}"),
-            tensor_entry(json!([rows, k]), "nvfp4", "block_scale_k16_m128x4_v1"),
+            tensor_entry(json!([n, k]), "nvfp4", "block_scale_k16_m128x4_v1"),
             vec![Piece::Data(payload)],
         );
-        self.bind(&id, (rows, k), (binding, 0, rows), &Policy::A16);
+        for &part in parts {
+            self.bind(&id, (n, k), part, &Policy::A16);
+        }
         Ok(())
     }
 
@@ -1082,18 +1096,20 @@ fn text_prefix(st: &SafeTensors) -> Result<&'static str> {
 /// Writes `out` from the HF checkpoint in `dir`: text stack, MTP head (when present) and the
 /// tokenizer, chat template and generation config. `progress` gets a line per written gigabyte.
 pub fn import(dir: &Path, out: &Path, progress: &mut dyn FnMut(&str)) -> Result<ImportReport> {
-    import_with(dir, out, None, progress)
+    import_with(dir, out, None, false, progress)
 }
 
 /// Tensor-name prefix of the DFlash2 drafter's checkpoint inside the merged tensor set.
 const DFLASH: &str = "dflash::";
 
 /// [`import`], adding the DFlash2 drafter checkpoint in `dflash` (a `DFlash2DraftModel`
-/// conditioned on this target) as the `dflash2` component when given.
+/// conditioned on this target) as the `dflash2` component when given; `dflash_nvfp4` encodes
+/// its matrices as NVFP4 (drafts only steer speed, never results).
 pub fn import_with(
     dir: &Path,
     out: &Path,
     dflash: Option<&Path>,
+    dflash_nvfp4: bool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<ImportReport> {
     let hf_cfg = read_json(&dir.join("config.json"))?;
@@ -1175,7 +1191,7 @@ pub fn import_with(
     }
 
     if let Some(v) = &dflash_cfg {
-        dflash2(&mut b, &c, v)?;
+        dflash2(&mut b, &c, v, dflash_nvfp4)?;
     }
 
     // Resources (text). The vision tower (`model.visual.*`, a `vision` component with
@@ -1388,7 +1404,7 @@ mod tests;
 /// The DFlash2 drafter (`dflash2/`): HF `DFlash2DraftModel` names to velox's bindings. All BF16
 /// as stored; norms are plain multipliers (Qwen3 RMSNorm). The context key / value projections
 /// share the block's key / value rows.
-fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value) -> Result<()> {
+fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value, nvfp4: bool) -> Result<()> {
     let dc = super::dflash::DFlashConfig::from_json(v)?;
     let h = c.hidden as u64;
     if dc.target_layers.iter().any(|&l| l >= c.layers.len()) {
@@ -1399,12 +1415,29 @@ fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value) -> Result<()> {
         )));
     }
     let t = |s: &str| format!("{DFLASH}{s}");
+    // Whole tensors `srcs` stacked into one matrix `id`, bound as `parts`: NVFP4 when asked and
+    // the shape allows, else as stored.
+    let mat = |b: &mut Builder<'_>, id: &str, srcs: &[String], parts: &[Part]| -> Result<()> {
+        let shapes: Vec<(u64, u64)> = srcs
+            .iter()
+            .map(|n| b.get(n).map(|t| t.matrix()))
+            .collect::<Result<_>>()?;
+        let n: u64 = shapes.iter().map(|s| s.0).sum();
+        let k = shapes.first().map_or(0, |s| s.1);
+        if nvfp4 && n.is_multiple_of(128) && k.is_multiple_of(64) {
+            let rows: Vec<(&str, u64, u64)> = srcs
+                .iter()
+                .zip(&shapes)
+                .map(|(n, s)| (n.as_str(), 0, s.0))
+                .collect();
+            b.nvfp4_stack(id, &rows, parts)
+        } else {
+            let rs: Vec<RowSrc> = srcs.iter().map(|n| RowSrc::all(n.clone())).collect();
+            b.stacked(id, &rs, parts)
+        }
+    };
     let one = |b: &mut Builder<'_>, name: &str, binding: &str, rows: u64| {
-        b.stacked(
-            &name.to_string(),
-            &[RowSrc::all(name.to_string())],
-            &[(binding, 0, rows)],
-        )
+        mat(b, name, &[name.to_string()], &[(binding, 0, rows)])
     };
     one(b, &t("fc.weight"), "dflash2/feature_projection", h)?;
     check_k(
@@ -1438,12 +1471,13 @@ fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value) -> Result<()> {
             &l("self_attn.k_norm.weight"),
             dc.head_dim,
         )?;
-        b.stacked(
+        mat(
+            b,
             &l("self_attn.qkv"),
             &[
-                RowSrc::all(l("self_attn.q_proj.weight")),
-                RowSrc::all(l("self_attn.k_proj.weight")),
-                RowSrc::all(l("self_attn.v_proj.weight")),
+                l("self_attn.q_proj.weight"),
+                l("self_attn.k_proj.weight"),
+                l("self_attn.v_proj.weight"),
             ],
             &[
                 (&q("attention/query"), 0, qd),
@@ -1454,12 +1488,10 @@ fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value) -> Result<()> {
             ],
         )?;
         one(b, &l("self_attn.o_proj.weight"), &q("attention/output"), h)?;
-        b.stacked(
+        mat(
+            b,
             &l("mlp.gate_up"),
-            &[
-                RowSrc::all(l("mlp.gate_proj.weight")),
-                RowSrc::all(l("mlp.up_proj.weight")),
-            ],
+            &[l("mlp.gate_proj.weight"), l("mlp.up_proj.weight")],
             &[(&q("mlp/gate"), 0, inter), (&q("mlp/up"), inter, inter)],
         )?;
         one(b, &l("mlp.down_proj.weight"), &q("mlp/down"), h)?;
@@ -1486,11 +1518,11 @@ fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value) -> Result<()> {
     )?;
     let vocab = c.vocab as u64;
     for book in ["predecessor_codebook", "successor_codebook"] {
-        one(
-            b,
-            &t(&format!("candidate_selector.{book}")),
-            &format!("dflash2/candidate_selector/{book}"),
-            vocab,
+        let name = t(&format!("candidate_selector.{book}"));
+        b.stacked(
+            &name,
+            &[RowSrc::all(name.clone())],
+            &[(&format!("dflash2/candidate_selector/{book}"), 0, vocab)],
         )?;
     }
     Ok(())
