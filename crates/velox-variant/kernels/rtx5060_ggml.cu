@@ -1494,65 +1494,203 @@ __global__ void moe_quant_kernel(const float* __restrict__ x, int n, int subs, i
 
 constexpr int kMoeWarps = 4;
 constexpr int kMoeUpRows = 2;
+constexpr int kMoeDownRows = 8;  // per warp; 4 lanes each
 
-// h[p][i] = silu(gate_i . x) * (up_i . x) for pair p = row * k + j (expert ids[p]).
+// Words of a type's lookup grid kept in shared memory (u64 entries as two words), 0 for none.
+template <int T>
+__host__ __device__ constexpr int moe_grid_words() {
+    return T == kIq1M ? 4096 : Grid<T>::kWords > 1 ? Grid<T>::kWords : 0;
+}
+
+// Sub-block ib of the stored block at x (shared memory), grids and sign patterns from the shared
+// copies; the same values as decode<T>.
+template <int T>
+__device__ __forceinline__ Sub<T> decode_smem(const uint8_t* x, int ib, const uint32_t* sg, const uint8_t* sks) {
+    if constexpr (T == kIq2S || T == kIq2Xxs || T == kIq2Xs || T == kIq3S || T == kIq3Xxs) {
+        Sub<T> r;
+        const float d = f16_at(x);
+        if constexpr (T == kIq2S || T == kIq2Xs) {
+            const uint32_t s = x[(T == kIq2S ? 74 : 66) + ib];
+            r.s[0] = d * (0.5f + static_cast<float>(s & 0xf)) * 0.25f;
+            r.s[1] = d * (0.5f + static_cast<float>(s >> 4)) * 0.25f;
+        } else if constexpr (T == kIq2Xxs) {
+            r.s[0] = d * (0.5f + static_cast<float>(u32_at2(x + 6 + 8 * ib) >> 28)) * 0.25f;
+        } else if constexpr (T == kIq3Xxs) {
+            r.s[0] = d * (0.5f + static_cast<float>(u32_at2(x + 66 + 4 * ib) >> 28)) * 0.5f;
+        } else {
+            const uint32_t s = x[106 + ib / 2];
+            r.s[0] = d * static_cast<float>(1 + 2 * (ib % 2 ? s >> 4 : s & 0xf));
+        }
+#pragma unroll
+        for (int wi = 0; wi < 8; ++wi) r.w[wi] = word<T>(x, ib, wi, sg, sks);
+        return r;
+    } else if constexpr (T == kIq1M) {
+        Sub<T> r;
+        const uint32_t s0 = u16_at(x + 48), s1 = u16_at(x + 50), s2 = u16_at(x + 52), s3 = u16_at(x + 54);
+        const uint32_t dbits = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
+        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dbits)));
+        const uint32_t w = u16_at(x + 48 + 2 * (ib / 2));
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const float dl = d * static_cast<float>(2 * ((w >> (6 * (ib % 2) + (l < 2 ? 0 : 3))) & 7) + 1);
+            const uint32_t qh = x[32 + 2 * ib + l / 2];
+            const uint32_t idx = x[4 * ib + l] | ((qh << (l % 2 ? 4 : 8)) & 0x700);
+            const float delta = qh & (l % 2 ? 0x80 : 0x08) ? -0.125f : 0.125f;
+            const uint64_t g = grid64(sg, idx);
+            r.w[2 * l] = static_cast<int>(static_cast<uint32_t>(g));
+            r.w[2 * l + 1] = static_cast<int>(static_cast<uint32_t>(g >> 32));
+            r.s[l] = dl;
+            r.o[l] = dl * delta;
+        }
+        return r;
+    } else {
+        return decode<T>(x, ib);
+    }
+}
+
+// The grid of T and the sign patterns into shared memory (every thread of the block takes part).
+template <int T>
+__device__ __forceinline__ void moe_load_tables(uint32_t* sg, uint8_t* sks) {
+    constexpr int W = moe_grid_words<T>();
+    if constexpr (W > 0) {
+        const uint32_t* src;
+        if constexpr (T == kIq1M) src = reinterpret_cast<const uint32_t*>(kIq1SGrid);
+        else src = Grid<T>::source();
+        for (int i = threadIdx.x; i < W; i += blockDim.x) sg[i] = __ldg(src + i);
+        for (int i = threadIdx.x; i < 128; i += blockDim.x) sks[i] = __ldg(kKsignsIq2xs + i);
+    }
+}
+
+// A byte span widened to 16-byte alignment, read by one warp as up to 32 N uint4 (lane l takes
+// words l, l + 32, ...): every load is issued before any is used, so a warp keeps N 512-byte
+// requests in flight (mapped system RAM is latency-bound otherwise). The widening stays inside
+// the 16-byte aligned record holding the span.
+template <int N>
+struct Span {
+    uint4 v[N];
+    int lead;  // offset of the span start in the copy
+    int n;     // uint4 words
+};
+
+template <int N>
+__device__ __forceinline__ void span_load(const uint8_t* src, int bytes, int lane, Span<N>& s) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(src);
+    const uint4* p = reinterpret_cast<const uint4*>(a & ~static_cast<uintptr_t>(15));
+    s.lead = static_cast<int>(a & 15);
+    s.n = (s.lead + bytes + 15) / 16;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const int w = lane + VELOX_WARP * i;
+        if (w < s.n) s.v[i] = p[w];
+    }
+}
+
+template <int N>
+__device__ __forceinline__ void span_store(uint4* dst, int lane, const Span<N>& s) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const int w = lane + VELOX_WARP * i;
+        if (w < s.n) dst[w] = s.v[i];
+    }
+}
+
+// Most uint4 per lane a staged span takes, and the bytes that bounds a span to.
+constexpr int kSpanUp = 4, kSpanDown = 3;
+__host__ __device__ constexpr int span_cap(int n) { return n * VELOX_WARP * 16 - 16; }
+
+// h[p][i] = silu(gate_i . x) * (up_i . x) for pair p = row * k + j (expert ids[p]): warp per R
+// consecutive rows, whose gate rows and up rows (one span each) are staged into shared memory.
 template <int T>
 __global__ void __launch_bounds__(kMoeWarps* VELOX_WARP)
     moe_gate_up_kernel(MoeDesc d, const float* __restrict__ ids, int k, const int8_t* __restrict__ xq,
                        const float* __restrict__ xd, float* __restrict__ h) {
-    constexpr int R = kMoeUpRows, SPB = sub_per_block<T>(), BB = block_bytes(T);
-    const int p = blockIdx.y, lane = threadIdx.x % VELOX_WARP;
-    const int r0 = (blockIdx.x * kMoeWarps + threadIdx.x / VELOX_WARP) * R;
+    constexpr int R = kMoeUpRows, SPB = sub_per_block<T>(), BB = block_bytes(T), N = kSpanUp;
+    constexpr int GW = moe_grid_words<T>() > 0 ? moe_grid_words<T>() : 1;
+    __shared__ uint32_t sg[GW];
+    __shared__ uint8_t sks[128];
+    __shared__ uint4 stage[kMoeWarps][2][N * VELOX_WARP];
+    moe_load_tables<T>(sg, sks);
+    __syncthreads();
+    const int p = blockIdx.y, lane = threadIdx.x % VELOX_WARP, warp = threadIdx.x / VELOX_WARP;
+    const int r0 = (blockIdx.x * kMoeWarps + warp) * R;
     if (r0 >= d.width) return;
+    const int rows = min(R, d.width - r0);
     const int tok = p / k, subs = d.hidden / 32;
     const uint8_t* rec = moe_record(d, static_cast<int>(__float_as_uint(ids[p])));
-    const long long row_bytes = static_cast<long long>(subs / SPB) * BB;
+    const int row_bytes = subs / SPB * BB;
+    const long long first = static_cast<long long>(r0) * row_bytes;
+    Span<N> sgate, sup;
+    span_load(rec + d.gate_off + first, rows * row_bytes, lane, sgate);
+    span_load(rec + d.up_off + first, rows * row_bytes, lane, sup);
+    span_store(stage[warp][0], lane, sgate);
+    span_store(stage[warp][1], lane, sup);
+    __syncwarp();
+    const uint8_t* gm = reinterpret_cast<const uint8_t*>(stage[warp][0]) + sgate.lead;
+    const uint8_t* um = reinterpret_cast<const uint8_t*>(stage[warp][1]) + sup.lead;
     float ag[R] = {}, au[R] = {};
     for (int u = lane; u < subs; u += VELOX_WARP) {
         const int4* ap = reinterpret_cast<const int4*>(xq + (static_cast<long long>(tok) * subs + u) * 32);
         const int4 a0 = __ldg(ap), a1 = __ldg(ap + 1);
         const int a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
         const float dx = __ldg(xd + static_cast<long long>(tok) * subs + u);
-        const long long off = static_cast<long long>(u / SPB) * BB;
+        const int off = u / SPB * BB;
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            const long long row = min(r0 + r, d.width - 1) * row_bytes + off;
-            ag[r] += dx * sub_dot<T>(decode<T>(rec + d.gate_off + row, u % SPB), a);
-            au[r] += dx * sub_dot<T>(decode<T>(rec + d.up_off + row, u % SPB), a);
+            const int at = min(r, rows - 1) * row_bytes + off;
+            ag[r] += dx * sub_dot<T>(decode_smem<T>(gm + at, u % SPB, sg, sks), a);
+            au[r] += dx * sub_dot<T>(decode_smem<T>(um + at, u % SPB, sg, sks), a);
         }
     }
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         const float g = velox_warp_sum(ag[r]), v = velox_warp_sum(au[r]);
-        if (lane == 0 && r0 + r < d.width)
-            h[static_cast<long long>(p) * d.width + r0 + r] = g / (1.0f + __expf(-g)) * v;
+        if (lane == 0 && r < rows) h[static_cast<long long>(p) * d.width + r0 + r] = g / (1.0f + __expf(-g)) * v;
     }
 }
 
-constexpr int kMoeDownRows = 8;  // per warp; 4 lanes each
-
-// y[tok][c] = sum_j w[p] * (down_c . h[p]) over the token's pairs p = tok * k + j in order.
+// y[tok][c] = sum_j w[p] * (down_c . h[p]) over the token's pairs p = tok * k + j in order: warp
+// per 8 consecutive output rows (one span of each expert's down rows), four lanes per row. The
+// next expert's span is loaded into registers while the current one is used.
 template <int T>
 __global__ void __launch_bounds__(kMoeWarps* VELOX_WARP)
     moe_down_kernel(MoeDesc d, const float* __restrict__ ids, const float* __restrict__ wts, int k,
                     const int8_t* __restrict__ hq, const float* __restrict__ hd, float* __restrict__ y) {
-    constexpr int SPB = sub_per_block<T>(), BB = block_bytes(T), L = VELOX_WARP / kMoeDownRows;
-    const int tok = blockIdx.y, lane = threadIdx.x % VELOX_WARP;
-    const int c = (blockIdx.x * kMoeWarps + threadIdx.x / VELOX_WARP) * kMoeDownRows + lane / L;
-    const int sl = lane % L, subs = d.width / 32;
-    const long long row_bytes = static_cast<long long>(subs / SPB) * BB;
-    const int cr = min(c, d.hidden - 1);
+    constexpr int SPB = sub_per_block<T>(), BB = block_bytes(T), L = VELOX_WARP / kMoeDownRows, N = kSpanDown;
+    constexpr int GW = moe_grid_words<T>() > 0 ? moe_grid_words<T>() : 1;
+    __shared__ uint32_t sg[GW];
+    __shared__ uint8_t sks[128];
+    __shared__ uint4 stage[kMoeWarps][N * VELOX_WARP];
+    moe_load_tables<T>(sg, sks);
+    __syncthreads();
+    const int tok = blockIdx.y, lane = threadIdx.x % VELOX_WARP, warp = threadIdx.x / VELOX_WARP;
+    const int c0 = (blockIdx.x * kMoeWarps + warp) * kMoeDownRows;
+    if (c0 >= d.hidden) return;
+    const int rows = min(kMoeDownRows, d.hidden - c0);
+    const int c = c0 + lane / L, sl = lane % L, subs = d.width / 32;
+    const int row_bytes = subs / SPB * BB;
+    const int mine = min(lane / L, rows - 1) * row_bytes;
+    auto span_of = [&](int j) {
+        return moe_record(d, static_cast<int>(__float_as_uint(ids[tok * k + j]))) + d.down_off +
+               static_cast<long long>(c0) * row_bytes;
+    };
+    Span<N> next;
+    span_load(span_of(0), rows * row_bytes, lane, next);
     float acc = 0.0f;
     for (int j = 0; j < k; ++j) {
         const int p = tok * k + j;
-        const uint8_t* w = moe_record(d, static_cast<int>(__float_as_uint(ids[p]))) + d.down_off + cr * row_bytes;
+        __syncwarp();
+        span_store(stage[warp], lane, next);
+        const int lead = next.lead;
+        __syncwarp();
+        if (j + 1 < k) span_load(span_of(j + 1), rows * row_bytes, lane, next);
+        const uint8_t* sm = reinterpret_cast<const uint8_t*>(stage[warp]) + lead + mine;
         float part = 0.0f;
         for (int u = sl; u < subs; u += L) {
             const int4* ap = reinterpret_cast<const int4*>(hq + (static_cast<long long>(p) * subs + u) * 32);
             const int4 a0 = __ldg(ap), a1 = __ldg(ap + 1);
             const int a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
             part += __ldg(hd + static_cast<long long>(p) * subs + u) *
-                    sub_dot<T>(decode<T>(w + static_cast<long long>(u / SPB) * BB, u % SPB), a);
+                    sub_dot<T>(decode_smem<T>(sm + u / SPB * BB, u % SPB, sg, sks), a);
         }
         acc += __ldg(wts + p) * part;
     }
@@ -1564,6 +1702,8 @@ __global__ void __launch_bounds__(kMoeWarps* VELOX_WARP)
 template <int T>
 int moe_up_launch(const MoeDesc& d, const float* ids, int pairs, int k, const int8_t* xq, const float* xd, float* h) {
     const int per_block = kMoeWarps * kMoeUpRows;
+    const int row_bytes = d.hidden / 32 / sub_per_block<T>() * block_bytes(T);
+    if (kMoeUpRows * row_bytes > span_cap(kSpanUp)) return VELOX_ERR_UNSUPPORTED;
     const dim3 grid((d.width + per_block - 1) / per_block, pairs);
     moe_gate_up_kernel<T><<<grid, kMoeWarps * VELOX_WARP>>>(d, ids, k, xq, xd, h);
     return velox_launch_status();
@@ -1573,6 +1713,8 @@ template <int T>
 int moe_down_launch(const MoeDesc& d, const float* ids, const float* wts, int rows, int k, const int8_t* hq,
                     const float* hd, float* y) {
     const int per_block = kMoeWarps * kMoeDownRows;
+    const int row_bytes = d.width / 32 / sub_per_block<T>() * block_bytes(T);
+    if (kMoeDownRows * row_bytes > span_cap(kSpanDown)) return VELOX_ERR_UNSUPPORTED;
     const dim3 grid((d.hidden + per_block - 1) / per_block, rows);
     moe_down_kernel<T><<<grid, kMoeWarps * VELOX_WARP>>>(d, ids, wts, k, hq, hd, y);
     return velox_launch_status();
@@ -1628,7 +1770,7 @@ VELOX_API int velox_5060_moe_experts(const float* x, const float* ids, const flo
                                      float* y, void* scratch) {
     if (rows < 1 || k < 1 || up_type < 0 || up_type > kQ2_0 || down_type < 0 || down_type > kQ2_0 ||
         hidden % block_values(up_type) != 0 || width % block_values(down_type) != 0 ||
-        reinterpret_cast<uintptr_t>(scratch) % 16 != 0)
+        reinterpret_cast<uintptr_t>(scratch) % 16 != 0 || (gate_off | up_off | down_off | record_bytes | slot_bytes) % 4 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const MoeDesc d{records, slots, map, record_bytes, slot_bytes, gate_off, up_off, down_off, width, hidden};
     const long long pairs = static_cast<long long>(rows) * k;

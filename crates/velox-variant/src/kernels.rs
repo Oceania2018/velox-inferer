@@ -864,6 +864,13 @@ fn moe_types(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> Option<(i32, i32
     {
         return None;
     }
+    // The kernels stage rows with 4-byte loads.
+    let aligned = |m: &velox_core::ExpertMatrix| {
+        m.format.payload_bytes(1, m.k) % 4 == 0 && m.offset % 4 == 0
+    };
+    if !(aligned(&bank.gate) && aligned(&bank.up) && aligned(&bank.down)) {
+        return None;
+    }
     Some((ty(bank.gate.format)?, ty(bank.down.format)?))
 }
 
