@@ -125,6 +125,21 @@ impl<B: Backend> ExpertCache<B> {
         layers: &[&ExpertRecords<B>],
         max_moves: usize,
     ) -> Result<CacheReport> {
+        self.update_steps(b, layers, max_moves, u64::MAX, false)
+    }
+
+    /// [`Self::update`] after `steps` forward steps: hits and misses count weight reads (a step
+    /// reads a selected expert once for all its rows, so at most `steps` per expert), and with
+    /// `score_reads` the scores do too, so a long prefill chunk weighs what it costs to read,
+    /// not its token count.
+    pub fn update_steps(
+        &mut self,
+        b: &B,
+        layers: &[&ExpertRecords<B>],
+        max_moves: usize,
+        steps: u64,
+        score_reads: bool,
+    ) -> Result<CacheReport> {
         let experts = self.host_map.first().map_or(0, Vec::len);
         let mut report = CacheReport::default();
         let zeros = vec![0f32; experts];
@@ -134,17 +149,19 @@ impl<B: Backend> ExpertCache<B> {
         for l in 0..self.counts.len() {
             b.download(&self.counts[l], &mut host)?;
             for (e, &c) in host.iter().enumerate() {
-                let c = c as u64;
+                let selected = c as u64;
+                let c = selected.min(steps);
                 if c > 0 && self.trace.is_some() {
-                    seen.push((l as u16, e as u16, c as u32));
+                    seen.push((l as u16, e as u16, selected as u32));
                 }
                 if self.host_map[l][e] >= 0 {
                     report.hits += c;
                 } else {
                     report.misses += c;
                 }
-                self.score[l][e] = self.score[l][e] * self.decay + c as f32;
-                self.totals[l][e] += c;
+                let s = if score_reads { c } else { selected };
+                self.score[l][e] = self.score[l][e] * self.decay + s as f32;
+                self.totals[l][e] += selected;
             }
             if host.iter().any(|&c| c != 0.0) {
                 b.write_at(&mut self.counts[l], 0, &zeros)?;

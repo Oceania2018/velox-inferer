@@ -806,12 +806,14 @@ pub struct Qwen35Text<B: Backend> {
 }
 
 /// When the expert cache moves experts: every `interval` tokens at most `moves` of them, and
-/// without a limit after a prompt (`prompt` tokens or more since the last update).
+/// without a limit after a prompt (`prompt` tokens or more since the last update). `reads`
+/// scores weight reads (an expert once per forward step) instead of selections (once per row).
 #[derive(Clone, Copy, Debug)]
 pub struct ExpertPolicy {
     pub interval: usize,
     pub moves: usize,
     pub prompt: usize,
+    pub reads: bool,
 }
 
 impl Default for ExpertPolicy {
@@ -821,6 +823,7 @@ impl Default for ExpertPolicy {
             interval: 8,
             moves: 512,
             prompt: 64,
+            reads: false,
         }
     }
 }
@@ -834,8 +837,9 @@ struct Experts<B: Backend> {
     /// they do not size the stack's slots.
     rest: ExpertCache<B>,
     policy: ExpertPolicy,
-    /// Tokens run since the last update.
+    /// Tokens and forward steps run since the last update.
     pending: usize,
+    steps: u64,
     /// Totals over every update.
     report: CacheReport,
 }
@@ -913,12 +917,14 @@ impl<B: Backend> Qwen35Text<B> {
             rest,
             policy,
             pending: 0,
+            steps: 0,
             report: CacheReport::default(),
         }));
         Ok(())
     }
 
-    /// Selections served from device slots and from system RAM so far, and experts moved.
+    /// Expert weight reads served from device slots and from system RAM so far (an expert once
+    /// per forward step that selects it), and experts moved.
     pub fn expert_report(&self) -> Option<CacheReport> {
         self.experts
             .as_ref()
@@ -940,14 +946,18 @@ impl<B: Backend> Qwen35Text<B> {
                 e.policy.moves
             };
             let recs: Vec<_> = self.w.experts[..e.main].iter().collect();
-            let r = e.cache.update(b, &recs, moves)?;
+            let r = e
+                .cache
+                .update_steps(b, &recs, moves, e.steps, e.policy.reads)?;
             e.report.hits += r.hits;
             e.report.misses += r.misses;
             e.report.moves += r.moves;
             e.report.resident = r.resident;
             e.pending = 0;
+            e.steps = 0;
         }
         e.pending += tokens;
+        e.steps += 1;
         Ok(())
     }
 
