@@ -125,6 +125,27 @@ impl<B: Backend> Qwen4Exp<B> {
         }
     }
 
+    /// Starts `s` over as an empty sequence, keeping its buffers: recorded decode steps hold
+    /// some of a session's buffer addresses, so a run of sequences reuses one session.
+    pub fn reset(&self, b: &B, s: &mut Session<B>) -> Result<()> {
+        for l in &mut s.layers {
+            if let LayerState::Gdn { conv, ssm } = l {
+                // KV and index caches need no clearing: every position is written before it is read.
+                for buf in [conv, ssm] {
+                    let n = b.len(buf);
+                    b.write_at(buf, 0, &vec![0.0; n])?;
+                }
+            }
+        }
+        if let Some(c) = &mut s.ple_conv {
+            let n = b.len(c);
+            b.write_at(c, 0, &vec![0.0; n])?;
+        }
+        s.pos = 0;
+        s.history.clear();
+        Ok(())
+    }
+
     pub fn session(&self, b: &B, capacity: usize, kv: KvFormat) -> Result<Session<B>> {
         let c = &self.cfg;
         kv.check_head_dim(c.head_dim)?;
