@@ -2101,6 +2101,245 @@ int grouped_down_any(int type, const MoeDesc& d, int experts, const int* offsets
 
 }  // namespace
 
+// ---- Routed experts at prefill widths on int8 tensor cores ----------------------------------
+//
+// The grouped scheme above with mma.m16n8k32 (k16 per half for 16-value scales): a block owns one
+// expert and 64 weight rows (4 warps x 16) and walks K in steps; each step stages the rows' bytes
+// and the gathered activations of up to 64 of the expert's pairs, decodes the weights into int8
+// codes with per-32 (or per-16) scales, and every warp multiplies its 16 rows by the 8-pair tiles.
+// Products accumulate in int32 per sub-block and in f32 with both scales (plus the offset types'
+// offset times the activation code sums).
+namespace {
+
+constexpr int kGmRows = 64, kGmTok = 32;
+// Shared memory the block's 64 full weight rows may take (staged once, 16-byte loads).
+constexpr int kGmRawMax = 56 * 1024;
+
+template <int T>
+struct Gm {
+    static constexpr int G = Traits<T>::G;
+    static constexpr bool kOff = Traits<T>::kOff;
+    static constexpr int kStep = T == kQ2_0 ? 128 : 256;  // values per K step
+    static constexpr int kSu = kStep / 32;               // sub-blocks per step
+    static constexpr int kStride = kStep + 16;           // code / activation row stride (bytes)
+    struct Smem {
+        int8_t codes[kGmRows * kStride];
+        int8_t act[kGmTok * kStride];
+        float ws[kGmRows][kSu][G];
+        float wo[kOff ? kGmRows : 1][kSu][G];
+        float xd[kGmTok][kSu];
+        int xsum[kOff ? kGmTok : 1][kSu][G];
+        // followed by the staged rows
+    };
+};
+
+// mode 0: out[p][r] = W_r . x[p / k]; mode 1: out[p][r] = silu(out[p][r]) * (W_r . x[p / k]);
+// mode 2: out[p][r] = W_r . a[p]. W: the expert's matrix at mat_off, `rows` x K; activations aq
+// (int8 per 32 values) with scales ad.
+template <int T>
+__global__ void __launch_bounds__(128)
+    moe_mma_kernel(MoeDesc d, long long mat_off, int rows, int K, const int* __restrict__ offsets,
+                   const int* __restrict__ list, int k, const int8_t* __restrict__ aq, const float* __restrict__ ad,
+                   int mode, float* __restrict__ out) {
+    using C = Gm<T>;
+    constexpr int G = C::G, SU = C::kSu, ST = C::kStride, SPB = sub_per_block<T>(), BB = block_bytes(T);
+    constexpr int GW = moe_grid_words<T>() > 0 ? moe_grid_words<T>() : 1;
+    __shared__ uint32_t sg[GW];
+    __shared__ uint8_t sks[128];
+    extern __shared__ __align__(16) uint8_t smem[];
+    auto& S = *reinterpret_cast<typename C::Smem*>(smem);
+    const int e = blockIdx.y, begin = offsets[e], count = offsets[e + 1] - begin;
+    if (count == 0) return;
+    moe_load_tables<T>(sg, sks);
+    const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP, g = lane / 4, t = lane % 4;
+    const int r0 = blockIdx.x * kGmRows;
+    const uint8_t* wbase = moe_record(d, e) + mat_off;
+    const long long row_bytes = static_cast<long long>(K / (SPB * 32)) * BB;
+    const int subs = K / 32, steps = K / C::kStep;
+    // The block's rows (contiguous in the record) staged once: one span widened to 16 bytes.
+    const int live_rows = min(kGmRows, rows - r0);
+    uint8_t* raw = smem + sizeof(typename C::Smem);
+    {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(wbase + r0 * row_bytes);
+        const uint4* src = reinterpret_cast<const uint4*>(a & ~static_cast<uintptr_t>(15));
+        const int n = static_cast<int>(((a & 15) + live_rows * row_bytes + 15) / 16);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) cp_async16(raw + 16 * i, src + i);
+        cp_async_commit();
+        raw += a & 15;
+    }
+    cp_async_wait0();
+    __syncthreads();
+    for (int tg = 0; tg < count; tg += kGmTok) {
+        const int nt = min(kGmTok, count - tg);
+        float acc[kGmTok / 8][4];
+#pragma unroll
+        for (int n = 0; n < kGmTok / 8; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+        for (int step = 0; step < steps; ++step) {
+            __syncthreads();  // the previous step's mma is done with act, codes and scales
+            for (int i = threadIdx.x; i < kGmTok * (C::kStep / 16); i += blockDim.x) {
+                const int tk = i / (C::kStep / 16), c = i % (C::kStep / 16);
+                int4 v = make_int4(0, 0, 0, 0);
+                if (tk < nt) {
+                    const int p = list[begin + tg + tk], row = mode < 2 ? p / k : p;
+                    v = *reinterpret_cast<const int4*>(aq + static_cast<long long>(row) * K + step * C::kStep + c * 16);
+                }
+                *reinterpret_cast<int4*>(&S.act[tk * ST + c * 16]) = v;
+            }
+            for (int i = threadIdx.x; i < kGmTok * SU; i += blockDim.x) {
+                const int tk = i / SU, u = i % SU;
+                float v = 0.0f;
+                if (tk < nt) {
+                    const int p = list[begin + tg + tk], row = mode < 2 ? p / k : p;
+                    v = ad[static_cast<long long>(row) * subs + step * SU + u];
+                }
+                S.xd[tk][u] = v;
+            }
+            __syncthreads();
+            for (int i = threadIdx.x; i < kGmRows * SU; i += blockDim.x) {
+                const int rr = i / SU, u = i % SU;
+                const int su = step * SU + u;  // sub-block within the row
+                const uint8_t* x = raw + min(rr, live_rows - 1) * row_bytes + (su / SPB) * BB;
+                const Sub<T> s = decode_smem<T>(x, su % SPB, sg, sks);
+                int4* cp = reinterpret_cast<int4*>(&S.codes[rr * ST + u * 32]);
+                cp[0] = make_int4(s.w[0], s.w[1], s.w[2], s.w[3]);
+                cp[1] = make_int4(s.w[4], s.w[5], s.w[6], s.w[7]);
+#pragma unroll
+                for (int q = 0; q < G; ++q) {
+                    S.ws[rr][u][q] = s.s[q];
+                    if constexpr (C::kOff) S.wo[rr][u][q] = s.o[q];
+                }
+            }
+            if constexpr (C::kOff) {
+                for (int i = threadIdx.x; i < kGmTok * SU * G; i += blockDim.x) {
+                    const int tk = i / (SU * G), u = (i / G) % SU, q = i % G;
+                    const int* w4 = reinterpret_cast<const int*>(&S.act[tk * ST + u * 32 + q * (32 / G)]);
+                    int z = 0;
+#pragma unroll
+                    for (int j = 0; j < 8 / G; ++j) z = __dp4a(w4[j], 0x01010101, z);
+                    S.xsum[tk][u][q] = z;
+                }
+            }
+            __syncthreads();
+            const int ra = warp * 16 + g, rb = ra + 8;
+#pragma unroll
+            for (int u = 0; u < SU; ++u) {
+                const int* ca = reinterpret_cast<const int*>(&S.codes[ra * ST + u * 32]);
+                const int* cb = reinterpret_cast<const int*>(&S.codes[rb * ST + u * 32]);
+                const int a0 = ca[t], a1 = cb[t], a2 = ca[t + 4], a3 = cb[t + 4];
+#pragma unroll
+                for (int n = 0; n < kGmTok / 8; ++n) {
+                    if (n * 8 >= nt) break;
+                    const int* xb = reinterpret_cast<const int*>(&S.act[(n * 8 + g) * ST + u * 32]);
+                    const int b0 = xb[t], b1 = xb[t + 4];
+                    float va[2], vb[2];  // per token 2t, 2t + 1: rows ra, rb
+                    if constexpr (G == 1) {
+                        int c[4] = {0, 0, 0, 0};
+                        mma_k32(c, a0, a1, a2, a3, b0, b1);
+#pragma unroll
+                        for (int q = 0; q < 2; ++q) {
+                            va[q] = S.ws[ra][u][0] * static_cast<float>(c[q]);
+                            vb[q] = S.ws[rb][u][0] * static_cast<float>(c[2 + q]);
+                        }
+                    } else {
+                        int lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
+                        mma_k16(lo, a0, a1, b0);
+                        mma_k16(hi, a2, a3, b1);
+#pragma unroll
+                        for (int q = 0; q < 2; ++q) {
+                            va[q] = S.ws[ra][u][0] * static_cast<float>(lo[q]) + S.ws[ra][u][1] * static_cast<float>(hi[q]);
+                            vb[q] = S.ws[rb][u][0] * static_cast<float>(lo[2 + q]) +
+                                    S.ws[rb][u][1] * static_cast<float>(hi[2 + q]);
+                        }
+                    }
+#pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        const int tk = n * 8 + 2 * t + q;
+                        if constexpr (C::kOff) {
+#pragma unroll
+                            for (int h = 0; h < G; ++h) {
+                                const float z = static_cast<float>(S.xsum[tk][u][h]);
+                                va[q] += S.wo[ra][u][h] * z;
+                                vb[q] += S.wo[rb][u][h] * z;
+                            }
+                        }
+                        const float xs = S.xd[tk][u];
+                        acc[n][q] += xs * va[q];
+                        acc[n][2 + q] += xs * vb[q];
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < kGmTok / 8; ++n) {
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const int tk = n * 8 + 2 * t + q;
+                if (tk >= nt) continue;
+                const long long p = list[begin + tg + tk];
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int r = r0 + warp * 16 + g + 8 * h;
+                    if (r >= rows) continue;
+                    float* o = out + p * rows + r;
+                    const float v = acc[n][2 * h + q];
+                    if (mode == 1) {
+                        const float gt = *o;
+                        *o = gt / (1.0f + __expf(-gt)) * v;
+                    } else {
+                        *o = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int T>
+int moe_mma_launch(const MoeDesc& d, long long mat_off, int rows, int K, int experts, const int* offsets,
+                   const int* list, int k, const int8_t* aq, const float* ad, int mode, float* out) {
+    using C = Gm<T>;
+    if constexpr (C::G > 2) {
+        return VELOX_ERR_UNSUPPORTED;
+    } else {
+        if (K % C::kStep != 0) return VELOX_ERR_UNSUPPORTED;
+        const long long row_bytes = static_cast<long long>(K / (sub_per_block<T>() * 32)) * block_bytes(T);
+        const long long raw = (kGmRows * row_bytes + 31) / 16 * 16;
+        if (raw > kGmRawMax) return VELOX_ERR_UNSUPPORTED;
+        const size_t smem = sizeof(typename C::Smem) + static_cast<size_t>(raw);
+        if (smem + 4 * moe_grid_words<T>() + 128 > 99 * 1024) return VELOX_ERR_UNSUPPORTED;
+        static const cudaError_t attr =
+            cudaFuncSetAttribute(moe_mma_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(sizeof(typename Gm<T>::Smem)) + kGmRawMax);
+        if (attr != cudaSuccess) return static_cast<int>(attr);
+        const dim3 grid((rows + kGmRows - 1) / kGmRows, experts);
+        moe_mma_kernel<T><<<grid, 128, smem>>>(d, mat_off, rows, K, offsets, list, k, aq, ad, mode, out);
+        return velox_launch_status();
+    }
+}
+
+#define MOE_MMA(F, ...)                               \
+    switch (type) {                                   \
+        case kQ2K: return F<kQ2K>(__VA_ARGS__);       \
+        case kQ4K: return F<kQ4K>(__VA_ARGS__);       \
+        case kIq2Xxs: return F<kIq2Xxs>(__VA_ARGS__); \
+        case kIq2Xs: return F<kIq2Xs>(__VA_ARGS__);   \
+        case kIq2S: return F<kIq2S>(__VA_ARGS__);     \
+        case kIq3Xxs: return F<kIq3Xxs>(__VA_ARGS__); \
+        case kIq3S: return F<kIq3S>(__VA_ARGS__);     \
+        case kIq4Xs: return F<kIq4Xs>(__VA_ARGS__);   \
+        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);     \
+        default: return VELOX_ERR_UNSUPPORTED;        \
+    }
+
+int moe_mma_any(int type, const MoeDesc& d, long long mat_off, int rows, int K, int experts, const int* offsets,
+                const int* list, int k, const int8_t* aq, const float* ad, int mode, float* out) {
+    MOE_MMA(moe_mma_launch, d, mat_off, rows, K, experts, offsets, list, k, aq, ad, mode, out)
+}
+
+#undef MOE_MMA
+
+}  // namespace
+
 // Bytes of scratch velox_5060_moe_grouped needs.
 VELOX_API long long velox_5060_moe_grouped_scratch(int rows, int k, int width, int hidden, int experts) {
     const long long pairs = static_cast<long long>(rows) * k;
@@ -2142,13 +2381,18 @@ VELOX_API int velox_5060_moe_grouped(const float* x, const float* ids, const flo
                                                                list);
     moe_quant_kernel<<<static_cast<unsigned>((xs / 32 * VELOX_WARP + threads - 1) / threads), threads>>>(
         x, rows, hidden / 32, xq, xd);
-    for (int mode = 0; mode < 2; ++mode)
-        if (const int e = grouped_up_any(up_type, d, mode ? up_off : gate_off, experts, offsets, list, k, xq, xd, h,
-                                         mode))
-            return e;
+    // Tensor cores where the type's scales cover 16 or 32 values; dp4a otherwise (IQ1_M).
+    for (int mode = 0; mode < 2; ++mode) {
+        const long long off = mode ? up_off : gate_off;
+        int e = moe_mma_any(up_type, d, off, width, hidden, experts, offsets, list, k, xq, xd, mode, h);
+        if (e == VELOX_ERR_UNSUPPORTED) e = grouped_up_any(up_type, d, off, experts, offsets, list, k, xq, xd, h, mode);
+        if (e) return e;
+    }
     moe_quant_kernel<<<static_cast<unsigned>((hw / 32 * VELOX_WARP + threads - 1) / threads), threads>>>(
         h, static_cast<int>(pairs), width / 32, hq, hd);
-    if (const int e = grouped_down_any(down_type, d, experts, offsets, list, hq, hd, o)) return e;
+    int e = moe_mma_any(down_type, d, down_off, hidden, width, experts, offsets, list, k, hq, hd, 2, o);
+    if (e == VELOX_ERR_UNSUPPORTED) e = grouped_down_any(down_type, d, experts, offsets, list, hq, hd, o);
+    if (e) return e;
     moe_sum_kernel<<<velox_grid_1d(static_cast<long long>(rows) * hidden, threads), threads>>>(o, wts, rows, k, hidden,
                                                                                              y);
     return velox_launch_status();
