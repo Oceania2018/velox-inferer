@@ -1437,7 +1437,10 @@ impl<B: Backend> Core<B> {
             );
             // Cumulative since load: diff consecutive lines for a request's own hit rate.
             if let Some(r) = self.model.expert_report() {
-                eprintln!("[experts] hits {} misses {} moves {}", r.hits, r.misses, r.moves);
+                eprintln!(
+                    "[experts] hits {} misses {} moves {}",
+                    r.hits, r.misses, r.moves
+                );
             }
         }
         let _ = a.job.reply.send(Reply::Done(Ok(Done {
