@@ -1403,7 +1403,10 @@ VELOX_API int velox_5060_linear_ggml_from(const int8_t* xq, const float* xd, int
                                           int mode) {
     if (m < 1 || m > 65536 || rows <= 0 || k % 256 != 0 || type < 0 || type > 8) return VELOX_ERR_UNSUPPORTED;
     const long long row_bytes = k / 256 * block_bytes(type);
-    if (row_bytes % 4 != 0 || k % 1024 != 0 || reinterpret_cast<uintptr_t>(w) % 16 != 0 || mode < 0 || mode > 1)
+    // K % 1024 for the tensor-core path; dp4a (fewer tokens) needs only 16-byte rows.
+    const bool dp4a_rows = m < mma_min_m() && row_bytes % 16 == 0;
+    if (row_bytes % 4 != 0 || (k % 1024 != 0 && !dp4a_rows) || reinterpret_cast<uintptr_t>(w) % 16 != 0 || mode < 0 ||
+        mode > 1)
         return VELOX_ERR_UNSUPPORTED;
     const int subs = static_cast<int>(k / 32);
     switch (type) {

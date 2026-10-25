@@ -683,6 +683,10 @@ fn gdn_step(qkv: &CudaBuffer, s: &velox_core::backend::GdnShape) -> bool {
 /// path's format 16 + type); below, the per-32 kernels of `ggml_mmvq`.
 const GGML_Q8_MIN_M: usize = 17;
 
+/// From this many tokens (rtx5060_ggml.cu mma_min_m, VELOX_GGML_MMA_MIN unset) the decode-width
+/// GGML linears run on int8 tensor cores instead of dp4a.
+const GGML_MMA_MIN_M: usize = 5;
+
 /// Types rtx5060_ggml.cu decodes: the first nine of `GgmlType::ALL` (q2_k .. iq4_xs). Later
 /// types (q2_0, iq4_nl, q6_k, q8_0) run the portable kernels.
 fn ggml_served(t: velox_core::ggml::GgmlType) -> bool {
@@ -699,14 +703,16 @@ fn ggml_index(t: velox_core::ggml::GgmlType) -> i32 {
 /// The GGML type code (`GgmlType::ALL` order) of a weight rtx5060_ggml.cu serves at `m` tokens
 /// (int8 activations per 32 values: dp4a up to 4 tokens, int8 tensor cores from 5, prefill
 /// included): AllowA8 (the importer's policy for GGML matrices), K a multiple of 1024 so two
-/// blocks of a row start 4-byte aligned for every block size.
+/// blocks of a row start 4-byte aligned for every block size. The dp4a kernel (up to 4 tokens)
+/// also takes K a multiple of 256 whose rows are 16-byte multiples (Qwen3.8-Flash-Next's 2560).
 fn ggml_mmvq(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     let WeightFormat::Ggml(t) = w.format else {
         return None;
     };
+    let dp4a_rows = m < GGML_MMA_MIN_M && w.k % 256 == 0 && t.row_bytes(w.k) % 16 == 0;
     if !ggml_served(t)
         || !(1..GGML_Q8_MIN_M).contains(&m)
-        || w.k % 1024 != 0
+        || (w.k % 1024 != 0 && !dp4a_rows)
         || !matches!(w.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. })
     {
         return None;
