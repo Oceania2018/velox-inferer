@@ -8,18 +8,24 @@
 mod config;
 mod experts;
 mod load;
+mod mtp;
 mod ple;
 
 pub use config::{LayerKind, PleConfig, Qwen4Config};
 pub use experts::{CacheReport, ExpertCache};
-pub use load::{load, Qwen4Weights, Shards};
+pub use load::{load, load_mtp, MtpWeights, Qwen4Weights, Shards};
+pub use mtp::{Mtp, MtpSession};
 pub use ple::{hash_rows, PleTable};
 
+use velox_core::backend::{Copy2dShape, GdnReplayLayer};
 use velox_core::{
     AttnShape, Backend, ConvShape, DilatedConvShape, Error, GdnShape, HcCombineShape, KvFormat,
     KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, Result, RopeShape,
     RowGateShape, GRAPH_KV_BUCKET, GRAPH_STATIC,
 };
+
+/// Most rows of a speculative window (`verify`).
+pub const VERIFY_MAX: usize = 4;
 
 /// Graph key kind of single-token decode steps.
 const GRAPH_DECODE: u64 = 1 << 16;
@@ -53,6 +59,24 @@ pub struct Session<B: Backend> {
     ple_conv: Option<B::Buffer>,
     /// The last `ngram - 1` tokens (PLE hashing context).
     history: Vec<u32>,
+    /// A verified window's record, for `commit` (allocated by the first `verify`).
+    spec: Option<Spec<B>>,
+}
+
+/// What `commit` needs to keep a prefix of a verified window: verify leaves the session's
+/// recurrent states as they were before the window and records, per GDN layer, the rows the
+/// convolution and the recurrence consumed (replaying a prefix from them reproduces the
+/// trajectory bit for bit), and the PLE convolution's normalised input rows.
+struct Spec<B: Backend> {
+    qkv: Vec<B::Buffer>,
+    conv_out: Vec<B::Buffer>,
+    ab: Vec<B::Buffer>,
+    conv_scratch: B::Buffer,
+    ssm_scratch: B::Buffer,
+    ple_gn: Option<B::Buffer>,
+    ple_scratch: Option<B::Buffer>,
+    pos0: usize,
+    tokens: usize,
 }
 
 /// Intermediate buffers for steps of up to `max_tokens` tokens.
@@ -184,7 +208,36 @@ impl<B: Backend> Qwen4Exp<B> {
             layers,
             ple_conv,
             history: Vec::new(),
+            spec: None,
         })
+    }
+
+    fn ensure_spec(&self, b: &B, s: &mut Session<B>) -> Result<()> {
+        if s.spec.is_some() {
+            return Ok(());
+        }
+        let c = &self.cfg;
+        let gdn = c.layers.iter().filter(|k| **k == LayerKind::Gdn).count();
+        let rows = |n: usize| -> Result<Vec<B::Buffer>> { (0..gdn).map(|_| b.alloc(n)).collect() };
+        let hist = c.ple.as_ref().map(|p| (p.conv_width - 1) * p.dilation);
+        s.spec = Some(Spec {
+            qkv: rows(VERIFY_MAX * c.gdn_qkv())?,
+            conv_out: rows(VERIFY_MAX * c.gdn_qkv())?,
+            ab: rows(VERIFY_MAX * 2 * c.gdn_v_heads)?,
+            conv_scratch: b.alloc((c.conv_width - 1) * c.gdn_qkv())?,
+            ssm_scratch: b.alloc(c.gdn_v_heads * c.gdn_v_dim * c.gdn_k_dim)?,
+            ple_gn: match hist {
+                Some(_) => Some(b.alloc(VERIFY_MAX * c.wide())?),
+                None => None,
+            },
+            ple_scratch: match hist {
+                Some(h) => Some(b.alloc(h * c.wide())?),
+                None => None,
+            },
+            pos0: 0,
+            tokens: 0,
+        });
+        Ok(())
     }
 
     pub fn workspace(
@@ -242,8 +295,8 @@ impl<B: Backend> Qwen4Exp<B> {
             ple_gn: a(t * c.wide())?,
             ple_c: a(t * c.wide())?,
             last: a(c.wide())?,
-            logits: a(c.vocab)?,
-            best: a(1)?,
+            logits: a(VERIFY_MAX.min(t) * c.vocab)?,
+            best: a(VERIFY_MAX)?,
         })
     }
 
@@ -299,10 +352,10 @@ impl<B: Backend> Qwen4Exp<B> {
                 | GRAPH_DECODE
                 | u64::from(pool)
                 | ((pos0 + 1).div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
-            let mut step = || self.step(b, s, ws, cache, ids, ple_e.as_deref());
+            let mut step = || self.step(b, s, ws, cache, ids, ple_e.as_deref(), false);
             b.graph(key, &mut step)?;
         } else {
-            self.step(b, s, ws, cache, ids, ple_e.as_deref())?;
+            self.step(b, s, ws, cache, ids, ple_e.as_deref(), false)?;
         }
         s.pos += t;
         if let Some(p) = &c.ple {
@@ -315,7 +368,160 @@ impl<B: Backend> Qwen4Exp<B> {
         Ok(())
     }
 
-    /// The device work of a step of `ids` at `s.pos` (no host waits: it may be recorded).
+    /// Runs a speculative window `ids` (at most [`VERIFY_MAX`]) after the session's tokens and
+    /// leaves every row's logits in `ws.logits` (`[ids.len(), vocab]`), without advancing the
+    /// session: [`Self::commit`] then keeps a prefix.
+    pub fn verify(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        cache: &mut ExpertCache<B>,
+        ids: &[u32],
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let t = ids.len();
+        if t == 0 || t > VERIFY_MAX.min(ws.max_tokens) || s.pos + t > s.capacity {
+            return Err(Error::Shape(format!(
+                "verify window of {t} tokens at {} (most {VERIFY_MAX}, capacity {})",
+                s.pos, s.capacity
+            )));
+        }
+        self.ensure_spec(b, s)?;
+        let ple_e = match (&c.ple, &self.w.ple_table) {
+            (Some(_), Some(table)) => {
+                let rows = table.rows(&s.history, ids);
+                Some(table.embed(&rows, self.ple_threads)?)
+            }
+            _ => None,
+        };
+        self.step(b, s, ws, cache, ids, ple_e.as_deref(), true)?;
+        let sp = s.spec.as_mut().expect("ensured above");
+        sp.pos0 = s.pos;
+        sp.tokens = t;
+        Ok(())
+    }
+
+    /// Keeps the first `keep` tokens `ids[..keep]` of the last verified window: the recurrent
+    /// states advance over them (replayed from the window's record), the position and the PLE
+    /// history move past them.
+    pub fn commit(&self, b: &B, s: &mut Session<B>, ids: &[u32], keep: usize) -> Result<()> {
+        let c = &self.cfg;
+        let Session {
+            layers,
+            ple_conv,
+            spec,
+            pos,
+            history,
+            ..
+        } = s;
+        let sp = spec
+            .as_mut()
+            .ok_or_else(|| Error::Config("commit without verify".into()))?;
+        if keep > sp.tokens || keep > ids.len() || *pos != sp.pos0 {
+            return Err(Error::Shape(format!(
+                "commit of {keep} after a {}-token window at {}",
+                sp.tokens, sp.pos0
+            )));
+        }
+        if keep > 0 {
+            let params = self.w.layers.iter().filter_map(|l| match &l.mixer {
+                Mixer::Gdn(g) => Some(g),
+                _ => None,
+            });
+            let states = layers.iter_mut().filter_map(|l| match l {
+                LayerState::Gdn { conv, ssm } => Some((conv, ssm)),
+                _ => None,
+            });
+            let mut replay: Vec<GdnReplayLayer<'_, B::Buffer>> = states
+                .zip(params)
+                .enumerate()
+                .map(|(gi, ((conv, ssm), g))| GdnReplayLayer {
+                    qkv: &sp.qkv[gi],
+                    conv_out: &sp.conv_out[gi],
+                    ab: &sp.ab[gi],
+                    a_log: &g.a_log,
+                    dt_bias: &g.dt_bias,
+                    conv_state: conv,
+                    ssm,
+                })
+                .collect();
+            b.gdn_replay(
+                &mut replay,
+                ConvShape {
+                    tokens: keep,
+                    channels: c.gdn_qkv(),
+                    width: c.conv_width,
+                    row0: 0,
+                },
+                GdnShape {
+                    tokens: keep,
+                    k_heads: c.gdn_k_heads,
+                    v_heads: c.gdn_v_heads,
+                    k_dim: c.gdn_k_dim,
+                    v_dim: c.gdn_v_dim,
+                    row0: 0,
+                },
+            )?;
+            // PLE history: the last rows of [history; kept normalised rows].
+            if let (Some(p), Some(state), Some(gn), Some(tmp)) = (
+                &c.ple,
+                ple_conv.as_mut(),
+                &sp.ple_gn,
+                sp.ple_scratch.as_mut(),
+            ) {
+                let (hist, wide) = ((p.conv_width - 1) * p.dilation, c.wide());
+                for j in 0..hist {
+                    let r = keep + j;
+                    if r < hist {
+                        b.copy(state, r * wide, tmp, j * wide, wide)?;
+                    } else {
+                        b.copy(gn, (r - hist) * wide, tmp, j * wide, wide)?;
+                    }
+                }
+                b.copy(tmp, 0, state, 0, hist * wide)?;
+            }
+        }
+        *pos += keep;
+        if let Some(p) = &c.ple {
+            history.extend_from_slice(&ids[..keep]);
+            let n = p.ngram - 1;
+            if history.len() > n {
+                history.drain(..history.len() - n);
+            }
+        }
+        sp.tokens = 0;
+        Ok(())
+    }
+
+    /// The best of the first `limit` logits of each of the last verify's `rows` rows.
+    pub fn argmax_rows(
+        &self,
+        b: &B,
+        ws: &Workspace<B>,
+        rows: usize,
+        limit: usize,
+    ) -> Result<Vec<u32>> {
+        let best = b.top_k(
+            &ws.logits,
+            rows,
+            self.cfg.vocab,
+            limit.min(self.cfg.vocab),
+            1,
+        )?;
+        best.into_iter()
+            .map(|r| {
+                r.first()
+                    .map(|c| c.0)
+                    .ok_or_else(|| Error::Shape("argmax_rows: empty row".into()))
+            })
+            .collect()
+    }
+
+    /// The device work of a step of `ids` at `s.pos` (no host waits: it may be recorded). A
+    /// `verify` step leaves the recurrent states untouched (recording what `commit` replays) and
+    /// computes every row's logits.
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &self,
         b: &B,
@@ -324,6 +530,7 @@ impl<B: Backend> Qwen4Exp<B> {
         cache: &mut ExpertCache<B>,
         ids: &[u32],
         ple_e: Option<&[f32]>,
+        verify: bool,
     ) -> Result<()> {
         let c = &self.cfg;
         let t = ids.len();
@@ -334,7 +541,7 @@ impl<B: Backend> Qwen4Exp<B> {
             b.copy2d(
                 &ws.y,
                 &mut ws.r,
-                velox_core::backend::Copy2dShape {
+                Copy2dShape {
                     rows: t,
                     cols: h,
                     src_offset: 0,
@@ -351,15 +558,18 @@ impl<B: Backend> Qwen4Exp<B> {
             inject_ld: st,
             inject_col: 0,
         };
+        let mut gi = 0;
         for (li, layer) in self.w.layers.iter().enumerate() {
             if let (Some(pw), Some(e)) = (&layer.ple, ple_e) {
                 b.write_at(&mut ws.ple_e, 0, e)?;
-                self.ple(b, pw, s, ws, t)?;
+                self.ple(b, pw, s, ws, t, verify)?;
             }
             self.hc_pre(b, &layer.hc_attn, ws, t)?;
+            let spec = if verify { s.spec.as_mut() } else { None };
             match (&layer.mixer, &mut s.layers[li]) {
                 (Mixer::Gdn(gw), LayerState::Gdn { conv, ssm }) => {
-                    self.gdn(b, gw, conv, ssm, ws, t)?
+                    self.gdn(b, gw, conv, ssm, spec.map(|sp| (sp, gi)), ws, t)?;
+                    gi += 1;
                 }
                 (Mixer::Qsa(qw), LayerState::Qsa { k, v, raw, pooled }) => {
                     self.qsa(b, qw, (k, v, raw, pooled), s.kv, s.pos, ws, t)?
@@ -371,15 +581,27 @@ impl<B: Backend> Qwen4Exp<B> {
             self.moe(b, li, &layer.moe, cache, ws, t)?;
             b.hc_combine(&mut ws.r, &ws.y, &ws.inj, combine)?;
         }
-        // The head mixer is the final norm: the last token only.
-        b.copy(&ws.r, (t - 1) * wide, &mut ws.last, 0, wide)?;
+        // The head mixer is the final norm: the last token only, or every row of a window.
         let hc = &self.w.hc_head;
-        b.rms_norm_groups(&ws.last, &hc.norm, &mut ws.xn, 1, st, h, c.eps)?;
-        lin(b, &ws.xn, &hc.down, &mut ws.lo, 1)?;
-        b.silu(&mut ws.lo, c.hc_rank)?;
-        lin(b, &ws.lo, &hc.up, &mut ws.gate, 1)?;
-        b.hc_mix(&ws.xn, &ws.gate, &mut ws.mixed, 1, st, h)?;
-        lin(b, &ws.mixed, &self.w.output, &mut ws.logits, 1)
+        let rows = if verify { t } else { 1 };
+        let src = if verify {
+            &ws.r
+        } else {
+            b.copy(&ws.r, (t - 1) * wide, &mut ws.last, 0, wide)?;
+            &ws.last
+        };
+        b.rms_norm_groups(src, &hc.norm, &mut ws.xn, rows, st, h, c.eps)?;
+        lin(b, &ws.xn, &hc.down, &mut ws.lo, rows)?;
+        b.silu(&mut ws.lo, rows * c.hc_rank)?;
+        lin(b, &ws.lo, &hc.up, &mut ws.gate, rows)?;
+        b.hc_mix(&ws.xn, &ws.gate, &mut ws.mixed, rows, st, h)?;
+        lin(b, &ws.mixed, &self.w.output, &mut ws.logits, rows)
+    }
+
+    /// The residual streams `[rows, streams * hidden]` after the last step or verify: the
+    /// hidden states an MTP head drafts from.
+    pub fn residual<'a>(&self, ws: &'a Workspace<B>) -> &'a B::Buffer {
+        &ws.r
     }
 
     /// The last step's logits.
@@ -419,6 +641,7 @@ impl<B: Backend> Qwen4Exp<B> {
         s: &mut Session<B>,
         ws: &mut Workspace<B>,
         t: usize,
+        verify: bool,
     ) -> Result<()> {
         let c = &self.cfg;
         let p = c.ple.as_ref().expect("PLE layer has a PLE config");
@@ -437,10 +660,23 @@ impl<B: Backend> Qwen4Exp<B> {
             h,
         )?;
         b.rms_norm_groups(&ws.ple_gv, &pw.norm_conv, &mut ws.ple_gn, t, st, h, c.eps)?;
-        let state = s
-            .ple_conv
+        let Session { ple_conv, spec, .. } = s;
+        let state = ple_conv
             .as_mut()
             .ok_or_else(|| Error::Backend("session has no PLE state".into()))?;
+        // A verify runs on a copy of the history and records its rows for commit.
+        let state = match (verify, spec.as_mut()) {
+            (true, Some(sp)) => {
+                let (tmp, gn) = (
+                    sp.ple_scratch.as_mut().expect("PLE spec state"),
+                    sp.ple_gn.as_mut().expect("PLE spec rows"),
+                );
+                b.copy(state, 0, tmp, 0, b.len(state))?;
+                b.copy(&ws.ple_gn, 0, gn, 0, t * wide)?;
+                tmp
+            }
+            _ => state,
+        };
         b.conv1d_dilated_silu(
             &ws.ple_gn,
             &pw.conv,
@@ -458,12 +694,16 @@ impl<B: Backend> Qwen4Exp<B> {
     }
 
     /// Gated DeltaNet on `ws.mixed` into `ws.y`.
+    /// Gated DeltaNet on `ws.mixed` into `ws.y`. With `spec` (a verify) the states stay as they
+    /// were and the window's rows are recorded for `commit`.
+    #[allow(clippy::too_many_arguments)]
     fn gdn(
         &self,
         b: &B,
         gw: &GdnWeights<B>,
         conv: &mut B::Buffer,
         ssm: &mut B::Buffer,
+        spec: Option<(&mut Spec<B>, usize)>,
         ws: &mut Workspace<B>,
         t: usize,
     ) -> Result<()> {
@@ -471,34 +711,57 @@ impl<B: Backend> Qwen4Exp<B> {
         lin(b, &ws.mixed, &gw.qkv, &mut ws.qkv, t)?;
         lin(b, &ws.mixed, &gw.z, &mut ws.z, t)?;
         lin(b, &ws.mixed, &gw.ab, &mut ws.ab, t)?;
-        b.conv1d_silu(
-            &ws.qkv,
-            &gw.conv,
-            conv,
-            &mut ws.conv,
-            ConvShape {
-                tokens: t,
-                channels: c.gdn_qkv(),
-                width: c.conv_width,
-                row0: 0,
-            },
-        )?;
-        b.gated_delta_net(
-            &ws.conv,
-            &ws.ab,
-            &gw.a_log,
-            &gw.dt_bias,
-            ssm,
-            &mut ws.o,
-            GdnShape {
-                tokens: t,
-                k_heads: c.gdn_k_heads,
-                v_heads: c.gdn_v_heads,
-                k_dim: c.gdn_k_dim,
-                v_dim: c.gdn_v_dim,
-                row0: 0,
-            },
-        )?;
+        let conv_shape = ConvShape {
+            tokens: t,
+            channels: c.gdn_qkv(),
+            width: c.conv_width,
+            row0: 0,
+        };
+        let gdn_shape = GdnShape {
+            tokens: t,
+            k_heads: c.gdn_k_heads,
+            v_heads: c.gdn_v_heads,
+            k_dim: c.gdn_k_dim,
+            v_dim: c.gdn_v_dim,
+            row0: 0,
+        };
+        match spec {
+            Some((sp, gi)) => {
+                b.conv1d_silu_from(
+                    &ws.qkv,
+                    &gw.conv,
+                    conv,
+                    &mut sp.conv_scratch,
+                    &mut ws.conv,
+                    conv_shape,
+                )?;
+                b.gated_delta_net_out(
+                    &ws.conv,
+                    &ws.ab,
+                    &gw.a_log,
+                    &gw.dt_bias,
+                    ssm,
+                    &mut sp.ssm_scratch,
+                    &mut ws.o,
+                    gdn_shape,
+                )?;
+                b.copy(&ws.qkv, 0, &mut sp.qkv[gi], 0, t * c.gdn_qkv())?;
+                b.copy(&ws.conv, 0, &mut sp.conv_out[gi], 0, t * c.gdn_qkv())?;
+                b.copy(&ws.ab, 0, &mut sp.ab[gi], 0, t * 2 * c.gdn_v_heads)?;
+            }
+            None => {
+                b.conv1d_silu(&ws.qkv, &gw.conv, conv, &mut ws.conv, conv_shape)?;
+                b.gated_delta_net(
+                    &ws.conv,
+                    &ws.ab,
+                    &gw.a_log,
+                    &gw.dt_bias,
+                    ssm,
+                    &mut ws.o,
+                    gdn_shape,
+                )?;
+            }
+        }
         // Grouped value heads to llama.cpp's tiled order, which z and the output projection use.
         let per = c.gdn_v_heads / c.gdn_k_heads;
         b.transpose_heads(&ws.o, &mut ws.ot, t, c.gdn_k_heads, per, c.gdn_v_dim)?;
