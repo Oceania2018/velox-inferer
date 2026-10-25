@@ -2600,6 +2600,38 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         64,
         ActPolicy::A16Only,
     )?;
+    // A DFlash2 drafter's NVFP4 MLP (Qwen3.6-35B-A3B: hidden 2048, width 6144) at every block
+    // width a draft window can have.
+    for m in 1..=9 {
+        s.linear_act(
+            WeightFormat::Nvfp4,
+            6144,
+            2048,
+            0,
+            6144,
+            m,
+            ActPolicy::A16Only,
+        )?;
+        s.linear_act(
+            WeightFormat::Nvfp4,
+            2048,
+            6144,
+            0,
+            2048,
+            m,
+            ActPolicy::A16Only,
+        )?;
+        s.linear_swiglu_with(
+            WeightFormat::Nvfp4,
+            2048,
+            6144,
+            0,
+            m,
+            false,
+            false,
+            ActPolicy::A16Only,
+        )?;
+    }
     // Batched drafting with A16-only NVFP4 weights (draft model, proposal head): 17..96 rows.
     for m in [21, 42, 48, 96] {
         s.linear_act(
@@ -3296,7 +3328,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             }
         }
     }
-    let stack = qwen4::qwen4_stack(b, &mut s.rng)?;
+    // Its own seed: the synthetic model must not change when cases are added before it.
+    let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);
     Ok(s.results)
 }
