@@ -74,17 +74,12 @@ hybrid GDN/attention stack and differ only in each block's FFN, so they are one 
 - `TextConfig::ffn` is `FfnConfig::Dense { intermediate }` or `FfnConfig::Moe(MoeConfig)`; the
   two field sets are mutually exclusive, as ninfer's converter writes them.
 - `Layer::ffn` is `Ffn::Dense(DenseFfn)` or `Ffn::Moe(MoeFfn)`. Routed experts load as
-  `ExpertBank`s: one parent in its stored encoding, expert `e` at a constant row stride, so a
-  kernel addresses any expert without gathering or repacking.
+  `[gate | up | down]` records in system RAM behind the shared expert cache
+  (`velox_models::experts`), so a model larger than device memory runs with its most selected
+  experts in device slots.
 - `Qwen35Text::mlp` is the single dispatch point; chunked prefill, verify, batched verify and MTP
   all reach the FFN through it. The engine, sessions, KV cache, context store and speculative
   decoding see no difference between the two.
-
-MoE execution is not implemented yet: a MoE block returns `Error::Unsupported`, and `velox
-serve` answers 501 for the architecture. It lands like any op, on main with a CPU reference,
-portable kernels, `CudaKernels` defaults and conformance cases (planned contract in
-[qwen3_5-text.md](qwen3_5-text.md#sparse-moe-qwen3_5moeforcausallm)); branches then tune the
-expert GEMMs.
 
 `Qwen4ExpForConditionalGeneration` (Qwen3.8-Flash-Next) is a separate model,
 `velox_models::qwen4_exp` ([qwen4_exp.md](qwen4_exp.md)): hyper-connection residual streams,

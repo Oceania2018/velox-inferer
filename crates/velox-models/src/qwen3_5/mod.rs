@@ -5,6 +5,7 @@
 mod config;
 mod dflash;
 pub mod gguf;
+pub mod hf;
 mod mtp;
 mod paging;
 mod vision;
@@ -825,7 +826,12 @@ impl Default for ExpertPolicy {
 }
 
 struct Experts<B: Backend> {
+    /// The stack's MoE layers (record sets `0..main`), with device slots.
     cache: ExpertCache<B>,
+    main: usize,
+    /// Sets past the stack's (the MTP layer's, often stored wider): read from system RAM, so
+    /// they do not size the stack's slots.
+    rest: ExpertCache<B>,
     policy: ExpertPolicy,
     /// Tokens run since the last update.
     pending: usize,
@@ -850,8 +856,27 @@ impl<B: Backend> Qwen35Text<B> {
         }
     }
 
-    /// Bytes of one expert slot: the largest record of any MoE layer (0 for a dense model).
+    /// Record sets of the stack's MoE layers (the first ones; the MTP layer's come after).
+    fn main_expert_sets(&self) -> usize {
+        self.w
+            .layers
+            .iter()
+            .filter(|l| matches!(l.ffn, Ffn::Moe(_)))
+            .count()
+    }
+
+    /// Bytes of one expert slot: the largest record of the stack's MoE layers (0 for a dense
+    /// model).
     pub fn expert_slot_bytes(&self) -> usize {
+        self.w.experts[..self.main_expert_sets()]
+            .iter()
+            .map(|r| r.record_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The largest record of any set (the MTP layer's included).
+    fn max_record_bytes(&self) -> usize {
         self.w
             .experts
             .iter()
@@ -866,15 +891,19 @@ impl<B: Backend> Qwen35Text<B> {
         let FfnConfig::Moe(m) = self.cfg.ffn else {
             return Ok(());
         };
-        let cache = ExpertCache::new(
+        let main = self.main_expert_sets();
+        let cache = ExpertCache::new(b, main, m.experts, self.expert_slot_bytes().max(16), slots)?;
+        let rest = ExpertCache::new(
             b,
-            self.w.experts.len(),
+            self.w.experts.len() - main,
             m.experts,
-            self.expert_slot_bytes().max(16),
-            slots,
+            self.max_record_bytes().max(16),
+            0,
         )?;
         self.experts = Some(Mutex::new(Experts {
             cache,
+            main,
+            rest,
             policy,
             pending: 0,
             report: CacheReport::default(),
@@ -903,7 +932,7 @@ impl<B: Backend> Qwen35Text<B> {
             } else {
                 e.policy.moves
             };
-            let recs: Vec<_> = self.w.experts.iter().collect();
+            let recs: Vec<_> = self.w.experts[..e.main].iter().collect();
             let r = e.cache.update(b, &recs, moves)?;
             e.report.hits += r.hits;
             e.report.misses += r.misses;
@@ -1117,7 +1146,7 @@ impl<B: Backend> Qwen35Text<B> {
         };
         let (e, k, sets) = (mc.experts, mc.top_k, self.w.experts.len());
         // Scratch for the largest any layer's experts need (a probe cache without slots).
-        let probe = ExpertCache::new(b, sets, e, self.expert_slot_bytes().max(16), 0)?;
+        let probe = ExpertCache::new(b, sets, e, self.max_record_bytes().max(16), 0)?;
         let scratch = (0..sets)
             .map(|i| b.moe_scratch_len(&probe.bank(i, &self.w.experts[i]), t, k))
             .max()
@@ -1889,11 +1918,22 @@ impl<B: Backend> Qwen35Text<B> {
             },
         )?;
         let mut ex = experts.lock().expect("expert cache lock");
+        let ex = &mut *ex;
+        // Stack layers count selections for their cache; the MTP layer's are not counted.
+        let (cache, l, counts) = if m.experts < ex.main {
+            (&mut ex.cache, m.experts, true)
+        } else {
+            (&mut ex.rest, m.experts - ex.main, false)
+        };
         b.moe_route(
             &mb.logits,
             &mut mb.ids,
             &mut mb.wts,
-            Some(ex.cache.counts_mut(m.experts)),
+            if counts {
+                Some(cache.counts_mut(l))
+            } else {
+                None
+            },
             MoeRouteShape {
                 rows: t,
                 row_len,
@@ -1901,7 +1941,7 @@ impl<B: Backend> Qwen35Text<B> {
                 k,
             },
         )?;
-        let bank = ex.cache.bank(m.experts, &self.w.experts[m.experts]);
+        let bank = cache.bank(l, &self.w.experts[m.experts]);
         b.moe_experts(
             &ws.h,
             &mb.ids,

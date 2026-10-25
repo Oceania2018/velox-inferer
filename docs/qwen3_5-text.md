@@ -88,29 +88,28 @@ routed = sum_j w_j * down[e_j](silu(gate[e_j](h)) * up[e_j](h))
 y      = routed + sigmoid(shared_score . h) * shared_down(silu(shared_gate(h)) * shared_up(h))
 ```
 
-The shared expert always runs and is outside the top-k. Bindings and the layout ninfer's
-converter packs them into:
+The shared expert always runs and is outside the top-k. Bindings:
 
 | Binding (`text/layers/i/` + ...) | Shape | Stored as |
 |---|---|---|
-| `moe/router`, `moe/shared_score` | `[E, H]`, `[1, H]` | one parent `[E + 1, H]` (BF16) |
-| `moe/experts/e/gate`, `.../up` | `[I, H]` each | one parent `[E * 2I, H]`: gate at row `2eI`, up at `(2e + 1)I` (Q4 G64) |
-| `moe/experts/e/down` | `[H, I]` | one parent `[E * H, I]`, expert at row `eH` (Q5/Q6 G64) |
+| `moe/router`, `moe/shared_score` | `[E, H]`, `[1, H]` | one parent `[E + 1, H]` (BF16): one GEMM, `row_len = E + 1` |
+| `moe/experts/e/{gate,up}` | `[I, H]` each | whole objects per expert (NVFP4 from the HF NVFP4 checkpoint), or row ranges of BF16/F32/GGML parents |
+| `moe/experts/e/down` | `[H, I]` | likewise |
 | `moe/shared/{gate,up,down}` | `[I_s, H]`, `[I_s, H]`, `[H, I_s]` | as a Dense MLP |
 
-The loader accepts any layout in which each role's experts sit at a constant row stride of one
-parent (`ExpertBank`), and refuses others. MTP (`Qwen3_5MoeMTP`) uses the same MoE block.
+Routed experts never become device parents: the loader reads each expert's three matrices into
+one `[gate | up | down]` record (each matrix 256-aligned, records a multiple of 16 bytes) in pinned
+system RAM, `TextWeights::experts` (one record set per MoE layer, the MTP layer's last). The
+device reads them directly or from the slots of the shared `velox_models::experts::ExpertCache`
+(as Qwen4-Exp, docs/qwen4_exp.md#expert-offload): `Qwen35Text::enable_experts(slots, policy)`
+before running; every step entry point (`advance*`, `verify*`, `mixed_step`) first lets the cache
+move experts when the policy says so (outside graph recording). `velox generate` / `serve` size the
+slots from free device memory (`--vram-margin-mib`, `--expert-slots`, `--cache-interval`,
+`--cache-moves`). MTP (`Qwen3_5MoeMTP`) uses the same MoE block.
 
-Planned op contract (not implemented; lands with CPU reference, portable kernels and conformance):
-
-- `moe_route(logits [T, row_len], experts, k) -> ids [T, k], weights [T, k]` on the device: the
-  softmax / top-k / renormalisation above over the first `experts` columns (the router and
-  shared-score rows run as one linear, so `row_len = E + 1`). Routing stays on the device so
-  recorded graph steps can replay it.
-- `moe_experts(x, ids, weights, gate, up, down banks) : y += routed`, with an `ActQuant` report
-  like `linear_act` for tuned low-precision kernels. Separate from routing so conformance can
-  feed both sides identical routes (near-tie logits may otherwise select different experts).
-- `sigmoid_scale_rows`: the shared expert's per-token scalar gate.
+The FFN (`Qwen35Text::moe_ffn`): the shared expert into `y` (dense SwiGLU scratch), gated by
+`sigmoid_scale_rows`; router logits; `moe_route` (softmax / top-k / renormalisation over the first
+`E` columns on the device, counting selections for the cache); `moe_experts` into `y`; add.
 
 ## Embedding, head, precision
 

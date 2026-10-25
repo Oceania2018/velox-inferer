@@ -69,6 +69,9 @@ COMMANDS:
   import-gguf             Qwen3.5/3.8 GGUF text weights + a donor artifact's config, tokenizer,
                           vision tower and DFlash2 drafter -> .vi (GGML blocks kept as stored)
       --gguf <path> --donor <.ninfer|.vi> --output <.vi>
+  import-hf               Qwen3.5/3.6 Hugging Face checkpoint (safetensors; BF16, compressed-tensors
+                          FP8 / NVFP4) text stack, MTP head, tokenizer and chat template -> .vi
+      --hf-dir <dir> --output <.vi>
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
@@ -145,6 +148,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
         Some("import-gguf") => weights::import_gguf(a),
+        Some("import-hf") => weights::import_hf(a),
         Some("generate") => generate::run(a),
         Some("serve") => serve::run(a),
         Some("prompt-debug") => prompt_debug::run(a),

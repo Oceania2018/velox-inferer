@@ -523,7 +523,7 @@ pub(crate) fn enable_experts<B: Backend>(
         ..ExpertPolicy::default()
     };
     model.enable_experts(b, slots, policy)?;
-    let total = model.w.experts.len() * model.cfg_experts();
+    let total = model.cfg.layers.len() * model.cfg_experts();
     eprintln!(
         "expert cache: {slots} slots of {:.2} MiB ({:.2} GB, {:.1}% of {total} experts)",
         slot as f64 / (1 << 20) as f64,
