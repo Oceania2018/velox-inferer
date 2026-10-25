@@ -82,6 +82,7 @@ COMMANDS:
       [--expert-slots <n>] [--cache-interval 16] [--cache-moves 64] (decode cache updates)
       [--expert-stats <file>] (JSON selections per layer and expert, after the run)
       [--show-top N] (logprobs of the N best first tokens) [--assistant-prefix <text>]
+      [--ple-threads 32] (parallel reads of the PLE n-gram table)
   serve                  OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
