@@ -579,9 +579,9 @@ fn q8_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
         return None;
     }
     if let WeightFormat::Ggml(t) = w.format {
-        // Blocks of a row start 4-byte aligned: K % 1024 for every type, any K % 256 for types
-        // whose blocks are 4-byte multiples (IQ4_XS, Q4_K, Q2_K, IQ1_M) at K % 512.
-        let aligned = w.k % 1024 == 0 || (w.k % 512 == 0 && t.block_bytes() % 4 == 0);
+        // The prefill kernel copies each block from the 4-byte aligned address at or below it,
+        // which stays inside the row when rows are 4-byte multiples.
+        let aligned = w.k % 1024 == 0 || t.row_bytes(w.k) % 4 == 0;
         return (ggml_served(t) && m >= GGML_Q8_MIN_M && aligned)
             .then(|| 16 + ggml_index(t));
     }

@@ -1432,9 +1432,9 @@ extern "C" int velox_5060_q8_view(const void* blob, int m, long long k, int layo
 // is null, else a caller blob (an int8 twin). mode 1 writes silu(y) * that. k % 1024 == 0.
 VELOX_API int velox_5060_linear_ggml_q8(const void* blob, int m, const uint8_t* w, int type, long long k,
                                         long long row_begin, int rows, float* y, long long ldy, int mode) {
-    // Every block of a row 4-byte aligned: K % 1024, or blocks of a 4-byte multiple.
+    // Rows of a 4-byte multiple: blocks are copied from the aligned address at or below them.
     if (m < 1 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || type < 0 || type > 8 || mode < 0 || mode > 1 ||
-        (k % 1024 != 0 && (k % 512 != 0 || block_bytes(type) % 4 != 0)) || reinterpret_cast<uintptr_t>(w) % 16 != 0)
+        (k % 1024 != 0 && (k / 256 * block_bytes(type)) % 4 != 0) || reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const int8_t* xq;
     const float* sx;
