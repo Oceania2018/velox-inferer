@@ -46,6 +46,9 @@ pub struct ExpertCache<B: Backend> {
     totals: Vec<Vec<u64>>,
     /// Score kept per update: an expert's score is its decayed selection count.
     pub decay: f32,
+    /// When set, each update appends the selections it folded in as `(layer, expert, count)`
+    /// (routing traces for studying cache policies offline).
+    pub trace: Option<Vec<Vec<(u16, u16, u32)>>>,
 }
 
 impl<B: Backend> ExpertCache<B> {
@@ -72,7 +75,8 @@ impl<B: Backend> ExpertCache<B> {
             owner: vec![None; capacity],
             score: vec![vec![0.0; experts]; layers],
             totals: vec![vec![0; experts]; layers],
-            decay: 0.9,
+            decay: 0.7,
+            trace: None,
         })
     }
 
@@ -111,10 +115,14 @@ impl<B: Backend> ExpertCache<B> {
         let zeros = vec![0f32; experts];
         let mut host = vec![0f32; experts];
         b.synchronize()?;
+        let mut seen = Vec::new();
         for l in 0..self.counts.len() {
             b.download(&self.counts[l], &mut host)?;
             for (e, &c) in host.iter().enumerate() {
                 let c = c as u64;
+                if c > 0 && self.trace.is_some() {
+                    seen.push((l as u16, e as u16, c as u32));
+                }
                 if self.host_map[l][e] >= 0 {
                     report.hits += c;
                 } else {
@@ -126,6 +134,9 @@ impl<B: Backend> ExpertCache<B> {
             if host.iter().any(|&c| c != 0.0) {
                 b.write_at(&mut self.counts[l], 0, &zeros)?;
             }
+        }
+        if let Some(t) = &mut self.trace {
+            t.push(seen);
         }
         // Candidates best first; residents worst first; free slots before any eviction.
         let mut wanted: Vec<(f32, usize, usize)> = Vec::new();

@@ -8,7 +8,10 @@ use std::time::Instant;
 use serde_json::json;
 use velox_core::{Backend, Error, KvFormat, Result};
 use velox_frontend::Frontend;
-use velox_models::qwen4_exp::{load, load_mtp, ExpertCache, Qwen4Config, Qwen4Exp, Shards};
+use velox_models::qwen4_exp::{
+    load, load_mtp, ExpertCache, Mtp, MtpSession, Qwen4Config, Qwen4Exp, Shards, Workspace,
+    VERIFY_MAX,
+};
 
 use crate::args::Args;
 
@@ -27,8 +30,16 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
     let margin_mib: usize = a.parse("vram-margin-mib", 768)?;
     let max_slots: usize = a.parse("expert-slots", usize::MAX)?;
     // Decode steps between expert cache updates, and experts moved per update at most.
-    let interval: usize = a.parse("cache-interval", 16)?;
-    let moves: usize = a.parse("cache-moves", 64)?;
+    let interval: usize = a.parse("cache-interval", 8)?;
+    let moves: usize = a.parse("cache-moves", 512)?;
+    // Drafts per verify (the MTP layer chained on its own residual past the first).
+    let n_drafts: usize = a.parse("mtp-drafts", 2)?;
+    if n_drafts == 0 || n_drafts >= VERIFY_MAX {
+        return Err(Error::Config(format!(
+            "--mtp-drafts must be 1..{}",
+            VERIFY_MAX - 1
+        )));
+    }
     let template = match a.get("chat-template") {
         Some(p) => {
             Some(std::fs::read_to_string(p).map_err(|e| Error::Config(format!("{p}: {e}")))?)
@@ -99,6 +110,13 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
     let free = b.mem_info().map_or(0, |(free, _)| free);
     let slots = (free.saturating_sub(margin_mib << 20) / slot_bytes).min(max_slots);
     let mut cache = ExpertCache::new(b, layers, experts, slot_bytes, slots)?;
+    cache.decay = a.parse("cache-decay", cache.decay)?;
+    // Per prompt, the trace index of its prefill update and its end.
+    let trace_path = a.get("expert-trace");
+    if trace_path.is_some() {
+        cache.trace = Some(Vec::new());
+    }
+    let mut trace_spans = Vec::new();
     eprintln!(
         "expert cache: {slots} slots of {:.2} MiB ({:.2} GB, {:.1}% of {} experts)",
         slot_bytes as f64 / (1 << 20) as f64,
@@ -155,17 +173,18 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
             }
         }
         let mut next = model.argmax(b, &mut ws, limit)?;
-        // The draft for the token after `next`.
-        let mut draft = None;
+        // The drafts for the tokens after `next`.
+        let mut drafts = Vec::new();
         if let (Some((m, ms)), Some((pos0, n))) = (mtp.as_mut(), pending) {
             let mut toks: Vec<u32> = ids[pos0 + 1..pos0 + n].to_vec();
             toks.push(next);
             model.mtp_forward(b, m, ms, &mut ws, pos0, &toks)?;
-            draft = Some(model.argmax(b, &mut ws, limit)?);
+            drafts = chain_drafts(b, &model, m, ms, &mut ws, session.pos, n_drafts, limit)?;
         }
         let prefill = t1.elapsed().as_secs_f64();
         // The prompt's routing decides the first placement.
         let filled = cache.update(b, &model.w, usize::MAX)?;
+        let trace_start = cache.trace.as_ref().map_or(0, |t| t.len() - 1);
         let fill = t1.elapsed().as_secs_f64() - prefill;
         on_phase("prefill");
         let mut out = Vec::new();
@@ -173,7 +192,7 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
         let (mut rounds, mut accepted) = (0usize, 0usize);
         let mut since_update = 0;
         let t2 = Instant::now();
-        while let (Some((m, ms)), Some(d)) = (mtp.as_mut(), draft) {
+        while let Some((m, ms)) = mtp.as_mut() {
             if fe.is_eos(next) || out.len() >= max_tokens {
                 break;
             }
@@ -181,31 +200,33 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
             if out.len() >= max_tokens {
                 break;
             }
-            // Verify [next, d]: row 0 predicts the token after next, row 1 the one after d.
+            // Verify [next, drafts]: row j predicts the token after the window's j-th.
             let pos0 = session.pos;
-            let window = [next, d];
+            let mut window = vec![next];
+            window.extend_from_slice(&drafts);
             model.verify(b, &mut session, &mut ws, &mut cache, &window)?;
-            let best = model.argmax_rows(b, &ws, 2, limit)?;
+            let best = model.argmax_rows(b, &ws, window.len(), limit)?;
+            let n = drafts.iter().zip(&best).take_while(|(d, g)| d == g).count();
             rounds += 1;
-            let toks = if best[0] == d {
-                accepted += 1;
-                model.commit(b, &mut session, &window, 2)?;
-                next = best[1];
-                if fe.is_eos(d) {
+            accepted += n;
+            model.commit(b, &mut session, &window, n + 1)?;
+            next = best[n];
+            let mut stop = false;
+            for &d in &drafts[..n] {
+                if fe.is_eos(d) || out.len() >= max_tokens {
+                    stop = true;
                     break;
                 }
                 out.push(d);
-                if out.len() >= max_tokens {
-                    break;
-                }
-                vec![d, next]
-            } else {
-                model.commit(b, &mut session, &window, 1)?;
-                next = best[0];
-                vec![next]
-            };
+            }
+            if stop || out.len() >= max_tokens {
+                break;
+            }
+            // MTP entries for the kept positions: h of row j with the token after it.
+            let mut toks = drafts[..n].to_vec();
+            toks.push(next);
             model.mtp_forward(b, m, ms, &mut ws, pos0, &toks)?;
-            draft = Some(model.argmax(b, &mut ws, limit)?);
+            drafts = chain_drafts(b, &model, m, ms, &mut ws, session.pos, n_drafts, limit)?;
             since_update += toks.len();
             if since_update >= interval {
                 since_update = 0;
@@ -226,6 +247,15 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
             }
         }
         let decode = t2.elapsed().as_secs_f64();
+        if cache.trace.is_some() {
+            // Fold the tail in so the trace covers every generated token.
+            cache.update(b, &model.w, 0)?;
+            trace_spans.push((
+                trace_start,
+                cache.trace.as_ref().map_or(0, Vec::len),
+                out.len(),
+            ));
+        }
         on_phase("decode");
         let hit_rate = hits as f64 / (hits + misses).max(1) as f64;
         let text = fe.decode(&out)?;
@@ -233,7 +263,8 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
             let line = json!({"prompt": p, "prompt_tokens": ids.len(), "ids": out, "text": text,
                               "prefill_s": prefill, "decode_tps": out.len() as f64 / decode.max(1e-9),
                               "expert_hit_rate": hit_rate,
-                              "mtp_accept": accepted as f64 / rounds.max(1) as f64});
+                              "mtp_accept": accepted as f64 / rounds.max(1) as f64 / n_drafts as f64,
+                              "mtp_per_verify": accepted as f64 / rounds.max(1) as f64});
             println!("{line}");
         } else {
             println!(
@@ -254,13 +285,19 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
             );
             if rounds > 0 {
                 println!(
-                    "mtp       {rounds} verifies, {accepted} drafts accepted ({:.1}%)",
-                    100.0 * accepted as f64 / rounds as f64
+                    "mtp       {rounds} verifies, {accepted} drafts accepted ({:.2} per verify)",
+                    accepted as f64 / rounds as f64
                 );
             }
             println!("ids       {out:?}");
             println!("text      {text:?}");
         }
+    }
+    if let (Some(path), Some(t)) = (trace_path, &cache.trace) {
+        // {"slots", "experts", "prompts": [[prefill update, end, tokens]], "updates": [[[l, e, n]]]}
+        let v = json!({"slots": cache.capacity, "layers": layers, "experts": experts,
+                       "interval": interval, "prompts": trace_spans, "updates": t});
+        std::fs::write(path, v.to_string()).map_err(|e| Error::Config(format!("{path}: {e}")))?;
     }
     if let Some(path) = a.get("expert-stats") {
         // Fold the counts since the last update in (no moves).
@@ -270,4 +307,25 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
         std::fs::write(path, v).map_err(|e| Error::Config(format!("{path}: {e}")))?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `n` greedy drafts after the last MTP entry (whose logits are in `ws`), the first at session
+/// position `pos + 1`: each further one chains the MTP layer on its own residual.
+#[allow(clippy::too_many_arguments)]
+fn chain_drafts<B: Backend>(
+    b: &B,
+    model: &Qwen4Exp<B>,
+    m: &mut Mtp<B>,
+    ms: &mut MtpSession<B>,
+    ws: &mut Workspace<B>,
+    pos: usize,
+    n: usize,
+    limit: usize,
+) -> Result<Vec<u32>> {
+    let mut drafts = vec![model.argmax(b, ws, limit)?];
+    for i in 1..n {
+        model.mtp_chain(b, m, ms, ws, pos + i - 1, drafts[i - 1])?;
+        drafts.push(model.argmax(b, ws, limit)?);
+    }
+    Ok(drafts)
 }

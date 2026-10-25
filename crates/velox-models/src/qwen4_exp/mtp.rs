@@ -13,6 +13,9 @@ use velox_core::{Backend, Error, HcCombineShape, KvFormat, NormKind, Result};
 use super::load::MtpWeights;
 use super::{lin, static_key, ExpertCache, LayerState, Qwen4Exp, Workspace, GRAPH_MTP};
 
+/// Graph key bit of chained MTP entries.
+const GRAPH_MTP_CHAIN: u64 = 1 << 12;
+
 pub struct Mtp<B: Backend> {
     pub w: MtpWeights<B>,
     /// The MTP layer's experts are always read from system RAM (no device slots).
@@ -93,12 +96,42 @@ impl<B: Backend> Qwen4Exp<B> {
         }
         // Decode-sized entries on dense attention replay one recording per row count.
         match static_key(c, GRAPH_MTP, pos0, t) {
-            Some(key) => b.graph(key, &mut || self.mtp_step(b, m, ms, ws, pos0, ids)),
-            None => self.mtp_step(b, m, ms, ws, pos0, ids),
+            Some(key) => b.graph(key, &mut || self.mtp_step(b, m, ms, ws, pos0, ids, false)),
+            None => self.mtp_step(b, m, ms, ws, pos0, ids, false),
         }
     }
 
-    /// The device work of [`Self::mtp_forward`] (no host waits: it may be recorded).
+    /// Chains one more draft: entry `pos` from the last MTP entry's own residual (in place of the
+    /// main model's, which the drafted tokens do not have yet) and token `id`. Its logits end up
+    /// in `ws.logits`. The entry is provisional: the entries written once `pos` is committed
+    /// replace it.
+    pub fn mtp_chain(
+        &self,
+        b: &B,
+        m: &mut Mtp<B>,
+        ms: &mut MtpSession<B>,
+        ws: &mut Workspace<B>,
+        pos: usize,
+        id: u32,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        if pos + 1 > ms.capacity {
+            return Err(Error::Shape(format!(
+                "MTP entry {pos} past capacity {}",
+                ms.capacity
+            )));
+        }
+        let ids = [id];
+        match static_key(c, GRAPH_MTP | GRAPH_MTP_CHAIN, pos, 1) {
+            Some(key) => b.graph(key, &mut || self.mtp_step(b, m, ms, ws, pos, &ids, true)),
+            None => self.mtp_step(b, m, ms, ws, pos, &ids, true),
+        }
+    }
+
+    /// The device work of [`Self::mtp_forward`] and, with `chain`, of [`Self::mtp_chain`] (the
+    /// hidden rows come from the last entry's residual in `ws.last`). No host waits: it may be
+    /// recorded.
+    #[allow(clippy::too_many_arguments)]
     fn mtp_step(
         &self,
         b: &B,
@@ -107,11 +140,16 @@ impl<B: Backend> Qwen4Exp<B> {
         ws: &mut Workspace<B>,
         pos0: usize,
         ids: &[u32],
+        chain: bool,
     ) -> Result<()> {
         let c = &self.cfg;
         let t = ids.len();
         let (h, st, wide, eps) = (c.hidden, c.streams, c.wide(), c.eps);
-        b.copy(&ws.r, 0, &mut ms.h, 0, t * wide)?;
+        if chain {
+            b.copy(&ws.last, 0, &mut ms.h, 0, wide)?;
+        } else {
+            b.copy(&ws.r, 0, &mut ms.h, 0, t * wide)?;
+        }
         // r_s = fc_h(norm_s(h_s)) over the t * streams rows, plus fc_e(norm(embed(x))) per stream.
         b.rms_norm_groups(&ms.h, &m.w.hnorm, &mut ws.xn, t, st, h, eps)?;
         lin(b, &ws.xn, &m.w.fc_h, &mut ws.r, t * st)?;
