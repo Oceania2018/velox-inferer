@@ -1961,7 +1961,8 @@ impl Backend for CudaBackend {
         shape: DilatedConvShape,
     ) -> Result<()> {
         check::conv1d_dilated(x.len, weight.len, state.len, out.len, &shape)?;
-        self.timed("conv1d_dilated_silu", || {
+        // Stages its state for graph steps: runs (to stage) in replays too.
+        self.staged("conv1d_dilated_silu", || {
             self.kernels
                 .conv1d_dilated_silu(x, weight, state, out, shape)
         })
@@ -2035,7 +2036,8 @@ impl Backend for CudaBackend {
         shape: QsaPoolShape,
     ) -> Result<()> {
         check::qsa_pool(raw.len, weight.len, pooled.len, &shape)?;
-        self.timed("qsa_pool", || {
+        // Stages its first block and caches for graph steps: runs (to stage) in replays too.
+        self.staged("qsa_pool", || {
             self.kernels.qsa_pool(raw, weight, pooled, shape)
         })
     }
