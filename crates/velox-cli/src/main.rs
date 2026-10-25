@@ -389,6 +389,9 @@ fn bench_moe(a: &Args) -> Result<ExitCode> {
     use velox_core::{Error, WeightFormat};
     let fmt = |key: &str, default: &str| -> Result<WeightFormat> {
         let name = a.get(key).unwrap_or(default);
+        if name == "nvfp4" {
+            return Ok(WeightFormat::Nvfp4);
+        }
         velox_core::ggml::GgmlType::from_name(name)
             .map(WeightFormat::Ggml)
             .ok_or_else(|| Error::Config(format!("unknown --{key} {name} (ggml_<type>)")))

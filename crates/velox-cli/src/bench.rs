@@ -180,15 +180,24 @@ pub struct MoeConfig {
 pub fn run_moe<B: Backend>(b: &B, c: &MoeConfig) -> Result<()> {
     use velox_core::{ActPolicy, ExpertBank, ExpertMatrix};
     let mut rng = Rng::new(13);
-    let gb = c.gate.payload_bytes(c.width, c.hidden);
+    // TEMP: NVFP4 records place each matrix at a 256-byte offset (Qwen3.6-35B-A3B layout).
+    let al = |n: usize| {
+        if c.gate == velox_core::WeightFormat::Nvfp4 {
+            n.div_ceil(256) * 256
+        } else {
+            n
+        }
+    };
+    let gb = al(c.gate.payload_bytes(c.width, c.hidden));
     let db = c.down.payload_bytes(c.hidden, c.width);
     let record_bytes = (2 * gb + db).div_ceil(16) * 16;
     let one = {
         let mut r = vec![0u8; record_bytes];
-        r[..gb].copy_from_slice(&velox_conformance::random_weight(
+        let gp = c.gate.payload_bytes(c.width, c.hidden);
+        r[..gp].copy_from_slice(&velox_conformance::random_weight(
             &mut rng, c.gate, c.width, c.hidden,
         ));
-        r[gb..2 * gb].copy_from_slice(&velox_conformance::random_weight(
+        r[gb..gb + gp].copy_from_slice(&velox_conformance::random_weight(
             &mut rng, c.gate, c.width, c.hidden,
         ));
         r[2 * gb..2 * gb + db].copy_from_slice(&velox_conformance::random_weight(
