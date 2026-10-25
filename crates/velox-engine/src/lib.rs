@@ -1435,6 +1435,10 @@ impl<B: Backend> Core<B> {
                 a.out.len(),
                 a.out.len() as f64 / rounds.max(1) as f64
             );
+            // Cumulative since load: diff consecutive lines for a request's own hit rate.
+            if let Some(r) = self.model.expert_report() {
+                eprintln!("[experts] hits {} misses {} moves {}", r.hits, r.misses, r.moves);
+            }
         }
         let _ = a.job.reply.send(Reply::Done(Ok(Done {
             out: a.out,
