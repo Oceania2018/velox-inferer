@@ -104,8 +104,12 @@ device reads them directly or from the slots of the shared `velox_models::expert
 (as Qwen4-Exp, docs/qwen4_exp.md#expert-offload): `Qwen35Text::enable_experts(slots, policy)`
 before running; every step entry point (`advance*`, `verify*`, `mixed_step`) first lets the cache
 move experts when the policy says so (outside graph recording). `velox generate` / `serve` size the
-slots from free device memory (`--vram-margin-mib`, `--expert-slots`, `--cache-interval`,
-`--cache-moves`). MTP (`Qwen3_5MoeMTP`) uses the same MoE block.
+slots from free device memory (`--vram-margin-mib`, serve default 1536; `--expert-slots`,
+`--cache-interval`, `--cache-moves`). The cache scores weight reads, an expert once per forward
+step however many rows select it (`--cache-score-reads 0` scores selections): a 1024-row prefill
+chunk reads each expert once, and counting its rows let image prompts evict the experts decode
+keeps reading (Qwen3.6-35B-A3B CUA replay, MTP 2: 106 -> 119 tok/s). MTP (`Qwen3_5MoeMTP`) uses
+the same MoE block.
 
 The FFN (`Qwen35Text::moe_ffn`): the shared expert into `y` (dense SwiGLU scratch), gated by
 `sigmoid_scale_rows`; router logits; `moe_route` (softmax / top-k / renormalisation over the first

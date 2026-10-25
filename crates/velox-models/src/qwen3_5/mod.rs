@@ -823,7 +823,7 @@ impl Default for ExpertPolicy {
             interval: 8,
             moves: 512,
             prompt: 64,
-            reads: false,
+            reads: true,
         }
     }
 }
