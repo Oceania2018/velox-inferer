@@ -115,7 +115,17 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
     let mut ws = model.workspace(b, chunk)?;
     enable_experts(b, &mut model, a, 1536)?;
 
+    let report_experts = |model: &Qwen35Text<B>| {
+        if let Some(r) = model.expert_report() {
+            eprintln!(
+                "experts   {:.1}% of selections from device slots so far, {} moves",
+                100.0 * r.hit_rate(),
+                r.moves
+            );
+        }
+    };
     for input in inputs {
+        report_experts(&model);
         let (prompt, ids) = match input {
             Input::Prompt(p) => {
                 let text = fe.template.render(
@@ -237,6 +247,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             println!("text      {text:?}");
         }
     }
+    report_experts(&model);
     Ok(ExitCode::SUCCESS)
 }
 
