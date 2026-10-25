@@ -51,6 +51,11 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
         }
     };
     let jsonl = a.get("prompts-file").is_some();
+    // Log-probabilities of the best candidates for the first generated position (comparing with
+    // another engine's logprobs at a divergence).
+    let show_top: usize = a.parse("show-top", 0)?;
+    // Text appended after the rendered prompt (e.g. the shared start of two engines' answers).
+    let prefix = a.get("assistant-prefix").unwrap_or("").to_string();
 
     eprintln!("backend {}", b.describe());
     let t0 = Instant::now();
@@ -90,10 +95,19 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
         let text =
             fe.template
                 .render(&json!([{"role": "user", "content": p}]), None, false, true)?;
-        let ids = fe.encode(&text)?;
+        let ids = fe.encode(&(text + &prefix))?;
         let t1 = Instant::now();
         for part in ids.chunks(ws.max_tokens) {
             model.forward(b, &mut session, &mut ws, &mut cache, part)?;
+        }
+        if show_top > 0 {
+            let logits = model.logits(b, &ws)?;
+            let max = logits[..limit].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let lse = max as f64
+                + logits[..limit].iter().map(|&l| (f64::from(l - max)).exp()).sum::<f64>().ln();
+            for (id, l) in velox_core::backend::top_k_row(&logits[..limit], show_top) {
+                eprintln!("top {:>8} {:>8.3} {:?}", id, f64::from(l) - lse, fe.decode(&[id])?);
+            }
         }
         let mut next = model.argmax(b, &mut ws, limit)?;
         let prefill = t1.elapsed().as_secs_f64();
