@@ -42,6 +42,8 @@ pub struct ExpertCache<B: Backend> {
     /// (layer, expert) in each slot.
     owner: Vec<Option<(usize, usize)>>,
     score: Vec<Vec<f32>>,
+    /// Selections of each expert since the cache was made.
+    totals: Vec<Vec<u64>>,
     /// Score kept per update: an expert's score is its decayed selection count.
     pub decay: f32,
 }
@@ -69,6 +71,7 @@ impl<B: Backend> ExpertCache<B> {
             host_map: vec![vec![UNMAPPED; experts]; layers],
             owner: vec![None; capacity],
             score: vec![vec![0.0; experts]; layers],
+            totals: vec![vec![0; experts]; layers],
             decay: 0.9,
         })
     }
@@ -88,6 +91,11 @@ impl<B: Backend> ExpertCache<B> {
             down: rec.down,
             act: ActPolicy::AllowA8,
         }
+    }
+
+    /// Selections of every expert (`[layer][expert]`) counted by the updates so far.
+    pub fn totals(&self) -> &[Vec<u64>] {
+        &self.totals
     }
 
     /// Layer `l`'s selection counters, for `moe_route`.
@@ -113,6 +121,7 @@ impl<B: Backend> ExpertCache<B> {
                     report.misses += c;
                 }
                 self.score[l][e] = self.score[l][e] * self.decay + c as f32;
+                self.totals[l][e] += c;
             }
             if host.iter().any(|&c| c != 0.0) {
                 b.write_at(&mut self.counts[l], 0, &zeros)?;

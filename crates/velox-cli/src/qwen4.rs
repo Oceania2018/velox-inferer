@@ -146,5 +146,12 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
             println!("text      {text:?}");
         }
     }
+    if let Some(path) = a.get("expert-stats") {
+        // Fold the counts since the last update in (no moves).
+        cache.update(b, &model.w, 0)?;
+        // Selections per [layer][expert], for studying routing skew and cache policies.
+        let v = serde_json::to_string(cache.totals()).map_err(|e| Error::Config(e.to_string()))?;
+        std::fs::write(path, v).map_err(|e| Error::Config(format!("{path}: {e}")))?;
+    }
     Ok(ExitCode::SUCCESS)
 }
