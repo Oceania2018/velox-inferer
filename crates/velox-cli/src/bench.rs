@@ -162,6 +162,128 @@ pub fn run_linear<B: Backend>(b: &B, c: &LinearConfig) -> Result<()> {
     Ok(())
 }
 
+/// `velox bench-moe`: `moe_experts` over one layer's bank of random experts in system RAM, half of
+/// them copied into device slots, with each row's experts drawn so that a fraction `resident` of
+/// them has a slot: separates the device-memory and the mapped system-RAM cost.
+pub struct MoeConfig {
+    pub gate: velox_core::WeightFormat,
+    pub down: velox_core::WeightFormat,
+    pub experts: usize,
+    pub width: usize,
+    pub hidden: usize,
+    pub k: usize,
+    pub rows: Vec<usize>,
+    pub resident: Vec<f64>,
+    pub iters: usize,
+}
+
+pub fn run_moe<B: Backend>(b: &B, c: &MoeConfig) -> Result<()> {
+    use velox_core::{ActPolicy, ExpertBank, ExpertMatrix};
+    let mut rng = Rng::new(13);
+    let gb = c.gate.payload_bytes(c.width, c.hidden);
+    let db = c.down.payload_bytes(c.hidden, c.width);
+    let record_bytes = (2 * gb + db).div_ceil(16) * 16;
+    let one = {
+        let mut r = vec![0u8; record_bytes];
+        r[..gb].copy_from_slice(&velox_conformance::random_weight(&mut rng, c.gate, c.width, c.hidden));
+        r[gb..2 * gb].copy_from_slice(&velox_conformance::random_weight(&mut rng, c.gate, c.width, c.hidden));
+        r[2 * gb..2 * gb + db]
+            .copy_from_slice(&velox_conformance::random_weight(&mut rng, c.down, c.hidden, c.width));
+        r
+    };
+    // Every expert holds the same values (only placement is timed); the first half has slots.
+    let records = b.upload_bytes_host(&one.repeat(c.experts))?;
+    let half = c.experts / 2;
+    let slots = b.upload_bytes(&one.repeat(half))?;
+    let map: Vec<f32> = (0..c.experts)
+        .map(|e| f32::from_bits(if e < half { e as u32 } else { u32::MAX }))
+        .collect();
+    let map = b.upload(&map)?;
+    let m = |format, offset, rows, k| ExpertMatrix {
+        format,
+        offset,
+        rows,
+        k,
+    };
+    let bank = ExpertBank {
+        records: &records,
+        slots: &slots,
+        map: &map,
+        experts: c.experts,
+        slot_count: half,
+        slot_bytes: record_bytes,
+        record_bytes,
+        gate: m(c.gate, 0, c.width, c.hidden),
+        up: m(c.gate, gb, c.width, c.hidden),
+        down: m(c.down, 2 * gb, c.hidden, c.width),
+        act: ActPolicy::AllowA8,
+    };
+    println!(
+        "moe_experts {}/{} {} experts [{}, {}] k={}  {:.2} MB per expert  on {}",
+        c.gate.name(),
+        c.down.name(),
+        c.experts,
+        c.width,
+        c.hidden,
+        c.k,
+        record_bytes as f64 / 1e6,
+        b.describe()
+    );
+    for &rows in &c.rows {
+        for &frac in &c.resident {
+            let sets = 32;
+            let on = (c.k as f64 * frac).round() as usize;
+            let mut idsets = Vec::with_capacity(sets);
+            for _ in 0..sets {
+                let mut ids = Vec::with_capacity(rows * c.k);
+                for _ in 0..rows {
+                    let (mut a, mut z) = (rng.next_u64() as usize % half, rng.next_u64() as usize % half);
+                    for j in 0..c.k {
+                        let e = if j < on {
+                            a = (a + 7) % half;
+                            a
+                        } else {
+                            z = (z + 7) % half;
+                            half + z
+                        };
+                        ids.push(f32::from_bits(e as u32));
+                    }
+                }
+                idsets.push(b.upload(&ids)?);
+            }
+            let w = b.upload(&vec![1.0 / c.k as f32; rows * c.k])?;
+            let x = b.upload(&rng.vec(rows * c.hidden, 1.0))?;
+            let mut y = b.alloc(rows * c.hidden)?;
+            let mut scratch = b.alloc(b.moe_scratch_len(&bank, rows, c.k))?;
+            for ids in &idsets {
+                b.moe_experts(&x, ids, &w, &bank, &mut y, &mut scratch, rows, c.k)?;
+            }
+            b.synchronize()?;
+            let mut samples = Vec::new();
+            for _ in 0..c.iters.div_ceil(sets).max(3) {
+                let t0 = Instant::now();
+                for ids in &idsets {
+                    b.moe_experts(&x, ids, &w, &bank, &mut y, &mut scratch, rows, c.k)?;
+                }
+                b.synchronize()?;
+                samples.push(t0.elapsed().as_secs_f64() / sets as f64);
+            }
+            let t = median(samples);
+            let moved = (rows * c.k) as f64 * record_bytes as f64;
+            let host = (rows * (c.k - on)) as f64 * record_bytes as f64;
+            println!(
+                "  rows={rows:<3} resident {:>3.0}%  {:>8.1} us  {:>6.1} GB/s all  {:>5.1} GB/s system RAM part  act {:?}",
+                100.0 * frac,
+                t * 1e6,
+                moved / t / 1e9,
+                host / t / 1e9,
+                b.moe_experts_act(&bank, rows)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `velox bench-gdn`: one `gated_delta_net` call at a model head geometry with random inputs,
 /// timed per token count (decode/verify sizes and prefill chunks).
 pub struct GdnConfig {
