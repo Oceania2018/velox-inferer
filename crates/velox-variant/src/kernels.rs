@@ -558,6 +558,13 @@ fn bf16_skinny(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
         && w.k % 32 == 0
 }
 
+/// bf16 weights of many rows at prefill widths: bf16 tensor cores (rtx5060_bf16.cu).
+fn bf16_mma(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    w.format == WeightFormat::Bf16 && m >= BF16_MMA_MIN_M && w.k % 32 == 0 && !bf16_skinny(w, m)
+}
+
+const BF16_MMA_MIN_M: usize = 64;
+
 /// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
 fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     w.format == WeightFormat::Iq3Xxs && m >= 1
@@ -833,6 +840,16 @@ impl Rtx5060Kernels {
 
 extern "C" {
     fn velox_5060_moe_scratch(rows: i32, k: i32, width: i32, hidden: i32) -> i64;
+    fn velox_5060_linear_bf16_mma(
+        x: *const f32,
+        m: i32,
+        w: *const u16,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+        ldy: i64,
+    ) -> i32;
     fn velox_5060_moe_grouped_scratch(rows: i32, k: i32, width: i32, hidden: i32, experts: i32) -> i64;
     #[allow(clippy::too_many_arguments)]
     fn velox_5060_moe_grouped(
@@ -1190,7 +1207,7 @@ impl CudaKernels for Rtx5060Kernels {
         if skinny_iq3(w, m) || (m == 1 && skinny16_format(w, m).is_some()) {
             return ActQuant::Bf16;
         }
-        if bf16_skinny(w, m) {
+        if bf16_skinny(w, m) || bf16_mma(w, m) {
             return ActQuant::Bf16;
         }
         if m <= GEMV_MAX_M {
@@ -1958,6 +1975,23 @@ impl CudaKernels for Rtx5060Kernels {
                             )
                         },
                         "rtx5060 linear bf16 skinny",
+                    );
+                }
+                if bf16_mma(w, m) {
+                    return status(
+                        unsafe {
+                            velox_5060_linear_bf16_mma(
+                                x.as_ptr(),
+                                mi,
+                                w.buf.as_ptr().cast(),
+                                w.k as i64,
+                                w.row_begin as i64,
+                                rows,
+                                y.as_mut_ptr(),
+                                w.rows as i64,
+                            )
+                        },
+                        "rtx5060 linear bf16 mma",
                     );
                 }
                 if nvfp4_mma(w, m) {
