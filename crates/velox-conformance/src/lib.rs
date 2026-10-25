@@ -3183,6 +3183,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.moe_experts(Ggml(Iq2Xxs), Ggml(Q2_0), 24, 640, 2560, 8, 10, a8)?;
         s.moe_experts(Ggml(Iq1M), Ggml(Q2_0), 24, 640, 2560, 3, 10, a8)?;
         s.moe_experts(Ggml(Iq2S), Ggml(Q2_0), 24, 640, 2560, 40, 10, a8)?;
+        // The MTP head's IQ4_NL experts at decode, verify and prefill widths.
+        use velox_core::ggml::GgmlType::Iq4Nl;
+        for rows in [1, 2, 4, 16, 40] {
+            s.moe_experts(Ggml(Iq4Nl), Ggml(Iq4Nl), 24, 640, 2560, rows, 10, a8)?;
+        }
     }
     for (block0, blocks, ratio, dim, rot) in
         [(0, 1, 4, 128, 64), (5, 70, 4, 128, 64), (2, 9, 3, 40, 40)]
