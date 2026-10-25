@@ -18,7 +18,7 @@
 namespace {
 
 // velox_core::ggml::GgmlType::ALL order (main's VELOX_FMT_GGML_BASE + T).
-enum : int { kQ2K = 0, kQ4K, kIq1M, kIq2Xxs, kIq2Xs, kIq2S, kIq3Xxs, kIq3S, kIq4Xs, kQ2_0 };
+enum : int { kQ2K = 0, kQ4K, kIq1M, kIq2Xxs, kIq2Xs, kIq2S, kIq3Xxs, kIq3S, kIq4Xs, kQ2_0, kIq4Nl };
 
 __host__ __device__ constexpr int block_bytes(int t) {
     return t == kQ2K      ? 84
@@ -30,7 +30,15 @@ __host__ __device__ constexpr int block_bytes(int t) {
            : t == kIq3Xxs ? 98
            : t == kIq3S   ? 110
            : t == kQ2_0   ? 18
+           : t == kIq4Nl  ? 18
                           : 136;
+}
+
+// Values per stored block (the K granularity) and 32-value sub-blocks per block.
+__host__ __device__ constexpr int block_values(int t) { return t == kQ2_0 ? 64 : t == kIq4Nl ? 32 : 256; }
+template <int T>
+__host__ __device__ constexpr int sub_per_block() {
+    return block_values(T) / 32;
 }
 
 // Scale groups per 32-value sub-block (32 / G values each) and whether values carry an offset
@@ -116,6 +124,15 @@ __device__ __forceinline__ Sub<T> decode(const uint8_t* __restrict__ x, int ib) 
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int2 v = table16(u32_at2(qs + 4 * i), tab);
+            r.w[i] = v.x;      // values 4i .. 4i+3 (low nibbles)
+            r.w[4 + i] = v.y;  // values 16+4i .. (high nibbles)
+        }
+    } else if constexpr (T == kIq4Nl) {  // 32-value block: d | qs[16]; ib is 0
+        r.s[0] = f16_at(x);
+        const uint32_t tab[4] = {0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int2 v = table16(u32_at2(x + 2 + 4 * i), tab);
             r.w[i] = v.x;      // values 4i .. 4i+3 (low nibbles)
             r.w[4 + i] = v.y;  // values 16+4i .. (high nibbles)
         }
@@ -257,7 +274,7 @@ __global__ void __launch_bounds__(kWarps * VELOX_WARP)
     ggml_mmvq_kernel(const uint8_t* __restrict__ w, long long row_bytes, long long row_begin, int rows, int subs,
                      const int8_t* __restrict__ xq, const float* __restrict__ xd, int m, float* __restrict__ y,
                      long long ldy, int mode) {
-    constexpr int BB = block_bytes(T);
+    constexpr int BB = block_bytes(T), SPB = sub_per_block<T>();
     const int lane = threadIdx.x % VELOX_WARP;
     const int r0 = (blockIdx.x * kWarps + threadIdx.x / VELOX_WARP) * R;
     if (r0 >= rows) return;
@@ -272,7 +289,7 @@ __global__ void __launch_bounds__(kWarps * VELOX_WARP)
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int row = min(r0 + r, rows - 1);
-            s[r] = decode<T>(w + (row_begin + row) * row_bytes + static_cast<long long>(u / 8) * BB, u % 8);
+            s[r] = decode<T>(w + (row_begin + row) * row_bytes + static_cast<long long>(u / SPB) * BB, u % SPB);
         }
 #pragma unroll
         for (int t = 0; t < M; ++t) {
@@ -833,7 +850,7 @@ int launch_mma(const uint8_t* w, long long row_bytes, long long rb, int rows, in
 template <int T>
 int launch_any(const uint8_t* w, long long row_bytes, long long rb, int rows, int subs, const int8_t* xq,
                const float* xd, int m, float* y, long long ldy, int mode) {
-    if constexpr (T != kIq1M) {
+    if constexpr (T != kIq1M && T != kIq4Nl) {
         if (m >= mma_min_m())
             return launch_mma<T>(w, row_bytes, rb, rows, subs, reinterpret_cast<const uint8_t*>(xq), m, y, ldy,
                                  mode);
@@ -1398,11 +1415,19 @@ VELOX_API int velox_5060_ggml_act(const float* x, int m, long long k, const int8
 
 // y[t * ldy + r] (r < rows) = sum_c W[row_begin + r, c] * xq[t, c] for 1 <= m <= 16 token rows of
 // activations from velox_5060_ggml_act, W of GGML type `type` (0..8, GgmlType::ALL order) with k %
-// 1024 == 0. mode 1 instead writes silu(y) * that (the up projection of a SwiGLU after its gate).
-// VELOX_ERR_UNSUPPORTED otherwise.
+// 1024 == 0, or IQ4_NL (10) with k % 32 == 0 (dp4a only). mode 1 instead writes silu(y) * that
+// (the up projection of a SwiGLU after its gate). VELOX_ERR_UNSUPPORTED otherwise.
 VELOX_API int velox_5060_linear_ggml_from(const int8_t* xq, const float* xd, int m, const uint8_t* w, int type,
                                           long long k, long long row_begin, int rows, float* y, long long ldy,
                                           int mode) {
+    // IQ4_NL (32-value blocks, 2-byte aligned): dp4a at every width, any k % 32 == 0.
+    if (type == kIq4Nl) {
+        if (m < 1 || m > 65536 || rows <= 0 || k <= 0 || k % 32 != 0 || reinterpret_cast<uintptr_t>(w) % 16 != 0 ||
+            mode < 0 || mode > 1)
+            return VELOX_ERR_UNSUPPORTED;
+        return launch_any<kIq4Nl>(w, k / 32 * block_bytes(kIq4Nl), row_begin, rows, static_cast<int>(k / 32), xq, xd,
+                                  m, y, ldy, mode);
+    }
     if (m < 1 || m > 65536 || rows <= 0 || k % 256 != 0 || type < 0 || type > 8) return VELOX_ERR_UNSUPPORTED;
     const long long row_bytes = k / 256 * block_bytes(type);
     // K % 1024 for the tensor-core path; dp4a (fewer tokens) needs only 16-byte rows.
@@ -1477,12 +1502,6 @@ __device__ __forceinline__ const uint8_t* moe_record(const MoeDesc& d, int e) {
     const int slot = static_cast<int>(__float_as_uint(__ldg(d.map + e)));
     return slot >= 0 ? d.slots + static_cast<long long>(slot) * d.slot_bytes
                      : d.records + static_cast<long long>(e) * d.record_bytes;
-}
-
-// 32-value sub-blocks per stored block.
-template <int T>
-__host__ __device__ constexpr int sub_per_block() {
-    return T == kQ2_0 ? 2 : 8;
 }
 
 // Warp per (row, sub-block): int8 codes and scale per 32 values, ActQuant::Int8G32 bit for bit.
@@ -1601,7 +1620,17 @@ __device__ __forceinline__ void span_store(uint4* dst, int lane, const Span<N>& 
 }
 
 // Most uint4 per lane a staged span takes, and the bytes that bounds a span to.
+// IQ4_NL (4.5 bits per value) takes wider spans: two gate rows of K = 2560 are 2880 bytes, as are
+// eight down rows of K = 640 (Qwen3.8-Flash-Next's MTP experts).
 constexpr int kSpanUp = 4, kSpanDown = 3;
+template <int T>
+__host__ __device__ constexpr int span_up() {
+    return T == kIq4Nl ? 6 : kSpanUp;
+}
+template <int T>
+__host__ __device__ constexpr int span_down() {
+    return T == kIq4Nl ? 6 : kSpanDown;
+}
 __host__ __device__ constexpr int span_cap(int n) { return n * VELOX_WARP * 16 - 16; }
 
 // h[p][i] = silu(gate_i . x) * (up_i . x) for pair p = row * k + j (expert ids[p]): warp per R
@@ -1610,7 +1639,7 @@ template <int T>
 __global__ void __launch_bounds__(kMoeWarps* VELOX_WARP)
     moe_gate_up_kernel(MoeDesc d, const float* __restrict__ ids, int k, const int8_t* __restrict__ xq,
                        const float* __restrict__ xd, float* __restrict__ h) {
-    constexpr int R = kMoeUpRows, SPB = sub_per_block<T>(), BB = block_bytes(T), N = kSpanUp;
+    constexpr int R = kMoeUpRows, SPB = sub_per_block<T>(), BB = block_bytes(T), N = span_up<T>();
     constexpr int GW = moe_grid_words<T>() > 0 ? moe_grid_words<T>() : 1;
     __shared__ uint32_t sg[GW];
     __shared__ uint8_t sks[128];
@@ -1661,7 +1690,7 @@ template <int T>
 __global__ void __launch_bounds__(kMoeWarps* VELOX_WARP)
     moe_down_kernel(MoeDesc d, const float* __restrict__ ids, const float* __restrict__ wts, int k,
                     const int8_t* __restrict__ hq, const float* __restrict__ hd, float* __restrict__ y) {
-    constexpr int SPB = sub_per_block<T>(), BB = block_bytes(T), L = VELOX_WARP / kMoeDownRows, N = kSpanDown;
+    constexpr int SPB = sub_per_block<T>(), BB = block_bytes(T), L = VELOX_WARP / kMoeDownRows, N = span_down<T>();
     constexpr int GW = moe_grid_words<T>() > 0 ? moe_grid_words<T>() : 1;
     __shared__ uint32_t sg[GW];
     __shared__ uint8_t sks[128];
@@ -1709,7 +1738,7 @@ template <int T>
 int moe_up_launch(const MoeDesc& d, const float* ids, int pairs, int k, const int8_t* xq, const float* xd, float* h) {
     const int per_block = kMoeWarps * kMoeUpRows;
     const int row_bytes = d.hidden / 32 / sub_per_block<T>() * block_bytes(T);
-    if (kMoeUpRows * row_bytes > span_cap(kSpanUp)) return VELOX_ERR_UNSUPPORTED;
+    if (kMoeUpRows * row_bytes > span_cap(span_up<T>())) return VELOX_ERR_UNSUPPORTED;
     const dim3 grid((d.width + per_block - 1) / per_block, pairs);
     moe_gate_up_kernel<T><<<grid, kMoeWarps * VELOX_WARP>>>(d, ids, k, xq, xd, h);
     return velox_launch_status();
@@ -1720,7 +1749,7 @@ int moe_down_launch(const MoeDesc& d, const float* ids, const float* wts, int ro
                     const float* hd, float* y) {
     const int per_block = kMoeWarps * kMoeDownRows;
     const int row_bytes = d.width / 32 / sub_per_block<T>() * block_bytes(T);
-    if (kMoeDownRows * row_bytes > span_cap(kSpanDown)) return VELOX_ERR_UNSUPPORTED;
+    if (kMoeDownRows * row_bytes > span_cap(span_down<T>())) return VELOX_ERR_UNSUPPORTED;
     const dim3 grid((d.hidden + per_block - 1) / per_block, rows);
     moe_down_kernel<T><<<grid, kMoeWarps * VELOX_WARP>>>(d, ids, wts, k, hq, hd, y);
     return velox_launch_status();
@@ -1737,7 +1766,7 @@ int moe_down_launch(const MoeDesc& d, const float* ids, const float* wts, int ro
         case kIq3Xxs: return F<kIq3Xxs>(__VA_ARGS__); \
         case kIq3S: return F<kIq3S>(__VA_ARGS__);     \
         case kIq4Xs: return F<kIq4Xs>(__VA_ARGS__);   \
-        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);     \
+        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);             case kIq4Nl: return F<kIq4Nl>(__VA_ARGS__);   \
         default: return VELOX_ERR_UNSUPPORTED;        \
     }
 
@@ -1752,9 +1781,6 @@ int moe_down_any(int type, const MoeDesc& d, const float* ids, const float* wts,
 }
 
 #undef MOE_TYPES
-
-// Values per stored block of `type`: the K granularity the kernels need.
-int block_values(int type) { return type == kQ2_0 ? 64 : 256; }
 
 // Region sizes of the scratch, each rounded to 64 bytes (int4 loads need 16-byte alignment).
 long long moe_round(long long bytes) { return (bytes + 63) / 64 * 64; }
@@ -1774,7 +1800,7 @@ VELOX_API int velox_5060_moe_experts(const float* x, const float* ids, const flo
                                      long long slot_bytes, int up_type, long long gate_off, long long up_off,
                                      int down_type, long long down_off, int width, int hidden, int rows, int k,
                                      float* y, void* scratch) {
-    if (rows < 1 || k < 1 || up_type < 0 || up_type > kQ2_0 || down_type < 0 || down_type > kQ2_0 ||
+    if (rows < 1 || k < 1 || up_type < 0 || up_type > kIq4Nl || down_type < 0 || down_type > kIq4Nl ||
         hidden % block_values(up_type) != 0 || width % block_values(down_type) != 0 ||
         reinterpret_cast<uintptr_t>(scratch) % 16 != 0 || (gate_off | up_off | down_off | record_bytes | slot_bytes) % 4 != 0)
         return VELOX_ERR_UNSUPPORTED;
@@ -2083,7 +2109,7 @@ int grouped_down_launch(const MoeDesc& d, int experts, const int* offsets, const
         case kIq3Xxs: return F<kIq3Xxs>(__VA_ARGS__); \
         case kIq3S: return F<kIq3S>(__VA_ARGS__);     \
         case kIq4Xs: return F<kIq4Xs>(__VA_ARGS__);   \
-        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);     \
+        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);             case kIq4Nl: return F<kIq4Nl>(__VA_ARGS__);   \
         default: return VELOX_ERR_UNSUPPORTED;        \
     }
 
@@ -2119,7 +2145,7 @@ template <int T>
 struct Gm {
     static constexpr int G = Traits<T>::G;
     static constexpr bool kOff = Traits<T>::kOff;
-    static constexpr int kStep = T == kQ2_0 ? 128 : 256;  // values per K step
+    static constexpr int kStep = T == kQ2_0 || T == kIq4Nl ? 128 : 256;  // values per K step
     static constexpr int kSu = kStep / 32;               // sub-blocks per step
     static constexpr int kStride = kStep + 16;           // code / activation row stride (bytes)
     struct Smem {
@@ -2327,7 +2353,7 @@ int moe_mma_launch(const MoeDesc& d, long long mat_off, int rows, int K, int exp
         case kIq3Xxs: return F<kIq3Xxs>(__VA_ARGS__); \
         case kIq3S: return F<kIq3S>(__VA_ARGS__);     \
         case kIq4Xs: return F<kIq4Xs>(__VA_ARGS__);   \
-        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);     \
+        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);             case kIq4Nl: return F<kIq4Nl>(__VA_ARGS__);   \
         default: return VELOX_ERR_UNSUPPORTED;        \
     }
 
@@ -2355,7 +2381,7 @@ VELOX_API int velox_5060_moe_grouped(const float* x, const float* ids, const flo
                                      long long slot_bytes, int up_type, long long gate_off, long long up_off,
                                      int down_type, long long down_off, int width, int hidden, int rows, int k,
                                      int experts, float* y, void* scratch) {
-    if (rows < 1 || k < 1 || experts < 1 || up_type < 0 || up_type > kQ2_0 || down_type < 0 || down_type > kQ2_0 ||
+    if (rows < 1 || k < 1 || experts < 1 || up_type < 0 || up_type > kIq4Nl || down_type < 0 || down_type > kIq4Nl ||
         hidden % block_values(up_type) != 0 || width % block_values(down_type) != 0 ||
         reinterpret_cast<uintptr_t>(scratch) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;

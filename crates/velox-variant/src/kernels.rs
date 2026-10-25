@@ -697,8 +697,9 @@ const GGML_Q8_MIN_M: usize = 17;
 /// GGML linears run on int8 tensor cores instead of dp4a.
 const GGML_MMA_MIN_M: usize = 5;
 
-/// Types rtx5060_ggml.cu decodes: the first nine of `GgmlType::ALL` (q2_k .. iq4_xs). Later
-/// types (q2_0, iq4_nl, q6_k, q8_0) run the portable kernels.
+/// Types rtx5060_ggml.cu decodes at every width: the first nine of `GgmlType::ALL` (q2_k ..
+/// iq4_xs). IQ4_NL runs its dp4a kernel up to 16 tokens (`ggml_mmvq`) and the MoE kernels; Q2_0
+/// only the MoE kernels; the rest (q6_k, q8_0) the portable kernels.
 fn ggml_served(t: velox_core::ggml::GgmlType) -> bool {
     ggml_index(t) < 9
 }
@@ -715,15 +716,19 @@ fn ggml_index(t: velox_core::ggml::GgmlType) -> i32 {
 /// included): AllowA8 (the importer's policy for GGML matrices), K a multiple of 1024 so two
 /// blocks of a row start 4-byte aligned for every block size. The dp4a kernel (up to 4 tokens)
 /// also takes K a multiple of 256 whose rows are 16-byte multiples (Qwen3.8-Flash-Next's 2560).
+/// IQ4_NL (32-value blocks) runs the dp4a kernel at every width up to 16 tokens, K a multiple of
+/// 256: model widths, not the narrow layers (K 32 / 64) of small test stacks, whose exact
+/// reference the int8 rounding would push past the end-to-end tolerance.
 fn ggml_mmvq(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     let WeightFormat::Ggml(t) = w.format else {
         return None;
     };
+    let a8 = matches!(w.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. });
+    if t == velox_core::ggml::GgmlType::Iq4Nl {
+        return (a8 && (1..GGML_Q8_MIN_M).contains(&m) && w.k % 256 == 0).then(|| ggml_index(t));
+    }
     let dp4a_rows = m < GGML_MMA_MIN_M && w.k % 256 == 0 && t.row_bytes(w.k) % 16 == 0;
-    if !ggml_served(t)
-        || !(1..GGML_Q8_MIN_M).contains(&m)
-        || (w.k % 1024 != 0 && !dp4a_rows)
-        || !matches!(w.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. })
+    if !ggml_served(t) || !(1..GGML_Q8_MIN_M).contains(&m) || (w.k % 1024 != 0 && !dp4a_rows) || !a8
     {
         return None;
     }
@@ -903,10 +908,10 @@ extern "C" {
 const MOE_DECODE_MAX: usize = 16;
 
 /// (gate/up type, down type) of rtx5060_ggml.cu's MoE kernels for `bank` at `rows` rows: GGML
-/// experts of the served types or Q2_0, 8-bit activations allowed.
+/// experts of the served types, Q2_0 or IQ4_NL, 8-bit activations allowed.
 fn moe_types(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> Option<(i32, i32)> {
     let ty = |f: WeightFormat| match f {
-        WeightFormat::Ggml(t) if ggml_index(t) <= 9 => Some(ggml_index(t)),
+        WeightFormat::Ggml(t) if ggml_index(t) <= 10 => Some(ggml_index(t)),
         _ => None,
     };
     if rows == 0
