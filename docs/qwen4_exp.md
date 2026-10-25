@@ -108,6 +108,15 @@ into the least selected slots. A swap is three stream-ordered writes (the evicte
 entry to -1, the record into its slot, the promoted expert's map entry), so steps already queued
 read either the old or the new placement consistently.
 
+Policy: an expert's score is its selection count decayed by 0.7 per update; every 8 decode tokens
+up to 512 experts move in when they beat the worst resident by 25% + 1. Fast decay and a large move
+budget follow the prompt: the experts a 256-token answer uses fit the slots (a per-prompt oracle
+placement of 27.6% of the experts serves 94% of its selections), they just are not the same
+experts from one prompt to the next. A routing trace (`--expert-trace`) replays policies offline
+exactly, since placement never changes selections. On 16 mixed prompts (5060 Ti, MTP, 6,786
+slots) the hit rate went from 63% (decay 0.9 and 64 moves per 16 tokens) to 84%; a popularity
+prior from other prompts and stronger hysteresis changed it by under 1%.
+
 Measured on the RTX 5060 Ti (PCIe 5.0 x8, WSL2): 36 GB of pinned mapped memory allocates, kernels
 stream it at ~26 GB/s with 16-byte loads (one thread block per 1.5 MiB expert already saturates
 it), the same as `cudaMemcpyAsync`.
@@ -142,7 +151,9 @@ Ops: `ple_gate` (the per-stream gate and the gated values), `conv1d_dilated_silu
 The published checkpoint has one MTP layer (`mtp.*`). velox reads it from a sidecar GGUF named as
 llama.cpp names layer `L = 48` (`blk.48.nextn.{fc_e,fc_h,enorm,hnorm,hc_head_*}`,
 `blk.48.{hc_attn_*,hc_ffn_*,attn_*,indexer.*,ffn_*}`; norms stored as 1 + w, routed experts
-IQ4_NL). `velox generate --mtp <sidecar>` loads it with the model's shards.
+IQ4_NL). `velox generate --mtp <sidecar>` loads it with the model's shards. `--mtp-drafts k`
+chains the layer on its own residual for drafts past the first (provisional entries, rewritten
+once their positions are committed) and verifies `k + 1` rows.
 
 ```text
 entry p (h_p = the main residual [S, H] after the last layer at position p, x = token p + 1):
@@ -155,7 +166,9 @@ Every kept position gets its entry: prompt chunks (shifted by one token) right a
 step, then each round's committed tokens. A round verifies `[next, draft]` as one two-row window
 that leaves the recurrent states (GDN conv/SSM, PLE conv history) untouched and records the rows
 `commit` replays (`gdn_replay`) for the kept prefix; KV and index rows past the kept prefix are
-rewritten before they are read. Greedy output is identical to plain decoding. The MTP layer's
+rewritten before they are read. On the oracle, windows and commits reproduce token-by-token
+logits exactly (conformance `qwen4 synthetic ... verify windows + commits`); on a GPU a window's
+rows round differently from single steps, so near-ties (a few hundredths of a nat) can flip. The MTP layer's
 experts are read from system RAM (no device slots).
 
 ## GGUF mapping

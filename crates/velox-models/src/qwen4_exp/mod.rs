@@ -49,7 +49,11 @@ fn static_key(c: &Qwen4Config, kind: u64, pos0: usize, t: usize) -> Option<u64> 
         return None;
     }
     let pool = (pos0 + t) / c.qsa_ratio > pos0 / c.qsa_ratio;
-    let rows = if kind == GRAPH_DECODE { 0 } else { (t as u64) << 1 };
+    let rows = if kind == GRAPH_DECODE {
+        0
+    } else {
+        (t as u64) << 1
+    };
     Some(
         GRAPH_STATIC
             | kind
@@ -622,6 +626,14 @@ impl<B: Backend> Qwen4Exp<B> {
     /// hidden states an MTP head drafts from.
     pub fn residual<'a>(&self, ws: &'a Workspace<B>) -> &'a B::Buffer {
         &ws.r
+    }
+
+    /// The logits of the last verify's first `rows` rows (`[rows, vocab]`).
+    pub fn logits_rows(&self, b: &B, ws: &Workspace<B>, rows: usize) -> Result<Vec<f32>> {
+        let mut out = vec![0.0; rows * self.cfg.vocab];
+        b.synchronize()?;
+        b.download(&ws.logits, &mut out)?;
+        Ok(out)
     }
 
     /// The last step's logits.

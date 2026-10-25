@@ -79,8 +79,11 @@ COMMANDS:
                             Qwen4-Exp (Qwen3.8-Flash-Next) GGUFs; routed experts stay in system
                             RAM with a device cache; tokenizer and chat template from <dir>
       [--vram-margin-mib 768] (device memory left free after the expert slots)
-      [--expert-slots <n>] [--cache-interval 16] [--cache-moves 64] (decode cache updates)
+      [--expert-slots <n>] [--cache-interval 8] [--cache-moves 512] [--cache-decay 0.7]
+                            (decode cache updates: tokens between, experts moved, score kept)
       [--expert-stats <file>] (JSON selections per layer and expert, after the run)
+      [--expert-trace <file>] (JSON selections per cache update, for replaying cache policies)
+      [--mtp <sidecar GGUF>] [--mtp-drafts 2] (MTP speculative greedy, drafts per verify)
       [--show-top N] (logprobs of the N best first tokens) [--assistant-prefix <text>]
       [--ple-threads 32] (parallel reads of the PLE n-gram table)
   serve                  OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)

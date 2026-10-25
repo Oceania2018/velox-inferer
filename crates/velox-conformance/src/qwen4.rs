@@ -301,21 +301,7 @@ pub fn qwen4_stack<B: Backend>(b: &B, rng: &mut Rng) -> Result<Vec<CaseResult>> 
         md.forward(b, &mut sd, &mut wd, &mut cd, part)?;
         let want = logits(&cpu, &mc, &wc)?;
         let got = logits(b, &md, &wd)?;
-        // Relative L2 error of the logits: kernels that round activations as their ops report
-        // (bf16, int8) drift by ~1e-2 through a random model, which the per-op cases check
-        // exactly; a wrong layer or state is O(1).
-        let (num, den) = got
-            .iter()
-            .zip(&want)
-            .fold((0f64, 0f64), |(n, d), (&g, &w)| {
-                let e = f64::from(g) - f64::from(w);
-                (n + e * e, d + f64::from(w) * f64::from(w))
-            });
-        let rel = if num.is_nan() {
-            f64::INFINITY
-        } else {
-            (num / den.max(1e-30)).sqrt()
-        };
+        let rel = rel_l2(&got, &want);
         out.push(CaseResult {
             name: format!("qwen4 synthetic step {step} ({n} tokens at {pos}), relative L2"),
             op: None,
@@ -351,6 +337,71 @@ pub fn qwen4_stack<B: Backend>(b: &B, rng: &mut Rng) -> Result<Vec<CaseResult>> 
         max_err: max_err(&once, &chunked),
         tol: 1e-4,
     });
+    // Speculative windows: verify 3 tokens, keep a prefix, go on. Every row's logits match the
+    // oracle's token-by-token run at that position, and so does every later step (the commits
+    // replayed the recurrent states exactly over the kept tokens), dense and sparse QSA alike.
+    let mut want = Vec::new();
+    let mut s1 = mc.session(&cpu, cap, KvFormat::F32)?;
+    for &t in &ids {
+        mc.forward(&cpu, &mut s1, &mut wc, &mut cc, &[t])?;
+        want.push(logits(&cpu, &mc, &wc)?);
+    }
+    let vocab = cfg.vocab;
+    let mut so = mc.session(&cpu, cap, KvFormat::F32)?;
+    let mut sd = md.session(b, cap, KvFormat::F32)?;
+    mc.forward(&cpu, &mut so, &mut wc, &mut cc, &ids[..5])?;
+    md.forward(b, &mut sd, &mut wd, &mut cd, &ids[..5])?;
+    let (mut pos, mut worst_o, mut worst_d) = (5, 0f64, 0f64);
+    for keep in [3usize, 1, 2, 3, 1, 2, 3, 3, 2, 1] {
+        let w = &ids[pos..(pos + 3).min(ids.len())];
+        if w.len() < keep {
+            break;
+        }
+        mc.verify(&cpu, &mut so, &mut wc, &mut cc, w)?;
+        md.verify(b, &mut sd, &mut wd, &mut cd, w)?;
+        let (lo, ld) = (
+            mc.logits_rows(&cpu, &wc, w.len())?,
+            md.logits_rows(b, &wd, w.len())?,
+        );
+        for j in 0..w.len() {
+            let r = j * vocab..(j + 1) * vocab;
+            worst_o = worst_o.max(rel_l2(&lo[r.clone()], &want[pos + j]));
+            worst_d = worst_d.max(rel_l2(&ld[r], &want[pos + j]));
+        }
+        mc.commit(&cpu, &mut so, w, keep)?;
+        md.commit(b, &mut sd, w, keep)?;
+        pos += keep;
+        cd.update(b, &md.w, 3)?;
+    }
+    out.push(CaseResult {
+        name: format!(
+            "qwen4 synthetic oracle: verify windows + commits == token by token ({pos} tokens)"
+        ),
+        op: None,
+        max_err: worst_o,
+        tol: 1e-5,
+    });
+    out.push(CaseResult {
+        name: format!("qwen4 synthetic verify windows + commits ({pos} tokens), relative L2"),
+        op: None,
+        max_err: worst_d,
+        tol: 3e-2,
+    });
     let _ = std::fs::remove_dir_all(&dir);
     Ok(out)
+}
+
+/// Relative L2 error of logits: kernels that round activations as their ops report (bf16, int8)
+/// drift by ~1e-2 through a random model, which the per-op cases check exactly; a wrong layer or
+/// state is O(1).
+fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
+    let (num, den) = got.iter().zip(want).fold((0f64, 0f64), |(n, d), (&g, &w)| {
+        let e = f64::from(g) - f64::from(w);
+        (n + e * e, d + f64::from(w) * f64::from(w))
+    });
+    if num.is_nan() {
+        f64::INFINITY
+    } else {
+        (num / den.max(1e-30)).sqrt()
+    }
 }
