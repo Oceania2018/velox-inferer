@@ -944,13 +944,19 @@ extern "C" {
 /// grouped by expert on tensor cores (bf16 activations).
 const MOE_NVFP4_DECODE_MAX: usize = 16;
 
+/// Most rows rtx5060_moe_nvfp4.cu's exact per-expert GEMVs take; wider verify windows stream on
+/// tensor cores.
+const MOE_NVFP4_SMALL_MAX: usize = 4;
+
 /// rtx5060_moe_nvfp4.cu's mode for `rows`: 0 a GEMV per routed pair (decode), 1 the GEMVs per
-/// expert over its pairs (verify windows: an expert chosen by several rows is read once), 2
-/// grouped on tensor cores (prefill).
+/// routed expert over its pairs (small verify windows), 3 persistent tensor-core streams over the
+/// routed experts (verify windows), 2 grouped on tensor cores (prefill). Modes 0 and 1 keep
+/// activations exact, 2 and 3 round them to bf16.
 fn moe_nvfp4_mode(rows: usize) -> i32 {
     match rows {
         0 | 1 => 0,
-        r if r <= MOE_NVFP4_DECODE_MAX => 1,
+        r if r <= MOE_NVFP4_SMALL_MAX => 1,
+        r if r <= MOE_NVFP4_DECODE_MAX => 3,
         _ => 2,
     }
 }
@@ -1069,7 +1075,7 @@ impl CudaKernels for Rtx5060Kernels {
     fn moe_experts_act(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> ActQuant {
         if moe_types(bank, rows).is_some() {
             ActQuant::Int8G32
-        } else if moe_nvfp4(bank, rows) && moe_nvfp4_mode(rows) == 2 {
+        } else if moe_nvfp4(bank, rows) && moe_nvfp4_mode(rows) >= 2 {
             ActQuant::Bf16
         } else {
             ActQuant::Exact
