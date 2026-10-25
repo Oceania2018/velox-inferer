@@ -826,7 +826,8 @@ impl Default for ExpertPolicy {
 }
 
 struct Experts<B: Backend> {
-    /// The stack's MoE layers (record sets `0..main`), with device slots.
+    /// The stack's MoE layers (record sets `0..main`, the MTP layer's too when its records fit
+    /// the slots), with device slots.
     cache: ExpertCache<B>,
     main: usize,
     /// Sets past the stack's (the MTP layer's, often stored wider): read from system RAM, so
@@ -891,7 +892,13 @@ impl<B: Backend> Qwen35Text<B> {
         let FfnConfig::Moe(m) = self.cfg.ffn else {
             return Ok(());
         };
-        let main = self.main_expert_sets();
+        // The MTP layer's sets share the stack's slots when their records fit them.
+        let slot = self.expert_slot_bytes();
+        let main = if self.w.experts.iter().all(|r| r.record_bytes <= slot) {
+            self.w.experts.len()
+        } else {
+            self.main_expert_sets()
+        };
         let cache = ExpertCache::new(b, main, m.experts, self.expert_slot_bytes().max(16), slots)?;
         let rest = ExpertCache::new(
             b,
@@ -1919,7 +1926,7 @@ impl<B: Backend> Qwen35Text<B> {
         )?;
         let mut ex = experts.lock().expect("expert cache lock");
         let ex = &mut *ex;
-        // Stack layers count selections for their cache; the MTP layer's are not counted.
+        // Sets in the slotted cache count selections for it; the rest are not counted.
         let (cache, l, counts) = if m.experts < ex.main {
             (&mut ex.cache, m.experts, true)
         } else {

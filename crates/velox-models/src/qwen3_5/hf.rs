@@ -34,7 +34,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
-use velox_core::format::{align256, nvfp4_scale_offset};
+use velox_core::format::{align256, bf16_to_f32, encode_nvfp4, nvfp4_scale_offset};
 use velox_core::{Error, Result};
 use velox_weights::{Artifact, Container};
 
@@ -342,6 +342,40 @@ impl<'a> Builder<'a> {
             uses: Vec::new(),
             divisors: HashMap::new(),
         }
+    }
+
+    /// Rows `[r0, r0 + rows)` of BF16 tensor `weight` (read as a matrix) encoded as one `nvfp4`
+    /// object `id`, bound whole to `binding` (A16: no activation divisor is known for them).
+    fn nvfp4_from_bf16(
+        &mut self,
+        id: &str,
+        weight: &str,
+        r0: u64,
+        rows: u64,
+        binding: &str,
+    ) -> Result<()> {
+        let t = self.get(weight)?;
+        let (_, k) = t.matrix();
+        if t.dtype != "BF16" {
+            return Err(Error::Unsupported(format!(
+                "{weight}: {} is not BF16",
+                t.dtype
+            )));
+        }
+        let mut raw = vec![0u8; (rows * k * 2) as usize];
+        self.st.read_at(t.file, t.at + r0 * k * 2, &mut raw)?;
+        let x: Vec<f32> = raw
+            .chunks_exact(2)
+            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let payload = encode_nvfp4(&x, rows as usize, k as usize);
+        let id = self.push(
+            format!("hf/{id}"),
+            tensor_entry(json!([rows, k]), "nvfp4", "block_scale_k16_m128x4_v1"),
+            vec![Piece::Data(payload)],
+        );
+        self.bind(&id, (rows, k), (binding, 0, rows), &Policy::A16);
+        Ok(())
     }
 
     fn get(&self, name: &str) -> Result<&'a StTensor> {
@@ -901,7 +935,21 @@ fn block(b: &mut Builder, c: &TextConfig, kind: LayerKind, src: &str, dst: &str)
                         2 * i
                     )));
                 }
-                for x in 0..e {
+                // NVFP4 like the stack's experts when the shapes allow (the MTP layer's experts
+                // then share their slot size and cost 3.5x less to read), else BF16 as stored.
+                let quantize = i.is_multiple_of(128)
+                    && h.is_multiple_of(128)
+                    && i.is_multiple_of(64)
+                    && h.is_multiple_of(64);
+                for x in (0..e).filter(|_| quantize) {
+                    let q = |r: &str| p(&format!("moe/experts/{x}/{r}"));
+                    let id = |r: &str| format!("{}.{x}.{r}_proj", t("mlp.experts"));
+                    let r0 = 2 * i * x;
+                    b.nvfp4_from_bf16(&id("gate"), &fused, r0, i, &q("gate"))?;
+                    b.nvfp4_from_bf16(&id("up"), &fused, r0 + i, i, &q("up"))?;
+                    b.nvfp4_from_bf16(&id("down"), &down, h * x, h, &q("down"))?;
+                }
+                for x in (0..e).filter(|_| !quantize) {
                     let q = |r: &str| p(&format!("moe/experts/{x}/{r}"));
                     let r0 = 2 * i * x;
                     for (role, a) in [("gate", r0), ("up", r0 + i)] {

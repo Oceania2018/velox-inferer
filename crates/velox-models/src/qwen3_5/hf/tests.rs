@@ -561,23 +561,28 @@ fn compressed_tensors_checkpoint_imports_exactly() {
         bf16_values(c.data(&format!("{m}.layers.0.input_layernorm.weight")))
     );
 
-    // MTP experts: gate rows [0, I), up rows [I, 2I) of gate_up_proj[e].
+    // MTP experts: gate rows [0, I), up rows [I, 2I) of gate_up_proj[e], encoded as NVFP4
+    // (these shapes allow it): each value within its block's quantization step.
     let gu = bf16_values(c.data("mtp.layers.0.mlp.experts.gate_up_proj"));
+    let dn = bf16_values(c.data("mtp.layers.0.mlp.experts.down_proj"));
     let (iu, e) = (I as usize, 1usize);
     let at = |r: usize| e * 2 * iu * hk + r * hk;
-    assert_eq!(
-        decoded(&art, "mtp/layers/0/moe/experts/1/gate").3,
-        gu[at(0)..at(iu)]
-    );
-    assert_eq!(
-        decoded(&art, "mtp/layers/0/moe/experts/1/up").3,
-        gu[at(iu)..at(2 * iu)]
-    );
-    let dn = bf16_values(c.data("mtp.layers.0.mlp.experts.down_proj"));
-    assert_eq!(
-        decoded(&art, "mtp/layers/0/moe/experts/1/down").3,
-        dn[hk * iu..2 * hk * iu]
-    );
+    let near = |binding: &str, want: &[f32]| {
+        let (fmt, _, _, got) = decoded(&art, binding);
+        assert_eq!(fmt, WeightFormat::Nvfp4, "{binding}");
+        for (blk, (w, g)) in want.chunks(16).zip(got.chunks(16)).enumerate() {
+            let amax = w.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for (a, b) in w.iter().zip(g) {
+                assert!(
+                    (a - b).abs() <= amax / 6.0 * 1.07 + 1e-6,
+                    "{binding} block {blk}"
+                );
+            }
+        }
+    };
+    near("mtp/layers/0/moe/experts/1/gate", &gu[at(0)..at(iu)]);
+    near("mtp/layers/0/moe/experts/1/up", &gu[at(iu)..at(2 * iu)]);
+    near("mtp/layers/0/moe/experts/1/down", &dn[hk * iu..2 * hk * iu]);
     assert_eq!(policy(&art, "mtp/layers/0/moe/experts/1/down").0, "A16Only");
 
     // The loader takes the whole artifact, with the stacked projections as single views.

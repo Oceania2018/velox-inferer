@@ -3189,6 +3189,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             s.moe_experts(Nvfp4, Nvfp4, 16, 512, 2048, rows, 8, ActPolicy::A16Only)?;
         }
         s.moe_experts(Bf16, Bf16, 16, 512, 2048, 2, 8, ActPolicy::A16Only)?;
+        // TEMP (local only): NVFP4 experts under AllowA8, as ExpertCache::bank hands them.
+        for rows in [1, 2, 3, 4, 16, 17, 40, 130] {
+            s.moe_experts(Nvfp4, Nvfp4, 16, 512, 2048, rows, 8, a8)?;
+        }
+        s.moe_experts(Nvfp4, Nvfp4, 300, 256, 512, 70, 10, a8)?;
         // The MTP head's IQ4_NL experts at decode, verify and prefill widths.
         use velox_core::ggml::GgmlType::Iq4Nl;
         for rows in [1, 2, 4, 16, 40] {
