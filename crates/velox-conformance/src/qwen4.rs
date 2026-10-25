@@ -309,7 +309,11 @@ pub fn qwen4_stack<B: Backend>(b: &B, rng: &mut Rng) -> Result<Vec<CaseResult>> 
             tol: 3e-2,
         });
         pos += n;
-        cd.update(b, &md.w, if step % 2 == 0 { usize::MAX } else { 3 })?;
+        cd.update(
+            b,
+            &md.w.expert_records(),
+            if step % 2 == 0 { usize::MAX } else { 3 },
+        )?;
     }
     // Token by token on the oracle reaches the same last logits as the chunked run.
     let mut s1 = mc.session(&cpu, cap, KvFormat::F32)?;
@@ -371,7 +375,7 @@ pub fn qwen4_stack<B: Backend>(b: &B, rng: &mut Rng) -> Result<Vec<CaseResult>> 
         mc.commit(&cpu, &mut so, w, keep)?;
         md.commit(b, &mut sd, w, keep)?;
         pos += keep;
-        cd.update(b, &md.w, 3)?;
+        cd.update(b, &md.w.expert_records(), 3)?;
     }
     out.push(CaseResult {
         name: format!(

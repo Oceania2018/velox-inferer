@@ -10,12 +10,20 @@ mod paging;
 mod vision;
 mod weights;
 
+use std::sync::Mutex;
+
 use velox_core::backend::{
     AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, LinearDst, LinearPart,
     NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
-use velox_core::{CopySpec, Error, KvFormat, KvStoreShape, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
+use velox_core::{
+    CopySpec, Error, KvFormat, KvStoreShape, MoeRouteShape, Result, RowGateShape, GRAPH_KV_BUCKET,
+    GRAPH_STATIC,
+};
 
+use crate::experts::ExpertCache;
+
+pub use crate::experts::CacheReport;
 pub use config::{
     FfnConfig, LayerKind, MoeConfig, TextConfig, DENSE_ARCHITECTURE, MOE_ARCHITECTURE,
 };
@@ -26,7 +34,7 @@ pub use dflash::{
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use paging::{KvChunkSet, KvPool, KvShare};
 pub use vision::{Qwen35Vision, VisionConfig};
-pub use weights::{DenseFfn, ExpertBank, Ffn, Layer, Mixer, MoeFfn, Runs, TextWeights, WDesc};
+pub use weights::{DenseFfn, Ffn, Layer, Mixer, MoeFfn, Runs, TextWeights, WDesc};
 
 /// Per-sequence state: attention KV caches, GDN convolution and recurrent states, position.
 pub struct Session<B: Backend> {
@@ -658,6 +666,17 @@ fn tile_v_heads<B: Backend>(b: &B, c: &TextConfig, ws: &mut Workspace<B>, t: usi
     b.copy(&ws.conv_out, 0, &mut ws.o, 0, t * c.gdn_v())
 }
 
+/// A MoE FFN's buffers: router logits (`[t, experts + 1]` with the shared gate fused), the
+/// shared gate alone otherwise, routes, `moe_experts` scratch and the gated shared output.
+struct MoeBufs<B: Backend> {
+    logits: B::Buffer,
+    score: B::Buffer,
+    ids: B::Buffer,
+    wts: B::Buffer,
+    scratch: B::Buffer,
+    shared: B::Buffer,
+}
+
 pub struct Workspace<B: Backend> {
     max_tokens: usize,
     x: B::Buffer,
@@ -707,6 +726,8 @@ pub struct Workspace<B: Backend> {
     /// f32 copies of a quantized cache's visible rows for long chunks (grown on demand), so they
     /// attend with the f32 prefill kernels instead of decoding packed rows per query.
     kv_f32: Option<(B::Buffer, B::Buffer)>,
+    /// Routing and routed-expert scratch of MoE models.
+    moe: Option<MoeBufs<B>>,
     /// Verify replay rows (allocated with the first verify).
     spec_rows: Option<SpecRows<B>>,
     /// Where verify's recurrences write their final state: one GDN layer's conv and SSM state,
@@ -778,11 +799,120 @@ fn overlay<B: Backend>(
 pub struct Qwen35Text<B: Backend> {
     pub cfg: TextConfig,
     pub w: TextWeights<B>,
+    /// Routed experts' device cache and its update policy (MoE models, after
+    /// [`Self::enable_experts`]).
+    experts: Option<Mutex<Experts<B>>>,
+}
+
+/// When the expert cache moves experts: every `interval` tokens at most `moves` of them, and
+/// without a limit after a prompt (`prompt` tokens or more since the last update).
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertPolicy {
+    pub interval: usize,
+    pub moves: usize,
+    pub prompt: usize,
+}
+
+impl Default for ExpertPolicy {
+    fn default() -> Self {
+        // As tuned on Flash-Next (docs/qwen4_exp.md#expert-offload): fast decay, large budget.
+        ExpertPolicy {
+            interval: 8,
+            moves: 512,
+            prompt: 64,
+        }
+    }
+}
+
+struct Experts<B: Backend> {
+    cache: ExpertCache<B>,
+    policy: ExpertPolicy,
+    /// Tokens run since the last update.
+    pending: usize,
+    /// Totals over every update.
+    report: CacheReport,
 }
 
 impl<B: Backend> Qwen35Text<B> {
     pub fn new(cfg: TextConfig, w: TextWeights<B>) -> Self {
-        Qwen35Text { cfg, w }
+        Qwen35Text {
+            cfg,
+            w,
+            experts: None,
+        }
+    }
+
+    /// Routed experts per MoE layer (0 for a dense model).
+    pub fn cfg_experts(&self) -> usize {
+        match self.cfg.ffn {
+            FfnConfig::Moe(m) => m.experts,
+            FfnConfig::Dense { .. } => 0,
+        }
+    }
+
+    /// Bytes of one expert slot: the largest record of any MoE layer (0 for a dense model).
+    pub fn expert_slot_bytes(&self) -> usize {
+        self.w
+            .experts
+            .iter()
+            .map(|r| r.record_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Readies the routed experts of a MoE model (required before running one): `slots` device
+    /// slots hold copies of the most selected experts (0: every expert is read from system RAM).
+    pub fn enable_experts(&mut self, b: &B, slots: usize, policy: ExpertPolicy) -> Result<()> {
+        let FfnConfig::Moe(m) = self.cfg.ffn else {
+            return Ok(());
+        };
+        let cache = ExpertCache::new(
+            b,
+            self.w.experts.len(),
+            m.experts,
+            self.expert_slot_bytes().max(16),
+            slots,
+        )?;
+        self.experts = Some(Mutex::new(Experts {
+            cache,
+            policy,
+            pending: 0,
+            report: CacheReport::default(),
+        }));
+        Ok(())
+    }
+
+    /// Selections served from device slots and from system RAM so far, and experts moved.
+    pub fn expert_report(&self) -> Option<CacheReport> {
+        self.experts
+            .as_ref()
+            .map(|e| e.lock().expect("expert cache lock").report)
+    }
+
+    /// Before a step of `tokens`: updates the expert cache when the policy says so. Runs outside
+    /// any graph recording (it waits for the device).
+    fn expert_tick(&self, b: &B, tokens: usize) -> Result<()> {
+        let Some(e) = &self.experts else {
+            return Ok(());
+        };
+        let mut e = e.lock().expect("expert cache lock");
+        let e = &mut *e;
+        if e.pending >= e.policy.interval {
+            let moves = if e.pending >= e.policy.prompt {
+                usize::MAX
+            } else {
+                e.policy.moves
+            };
+            let recs: Vec<_> = self.w.experts.iter().collect();
+            let r = e.cache.update(b, &recs, moves)?;
+            e.report.hits += r.hits;
+            e.report.misses += r.misses;
+            e.report.moves += r.moves;
+            e.report.resident = r.resident;
+            e.pending = 0;
+        }
+        e.pending += tokens;
+        Ok(())
     }
 
     pub fn session(&self, b: &B, capacity: usize) -> Result<Session<B>> {
@@ -972,11 +1102,34 @@ impl<B: Backend> Qwen35Text<B> {
             capture: Vec::new(),
             kv_f32: None,
             features: None,
+            moe: self.moe_bufs(b, t)?,
             spec_rows: None,
             spec_state: None,
             rows,
             _overlay: backing,
         })
+    }
+
+    /// MoE buffers for `t` rows (None for a dense model).
+    fn moe_bufs(&self, b: &B, t: usize) -> Result<Option<MoeBufs<B>>> {
+        let FfnConfig::Moe(mc) = self.cfg.ffn else {
+            return Ok(None);
+        };
+        let (e, k, sets) = (mc.experts, mc.top_k, self.w.experts.len());
+        // Scratch for the largest any layer's experts need (a probe cache without slots).
+        let probe = ExpertCache::new(b, sets, e, self.expert_slot_bytes().max(16), 0)?;
+        let scratch = (0..sets)
+            .map(|i| b.moe_scratch_len(&probe.bank(i, &self.w.experts[i]), t, k))
+            .max()
+            .unwrap_or(1);
+        Ok(Some(MoeBufs {
+            logits: b.alloc(t * (e + 1))?,
+            score: b.alloc(t)?,
+            ids: b.alloc(t * k)?,
+            wts: b.alloc(t * k)?,
+            scratch: b.alloc(scratch.max(1))?,
+            shared: b.alloc(t * self.cfg.hidden)?,
+        }))
     }
 
     /// Makes every chunk of `ws` keep the residual outputs of target `layers` (block indices) in
@@ -1036,6 +1189,7 @@ impl<B: Backend> Qwen35Text<B> {
     /// a host round trip. Its graph recording (one per session, like a decode step's) embeds
     /// from that slot every run.
     pub fn advance_from(&self, b: &B, s: &mut Session<B>, ws: &mut Workspace<B>) -> Result<()> {
+        self.expert_tick(b, 1)?;
         if s.pos >= s.capacity {
             return Err(Error::Config(format!(
                 "{} + 1 tokens exceed session capacity {}",
@@ -1092,6 +1246,7 @@ impl<B: Backend> Qwen35Text<B> {
         inserts: &[EmbedInsert<'_, B::Buffer>],
         snaps: &mut [Checkpoint<B>],
     ) -> Result<()> {
+        self.expert_tick(b, ids.len())?;
         if positions.is_some_and(|p| p.len() != ids.len()) {
             return Err(Error::Shape(
                 "one position triple per token is required".into(),
@@ -1681,12 +1836,83 @@ impl<B: Backend> Qwen35Text<B> {
     fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize, h_twin: HTwin) -> Result<()> {
         match &l.ffn {
             Ffn::Dense(d) => self.swiglu_ffn(b, ws, d, t, h_twin),
-            Ffn::Moe(_) => Err(Error::Unsupported(
-                "sparse MoE FFN execution (planned ops moe_route / moe_experts, see \
-                 docs/qwen3_5-text.md) is not implemented yet"
-                    .into(),
-            )),
+            Ffn::Moe(m) => self.moe_ffn(b, ws, m, t, h_twin),
         }
+    }
+
+    /// `ws.y = sum_j w_j expert_j(ws.h) + sigmoid(shared_score . ws.h) shared(ws.h)`.
+    fn moe_ffn(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        m: &MoeFfn,
+        t: usize,
+        h_twin: HTwin,
+    ) -> Result<()> {
+        let FfnConfig::Moe(mc) = self.cfg.ffn else {
+            return Err(Error::Config("MoE layer in a dense config".into()));
+        };
+        let (e, k, hidden) = (mc.experts, mc.top_k, self.cfg.hidden);
+        let experts = self.experts.as_ref().ok_or_else(|| {
+            Error::Config("MoE model: call Qwen35Text::enable_experts before running it".into())
+        })?;
+        // The shared expert first (it uses the dense FFN's scratch and writes ws.y).
+        self.swiglu_ffn(b, ws, &m.shared, t, h_twin)?;
+        let mb = ws
+            .moe
+            .as_mut()
+            .ok_or_else(|| Error::Config("workspace has no MoE buffers".into()))?;
+        b.copy(&ws.y, 0, &mut mb.shared, 0, t * hidden)?;
+        // Router logits, with the shared expert's gate logit as one more column when fused.
+        let fused = m.router_score.is_some();
+        match &m.router_score {
+            Some(d) => b.linear(&ws.h, &self.w.view(d), &mut mb.logits, t)?,
+            None => {
+                b.linear(&ws.h, &self.w.view(&m.router), &mut mb.logits, t)?;
+                b.linear(&ws.h, &self.w.view(&m.shared_score), &mut mb.score, t)?;
+            }
+        }
+        let row_len = if fused { e + 1 } else { e };
+        let (gate, gate_offset, gate_stride) = if fused {
+            (&mb.logits, e, e + 1)
+        } else {
+            (&mb.score, 0, 1)
+        };
+        b.sigmoid_scale_rows(
+            &mut mb.shared,
+            gate,
+            RowGateShape {
+                rows: t,
+                dim: hidden,
+                gate_offset,
+                gate_stride,
+            },
+        )?;
+        let mut ex = experts.lock().expect("expert cache lock");
+        b.moe_route(
+            &mb.logits,
+            &mut mb.ids,
+            &mut mb.wts,
+            Some(ex.cache.counts_mut(m.experts)),
+            MoeRouteShape {
+                rows: t,
+                row_len,
+                experts: e,
+                k,
+            },
+        )?;
+        let bank = ex.cache.bank(m.experts, &self.w.experts[m.experts]);
+        b.moe_experts(
+            &ws.h,
+            &mb.ids,
+            &mb.wts,
+            &bank,
+            &mut ws.y,
+            &mut mb.scratch,
+            t,
+            k,
+        )?;
+        b.add(&mut ws.y, &mb.shared, t * hidden)
     }
 
     /// `ws.y = down(silu(gate(ws.h)) * up(ws.h))`.
@@ -1752,6 +1978,7 @@ impl<B: Backend> Qwen35Text<B> {
         snaps: &mut [Checkpoint<B>],
         on_chunk: &mut dyn FnMut(&Workspace<B>, usize, usize) -> Result<()>,
     ) -> Result<()> {
+        self.expert_tick(b, ids.len())?;
         ws.keep_rows = true;
         let mut r = Ok(());
         for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
@@ -1782,6 +2009,7 @@ impl<B: Backend> Qwen35Text<B> {
         k: usize,
         limit: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>> {
+        self.expert_tick(b, ids.len())?;
         let t = ids.len();
         if t == 0 || t > VERIFY_MAX || t > ws.max_tokens {
             return Err(Error::Shape(format!(
@@ -2019,6 +2247,7 @@ impl<B: Backend> Qwen35Text<B> {
         k: usize,
         limit: usize,
     ) -> Result<Vec<Vec<Vec<(u32, f32)>>>> {
+        self.expert_tick(b, windows.iter().map(|w| w.len()).sum())?;
         let n = windows.len();
         if n != sessions.len() || n == 0 || n > bw.max_seqs {
             return Err(Error::Shape(format!(
@@ -2191,6 +2420,10 @@ impl<B: Backend> Qwen35Text<B> {
         k: usize,
         limit: usize,
     ) -> Result<(Option<Vec<(u32, f32)>>, Vec<Vec<Vec<(u32, f32)>>>)> {
+        self.expert_tick(
+            b,
+            prefill.ids.len() + windows.iter().map(|w| w.len()).sum::<usize>(),
+        )?;
         let (c, w) = (&self.cfg, &self.w);
         let n = windows.len();
         let tp = prefill.ids.len();

@@ -3168,7 +3168,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.moe_route(3, 16, 16, 1)?;
     {
         use velox_core::ggml::GgmlType::{Iq2S, Iq2Xxs, Q4K};
-        use WeightFormat::{Bf16, Ggml};
+        use WeightFormat::{Bf16, Ggml, Nvfp4};
         let a8 = ActPolicy::AllowA8;
         // Decode, a verify window and a prefill chunk where experts take several 64-row tiles.
         s.moe_experts(Ggml(Iq2S), Ggml(Q4K), 24, 512, 256, 1, 10, a8)?;
@@ -3183,6 +3183,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.moe_experts(Ggml(Iq2Xxs), Ggml(Q2_0), 24, 640, 2560, 8, 10, a8)?;
         s.moe_experts(Ggml(Iq1M), Ggml(Q2_0), 24, 640, 2560, 3, 10, a8)?;
         s.moe_experts(Ggml(Iq2S), Ggml(Q2_0), 24, 640, 2560, 40, 10, a8)?;
+        // Qwen3.6-35B-A3B: NVFP4 experts (width 512, hidden 2048, top-8) and its MTP head's
+        // bf16 experts, at decode, verify and prefill widths.
+        for rows in [1, 3, 40] {
+            s.moe_experts(Nvfp4, Nvfp4, 16, 512, 2048, rows, 8, ActPolicy::A16Only)?;
+        }
+        s.moe_experts(Bf16, Bf16, 16, 512, 2048, 2, 8, ActPolicy::A16Only)?;
         // The MTP head's IQ4_NL experts at decode, verify and prefill widths.
         use velox_core::ggml::GgmlType::Iq4Nl;
         for rows in [1, 2, 4, 16, 40] {

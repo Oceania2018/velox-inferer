@@ -7,7 +7,10 @@ use std::time::Instant;
 use velox_core::{Backend, Error, KvFormat, Result};
 use velox_engine::{EngineConfig, QwenEngine};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{DFlashModel, Qwen35Text, Qwen35Vision, TextConfig, TextWeights};
+use velox_models::qwen3_5::{
+    DFlashModel, Qwen35Text, Qwen35Vision, TextConfig, TextWeights, DENSE_ARCHITECTURE,
+    MOE_ARCHITECTURE,
+};
 use velox_serve::{ChatEngine, Config, Server, UnimplementedEngine};
 use velox_weights::Artifact;
 
@@ -168,7 +171,9 @@ where
     } else {
         None
     };
-    let model = Qwen35Text::new(cfg, w);
+    let mut model = Qwen35Text::new(cfg, w);
+    // The engine's sessions and workspaces are allocated after this: a larger default margin.
+    crate::generate::enable_experts(&b, &mut model, a, 3072)?;
     Ok(Box::new(QwenEngine::new(
         b, model, vision, dflash, fe, engine_cfg,
     )?))
@@ -194,20 +199,21 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     let port: u16 = a.parse("port", 8010)?;
     let profile = crate::select::profile(a)?.map_or("unknown", |p| p.id);
 
-    let engine: Box<dyn ChatEngine> = if architecture == "Qwen3_5ForCausalLM" {
-        match crate::select::backend(a)? {
-            Selected::Cpu(b) => build(b, &art, a)?,
-            #[cfg(feature = "cuda")]
-            Selected::Cuda(b) => build(b, &art, a)?,
-        }
-    } else {
-        eprintln!(
-            "note: no velox execution path for {architecture}; chat requests will answer 501"
-        );
-        Box::new(UnimplementedEngine {
-            architecture: architecture.clone(),
-        })
-    };
+    let engine: Box<dyn ChatEngine> =
+        if architecture == DENSE_ARCHITECTURE || architecture == MOE_ARCHITECTURE {
+            match crate::select::backend(a)? {
+                Selected::Cpu(b) => build(b, &art, a)?,
+                #[cfg(feature = "cuda")]
+                Selected::Cuda(b) => build(b, &art, a)?,
+            }
+        } else {
+            eprintln!(
+                "note: no velox execution path for {architecture}; chat requests will answer 501"
+            );
+            Box::new(UnimplementedEngine {
+                architecture: architecture.clone(),
+            })
+        };
     // As many concurrent generations as engine lanes (more wait for one here).
     let cfg = Config {
         model_id: model_id.clone(),

@@ -14,6 +14,7 @@ use velox_weights::gguf::{Gguf, GgufTensor};
 
 use super::config::{LayerKind, Qwen4Config};
 use super::ple::PleTable;
+use crate::experts::ExpertRecords;
 
 fn werr(e: velox_weights::Error) -> Error {
     Error::Config(e.to_string())
@@ -78,15 +79,6 @@ pub enum Mixer<B: Backend> {
     Qsa(QsaWeights<B>),
 }
 
-/// One layer's routed experts: records in system RAM.
-pub struct ExpertRecords<B: Backend> {
-    pub records: B::Buffer,
-    pub record_bytes: usize,
-    pub gate: ExpertMatrix,
-    pub up: ExpertMatrix,
-    pub down: ExpertMatrix,
-}
-
 pub struct MoeWeights<B: Backend> {
     /// Router rows then the shared expert's gate row `[experts + 1, hidden]`.
     pub router: Mat<B>,
@@ -128,6 +120,11 @@ pub struct Qwen4Weights<B: Backend> {
 
 impl<B: Backend> Qwen4Weights<B> {
     /// The largest expert record of any layer: the slot size of a shared pool.
+    /// Every layer's routed experts, for [`crate::experts::ExpertCache::update`].
+    pub fn expert_records(&self) -> Vec<&ExpertRecords<B>> {
+        self.layers.iter().map(|l| &l.moe.experts).collect()
+    }
+
     pub fn max_record_bytes(&self) -> usize {
         self.layers
             .iter()

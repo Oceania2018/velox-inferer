@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde_json::json;
 use velox_core::{Backend, Error, KvFormat, Result};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{Qwen35Text, TextConfig, TextWeights};
+use velox_models::qwen3_5::{ExpertPolicy, Qwen35Text, TextConfig, TextWeights};
 use velox_weights::Artifact;
 
 use crate::args::Args;
@@ -111,8 +111,9 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
         w.host_bytes as f64 / 1e9,
         t0.elapsed().as_secs_f64()
     );
-    let model = Qwen35Text::new(cfg, w);
+    let mut model = Qwen35Text::new(cfg, w);
     let mut ws = model.workspace(b, chunk)?;
+    enable_experts(b, &mut model, a, 1536)?;
 
     for input in inputs {
         let (prompt, ids) = match input {
@@ -495,5 +496,39 @@ fn dflash_generate<B: Backend>(
     );
     println!("ids       {out:?}");
     println!("text      {:?}", fe.decode(&out)?);
+    Ok(())
+}
+
+/// Readies a MoE model's routed experts: device slots for the most selected ones in the memory
+/// left after `margin_mib` (`--vram-margin-mib`; room for what is still to be allocated), or
+/// `--expert-slots`. A dense model is left as is.
+pub(crate) fn enable_experts<B: Backend>(
+    b: &B,
+    model: &mut Qwen35Text<B>,
+    a: &Args,
+    margin_mib: usize,
+) -> Result<()> {
+    let slot = model.expert_slot_bytes();
+    if slot == 0 {
+        return Ok(());
+    }
+    b.synchronize()?;
+    let free = b.mem_info().map_or(0, |(free, _)| free);
+    let margin: usize = a.parse("vram-margin-mib", margin_mib)?;
+    let slots =
+        (free.saturating_sub(margin << 20) / slot).min(a.parse("expert-slots", usize::MAX)?);
+    let policy = ExpertPolicy {
+        interval: a.parse("cache-interval", ExpertPolicy::default().interval)?,
+        moves: a.parse("cache-moves", ExpertPolicy::default().moves)?,
+        ..ExpertPolicy::default()
+    };
+    model.enable_experts(b, slots, policy)?;
+    let total = model.w.experts.len() * model.cfg_experts();
+    eprintln!(
+        "expert cache: {slots} slots of {:.2} MiB ({:.2} GB, {:.1}% of {total} experts)",
+        slot as f64 / (1 << 20) as f64,
+        (slots * slot) as f64 / 1e9,
+        100.0 * slots as f64 / total.max(1) as f64,
+    );
     Ok(())
 }
