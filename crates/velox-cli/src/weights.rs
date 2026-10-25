@@ -1,4 +1,4 @@
-//! `velox inspect` and `velox convert`.
+//! `velox inspect`, `velox convert`, `velox import-gguf` and `velox import-hf`.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -147,6 +147,28 @@ pub fn import_gguf(a: &Args) -> Result<ExitCode> {
         output.display(),
         gb(r.payload_bytes),
         gb(r.donor_bytes),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn import_hf(a: &Args) -> Result<ExitCode> {
+    let dir = Path::new(required(a, "hf-dir")?);
+    let output = Path::new(required(a, "output")?);
+    let t0 = std::time::Instant::now();
+    let r =
+        velox_models::qwen3_5::hf::import(dir, output, &mut |line| eprintln!("[import] {line}"))?;
+    for (format, objects, bytes) in &r.formats {
+        println!("  {format:<22} {objects:>6} objects {:>7.2} GB", gb(*bytes));
+    }
+    println!(
+        "wrote {} ({:.2} GB; {} objects, {} bindings, {} uses; MTP {}) in {:.1}s; structure ok",
+        output.display(),
+        gb(r.payload_bytes),
+        r.objects,
+        r.bindings,
+        r.uses,
+        if r.mtp { "yes" } else { "no" },
         t0.elapsed().as_secs_f64()
     );
     Ok(ExitCode::SUCCESS)
