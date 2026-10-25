@@ -187,6 +187,20 @@ fn read_exact_at(f: &File, mut at: u64, mut buf: &mut [u8]) -> std::io::Result<(
 }
 
 impl Gguf {
+    /// Hints that reads of this handle are random (no readahead): for tables read a few rows at
+    /// a time, where readahead turns each read of a hundred bytes into one of 128 KB. A no-op
+    /// where unsupported.
+    pub fn advise_random(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: a valid descriptor owned by self.file; the advice changes no memory.
+            unsafe {
+                libc::posix_fadvise(self.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+            }
+        }
+    }
+
     pub fn meta_u64(&self, key: &str) -> Option<u64> {
         self.metadata.get(key).and_then(Value::as_u64)
     }

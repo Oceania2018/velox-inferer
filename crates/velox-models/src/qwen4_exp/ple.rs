@@ -45,6 +45,7 @@ impl PleTable {
         }
         // A second handle on the shard: reads here are positional and independent.
         let file = Gguf::open(&g.path).map_err(|e| Error::Config(e.to_string()))?;
+        file.advise_random();
         Ok(PleTable {
             file,
             offset: t.offset,
