@@ -6,13 +6,12 @@
 //! between steps.
 
 mod config;
-mod experts;
 mod load;
 mod mtp;
 mod ple;
 
+pub use crate::experts::{CacheReport, ExpertCache, ExpertRecords};
 pub use config::{LayerKind, PleConfig, Qwen4Config};
-pub use experts::{CacheReport, ExpertCache};
 pub use load::{load, load_mtp, MtpWeights, Qwen4Weights, Shards};
 pub use mtp::{Mtp, MtpSession};
 pub use ple::{hash_rows, PleTable};

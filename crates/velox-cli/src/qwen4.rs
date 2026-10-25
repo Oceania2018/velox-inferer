@@ -183,7 +183,7 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
         }
         let prefill = t1.elapsed().as_secs_f64();
         // The prompt's routing decides the first placement.
-        let filled = cache.update(b, &model.w, usize::MAX)?;
+        let filled = cache.update(b, &model.w.expert_records(), usize::MAX)?;
         let trace_start = cache.trace.as_ref().map_or(0, |t| t.len() - 1);
         let fill = t1.elapsed().as_secs_f64() - prefill;
         on_phase("prefill");
@@ -230,7 +230,7 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
             since_update += toks.len();
             if since_update >= interval {
                 since_update = 0;
-                let r = cache.update(b, &model.w, moves)?;
+                let r = cache.update(b, &model.w.expert_records(), moves)?;
                 (hits, misses, moved) = (hits + r.hits, misses + r.misses, moved + r.moves);
             }
         }
@@ -242,14 +242,14 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
             model.forward(b, &mut session, &mut ws, &mut cache, &[next])?;
             next = model.argmax(b, &mut ws, limit)?;
             if out.len() % interval == 0 {
-                let r = cache.update(b, &model.w, moves)?;
+                let r = cache.update(b, &model.w.expert_records(), moves)?;
                 (hits, misses, moved) = (hits + r.hits, misses + r.misses, moved + r.moves);
             }
         }
         let decode = t2.elapsed().as_secs_f64();
         if cache.trace.is_some() {
             // Fold the tail in so the trace covers every generated token.
-            cache.update(b, &model.w, 0)?;
+            cache.update(b, &model.w.expert_records(), 0)?;
             trace_spans.push((
                 trace_start,
                 cache.trace.as_ref().map_or(0, Vec::len),
@@ -301,7 +301,7 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
     }
     if let Some(path) = a.get("expert-stats") {
         // Fold the counts since the last update in (no moves).
-        cache.update(b, &model.w, 0)?;
+        cache.update(b, &model.w.expert_records(), 0)?;
         // Selections per [layer][expert], for studying routing skew and cache policies.
         let v = serde_json::to_string(cache.totals()).map_err(|e| Error::Config(e.to_string()))?;
         std::fs::write(path, v).map_err(|e| Error::Config(format!("{path}: {e}")))?;

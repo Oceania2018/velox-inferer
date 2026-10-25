@@ -1,4 +1,5 @@
-//! Which routed experts live on the device (docs/qwen4_exp.md#expert-offload).
+//! Routed experts in system RAM and which of them live on the device
+//! (docs/qwen4_exp.md#expert-offload); shared by the MoE models.
 //!
 //! Every layer's experts stay in system RAM; a pool of device slots shared by all layers holds
 //! copies of the most selected ones. `moe_route` counts selections per expert on the device;
@@ -7,9 +8,17 @@
 //! so queued steps read a consistent placement, and a slot is an exact copy: residency changes
 //! speed, never results.
 
-use velox_core::{ActPolicy, Backend, ExpertBank, Result};
+use velox_core::{ActPolicy, Backend, ExpertBank, ExpertMatrix, Result};
 
-use super::load::{ExpertRecords, Qwen4Weights};
+/// One layer's routed experts as `[gate | up | down]` records of `record_bytes` (a multiple of
+/// 16) in system RAM the device reads directly.
+pub struct ExpertRecords<B: Backend> {
+    pub records: B::Buffer,
+    pub record_bytes: usize,
+    pub gate: ExpertMatrix,
+    pub up: ExpertMatrix,
+    pub down: ExpertMatrix,
+}
 
 const UNMAPPED: i32 = -1;
 
@@ -109,7 +118,13 @@ impl<B: Backend> ExpertCache<B> {
 
     /// Folds the selection counts into the scores, then moves up to `max_moves` experts into
     /// slots where they score better than the residents they replace.
-    pub fn update(&mut self, b: &B, w: &Qwen4Weights<B>, max_moves: usize) -> Result<CacheReport> {
+    /// `layers`: each cache layer's records (what [`Self::bank`] reads).
+    pub fn update(
+        &mut self,
+        b: &B,
+        layers: &[&ExpertRecords<B>],
+        max_moves: usize,
+    ) -> Result<CacheReport> {
         let experts = self.host_map.first().map_or(0, Vec::len);
         let mut report = CacheReport::default();
         let zeros = vec![0f32; experts];
@@ -185,7 +200,7 @@ impl<B: Backend> ExpertCache<B> {
         }
         let mut promoted = vec![false; self.maps.len()];
         for &(slot, l, e) in &moves {
-            let rec = &w.layers[l].moe.experts;
+            let rec = layers[l];
             b.copy(
                 &rec.records,
                 e * rec.record_bytes / 4,
