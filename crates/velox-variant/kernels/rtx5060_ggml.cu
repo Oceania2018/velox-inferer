@@ -1792,3 +1792,361 @@ VELOX_API int velox_5060_moe_experts(const float* x, const float* ids, const flo
         h, static_cast<int>(pairs), width / 32, hq, hd);
     return moe_down_any(down_type, d, ids, wts, rows, k, hq, hd, y);
 }
+
+// ---- Routed experts at prefill widths: grouped by expert ------------------------------------
+//
+// Pairs are sorted by expert (counting sort). A block owns one expert and a tile of its weight
+// rows: it stages the rows once (device slot or mapped system RAM, 16-byte loads), decodes them
+// into int8 codes and per-32 scales in shared memory, then runs every pair routed to the expert
+// against that tile with dp4a. Each expert's weights are read once per call, so the cost is
+// the experts touched, not the pairs. Down writes one output row per pair; the weighted sum over
+// a row's experts runs in order afterwards (deterministic).
+namespace {
+
+__global__ void moe_count_kernel(const float* __restrict__ ids, int pairs, int experts, int* __restrict__ counts) {
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < pairs; p += gridDim.x * blockDim.x) {
+        const unsigned e = __float_as_uint(ids[p]);
+        if (e < static_cast<unsigned>(experts)) atomicAdd(counts + e, 1);
+    }
+}
+
+// One block: exclusive scan of the counts (cursors reset).
+__global__ void moe_scan_kernel(const int* __restrict__ counts, int* __restrict__ offsets, int* __restrict__ cursor,
+                                int experts) {
+    __shared__ int part[256];
+    const int t = threadIdx.x, per = (experts + 255) / 256;
+    int s = 0;
+    for (int i = 0; i < per; ++i) {
+        const int e = t * per + i;
+        if (e < experts) s += counts[e];
+    }
+    part[t] = s;
+    __syncthreads();
+    if (t == 0) {
+        int acc = 0;
+        for (int i = 0; i < 256; ++i) {
+            const int v = part[i];
+            part[i] = acc;
+            acc += v;
+        }
+        offsets[experts] = acc;
+    }
+    __syncthreads();
+    int acc = part[t];
+    for (int i = 0; i < per; ++i) {
+        const int e = t * per + i;
+        if (e < experts) {
+            offsets[e] = acc;
+            cursor[e] = 0;
+            acc += counts[e];
+        }
+    }
+}
+
+__global__ void moe_fill_kernel(const float* __restrict__ ids, int pairs, int experts, const int* __restrict__ offsets,
+                                int* __restrict__ cursor, int* __restrict__ list) {
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < pairs; p += gridDim.x * blockDim.x) {
+        const unsigned e = __float_as_uint(ids[p]);
+        if (e < static_cast<unsigned>(experts)) list[offsets[e] + atomicAdd(cursor + e, 1)] = p;
+    }
+}
+
+// A decoded weight tile in shared memory: RT rows x S sub-blocks of 32 int8 codes (rows padded by
+// 16 bytes against bank conflicts), G scales and (offset types) G offsets per sub-block.
+template <int T>
+struct Tile {
+    static constexpr int G = Traits<T>::G;
+    static constexpr bool kOff = Traits<T>::kOff;
+    __host__ __device__ static int row_stride(int subs) { return subs * 32 + 16; }
+    __host__ __device__ static size_t bytes(int rt, int subs, int raw) {
+        const size_t codes = static_cast<size_t>(rt) * row_stride(subs);
+        const size_t sc = static_cast<size_t>(rt) * subs * G * 4 * (kOff ? 2 : 1);
+        return codes + sc + (raw + 31) / 16 * 16;
+    }
+};
+
+// Stages rows [r0, r0 + rt) of a matrix at `w` (rows of row_bytes) into `raw` (16-byte loads over
+// the widened span) and decodes them into the tile; returns after a block barrier.
+template <int T>
+__device__ __forceinline__ void tile_build(const uint8_t* __restrict__ w, int row_bytes, int r0, int rt, int subs,
+                                           uint8_t* codes, float* sc, float* of, uint8_t* raw, const uint32_t* sg,
+                                           const uint8_t* sks) {
+    constexpr int SPB = sub_per_block<T>(), BB = block_bytes(T), G = Tile<T>::G;
+    const uint8_t* src = w + static_cast<long long>(r0) * row_bytes;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(src);
+    const uint4* p = reinterpret_cast<const uint4*>(a & ~static_cast<uintptr_t>(15));
+    const int lead = static_cast<int>(a & 15), n = (lead + rt * row_bytes + 15) / 16;
+    uint4* r = reinterpret_cast<uint4*>(raw);
+    for (int i = threadIdx.x; i < n; i += 4 * blockDim.x) {
+        uint4 v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (i + j * blockDim.x < n) v[j] = p[i + j * blockDim.x];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (i + j * blockDim.x < n) r[i + j * blockDim.x] = v[j];
+    }
+    __syncthreads();
+    const int stride = Tile<T>::row_stride(subs);
+    for (int idx = threadIdx.x; idx < rt * subs; idx += blockDim.x) {
+        const int row = idx / subs, u = idx % subs;
+        const Sub<T> s = decode_smem<T>(raw + lead + row * row_bytes + u / SPB * BB, u % SPB, sg, sks);
+        int4* c = reinterpret_cast<int4*>(codes + row * stride + u * 32);
+        c[0] = make_int4(s.w[0], s.w[1], s.w[2], s.w[3]);
+        c[1] = make_int4(s.w[4], s.w[5], s.w[6], s.w[7]);
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            sc[idx * G + g] = s.s[g];
+            if constexpr (Tile<T>::kOff) of[idx * G + g] = s.o[g];
+        }
+    }
+    __syncthreads();
+}
+
+// sub_dot of a decoded tile entry.
+template <int T>
+__device__ __forceinline__ float tile_dot(const uint8_t* codes, const float* sc, const float* of, int stride, int subs,
+                                          int row, int u, const int (&a)[8]) {
+    constexpr int G = Tile<T>::G;
+    Sub<T> s;
+    const int4* c = reinterpret_cast<const int4*>(codes + row * stride + u * 32);
+    const int4 c0 = c[0], c1 = c[1];
+    s.w[0] = c0.x, s.w[1] = c0.y, s.w[2] = c0.z, s.w[3] = c0.w;
+    s.w[4] = c1.x, s.w[5] = c1.y, s.w[6] = c1.z, s.w[7] = c1.w;
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        s.s[g] = sc[(row * subs + u) * G + g];
+        if constexpr (Tile<T>::kOff) s.o[g] = of[(row * subs + u) * G + g];
+    }
+    return sub_dot<T>(s, a);
+}
+
+template <int T>
+__host__ __device__ constexpr int up_tile_rows() {
+    return T == kIq1M ? 8 : 16;
+}
+
+// Gate (mode 0: h[p][i] = gate_i . x) or up (mode 1: h[p][i] = silu(h[p][i]) * (up_i . x)) for
+// every pair of expert blockIdx.y, rows [RT blockIdx.x, + RT). A warp per pair, lanes over K.
+template <int T>
+__global__ void __launch_bounds__(128)
+    moe_grouped_up_kernel(MoeDesc d, long long mat_off, const int* __restrict__ offsets, const int* __restrict__ list,
+                          int k, const int8_t* __restrict__ xq, const float* __restrict__ xd, float* __restrict__ h,
+                          int mode) {
+    constexpr int RT = up_tile_rows<T>(), G = Tile<T>::G;
+    constexpr int GW = moe_grid_words<T>() > 0 ? moe_grid_words<T>() : 1;
+    __shared__ uint32_t sg[GW];
+    __shared__ uint8_t sks[128];
+    extern __shared__ __align__(16) uint8_t smem[];
+    const int e = blockIdx.y, begin = offsets[e], count = offsets[e + 1] - begin;
+    if (count == 0) return;
+    moe_load_tables<T>(sg, sks);
+    const int subs = d.hidden / 32, r0 = blockIdx.x * RT, rt = min(RT, d.width - r0);
+    const int row_bytes = subs / sub_per_block<T>() * block_bytes(T), stride = Tile<T>::row_stride(subs);
+    uint8_t* codes = smem;
+    float* sc = reinterpret_cast<float*>(codes + RT * stride);
+    float* of = sc + RT * subs * G;
+    uint8_t* raw = reinterpret_cast<uint8_t*>(of + (Tile<T>::kOff ? RT * subs * G : 0));
+    __syncthreads();
+    tile_build<T>(moe_record(d, e) + mat_off, row_bytes, r0, rt, subs, codes, sc, of, raw, sg, sks);
+    const int lane = threadIdx.x % VELOX_WARP;
+    for (int i = threadIdx.x / VELOX_WARP; i < count; i += blockDim.x / VELOX_WARP) {
+        const int p = list[begin + i], tok = p / k;
+        float acc[RT];
+#pragma unroll
+        for (int r = 0; r < RT; ++r) acc[r] = 0.0f;
+        for (int u = lane; u < subs; u += VELOX_WARP) {
+            const int4* ap = reinterpret_cast<const int4*>(xq + (static_cast<long long>(tok) * subs + u) * 32);
+            const int4 a0 = __ldg(ap), a1 = __ldg(ap + 1);
+            const int a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float dx = __ldg(xd + static_cast<long long>(tok) * subs + u);
+#pragma unroll
+            for (int r = 0; r < RT; ++r) acc[r] += dx * tile_dot<T>(codes, sc, of, stride, subs, min(r, rt - 1), u, a);
+        }
+#pragma unroll
+        for (int r = 0; r < RT; ++r) {
+            const float v = velox_warp_sum(acc[r]);
+            if (lane == r && r < rt) {
+                float* o = h + static_cast<long long>(p) * d.width + r0 + r;
+                if (mode) {
+                    const float g = *o;
+                    *o = g / (1.0f + __expf(-g)) * v;
+                } else {
+                    *o = v;
+                }
+            }
+        }
+    }
+}
+
+constexpr int kDownTileRows = 64;
+
+// o[p][c] = down_c . h[p] for every pair of expert blockIdx.y, rows [64 blockIdx.x, + 64): a warp
+// per pair, two output rows per lane.
+template <int T>
+__global__ void __launch_bounds__(128)
+    moe_grouped_down_kernel(MoeDesc d, const int* __restrict__ offsets, const int* __restrict__ list,
+                            const int8_t* __restrict__ hq, const float* __restrict__ hd, float* __restrict__ o) {
+    constexpr int RT = kDownTileRows;
+    constexpr int GW = moe_grid_words<T>() > 0 ? moe_grid_words<T>() : 1;
+    __shared__ uint32_t sg[GW];
+    __shared__ uint8_t sks[128];
+    extern __shared__ __align__(16) uint8_t smem[];
+    const int e = blockIdx.y, begin = offsets[e], count = offsets[e + 1] - begin;
+    if (count == 0) return;
+    moe_load_tables<T>(sg, sks);
+    constexpr int G = Tile<T>::G;
+    const int subs = d.width / 32, r0 = blockIdx.x * RT, rt = min(RT, d.hidden - r0);
+    const int row_bytes = subs / sub_per_block<T>() * block_bytes(T), stride = Tile<T>::row_stride(subs);
+    uint8_t* codes = smem;
+    float* sc = reinterpret_cast<float*>(codes + RT * stride);
+    float* of = sc + RT * subs * G;
+    uint8_t* raw = reinterpret_cast<uint8_t*>(of + (Tile<T>::kOff ? RT * subs * G : 0));
+    __syncthreads();
+    tile_build<T>(moe_record(d, e) + d.down_off, row_bytes, r0, rt, subs, codes, sc, of, raw, sg, sks);
+    const int lane = threadIdx.x % VELOX_WARP;
+    for (int i = threadIdx.x / VELOX_WARP; i < count; i += blockDim.x / VELOX_WARP) {
+        const int p = list[begin + i];
+        float acc[2] = {0.0f, 0.0f};
+        for (int u = 0; u < subs; ++u) {
+            const int4* ap = reinterpret_cast<const int4*>(hq + (static_cast<long long>(p) * subs + u) * 32);
+            const int4 a0 = __ldg(ap), a1 = __ldg(ap + 1);
+            const int a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float dh = __ldg(hd + static_cast<long long>(p) * subs + u);
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const int r = lane + q * VELOX_WARP;
+                acc[q] += dh * tile_dot<T>(codes, sc, of, stride, subs, min(r, rt - 1), u, a);
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const int r = lane + q * VELOX_WARP;
+            if (r < rt) o[static_cast<long long>(p) * d.hidden + r0 + r] = acc[q];
+        }
+    }
+}
+
+__global__ void moe_sum_kernel(const float* __restrict__ o, const float* __restrict__ w, int rows, int k, int hidden,
+                               float* __restrict__ y) {
+    const long long n = static_cast<long long>(rows) * hidden;
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / hidden, c = i % hidden;
+        float acc = 0.0f;
+        for (int j = 0; j < k; ++j) acc += w[r * k + j] * o[(r * k + j) * hidden + c];
+        y[i] = acc;
+    }
+}
+
+template <int T>
+int grouped_up_launch(const MoeDesc& d, long long mat_off, int experts, const int* offsets, const int* list, int k,
+                      const int8_t* xq, const float* xd, float* h, int mode) {
+    constexpr int RT = up_tile_rows<T>();
+    const int subs = d.hidden / 32, row_bytes = subs / sub_per_block<T>() * block_bytes(T);
+    const size_t smem = Tile<T>::bytes(RT, subs, RT * row_bytes);
+    if (smem + 4 * moe_grid_words<T>() + 128 > 99 * 1024) return VELOX_ERR_UNSUPPORTED;
+    static const cudaError_t attr = cudaFuncSetAttribute(moe_grouped_up_kernel<T>,
+                                                         cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024 - 4 * moe_grid_words<T>() - 128);
+    if (attr != cudaSuccess) return static_cast<int>(attr);
+    const dim3 grid((d.width + RT - 1) / RT, experts);
+    moe_grouped_up_kernel<T><<<grid, 128, smem>>>(d, mat_off, offsets, list, k, xq, xd, h, mode);
+    return velox_launch_status();
+}
+
+template <int T>
+int grouped_down_launch(const MoeDesc& d, int experts, const int* offsets, const int* list, const int8_t* hq,
+                        const float* hd, float* o) {
+    constexpr int RT = kDownTileRows;
+    const int subs = d.width / 32, row_bytes = subs / sub_per_block<T>() * block_bytes(T);
+    const size_t smem = Tile<T>::bytes(RT, subs, RT * row_bytes);
+    if (smem + 4 * moe_grid_words<T>() + 128 > 99 * 1024) return VELOX_ERR_UNSUPPORTED;
+    static const cudaError_t attr = cudaFuncSetAttribute(moe_grouped_down_kernel<T>,
+                                                         cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024 - 4 * moe_grid_words<T>() - 128);
+    if (attr != cudaSuccess) return static_cast<int>(attr);
+    const dim3 grid((d.hidden + RT - 1) / RT, experts);
+    moe_grouped_down_kernel<T><<<grid, 128, smem>>>(d, offsets, list, hq, hd, o);
+    return velox_launch_status();
+}
+
+#define MOE_GROUPED(F, ...)                           \
+    switch (type) {                                   \
+        case kQ2K: return F<kQ2K>(__VA_ARGS__);       \
+        case kQ4K: return F<kQ4K>(__VA_ARGS__);       \
+        case kIq1M: return F<kIq1M>(__VA_ARGS__);     \
+        case kIq2Xxs: return F<kIq2Xxs>(__VA_ARGS__); \
+        case kIq2Xs: return F<kIq2Xs>(__VA_ARGS__);   \
+        case kIq2S: return F<kIq2S>(__VA_ARGS__);     \
+        case kIq3Xxs: return F<kIq3Xxs>(__VA_ARGS__); \
+        case kIq3S: return F<kIq3S>(__VA_ARGS__);     \
+        case kIq4Xs: return F<kIq4Xs>(__VA_ARGS__);   \
+        case kQ2_0: return F<kQ2_0>(__VA_ARGS__);     \
+        default: return VELOX_ERR_UNSUPPORTED;        \
+    }
+
+int grouped_up_any(int type, const MoeDesc& d, long long mat_off, int experts, const int* offsets, const int* list,
+                   int k, const int8_t* xq, const float* xd, float* h, int mode) {
+    MOE_GROUPED(grouped_up_launch, d, mat_off, experts, offsets, list, k, xq, xd, h, mode)
+}
+
+int grouped_down_any(int type, const MoeDesc& d, int experts, const int* offsets, const int* list, const int8_t* hq,
+                     const float* hd, float* o) {
+    MOE_GROUPED(grouped_down_launch, d, experts, offsets, list, hq, hd, o)
+}
+
+#undef MOE_GROUPED
+
+}  // namespace
+
+// Bytes of scratch velox_5060_moe_grouped needs.
+VELOX_API long long velox_5060_moe_grouped_scratch(int rows, int k, int width, int hidden, int experts) {
+    const long long pairs = static_cast<long long>(rows) * k;
+    const long long xs = static_cast<long long>(rows) * hidden, hw = pairs * width;
+    return moe_round(xs) + moe_round(4 * (xs / 32)) + moe_round(4 * hw) + moe_round(hw) + moe_round(4 * (hw / 32)) +
+           moe_round(4 * (3LL * experts + 1)) + moe_round(4 * pairs) + moe_round(4 * pairs * hidden);
+}
+
+// moe_experts grouped by expert, for many rows; arguments as velox_5060_moe_experts plus the bank
+// size. VELOX_ERR_UNSUPPORTED for geometry the kernels do not cover.
+VELOX_API int velox_5060_moe_grouped(const float* x, const float* ids, const float* wts, const uint8_t* records,
+                                     const uint8_t* slots, const float* map, long long record_bytes,
+                                     long long slot_bytes, int up_type, long long gate_off, long long up_off,
+                                     int down_type, long long down_off, int width, int hidden, int rows, int k,
+                                     int experts, float* y, void* scratch) {
+    if (rows < 1 || k < 1 || experts < 1 || up_type < 0 || up_type > kQ2_0 || down_type < 0 || down_type > kQ2_0 ||
+        hidden % block_values(up_type) != 0 || width % block_values(down_type) != 0 ||
+        reinterpret_cast<uintptr_t>(scratch) % 16 != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    const MoeDesc d{records, slots, map, record_bytes, slot_bytes, gate_off, up_off, down_off, width, hidden};
+    const long long pairs = static_cast<long long>(rows) * k;
+    const long long xs = static_cast<long long>(rows) * hidden, hw = pairs * width;
+    uint8_t* p = static_cast<uint8_t*>(scratch);
+    int8_t* xq = reinterpret_cast<int8_t*>(p);
+    float* xd = reinterpret_cast<float*>(p += moe_round(xs));
+    float* h = reinterpret_cast<float*>(p += moe_round(4 * (xs / 32)));
+    int8_t* hq = reinterpret_cast<int8_t*>(p += moe_round(4 * hw));
+    float* hd = reinterpret_cast<float*>(p += moe_round(hw));
+    int* counts = reinterpret_cast<int*>(p += moe_round(4 * (hw / 32)));
+    int* offsets = counts + experts;
+    int* cursor = offsets + experts + 1;
+    int* list = reinterpret_cast<int*>(p += moe_round(4 * (3LL * experts + 1)));
+    float* o = reinterpret_cast<float*>(p += moe_round(4 * pairs));
+    const int threads = 256;
+    if (cudaError_t e = cudaMemsetAsync(counts, 0, sizeof(int) * experts, 0)) return static_cast<int>(e);
+    moe_count_kernel<<<velox_grid_1d(pairs, threads), threads>>>(ids, static_cast<int>(pairs), experts, counts);
+    moe_scan_kernel<<<1, 256>>>(counts, offsets, cursor, experts);
+    moe_fill_kernel<<<velox_grid_1d(pairs, threads), threads>>>(ids, static_cast<int>(pairs), experts, offsets, cursor,
+                                                               list);
+    moe_quant_kernel<<<static_cast<unsigned>((xs / 32 * VELOX_WARP + threads - 1) / threads), threads>>>(
+        x, rows, hidden / 32, xq, xd);
+    for (int mode = 0; mode < 2; ++mode)
+        if (const int e = grouped_up_any(up_type, d, mode ? up_off : gate_off, experts, offsets, list, k, xq, xd, h,
+                                         mode))
+            return e;
+    moe_quant_kernel<<<static_cast<unsigned>((hw / 32 * VELOX_WARP + threads - 1) / threads), threads>>>(
+        h, static_cast<int>(pairs), width / 32, hq, hd);
+    if (const int e = grouped_down_any(down_type, d, experts, offsets, list, hq, hd, o)) return e;
+    moe_sum_kernel<<<velox_grid_1d(static_cast<long long>(rows) * hidden, threads), threads>>>(o, wts, rows, k, hidden,
+                                                                                             y);
+    return velox_launch_status();
+}

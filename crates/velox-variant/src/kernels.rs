@@ -830,6 +830,30 @@ impl Rtx5060Kernels {
 
 extern "C" {
     fn velox_5060_moe_scratch(rows: i32, k: i32, width: i32, hidden: i32) -> i64;
+    fn velox_5060_moe_grouped_scratch(rows: i32, k: i32, width: i32, hidden: i32, experts: i32) -> i64;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_5060_moe_grouped(
+        x: *const f32,
+        ids: *const f32,
+        wts: *const f32,
+        records: *const u8,
+        slots: *const u8,
+        map: *const f32,
+        record_bytes: i64,
+        slot_bytes: i64,
+        up_type: i32,
+        gate_off: i64,
+        up_off: i64,
+        down_type: i32,
+        down_off: i64,
+        width: i32,
+        hidden: i32,
+        rows: i32,
+        k: i32,
+        experts: i32,
+        y: *mut f32,
+        scratch: *mut f32,
+    ) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn velox_5060_moe_experts(
         x: *const f32,
@@ -854,7 +878,8 @@ extern "C" {
     ) -> i32;
 }
 
-/// Most rows the decode MoE kernels take (decode and verify windows); prefill chunks run portable.
+/// Most rows the decode MoE kernels take (decode and verify windows); larger chunks run the
+/// kernels grouped by expert.
 const MOE_DECODE_MAX: usize = 16;
 
 /// (gate/up type, down type) of rtx5060_ggml.cu's MoE kernels for `bank` at `rows` rows: GGML
@@ -864,7 +889,7 @@ fn moe_types(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> Option<(i32, i32
         WeightFormat::Ggml(t) if ggml_index(t) <= 9 => Some(ggml_index(t)),
         _ => None,
     };
-    if !(1..=MOE_DECODE_MAX).contains(&rows)
+    if rows == 0
         || !matches!(bank.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. })
         || bank.gate.format != bank.up.format
     {
@@ -928,9 +953,14 @@ impl CudaKernels for Rtx5060Kernels {
         if moe_types(bank, rows).is_none() {
             return portable;
         }
-        // SAFETY: a pure size computation.
+        let (r, kk, w, h) = (rows as i32, k as i32, bank.width() as i32, bank.hidden() as i32);
+        // SAFETY: pure size computations.
         let bytes = unsafe {
-            velox_5060_moe_scratch(rows as i32, k as i32, bank.width() as i32, bank.hidden() as i32)
+            if rows <= MOE_DECODE_MAX {
+                velox_5060_moe_scratch(r, kk, w, h)
+            } else {
+                velox_5060_moe_grouped_scratch(r, kk, w, h, bank.experts as i32)
+            }
         };
         portable.max((bytes as usize).div_ceil(4))
     }
@@ -960,6 +990,39 @@ impl CudaKernels for Rtx5060Kernels {
         };
         // SAFETY: CudaBackend validated the bank and extents (check::moe_experts); the scratch
         // holds moe_scratch_len slots; expert ids come from moe_route.
+        if rows > MOE_DECODE_MAX {
+            // SAFETY: as below; the scratch holds moe_scratch_len slots for this row count.
+            let r = status(
+                unsafe {
+                    velox_5060_moe_grouped(
+                        x.as_ptr(),
+                        ids.as_ptr(),
+                        weights.as_ptr(),
+                        bank.records.as_ptr().cast(),
+                        bank.slots.as_ptr().cast(),
+                        bank.map.as_ptr(),
+                        bank.record_bytes as i64,
+                        bank.slot_bytes as i64,
+                        tu,
+                        bank.gate.offset as i64,
+                        bank.up.offset as i64,
+                        td,
+                        bank.down.offset as i64,
+                        to_i32("width", bank.width())?,
+                        to_i32("hidden", bank.hidden())?,
+                        to_i32("rows", rows)?,
+                        k as i32,
+                        to_i32("experts", bank.experts)?,
+                        y.as_mut_ptr(),
+                        scratch.as_mut_ptr(),
+                    )
+                },
+                "rtx5060 moe_experts (grouped)",
+            );
+            return or_fallback(r, || {
+                portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+            });
+        }
         let r = status(
             unsafe {
                 velox_5060_moe_experts(
