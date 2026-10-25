@@ -1104,7 +1104,8 @@ const DFLASH: &str = "dflash::";
 
 /// [`import`], adding the DFlash2 drafter checkpoint in `dflash` (a `DFlash2DraftModel`
 /// conditioned on this target) as the `dflash2` component when given; `dflash_nvfp4` encodes
-/// its matrices as NVFP4 (drafts only steer speed, never results).
+/// its MLP as NVFP4 (drafts only steer speed, never results; quantising attention, the conv
+/// kernels or the selector too collapses acceptance).
 pub fn import_with(
     dir: &Path,
     out: &Path,
@@ -1417,27 +1418,28 @@ fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value, nvfp4: bool) -> Resul
     let t = |s: &str| format!("{DFLASH}{s}");
     // Whole tensors `srcs` stacked into one matrix `id`, bound as `parts`: NVFP4 when asked and
     // the shape allows, else as stored.
-    let mat = |b: &mut Builder<'_>, id: &str, srcs: &[String], parts: &[Part]| -> Result<()> {
-        let shapes: Vec<(u64, u64)> = srcs
-            .iter()
-            .map(|n| b.get(n).map(|t| t.matrix()))
-            .collect::<Result<_>>()?;
-        let n: u64 = shapes.iter().map(|s| s.0).sum();
-        let k = shapes.first().map_or(0, |s| s.1);
-        if nvfp4 && n.is_multiple_of(128) && k.is_multiple_of(64) {
-            let rows: Vec<(&str, u64, u64)> = srcs
+    let mat =
+        |b: &mut Builder<'_>, id: &str, srcs: &[String], parts: &[Part], q: bool| -> Result<()> {
+            let shapes: Vec<(u64, u64)> = srcs
                 .iter()
-                .zip(&shapes)
-                .map(|(n, s)| (n.as_str(), 0, s.0))
-                .collect();
-            b.nvfp4_stack(id, &rows, parts)
-        } else {
-            let rs: Vec<RowSrc> = srcs.iter().map(|n| RowSrc::all(n.clone())).collect();
-            b.stacked(id, &rs, parts)
-        }
-    };
+                .map(|n| b.get(n).map(|t| t.matrix()))
+                .collect::<Result<_>>()?;
+            let n: u64 = shapes.iter().map(|s| s.0).sum();
+            let k = shapes.first().map_or(0, |s| s.1);
+            if q && nvfp4 && n.is_multiple_of(128) && k.is_multiple_of(64) {
+                let rows: Vec<(&str, u64, u64)> = srcs
+                    .iter()
+                    .zip(&shapes)
+                    .map(|(n, s)| (n.as_str(), 0, s.0))
+                    .collect();
+                b.nvfp4_stack(id, &rows, parts)
+            } else {
+                let rs: Vec<RowSrc> = srcs.iter().map(|n| RowSrc::all(n.clone())).collect();
+                b.stacked(id, &rs, parts)
+            }
+        };
     let one = |b: &mut Builder<'_>, name: &str, binding: &str, rows: u64| {
-        mat(b, name, &[name.to_string()], &[(binding, 0, rows)])
+        mat(b, name, &[name.to_string()], &[(binding, 0, rows)], false)
     };
     one(b, &t("fc.weight"), "dflash2/feature_projection", h)?;
     check_k(
@@ -1486,6 +1488,7 @@ fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value, nvfp4: bool) -> Resul
                 (&q("attention/context_key"), qd, kvd),
                 (&q("attention/context_value"), qd + kvd, kvd),
             ],
+            false,
         )?;
         one(b, &l("self_attn.o_proj.weight"), &q("attention/output"), h)?;
         mat(
@@ -1493,8 +1496,16 @@ fn dflash2(b: &mut Builder<'_>, c: &TextConfig, v: &Value, nvfp4: bool) -> Resul
             &l("mlp.gate_up"),
             &[l("mlp.gate_proj.weight"), l("mlp.up_proj.weight")],
             &[(&q("mlp/gate"), 0, inter), (&q("mlp/up"), inter, inter)],
+            true,
         )?;
-        one(b, &l("mlp.down_proj.weight"), &q("mlp/down"), h)?;
+        let down = l("mlp.down_proj.weight");
+        mat(
+            b,
+            &down,
+            std::slice::from_ref(&down),
+            &[(&q("mlp/down"), 0, h)],
+            true,
+        )?;
         for conv in ["attention_conv", "mlp_conv"] {
             b.vector(
                 &q(&format!("{conv}/base_kernel")),
