@@ -91,7 +91,7 @@ pub fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> 
     let limit = fe.public_vocab;
     for (pi, p) in prompts.iter().enumerate() {
         if pi > 0 {
-            session = model.session(b, capacity, kv_format)?;
+            model.reset(b, &mut session)?;
         }
         let text =
             fe.template
