@@ -14,7 +14,7 @@ DeltaNet otherwise (36 layers). Attention: 24 query heads, 2 KV heads, head_dim 
 interleaved MRoPE (64 rotary dims, theta 1e7). GDN: 16 key heads, 48 value heads, Dk = Dv = 128,
 conv width 4. MoE in every layer: 512 experts, top-10, expert width 640, one shared expert of
 width 640. Hyper-connections: S = 4 residual streams, low rank 320. PLE on layer 1. Vocabulary
-248,320. eps = 1e-6. The GGUF has no MTP block.
+248,320. eps = 1e-6. The GGUF has no MTP block; one can be added as a sidecar ([MTP](#mtp-drafting)).
 
 ## Residual streams (hyper-connections)
 
@@ -136,6 +136,27 @@ conv state holds the last 9 normalised rows; the n-gram context needs the previo
 Image positions hash as the image token id.
 
 Ops: `ple_gate` (the per-stream gate and the gated values), `conv1d_dilated_silu`.
+
+## MTP drafting
+
+The published checkpoint has one MTP layer (`mtp.*`). velox reads it from a sidecar GGUF named as
+llama.cpp names layer `L = 48` (`blk.48.nextn.{fc_e,fc_h,enorm,hnorm,hc_head_*}`,
+`blk.48.{hc_attn_*,hc_ffn_*,attn_*,indexer.*,ffn_*}`; norms stored as 1 + w, routed experts
+IQ4_NL). `velox generate --mtp <sidecar>` loads it with the model's shards.
+
+```text
+entry p (h_p = the main residual [S, H] after the last layer at position p, x = token p + 1):
+  R[s] = fc_h(rmsnorm(h_p[s]) * hnorm[s]) + fc_e(rmsnorm(embed(x)) * enorm)
+  one QSA layer (own KV / index caches, entry p at position p) and one MoE layer, as the stack
+  draft(p + 2) = argmax output(hc_pre(R; nextn.hc_head_*).mixed)
+```
+
+Every kept position gets its entry: prompt chunks (shifted by one token) right after their main
+step, then each round's committed tokens. A round verifies `[next, draft]` as one two-row window
+that leaves the recurrent states (GDN conv/SSM, PLE conv history) untouched and records the rows
+`commit` replays (`gdn_replay`) for the kept prefix; KV and index rows past the kept prefix are
+rewritten before they are read. Greedy output is identical to plain decoding. The MTP layer's
+experts are read from system RAM (no device slots).
 
 ## GGUF mapping
 

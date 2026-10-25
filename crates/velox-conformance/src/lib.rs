@@ -2129,12 +2129,25 @@ impl<B: Backend> Suite<'_, B> {
             // The SwiGLU product is rounded again from values the device computes in f32: a value
             // on an int8 rounding boundary may land one code apart from the oracle's. Relative L2
             // error tolerates such isolated codes; a wrong expert, row or scale is O(1).
-            let (num, den) = got.iter().zip(&want).fold((0f64, 0f64), |(n, d), (&g, &w)| {
-                let e = f64::from(g) - f64::from(w);
-                (n + e * e, d + f64::from(w) * f64::from(w))
-            });
-            let rel = if num.is_nan() { f64::INFINITY } else { (num / den.max(1e-30)).sqrt() };
-            self.record(name + ", relative L2", Some(Op::MoeExperts), &[rel as f32], &[0.0], 1e-3);
+            let (num, den) = got
+                .iter()
+                .zip(&want)
+                .fold((0f64, 0f64), |(n, d), (&g, &w)| {
+                    let e = f64::from(g) - f64::from(w);
+                    (n + e * e, d + f64::from(w) * f64::from(w))
+                });
+            let rel = if num.is_nan() {
+                f64::INFINITY
+            } else {
+                (num / den.max(1e-30)).sqrt()
+            };
+            self.record(
+                name + ", relative L2",
+                Some(Op::MoeExperts),
+                &[rel as f32],
+                &[0.0],
+                1e-3,
+            );
         } else if permitted(act, policy) {
             self.record(name, Some(Op::MoeExperts), &got, &want, 5e-4);
         } else {
@@ -3232,7 +3245,14 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     )?;
     // Qwen3.8-Flash-Next's bf16 projections at their real shapes (hyper-connection low rank,
     // injection, router + shared gate, GDN gates, PLE) at decode, verify and prefill widths.
-    for (n, k) in [(320, 10240), (10240, 320), (4, 10240), (513, 2560), (96, 2560), (10240, 2560)] {
+    for (n, k) in [
+        (320, 10240),
+        (10240, 320),
+        (4, 10240),
+        (513, 2560),
+        (96, 2560),
+        (10240, 2560),
+    ] {
         for m in [1, 8, 70] {
             s.linear(WeightFormat::Bf16, n, k, 0, n, m)?;
         }
@@ -3242,9 +3262,21 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         use velox_core::ggml::GgmlType::{Iq3S, Iq4Xs, Q4K};
         for t in [Iq4Xs, Q4K, Iq3S] {
             // IQ4_XS's large weights take the portable f32 GEMM past 2e-4 at prefill widths.
-            let ms: &[usize] = if t == Iq4Xs { &[1, 3, 8] } else { &[1, 3, 8, 70, 300] };
+            let ms: &[usize] = if t == Iq4Xs {
+                &[1, 3, 8]
+            } else {
+                &[1, 3, 8, 70, 300]
+            };
             for &m in ms {
-                s.linear_act(WeightFormat::Ggml(t), 96, 2560, 0, 96, m, ActPolicy::AllowA8)?;
+                s.linear_act(
+                    WeightFormat::Ggml(t),
+                    96,
+                    2560,
+                    0,
+                    96,
+                    m,
+                    ActPolicy::AllowA8,
+                )?;
             }
         }
     }

@@ -168,6 +168,12 @@ impl Shards {
         Ok(Shards { files })
     }
 
+    /// Adds the tensors of another GGUF (a sidecar such as an MTP head).
+    pub fn add(&mut self, path: &Path) -> Result<()> {
+        self.files.push(Gguf::open(path).map_err(werr)?);
+        Ok(())
+    }
+
     pub fn first(&self) -> &Gguf {
         &self.files[0]
     }
@@ -567,6 +573,51 @@ fn expect_len(what: &str, got: usize, want: usize) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The MTP head (`blk.{layers}`, `blk.{layers}.nextn.*`): one QSA layer fed by
+/// `fc_e(norm(embed(x))) + fc_h(norm(h_s))` per residual stream, its own head mixer.
+pub struct MtpWeights<B: Backend> {
+    pub fc_e: Mat<B>,
+    pub fc_h: Mat<B>,
+    pub enorm: B::Buffer,
+    /// Per stream `[streams * hidden]`.
+    pub hnorm: B::Buffer,
+    pub hc_attn: HcWeights<B>,
+    pub attn: QsaWeights<B>,
+    pub hc_ffn: HcWeights<B>,
+    pub moe: MoeWeights<B>,
+    pub hc_head: HcWeights<B>,
+}
+
+/// Loads the MTP head from `shards` (the model's, or a sidecar added to them), when present.
+pub fn load_mtp<B: Backend>(
+    b: &B,
+    shards: &Shards,
+    c: &Qwen4Config,
+) -> Result<Option<MtpWeights<B>>> {
+    let i = c.layers.len();
+    let t = |s: &str| format!("blk.{i}.{s}");
+    if shards.tensor(&t("nextn.fc_e.weight")).is_err() {
+        return Ok(None);
+    }
+    let mut l = Loader {
+        b,
+        shards,
+        device_bytes: 0,
+        host_bytes: 0,
+    };
+    Ok(Some(MtpWeights {
+        fc_e: l.matrix(&t("nextn.fc_e.weight"), None)?,
+        fc_h: l.matrix(&t("nextn.fc_h.weight"), None)?,
+        enorm: l.vector(&t("nextn.enorm.weight"), c.hidden)?,
+        hnorm: l.vector(&t("nextn.hnorm.weight"), c.wide())?,
+        hc_attn: l.hc(&t("hc_attn"), c, true)?,
+        attn: l.qsa(i, c)?,
+        hc_ffn: l.hc(&t("hc_ffn"), c, true)?,
+        moe: l.moe(i, c)?,
+        hc_head: l.hc(&t("nextn.hc_head"), c, false)?,
+    }))
 }
 
 /// Loads every weight of the model in `shards`; `progress` gets a line per layer.

@@ -185,10 +185,15 @@ pub fn run_moe<B: Backend>(b: &B, c: &MoeConfig) -> Result<()> {
     let record_bytes = (2 * gb + db).div_ceil(16) * 16;
     let one = {
         let mut r = vec![0u8; record_bytes];
-        r[..gb].copy_from_slice(&velox_conformance::random_weight(&mut rng, c.gate, c.width, c.hidden));
-        r[gb..2 * gb].copy_from_slice(&velox_conformance::random_weight(&mut rng, c.gate, c.width, c.hidden));
-        r[2 * gb..2 * gb + db]
-            .copy_from_slice(&velox_conformance::random_weight(&mut rng, c.down, c.hidden, c.width));
+        r[..gb].copy_from_slice(&velox_conformance::random_weight(
+            &mut rng, c.gate, c.width, c.hidden,
+        ));
+        r[gb..2 * gb].copy_from_slice(&velox_conformance::random_weight(
+            &mut rng, c.gate, c.width, c.hidden,
+        ));
+        r[2 * gb..2 * gb + db].copy_from_slice(&velox_conformance::random_weight(
+            &mut rng, c.down, c.hidden, c.width,
+        ));
         r
     };
     // Every expert holds the same values (only placement is timed); the first half has slots.
@@ -237,7 +242,10 @@ pub fn run_moe<B: Backend>(b: &B, c: &MoeConfig) -> Result<()> {
             for _ in 0..sets {
                 let mut ids = Vec::with_capacity(rows * c.k);
                 for _ in 0..rows {
-                    let (mut a, mut z) = (rng.next_u64() as usize % half, rng.next_u64() as usize % half);
+                    let (mut a, mut z) = (
+                        rng.next_u64() as usize % half,
+                        rng.next_u64() as usize % half,
+                    );
                     for j in 0..c.k {
                         let e = if j < on {
                             a = (a + 7) % half;
