@@ -175,6 +175,9 @@ pub struct MoeConfig {
     pub rows: Vec<usize>,
     pub resident: Vec<f64>,
     pub iters: usize,
+    /// Verify-window routing: each row picks k distinct experts from a pool of this many
+    /// (0: every row independent).
+    pub pool: usize,
 }
 
 pub fn run_moe<B: Backend>(b: &B, c: &MoeConfig) -> Result<()> {
@@ -248,9 +251,39 @@ pub fn run_moe<B: Backend>(b: &B, c: &MoeConfig) -> Result<()> {
             let sets = 32;
             let on = (c.k as f64 * frac).round() as usize;
             let mut idsets = Vec::with_capacity(sets);
+            let mut uniq_total = 0usize;
             for _ in 0..sets {
                 let mut ids = Vec::with_capacity(rows * c.k);
-                for _ in 0..rows {
+                if c.pool >= c.k {
+                    // A pool of experts, round(frac * pool) of them resident, rows choose from it.
+                    let pon = (c.pool as f64 * frac).round() as usize;
+                    let mut pool = Vec::with_capacity(c.pool);
+                    while pool.len() < c.pool {
+                        let e = if pool.len() < pon {
+                            rng.next_u64() as usize % half
+                        } else {
+                            half + rng.next_u64() as usize % (c.experts - half)
+                        };
+                        if !pool.contains(&e) {
+                            pool.push(e);
+                        }
+                    }
+                    for _ in 0..rows {
+                        let mut row: Vec<usize> = Vec::with_capacity(c.k);
+                        while row.len() < c.k {
+                            let e = pool[rng.next_u64() as usize % c.pool];
+                            if !row.contains(&e) {
+                                row.push(e);
+                            }
+                        }
+                        ids.extend(row.iter().map(|&e| f32::from_bits(e as u32)));
+                    }
+                }
+                let mut u: Vec<u32> = ids.iter().map(|v: &f32| v.to_bits()).collect();
+                u.sort_unstable();
+                u.dedup();
+                uniq_total += if c.pool >= c.k { u.len() } else { 0 };
+                for _ in 0..if c.pool >= c.k { 0 } else { rows } {
                     let (mut a, mut z) = (
                         rng.next_u64() as usize % half,
                         rng.next_u64() as usize % half,
@@ -266,8 +299,15 @@ pub fn run_moe<B: Backend>(b: &B, c: &MoeConfig) -> Result<()> {
                         ids.push(f32::from_bits(e as u32));
                     }
                 }
+                if c.pool < c.k {
+                    let mut u: Vec<u32> = ids.iter().map(|v: &f32| v.to_bits()).collect();
+                    u.sort_unstable();
+                    u.dedup();
+                    uniq_total += u.len();
+                }
                 idsets.push(b.upload(&ids)?);
             }
+            let uniq = uniq_total as f64 / sets as f64;
             let w = b.upload(&vec![1.0 / c.k as f32; rows * c.k])?;
             let x = b.upload(&rng.vec(rows * c.hidden, 1.0))?;
             let mut y = b.alloc(rows * c.hidden)?;
@@ -289,10 +329,12 @@ pub fn run_moe<B: Backend>(b: &B, c: &MoeConfig) -> Result<()> {
             let moved = (rows * c.k) as f64 * record_bytes as f64;
             let host = (rows * (c.k - on)) as f64 * record_bytes as f64;
             println!(
-                "  rows={rows:<3} resident {:>3.0}%  {:>8.1} us  {:>6.1} GB/s all  {:>5.1} GB/s system RAM part  act {:?}",
+                "  rows={rows:<3} resident {:>3.0}%  {:>8.1} us  {:>6.1} GB/s all  {:>5.1} unique experts {:>6.1} GB/s unique  {:>5.1} GB/s system RAM part  act {:?}",
                 100.0 * frac,
                 t * 1e6,
                 moved / t / 1e9,
+                uniq,
+                uniq * record_bytes as f64 / t / 1e9,
                 host / t / 1e9,
                 b.moe_experts_act(&bank, rows)
             );

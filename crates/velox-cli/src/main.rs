@@ -417,6 +417,7 @@ fn bench_moe(a: &Args) -> Result<ExitCode> {
             .collect(),
         resident: list("resident", "0,0.5,1")?,
         iters: a.parse("iters", 64)?,
+        pool: a.parse("pool", 0)?,
     };
     let sel = select::backend(a)?;
     match &sel {
