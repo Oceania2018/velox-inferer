@@ -470,6 +470,29 @@ __device__ __forceinline__ uint64_t grid64(const uint32_t* sg, uint32_t i) {
     return static_cast<uint64_t>(v.x) | (static_cast<uint64_t>(v.y) << 32);
 }
 
+// IQ1 codes 8 g + dl of a grid word (bytes g of -1, 0, 1) and a per-byte delta word (dl = +-1).
+__device__ __forceinline__ uint32_t iq1_codes(uint32_t gw, uint32_t dlw) {
+    return __vsub4(__vadd4((gw & 0x01010101u) << 3, dlw), ((gw >> 7) & 0x01010101u) << 4);
+}
+
+// IQ1_S / IQ1_M word wi of sub-block ib as codes 8 g + dl (|code| <= 9); the grid from global
+// memory (16 KiB, too large for the v2 kernel's static shared memory next to its staging).
+template <int T>
+__device__ __forceinline__ uint32_t iq1_word(const uint8_t* __restrict__ x, int ib, int wi) {
+    const int l = wi / 2, half = wi % 2;
+    uint32_t idx, dlw;
+    if constexpr (T == kIq1S) {  // d | qs[32] | qh u16[8]
+        const uint32_t qh = u16_at(x + 34 + 2 * ib);
+        idx = x[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+        dlw = qh & 0x8000 ? 0xffffffffu : 0x01010101u;
+    } else {  // IQ1_M: qs[32] | qh[16] | scales[8]
+        const uint32_t qh = x[32 + 2 * ib + l / 2];
+        idx = x[4 * ib + l] | ((qh << (l % 2 ? 4 : 8)) & 0x700);
+        dlw = qh & (l % 2 ? 0x80 : 0x08) ? 0xffffffffu : 0x01010101u;
+    }
+    return iq1_codes(static_cast<uint32_t>(__ldg(&kIq1SGrid[idx]) >> (32 * half)), dlw);
+}
+
 // Word wi (values 4wi .. 4wi+3) of sub-block ib as 4 int8 codes, for the types whose scales cover
 // 16 or 32 values (all but IQ1_M); grids and sign patterns from the shared copies.
 template <int T>
@@ -504,6 +527,8 @@ __device__ __forceinline__ int word(const uint8_t* __restrict__ x, int ib, int w
         const uint32_t g = sg[2 * (q & 511) + half];
         const uint32_t sb = sks[q >> 9];
         return signed4(g, (sb >> (4 * half)) & 0xf);
+    } else if constexpr (T == kIq1S) {
+        return static_cast<int>(iq1_word<T>(x, ib, wi));
     } else {  // IQ2_S
         const uint32_t idx = x[2 + 4 * ib + l] | ((static_cast<uint32_t>(x[66 + ib]) << (8 - 2 * l)) & 0x300);
         const uint64_t g = grid64(sg, idx);
@@ -516,7 +541,11 @@ template <int T>
 __device__ __forceinline__ uint2 mag_sign(const uint8_t* __restrict__ x, int ib, int wi, const uint32_t* sg,
                                           const uint8_t* sks) {
     const int l = wi / 2, half = wi % 2;
-    if constexpr (T == kIq2Xs) {
+    if constexpr (T == kIq1M) {  // |8 g + dl| and the code's signs
+        const uint32_t c = iq1_word<T>(x, ib, wi);
+        const uint32_t sb = ((c >> 7) & 1u) | ((c >> 14) & 2u) | ((c >> 21) & 4u) | ((c >> 28) & 8u);
+        return make_uint2(__vabsss4(c), sb);
+    } else if constexpr (T == kIq2Xs) {
         const uint32_t q = u16_at(x + 2 + 2 * (4 * ib + l));
         return make_uint2(sg[2 * (q & 511) + half], (sks[q >> 9] >> (4 * half)) & 0xf);
     } else {  // IQ2_S
@@ -1265,6 +1294,16 @@ __device__ __forceinline__ void int_scales(const uint8_t* __restrict__ x, int ib
     } else if constexpr (T == kIq2Xxs) {
         sc[0] = sc[1] = 2 * static_cast<int>(u16_at(x + 8 + 8 * ib) >> 12) + 1;
         dm.x = f16_at(x) * 0.125f;
+    } else if constexpr (T == kIq1S) {  // codes 8 g +- 1 over 8, one scale per 32 values
+        sc[0] = sc[1] = 2 * static_cast<int>((u16_at(x + 34 + 2 * ib) >> 12) & 7) + 1;
+        dm.x = f16_at(x) * 0.125f;
+    } else if constexpr (T == kIq1M) {  // codes 8 g +- 1 over 8, scales per 16 values
+        const uint32_t s0 = u16_at(x + 48), s1 = u16_at(x + 50), s2 = u16_at(x + 52), s3 = u16_at(x + 54);
+        const uint32_t dbits = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
+        dm.x = __half2float(__ushort_as_half(static_cast<unsigned short>(dbits))) * 0.125f;
+        const uint32_t w = u16_at(x + 48 + 2 * (ib / 2));
+        sc[0] = 2 * static_cast<int>((w >> (6 * (ib % 2))) & 7) + 1;
+        sc[1] = 2 * static_cast<int>((w >> (6 * (ib % 2) + 3)) & 7) + 1;
     } else {  // IQ2_XS (scales at 66), IQ2_S (scales at 74)
         const uint32_t v = x[(T == kIq2Xs ? 66 : 74) + ib];
         sc[0] = 2 * static_cast<int>(v & 0xf) + 1;
@@ -1287,7 +1326,7 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
     // IQ2_XS / IQ2_S: magnitude * scale reaches 1333, so the scaled codes go out as two int8 planes
     // (16 hi + lo), each one k32 mma per sub-block into its own super-block sums: the tensor-core
     // time of the two k16 mmas, without the per-tile rescale.
-    constexpr bool kSplit = T == kIq2S || T == kIq2Xs;
+    constexpr bool kSplit = T == kIq2S || T == kIq2Xs || T == kIq1M;  // IQ1_M: |code| 9 * 15
     constexpr bool kHalves = Traits<T>::G != 1 && !kFold && !kSplit;
     constexpr bool kOff = T == kQ2K || T == kQ4K;
     __shared__ __align__(16) int8_t act[2][kQ2Tokens * kQ2S];
@@ -1568,13 +1607,13 @@ VELOX_API int velox_5060_linear_ggml_q8(const void* blob, int m, const uint8_t* 
     switch (type) {
         case kQ2K: return launch_pre2<kQ2K>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         case kQ4K: return launch_pre2<kQ4K>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
-        case kIq1M: return launch_pre<kIq1M>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
+        case kIq1M: return launch_pre2<kIq1M>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         case kIq2Xxs: return launch_pre2<kIq2Xxs>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         case kIq2Xs: return launch_pre2<kIq2Xs>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         case kIq2S: return launch_pre2<kIq2S>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         case kIq3Xxs: return launch_pre2<kIq3Xxs>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         case kIq3S: return launch_pre2<kIq3S>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
-        case kIq1S: return launch_pre<kIq1S>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
+        case kIq1S: return launch_pre2<kIq1S>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         default: return launch_pre2<kIq4Xs>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
     }
 }
