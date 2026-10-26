@@ -5,9 +5,10 @@
 //! change its numerics.
 
 use velox_core::backend::{
-    top_k_row, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, NormKind, RopePosShape,
-    RopeShape, WeightView,
+    log_softmax_gather_row, top_k_row, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
+    Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank, ExpertMatrix, FullAttnShape, GdnShape,
+    GeluKind, HcCombineShape, KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape,
+    RopePosShape, RopeShape, RowGateShape, WeightView,
 };
 use velox_core::format::decode_rows;
 use velox_core::kv::{decode_cache, decode_row, encode_row, KvFormat};
@@ -736,6 +737,20 @@ impl Backend for CpuBackend {
             .collect())
     }
 
+    fn log_softmax_gather(
+        &self,
+        x: &Vec<f32>,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        check::log_softmax_gather(x.len(), rows, row_len, limit, ids.len())?;
+        Ok((0..rows)
+            .flat_map(|r| log_softmax_gather_row(&x[r * row_len..r * row_len + limit], ids))
+            .collect())
+    }
+
     fn rope_positions(&self, x: &mut Vec<f32>, positions: &[u32], s: RopePosShape) -> Result<()> {
         check::rope_positions(x.len(), positions, &s)?;
         let half = s.rotary_dim / 2;
@@ -754,6 +769,400 @@ impl Backend for CpuBackend {
         }
         Ok(())
     }
+
+    fn rms_norm_groups(
+        &self,
+        x: &Vec<f32>,
+        weight: &Vec<f32>,
+        y: &mut Vec<f32>,
+        rows: usize,
+        groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        check::rms_norm_groups(x.len(), weight.len(), y.len(), rows, groups, dim)?;
+        for r in 0..rows * groups {
+            let w = &weight[(r % groups) * dim..][..dim];
+            let xr = &x[r * dim..(r + 1) * dim];
+            let inv = rms_inv(xr, eps);
+            for c in 0..dim {
+                y[r * dim + c] = (f64::from(xr[c]) * inv * f64::from(w[c])) as f32;
+            }
+        }
+        Ok(())
+    }
+
+    fn silu(&self, x: &mut Vec<f32>, len: usize) -> Result<()> {
+        check::elementwise("silu", &[x.len()], len)?;
+        for v in &mut x[..len] {
+            *v = silu(f64::from(*v)) as f32;
+        }
+        Ok(())
+    }
+
+    fn hc_mix(
+        &self,
+        xn: &Vec<f32>,
+        gate: &Vec<f32>,
+        out: &mut Vec<f32>,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()> {
+        check::hc_mix(xn.len(), gate.len(), out.len(), rows, streams, dim)?;
+        for r in 0..rows {
+            for d in 0..dim {
+                let acc: f64 = (0..streams)
+                    .map(|s| {
+                        let i = (r * streams + s) * dim + d;
+                        f64::from(xn[i]) * sigmoid(f64::from(gate[i]))
+                    })
+                    .sum();
+                out[r * dim + d] = (acc / streams as f64) as f32;
+            }
+        }
+        Ok(())
+    }
+
+    fn hc_combine(
+        &self,
+        res: &mut Vec<f32>,
+        y: &Vec<f32>,
+        inject: &Vec<f32>,
+        s: HcCombineShape,
+    ) -> Result<()> {
+        check::hc_combine(res.len(), y.len(), inject.len(), &s)?;
+        for r in 0..s.rows {
+            for st in 0..s.streams {
+                let w = 2.0 * sigmoid(f64::from(inject[r * s.inject_ld + s.inject_col + st]));
+                for d in 0..s.dim {
+                    let i = (r * s.streams + st) * s.dim + d;
+                    res[i] = (f64::from(res[i]) + f64::from(y[r * s.dim + d]) * w) as f32;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ple_gate(
+        &self,
+        key_n: &Vec<f32>,
+        q_n: &Vec<f32>,
+        value: &Vec<f32>,
+        out: &mut Vec<f32>,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()> {
+        check::ple_gate(
+            key_n.len(),
+            q_n.len(),
+            value.len(),
+            out.len(),
+            rows,
+            streams,
+            dim,
+        )?;
+        for r in 0..rows {
+            for s in 0..streams {
+                let at = (r * streams + s) * dim;
+                let g = dot(&key_n[at..at + dim], &q_n[at..at + dim]) / (dim as f64).sqrt();
+                let gate = sigmoid(g.signum() * g.abs().max(1e-6).sqrt());
+                for d in 0..dim {
+                    out[at + d] = (f64::from(value[r * dim + d]) * gate) as f32;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn conv1d_dilated_silu(
+        &self,
+        x: &Vec<f32>,
+        weight: &Vec<f32>,
+        state: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+        s: DilatedConvShape,
+    ) -> Result<()> {
+        check::conv1d_dilated(x.len(), weight.len(), state.len(), out.len(), &s)?;
+        let (c, hist) = (s.channels, s.state_rows());
+        // u = [state; x], rows of `c` channels.
+        let mut u = state[..hist * c].to_vec();
+        u.extend_from_slice(&x[..s.tokens * c]);
+        for t in 0..s.tokens {
+            for ch in 0..c {
+                let acc: f64 = (0..s.width)
+                    .map(|j| {
+                        f64::from(weight[j * c + ch]) * f64::from(u[(t + j * s.dilation) * c + ch])
+                    })
+                    .sum();
+                out[t * c + ch] = silu(acc) as f32;
+            }
+        }
+        state[..hist * c].copy_from_slice(&u[s.tokens * c..]);
+        Ok(())
+    }
+
+    fn sigmoid_scale_rows(&self, x: &mut Vec<f32>, gate: &Vec<f32>, s: RowGateShape) -> Result<()> {
+        check::row_gate(x.len(), gate.len(), &s)?;
+        for r in 0..s.rows {
+            let g = sigmoid(f64::from(gate[s.gate_offset + r * s.gate_stride]));
+            for v in &mut x[r * s.dim..(r + 1) * s.dim] {
+                *v = (f64::from(*v) * g) as f32;
+            }
+        }
+        Ok(())
+    }
+
+    fn moe_route(
+        &self,
+        logits: &Vec<f32>,
+        ids: &mut Vec<f32>,
+        weights: &mut Vec<f32>,
+        mut counts: Option<&mut Vec<f32>>,
+        s: MoeRouteShape,
+    ) -> Result<()> {
+        check::moe_route(
+            logits.len(),
+            ids.len(),
+            weights.len(),
+            counts.as_ref().map(|c| c.len()),
+            &s,
+        )?;
+        for r in 0..s.rows {
+            let row = &logits[r * s.row_len..][..s.experts];
+            // Softmax is monotonic, so the k most probable are the k largest logits; the full
+            // softmax denominator cancels in the renormalisation.
+            let top = top_k_row(row, s.k);
+            let max = f64::from(top[0].1);
+            let p: Vec<f64> = top
+                .iter()
+                .map(|&(_, l)| (f64::from(l) - max).exp())
+                .collect();
+            let sum: f64 = p.iter().sum();
+            for (j, (&(e, _), pj)) in top.iter().zip(&p).enumerate() {
+                ids[r * s.k + j] = f32::from_bits(e);
+                weights[r * s.k + j] = (pj / sum) as f32;
+                if let Some(c) = counts.as_deref_mut() {
+                    c[e as usize] += 1.0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn moe_experts(
+        &self,
+        x: &Vec<f32>,
+        ids: &Vec<f32>,
+        weights: &Vec<f32>,
+        bank: &ExpertBank<'_, Vec<f32>>,
+        y: &mut Vec<f32>,
+        _scratch: &mut Vec<f32>,
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        let bufs = (bank.records.len(), bank.slots.len(), bank.map.len());
+        check::moe_experts(
+            x.len(),
+            ids.len(),
+            weights.len(),
+            bank,
+            bufs,
+            y.len(),
+            rows,
+            k,
+        )?;
+        let (hidden, width) = (bank.hidden(), bank.width());
+        let decode = |e: usize, m: &ExpertMatrix| -> Result<Vec<f32>> {
+            let slot = bank.map[e].to_bits() as i32;
+            let (src, at) = if slot >= 0 {
+                (bank.slots, slot as usize * bank.slot_bytes)
+            } else {
+                (bank.records, e * bank.record_bytes)
+            };
+            let record = &as_bytes(src)[at..][..bank.record_bytes];
+            decode_rows(m.format, &record[m.offset..], m.rows, m.k, 0, m.rows)
+        };
+        for r in 0..rows {
+            let xr = &x[r * hidden..(r + 1) * hidden];
+            let mut acc = vec![0f64; hidden];
+            for j in 0..k {
+                let e = ids[r * k + j].to_bits() as usize;
+                if e >= bank.experts {
+                    return Err(velox_core::Error::Shape(format!(
+                        "moe_experts: expert {e} of {}",
+                        bank.experts
+                    )));
+                }
+                let (gate, up, down) = (
+                    decode(e, &bank.gate)?,
+                    decode(e, &bank.up)?,
+                    decode(e, &bank.down)?,
+                );
+                let h: Vec<f32> = (0..width)
+                    .map(|i| {
+                        let g = dot(xr, &gate[i * hidden..(i + 1) * hidden]);
+                        (silu(g) * dot(xr, &up[i * hidden..(i + 1) * hidden])) as f32
+                    })
+                    .collect();
+                let w = f64::from(weights[r * k + j]);
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a += w * dot(&h, &down[c * width..(c + 1) * width]);
+                }
+            }
+            for (c, a) in acc.into_iter().enumerate() {
+                y[r * hidden + c] = a as f32;
+            }
+        }
+        Ok(())
+    }
+
+    fn qsa_pool(
+        &self,
+        raw: &Vec<f32>,
+        weight: &Vec<f32>,
+        pooled: &mut Vec<f32>,
+        s: QsaPoolShape,
+    ) -> Result<()> {
+        check::qsa_pool(raw.len(), weight.len(), pooled.len(), &s)?;
+        let (d, half) = (s.dim, s.rotary_dim / 2);
+        for b in s.block0..s.block0 + s.blocks {
+            let mean: Vec<f64> = (0..d)
+                .map(|c| {
+                    (0..s.ratio)
+                        .map(|i| f64::from(raw[(b * s.ratio + i) * d + c]))
+                        .sum::<f64>()
+                        / s.ratio as f64
+                })
+                .collect();
+            let ms = mean.iter().map(|v| v * v).sum::<f64>() / d as f64;
+            let inv = 1.0 / (ms + f64::from(s.eps)).sqrt();
+            let mut v: Vec<f64> = (0..d)
+                .map(|c| mean[c] * inv * f64::from(weight[c]))
+                .collect();
+            let pos = (b * s.ratio) as f64;
+            for i in 0..half {
+                let freq = f64::from(s.theta).powf(-2.0 * i as f64 / s.rotary_dim as f64);
+                let (sin, cos) = (pos * freq).sin_cos();
+                let (a, c) = (v[i], v[i + half]);
+                v[i] = a * cos - c * sin;
+                v[i + half] = a * sin + c * cos;
+            }
+            for (c, val) in v.into_iter().enumerate() {
+                pooled[b * d + c] = val as f32;
+            }
+        }
+        Ok(())
+    }
+
+    fn qsa_select(
+        &self,
+        q: &Vec<f32>,
+        pooled: &Vec<f32>,
+        sel: &mut Vec<f32>,
+        scratch: &mut Vec<f32>,
+        s: QsaSelectShape,
+    ) -> Result<()> {
+        check::qsa_select(q.len(), pooled.len(), sel.len(), scratch.len(), &s)?;
+        let (d, len) = (s.dim, s.sel_len());
+        let top_blocks = s.budget / s.ratio;
+        for t in 0..s.tokens {
+            let nc = s.complete_blocks(t);
+            let mut scored: Vec<(f64, usize)> = (0..nc)
+                .map(|b| {
+                    let sum: f64 = (0..s.heads)
+                        .map(|h| {
+                            dot(&q[(t * s.heads + h) * d..][..d], &pooled[b * d..][..d]).max(0.0)
+                        })
+                        .sum();
+                    (sum / (d as f64).sqrt(), b)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            let mut blocks: Vec<usize> = scored.iter().take(top_blocks).map(|&(_, b)| b).collect();
+            blocks.sort_unstable();
+            let mut positions: Vec<usize> = blocks
+                .iter()
+                .flat_map(|&b| b * s.ratio..(b + 1) * s.ratio)
+                .collect();
+            positions.extend(nc * s.ratio..=s.pos0 + t);
+            let row = &mut sel[t * len..(t + 1) * len];
+            for (i, slot) in row.iter_mut().enumerate() {
+                *slot = f32::from_bits(positions.get(i).map_or(-1i32, |&p| p as i32) as u32);
+            }
+        }
+        Ok(())
+    }
+
+    fn attention_sparse(
+        &self,
+        q: &Vec<f32>,
+        k: &Vec<f32>,
+        v: &Vec<f32>,
+        sel: &Vec<f32>,
+        sel_len: usize,
+        out: &mut Vec<f32>,
+        s: AttnShape,
+    ) -> Result<()> {
+        check::attention_sparse(q.len(), k.len(), v.len(), sel.len(), sel_len, out.len(), &s)?;
+        if s.kv != KvFormat::F32 {
+            let rows = s.kv_len() * s.kv_heads;
+            let kd = decode_cache(s.kv, as_bytes(k), rows, s.head_dim, false);
+            let vd = decode_cache(s.kv, as_bytes(v), rows, s.head_dim, true);
+            let f32_shape = AttnShape {
+                kv: KvFormat::F32,
+                ..s
+            };
+            return self.attention_sparse(q, &kd, &vd, sel, sel_len, out, f32_shape);
+        }
+        let d = s.head_dim;
+        let group = s.heads / s.kv_heads;
+        let scale = f64::from(s.scale());
+        for t in 0..s.tokens {
+            let visible = s.pos0 + t + 1;
+            let mut keys = Vec::with_capacity(sel_len);
+            for &e in &sel[t * sel_len..(t + 1) * sel_len] {
+                let p = e.to_bits() as i32;
+                if p < 0 {
+                    continue;
+                }
+                if p as usize >= visible {
+                    return Err(velox_core::Error::Shape(format!(
+                        "attention_sparse: token {t} selects position {p}, sees {visible}"
+                    )));
+                }
+                keys.push(p as usize);
+            }
+            for h in 0..s.heads {
+                let kvh = h / group;
+                let qv = &q[(t * s.heads + h) * d..][..d];
+                let scores: Vec<f64> = keys
+                    .iter()
+                    .map(|&j| dot(qv, &k[(j * s.kv_heads + kvh) * d..][..d]) * scale)
+                    .collect();
+                let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let p: Vec<f64> = scores.iter().map(|sc| (sc - max).exp()).collect();
+                let denom: f64 = p.iter().sum();
+                let o = &mut out[(t * s.heads + h) * d..][..d];
+                for (c, oc) in o.iter_mut().enumerate() {
+                    let acc: f64 = keys
+                        .iter()
+                        .zip(&p)
+                        .map(|(&j, pj)| pj * f64::from(v[(j * s.kv_heads + kvh) * d + c]))
+                        .sum();
+                    *oc = (acc / denom) as f32;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `1 / sqrt(mean(x²) + eps)` in f64.
+fn rms_inv(x: &[f32], eps: f32) -> f64 {
+    let ms = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / x.len() as f64;
+    1.0 / (ms + f64::from(eps)).sqrt()
 }
 
 /// f64 error function: Maclaurin series below 2.5, erfc continued fraction above (both ~1e-15).

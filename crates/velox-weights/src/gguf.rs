@@ -2,7 +2,7 @@
 //! tensor types and names belongs to the model importers.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -160,12 +160,45 @@ impl Gguf {
         self.tensors.iter().find(|t| t.name == name)
     }
 
-    /// Reads `buf.len()` bytes at absolute file offset `at`.
+    /// Reads `buf.len()` bytes at absolute file offset `at`. Positional: concurrent reads from
+    /// several threads do not disturb each other.
     pub fn read_at(&self, at: u64, buf: &mut [u8]) -> Result<()> {
-        let io = |e| Error::Io(self.path.clone(), e);
-        let mut f = &self.file;
-        f.seek(SeekFrom::Start(at)).map_err(io)?;
-        f.read_exact(buf).map_err(io)
+        read_exact_at(&self.file, at, buf).map_err(|e| Error::Io(self.path.clone(), e))
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(f: &File, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, at)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, mut at: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_read(f, buf, at)? {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => {
+                buf = &mut buf[n..];
+                at += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Gguf {
+    /// Hints that reads of this handle are random (no readahead): for tables read a few rows at
+    /// a time, where readahead turns each read of a hundred bytes into one of 128 KB. A no-op
+    /// where unsupported.
+    pub fn advise_random(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: a valid descriptor owned by self.file; the advice changes no memory.
+            unsafe {
+                libc::posix_fadvise(self.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+            }
+        }
     }
 
     pub fn meta_u64(&self, key: &str) -> Option<u64> {

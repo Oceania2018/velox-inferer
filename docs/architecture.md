@@ -17,7 +17,7 @@ velox-cli ──► velox-conformance ──► velox-cpu (oracle)
 | `velox-variant` | The build's hardware variant: tuned kernels and per-SKU policy | **hardware branches** |
 | `velox-conformance` | Op and end-to-end cases compared against the oracle | main |
 | `velox-weights` | `.vi` / `.ninfer` reader, validator and converter | main |
-| `velox-serve` | OpenAI-compatible HTTP API over a `ChatEngine` | main |
+| `velox-serve` | OpenAI-compatible HTTP API and System One decisions ([systemone.md](systemone.md)) over a `ChatEngine` | main |
 | `velox-cli` | `velox` binary: devices, plan, selftest, bench, inspect, convert, serve, replay | main |
 
 ## Three layers of hardware specificity
@@ -85,18 +85,20 @@ hybrid GDN/attention stack and differ only in each block's FFN, so they are one 
 - `TextConfig::ffn` is `FfnConfig::Dense { intermediate }` or `FfnConfig::Moe(MoeConfig)`; the
   two field sets are mutually exclusive, as ninfer's converter writes them.
 - `Layer::ffn` is `Ffn::Dense(DenseFfn)` or `Ffn::Moe(MoeFfn)`. Routed experts load as
-  `ExpertBank`s: one parent in its stored encoding, expert `e` at a constant row stride, so a
-  kernel addresses any expert without gathering or repacking.
+  `[gate | up | down]` records in system RAM behind the shared expert cache
+  (`velox_models::experts`), so a model larger than device memory runs with its most selected
+  experts in device slots.
 - `Qwen35Text::mlp` is the single dispatch point; chunked prefill, verify, batched verify and MTP
   all reach the FFN through it. The engine, sessions, KV cache, context store and speculative
   decoding see no difference between the two.
 
-MoE execution is not implemented yet: a MoE block returns `Error::Unsupported`, and `velox
-serve` answers 501 for the architecture. It lands like any op, on main with a CPU reference,
-portable kernels, `CudaKernels` defaults and conformance cases (planned contract in
-[qwen3_5-text.md](qwen3_5-text.md#sparse-moe-qwen3_5moeforcausallm)); branches then tune the
-expert GEMMs. Models whose experts do not fit in VRAM (expert offload to system RAM) are out of
-scope for this design; 35B-A3B fits a 32 GB card.
+`Qwen4ExpForConditionalGeneration` (Qwen3.8-Flash-Next) is a separate model,
+`velox_models::qwen4_exp` ([qwen4_exp.md](qwen4_exp.md)): hyper-connection residual streams,
+QSA sparse attention and a per-layer n-gram embedding change the stack itself, not just the FFN.
+It runs MoE through `moe_route` / `moe_experts`, whose `ExpertBank` keeps every expert in
+system RAM the device reads directly and a shared pool of device slots for the most selected
+ones, so 35 GB of experts run on a 16 GB card. It loads llama.cpp GGUFs directly and is served
+by `velox generate --gguf`; the engine and `velox serve` still run Qwen3.5/3.8 only.
 
 ## Current scope and next steps
 

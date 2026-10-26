@@ -5,19 +5,26 @@
 mod config;
 mod dflash;
 pub mod gguf;
+pub mod hf;
 mod mtp;
 mod paging;
 mod vision;
 mod weights;
+
+use std::sync::Mutex;
 
 use velox_core::backend::{
     AttnShape, Backend, ConvShape, Copy2dShape, GdnReplayLayer, GdnShape, LinearDst, LinearPart,
     NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
 };
 use velox_core::{
-    CopySpec, Error, KvFormat, KvStoreShape, Result, StateFormat, GRAPH_KV_BUCKET, GRAPH_STATIC,
+    CopySpec, Error, KvFormat, KvStoreShape, MoeRouteShape, Result, RowGateShape, StateFormat,
+    GRAPH_KV_BUCKET, GRAPH_STATIC,
 };
 
+use crate::experts::ExpertCache;
+
+pub use crate::experts::CacheReport;
 pub use config::{
     FfnConfig, LayerKind, MoeConfig, TextConfig, DENSE_ARCHITECTURE, MOE_ARCHITECTURE,
 };
@@ -28,7 +35,7 @@ pub use dflash::{
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use paging::{KvChunkSet, KvPool, KvShare};
 pub use vision::{Qwen35Vision, VisionConfig};
-pub use weights::{DenseFfn, ExpertBank, Ffn, Layer, Mixer, MoeFfn, Runs, TextWeights, WDesc};
+pub use weights::{DenseFfn, Ffn, Layer, Mixer, MoeFfn, Runs, TextWeights, WDesc};
 
 /// Per-sequence state: attention KV caches, GDN convolution and recurrent states, position.
 pub struct Session<B: Backend> {
@@ -262,6 +269,9 @@ pub struct BatchWorkspace<B: Backend> {
     max_seqs: usize,
     /// Rows of one sequence's window, at most (the drafter's drafts plus the pending token).
     window: usize,
+    /// Branch-scoring buffers ([`Qwen35Text::score_workspace`]): every window continues one
+    /// session and nothing is replayed, so a single set of GDN rows serves every layer.
+    scoring: bool,
     /// Per GDN layer, `[max_seqs * window, *]` rows: what each sequence's commit replays.
     qkv: Vec<B::Buffer>,
     conv_out: Vec<B::Buffer>,
@@ -750,6 +760,17 @@ fn tile_v_heads<B: Backend>(b: &B, c: &TextConfig, ws: &mut Workspace<B>, t: usi
     b.copy(&ws.conv_out, 0, &mut ws.o, 0, t * c.gdn_v())
 }
 
+/// A MoE FFN's buffers: router logits (`[t, experts + 1]` with the shared gate fused), the
+/// shared gate alone otherwise, routes, `moe_experts` scratch and the gated shared output.
+struct MoeBufs<B: Backend> {
+    logits: B::Buffer,
+    score: B::Buffer,
+    ids: B::Buffer,
+    wts: B::Buffer,
+    scratch: B::Buffer,
+    shared: B::Buffer,
+}
+
 pub struct Workspace<B: Backend> {
     max_tokens: usize,
     x: B::Buffer,
@@ -799,6 +820,8 @@ pub struct Workspace<B: Backend> {
     /// f32 copies of a quantized cache's visible rows for long chunks (grown on demand), so they
     /// attend with the f32 prefill kernels instead of decoding packed rows per query.
     kv_f32: Option<(B::Buffer, B::Buffer)>,
+    /// Routing and routed-expert scratch of MoE models.
+    moe: Option<MoeBufs<B>>,
     /// Verify replay rows (allocated with the first verify).
     spec_rows: Option<SpecRows<B>>,
     /// Where verify's recurrences write their final state: one GDN layer's conv and SSM state,
@@ -870,11 +893,165 @@ fn overlay<B: Backend>(
 pub struct Qwen35Text<B: Backend> {
     pub cfg: TextConfig,
     pub w: TextWeights<B>,
+    /// Routed experts' device cache and its update policy (MoE models, after
+    /// [`Self::enable_experts`]).
+    experts: Option<Mutex<Experts<B>>>,
+}
+
+/// When the expert cache moves experts: every `interval` tokens at most `moves` of them, and
+/// without a limit after a prompt (`prompt` tokens or more since the last update). `reads`
+/// scores weight reads (an expert once per forward step) instead of selections (once per row).
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertPolicy {
+    pub interval: usize,
+    pub moves: usize,
+    pub prompt: usize,
+    pub reads: bool,
+}
+
+impl Default for ExpertPolicy {
+    fn default() -> Self {
+        // As tuned on Flash-Next (docs/qwen4_exp.md#expert-offload): fast decay, large budget.
+        ExpertPolicy {
+            interval: 8,
+            moves: 512,
+            prompt: 64,
+            reads: true,
+        }
+    }
+}
+
+struct Experts<B: Backend> {
+    /// The stack's MoE layers (record sets `0..main`, the MTP layer's too when its records fit
+    /// the slots), with device slots.
+    cache: ExpertCache<B>,
+    main: usize,
+    /// Sets past the stack's (the MTP layer's, often stored wider): read from system RAM, so
+    /// they do not size the stack's slots.
+    rest: ExpertCache<B>,
+    policy: ExpertPolicy,
+    /// Tokens and forward steps run since the last update.
+    pending: usize,
+    steps: u64,
+    /// Totals over every update.
+    report: CacheReport,
 }
 
 impl<B: Backend> Qwen35Text<B> {
     pub fn new(cfg: TextConfig, w: TextWeights<B>) -> Self {
-        Qwen35Text { cfg, w }
+        Qwen35Text {
+            cfg,
+            w,
+            experts: None,
+        }
+    }
+
+    /// Routed experts per MoE layer (0 for a dense model).
+    pub fn cfg_experts(&self) -> usize {
+        match self.cfg.ffn {
+            FfnConfig::Moe(m) => m.experts,
+            FfnConfig::Dense { .. } => 0,
+        }
+    }
+
+    /// Record sets of the stack's MoE layers (the first ones; the MTP layer's come after).
+    fn main_expert_sets(&self) -> usize {
+        self.w
+            .layers
+            .iter()
+            .filter(|l| matches!(l.ffn, Ffn::Moe(_)))
+            .count()
+    }
+
+    /// Bytes of one expert slot: the largest record of the stack's MoE layers (0 for a dense
+    /// model).
+    pub fn expert_slot_bytes(&self) -> usize {
+        self.w.experts[..self.main_expert_sets()]
+            .iter()
+            .map(|r| r.record_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The largest record of any set (the MTP layer's included).
+    fn max_record_bytes(&self) -> usize {
+        self.w
+            .experts
+            .iter()
+            .map(|r| r.record_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Readies the routed experts of a MoE model (required before running one): `slots` device
+    /// slots hold copies of the most selected experts (0: every expert is read from system RAM).
+    pub fn enable_experts(&mut self, b: &B, slots: usize, policy: ExpertPolicy) -> Result<()> {
+        let FfnConfig::Moe(m) = self.cfg.ffn else {
+            return Ok(());
+        };
+        // The MTP layer's sets share the stack's slots when their records fit them.
+        let slot = self.expert_slot_bytes();
+        let main = if self.w.experts.iter().all(|r| r.record_bytes <= slot) {
+            self.w.experts.len()
+        } else {
+            self.main_expert_sets()
+        };
+        let cache = ExpertCache::new(b, main, m.experts, self.expert_slot_bytes().max(16), slots)?;
+        let rest = ExpertCache::new(
+            b,
+            self.w.experts.len() - main,
+            m.experts,
+            self.max_record_bytes().max(16),
+            0,
+        )?;
+        self.experts = Some(Mutex::new(Experts {
+            cache,
+            main,
+            rest,
+            policy,
+            pending: 0,
+            steps: 0,
+            report: CacheReport::default(),
+        }));
+        Ok(())
+    }
+
+    /// Expert weight reads served from device slots and from system RAM so far (an expert once
+    /// per forward step that selects it), and experts moved.
+    pub fn expert_report(&self) -> Option<CacheReport> {
+        self.experts
+            .as_ref()
+            .map(|e| e.lock().expect("expert cache lock").report)
+    }
+
+    /// Before a step of `tokens`: updates the expert cache when the policy says so. Runs outside
+    /// any graph recording (it waits for the device).
+    fn expert_tick(&self, b: &B, tokens: usize) -> Result<()> {
+        let Some(e) = &self.experts else {
+            return Ok(());
+        };
+        let mut e = e.lock().expect("expert cache lock");
+        let e = &mut *e;
+        if e.pending >= e.policy.interval {
+            let moves = if e.pending >= e.policy.prompt {
+                usize::MAX
+            } else {
+                e.policy.moves
+            };
+            let recs: Vec<_> = self.w.experts[..e.main].iter().collect();
+            let r = e
+                .cache
+                .update_steps(b, &recs, moves, e.steps, e.policy.reads)?;
+            e.report.hits += r.hits;
+            e.report.misses += r.misses;
+            e.report.moves += r.moves;
+            e.report.resident = r.resident;
+            e.pending = 0;
+            e.steps = 0;
+        }
+        e.pending += tokens;
+        e.steps += 1;
+        Ok(())
     }
 
     pub fn session(&self, b: &B, capacity: usize) -> Result<Session<B>> {
@@ -1064,11 +1241,34 @@ impl<B: Backend> Qwen35Text<B> {
             capture: Vec::new(),
             kv_f32: None,
             features: None,
+            moe: self.moe_bufs(b, t)?,
             spec_rows: None,
             spec_state: None,
             rows,
             _overlay: backing,
         })
+    }
+
+    /// MoE buffers for `t` rows (None for a dense model).
+    fn moe_bufs(&self, b: &B, t: usize) -> Result<Option<MoeBufs<B>>> {
+        let FfnConfig::Moe(mc) = self.cfg.ffn else {
+            return Ok(None);
+        };
+        let (e, k, sets) = (mc.experts, mc.top_k, self.w.experts.len());
+        // Scratch for the largest any layer's experts need (a probe cache without slots).
+        let probe = ExpertCache::new(b, sets, e, self.max_record_bytes().max(16), 0)?;
+        let scratch = (0..sets)
+            .map(|i| b.moe_scratch_len(&probe.bank(i, &self.w.experts[i]), t, k))
+            .max()
+            .unwrap_or(1);
+        Ok(Some(MoeBufs {
+            logits: b.alloc(t * (e + 1))?,
+            score: b.alloc(t)?,
+            ids: b.alloc(t * k)?,
+            wts: b.alloc(t * k)?,
+            scratch: b.alloc(scratch.max(1))?,
+            shared: b.alloc(t * self.cfg.hidden)?,
+        }))
     }
 
     /// Makes every chunk of `ws` keep the residual outputs of target `layers` (block indices) in
@@ -1128,6 +1328,7 @@ impl<B: Backend> Qwen35Text<B> {
     /// a host round trip. Its graph recording (one per session, like a decode step's) embeds
     /// from that slot every run.
     pub fn advance_from(&self, b: &B, s: &mut Session<B>, ws: &mut Workspace<B>) -> Result<()> {
+        self.expert_tick(b, 1)?;
         if s.pos >= s.capacity {
             return Err(Error::Config(format!(
                 "{} + 1 tokens exceed session capacity {}",
@@ -1184,6 +1385,7 @@ impl<B: Backend> Qwen35Text<B> {
         inserts: &[EmbedInsert<'_, B::Buffer>],
         snaps: &mut [Checkpoint<B>],
     ) -> Result<()> {
+        self.expert_tick(b, ids.len())?;
         if positions.is_some_and(|p| p.len() != ids.len()) {
             return Err(Error::Shape(
                 "one position triple per token is required".into(),
@@ -1534,6 +1736,19 @@ impl<B: Backend> Qwen35Text<B> {
             .unwrap_or_default())
     }
 
+    /// Log-probabilities (over the first `limit` ids) of `targets` after the last advanced row.
+    pub fn last_logprobs(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        targets: &[u32],
+        limit: usize,
+    ) -> Result<Vec<f32>> {
+        self.head(b, ws)?;
+        let v = self.cfg.vocab;
+        b.log_softmax_gather(&ws.logits, 1, v, limit.min(v), targets)
+    }
+
     /// Gated attention mixer of one layer: `ws.h` (normed input, `t` rows) to `ws.y`, appending
     /// K/V at cache rows `pos0..` of `kv`.
     #[allow(clippy::too_many_arguments)]
@@ -1772,12 +1987,94 @@ impl<B: Backend> Qwen35Text<B> {
     fn mlp(&self, b: &B, ws: &mut Workspace<B>, l: &Layer, t: usize, h_twin: HTwin) -> Result<()> {
         match &l.ffn {
             Ffn::Dense(d) => self.swiglu_ffn(b, ws, d, t, h_twin),
-            Ffn::Moe(_) => Err(Error::Unsupported(
-                "sparse MoE FFN execution (planned ops moe_route / moe_experts, see \
-                 docs/qwen3_5-text.md) is not implemented yet"
-                    .into(),
-            )),
+            Ffn::Moe(m) => self.moe_ffn(b, ws, m, t, h_twin),
         }
+    }
+
+    /// `ws.y = sum_j w_j expert_j(ws.h) + sigmoid(shared_score . ws.h) shared(ws.h)`.
+    fn moe_ffn(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        m: &MoeFfn,
+        t: usize,
+        h_twin: HTwin,
+    ) -> Result<()> {
+        let FfnConfig::Moe(mc) = self.cfg.ffn else {
+            return Err(Error::Config("MoE layer in a dense config".into()));
+        };
+        let (e, k, hidden) = (mc.experts, mc.top_k, self.cfg.hidden);
+        let experts = self.experts.as_ref().ok_or_else(|| {
+            Error::Config("MoE model: call Qwen35Text::enable_experts before running it".into())
+        })?;
+        // The shared expert first (it uses the dense FFN's scratch and writes ws.y).
+        self.swiglu_ffn(b, ws, &m.shared, t, h_twin)?;
+        let mb = ws
+            .moe
+            .as_mut()
+            .ok_or_else(|| Error::Config("workspace has no MoE buffers".into()))?;
+        b.copy(&ws.y, 0, &mut mb.shared, 0, t * hidden)?;
+        // Router logits, with the shared expert's gate logit as one more column when fused.
+        let fused = m.router_score.is_some();
+        match &m.router_score {
+            Some(d) => b.linear(&ws.h, &self.w.view(d), &mut mb.logits, t)?,
+            None => {
+                b.linear(&ws.h, &self.w.view(&m.router), &mut mb.logits, t)?;
+                b.linear(&ws.h, &self.w.view(&m.shared_score), &mut mb.score, t)?;
+            }
+        }
+        let row_len = if fused { e + 1 } else { e };
+        let (gate, gate_offset, gate_stride) = if fused {
+            (&mb.logits, e, e + 1)
+        } else {
+            (&mb.score, 0, 1)
+        };
+        b.sigmoid_scale_rows(
+            &mut mb.shared,
+            gate,
+            RowGateShape {
+                rows: t,
+                dim: hidden,
+                gate_offset,
+                gate_stride,
+            },
+        )?;
+        let mut ex = experts.lock().expect("expert cache lock");
+        let ex = &mut *ex;
+        // Sets in the slotted cache count selections for it; the rest are not counted.
+        let (cache, l, counts) = if m.experts < ex.main {
+            (&mut ex.cache, m.experts, true)
+        } else {
+            (&mut ex.rest, m.experts - ex.main, false)
+        };
+        b.moe_route(
+            &mb.logits,
+            &mut mb.ids,
+            &mut mb.wts,
+            if counts {
+                Some(cache.counts_mut(l))
+            } else {
+                None
+            },
+            MoeRouteShape {
+                rows: t,
+                row_len,
+                experts: e,
+                k,
+            },
+        )?;
+        let bank = cache.bank(l, &self.w.experts[m.experts]);
+        b.moe_experts(
+            &ws.h,
+            &mb.ids,
+            &mb.wts,
+            &bank,
+            &mut ws.y,
+            &mut mb.scratch,
+            t,
+            k,
+        )?;
+        b.add(&mut ws.y, &mb.shared, t * hidden)
     }
 
     /// `ws.y = down(silu(gate(ws.h)) * up(ws.h))`.
@@ -1843,6 +2140,7 @@ impl<B: Backend> Qwen35Text<B> {
         snaps: &mut [Checkpoint<B>],
         on_chunk: &mut dyn FnMut(&Workspace<B>, usize, usize) -> Result<()>,
     ) -> Result<()> {
+        self.expert_tick(b, ids.len())?;
         ws.keep_rows = true;
         let mut r = Ok(());
         for (i, chunk) in ids.chunks(ws.max_tokens).enumerate() {
@@ -1873,6 +2171,7 @@ impl<B: Backend> Qwen35Text<B> {
         k: usize,
         limit: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>> {
+        self.expert_tick(b, ids.len())?;
         let t = ids.len();
         if t == 0 || t > VERIFY_MAX || t > ws.max_tokens {
             return Err(Error::Shape(format!(
@@ -2080,6 +2379,7 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(BatchWorkspace {
             max_seqs,
             window,
+            scoring: false,
             qkv: per_layer(c.gdn_qkv())?,
             conv_out: per_layer(c.gdn_qkv())?,
             ab: per_layer(2 * c.gdn_v_heads)?,
@@ -2110,7 +2410,13 @@ impl<B: Backend> Qwen35Text<B> {
         k: usize,
         limit: usize,
     ) -> Result<Vec<Vec<Vec<(u32, f32)>>>> {
+        self.expert_tick(b, windows.iter().map(|w| w.len()).sum())?;
         let n = windows.len();
+        if bw.scoring {
+            return Err(Error::Config(
+                "verify_batch on branch-scoring buffers".into(),
+            ));
+        }
         if n != sessions.len() || n == 0 || n > bw.max_seqs {
             return Err(Error::Shape(format!(
                 "verify_batch: {n} windows for {} sessions (at most {})",
@@ -2263,6 +2569,129 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
+    /// Buffers for [`Self::score_windows`]: `max_seqs * window` rows per forward pass (`window` at
+    /// most [`VERIFY_MAX`]), in windows of any length up to that. Scoring never commits, so one
+    /// set of GDN rows serves every layer (ninfer's throwaway ReplaySSM records) and no per-row
+    /// logits are kept: about `max_seqs * window * 2 * gdn_qkv` floats.
+    pub fn score_workspace(
+        &self,
+        b: &B,
+        max_seqs: usize,
+        window: usize,
+    ) -> Result<BatchWorkspace<B>> {
+        let c = &self.cfg;
+        let window = window.clamp(1, VERIFY_MAX);
+        let rows = max_seqs.max(1) * window;
+        Ok(BatchWorkspace {
+            max_seqs: max_seqs.max(1),
+            window,
+            scoring: true,
+            qkv: vec![b.alloc(rows * c.gdn_qkv())?],
+            conv_out: vec![b.alloc(rows * c.gdn_qkv())?],
+            ab: vec![b.alloc(rows * 2 * c.gdn_v_heads)?],
+            // Only verify_batch and mixed_step use these (scoring windows attend from the
+            // workspace's rows; see `attend_windows`).
+            q: b.alloc(1)?,
+            k: b.alloc(1)?,
+            v: b.alloc(1)?,
+            attn: b.alloc(1)?,
+            hidden: b.alloc(1)?,
+            logits: b.alloc(1)?,
+            o: b.alloc(1)?,
+        })
+    }
+
+    /// Scores continuations of `s`'s prompt without changing the session: each of `windows` (at
+    /// most `sw`'s rows) is fed from `s.pos` as if it were the only one, and the log-probabilities
+    /// (over the first `limit` ids) of `targets` after its last token are returned, window-major.
+    /// As many windows as `sw`'s rows hold (padded to the longest) share a forward pass, so every
+    /// weight is read once per pass rather than once per window, and each op takes every window of
+    /// the pass in one call. The GDN layers read the session's state and write scratch; window `i`'s
+    /// keys and values are written to the cache rows from `s.pos + i * longest` (rows past the
+    /// prompt hold nothing afterwards, as after a rejected verify). `ws`'s rows are overwritten.
+    #[allow(clippy::too_many_arguments)]
+    pub fn score_windows(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        sw: &mut BatchWorkspace<B>,
+        windows: &[&[u32]],
+        targets: &[u32],
+        limit: usize,
+    ) -> Result<Vec<f32>> {
+        let (c, w) = (&self.cfg, &self.w);
+        if !sw.scoring {
+            return Err(Error::Config(
+                "score_windows needs score_workspace buffers".into(),
+            ));
+        }
+        // The buffers hold `max_seqs * window` rows, in windows of any length.
+        let cap = (sw.max_seqs * sw.window).min(ws.max_tokens);
+        let longest = windows.iter().map(|w| w.len()).max().unwrap_or(0);
+        if windows.iter().any(|w| w.is_empty()) || longest == 0 || longest > cap {
+            return Err(Error::Shape(format!(
+                "score_windows takes 1..={cap} tokens per window"
+            )));
+        }
+        if s.pos == 0 {
+            return Err(Error::Config("score_windows needs a prompt".into()));
+        }
+        if s.pos + longest > s.capacity {
+            return Err(Error::Config(format!(
+                "{} + {longest} tokens exceed session capacity {}",
+                s.pos, s.capacity
+            )));
+        }
+        // Window i's keys and values go to cache rows s.pos + i * longest.
+        let per_pass = (cap / longest).min((s.capacity - s.pos) / longest);
+        s.prepare_kv(b, s.pos, s.pos + per_pass.min(windows.len()) * longest)?;
+        let mut out = Vec::with_capacity(windows.len() * targets.len());
+        for group in windows.chunks(per_pass) {
+            // Every window is padded to the longest (repeating its last token), so the windows
+            // of a pass are one shape for the batched kernels: tokens after a window's last one
+            // do not change that row (attention and the recurrences are causal).
+            let n = group.len();
+            let mut ids = Vec::with_capacity(n * longest);
+            let mut last = Vec::with_capacity(n);
+            for win in group {
+                last.push(ids.len() + win.len() - 1);
+                ids.extend_from_slice(win);
+                ids.resize(ids.len() + longest - win.len(), win[win.len() - 1]);
+            }
+            let rows: Vec<(usize, usize)> = (0..n).map(|i| (i * longest, longest)).collect();
+            self.expert_tick(b, ids.len())?;
+            // Eager: a pass is a few launches per layer (the windows batched in each op).
+            self.chunk_batch(b, None, &[], &mut [&mut *s], ws, sw, &ids, &rows)?;
+            // Each window's last row, final-normed, through the output head; the head's rows hold
+            // VERIFY_MAX at a time.
+            for part in last.chunks(VERIFY_MAX.min(ws.max_tokens)) {
+                for (j, &row) in part.iter().enumerate() {
+                    b.copy(&ws.x, row * c.hidden, &mut ws.h, j * c.hidden, c.hidden)?;
+                }
+                let g = part.len();
+                b.rms_norm(
+                    &ws.h,
+                    w.param(w.final_norm),
+                    &mut ws.hidden,
+                    g,
+                    c.hidden,
+                    c.eps,
+                    NormKind::Offset,
+                )?;
+                b.linear(&ws.hidden, &w.view(&w.head), &mut ws.logits_rows, g)?;
+                out.extend(b.log_softmax_gather(
+                    &ws.logits_rows,
+                    g,
+                    c.vocab,
+                    limit.min(c.vocab),
+                    targets,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
     /// One forward pass carrying a prefill chunk of one sequence and speculative verify windows of
     /// others (see [`Self::verify_batch`]): the chunk takes rows `0 .. T` of the workspace and
     /// window `i` the rows after it (plus the earlier windows' lengths). Projections and MLPs run
@@ -2282,9 +2711,16 @@ impl<B: Backend> Qwen35Text<B> {
         k: usize,
         limit: usize,
     ) -> Result<(Option<Vec<(u32, f32)>>, Vec<Vec<Vec<(u32, f32)>>>)> {
+        self.expert_tick(
+            b,
+            prefill.ids.len() + windows.iter().map(|w| w.len()).sum::<usize>(),
+        )?;
         let (c, w) = (&self.cfg, &self.w);
         let n = windows.len();
         let tp = prefill.ids.len();
+        if bw.scoring {
+            return Err(Error::Config("mixed_step on branch-scoring buffers".into()));
+        }
         if n != sessions.len() || n > bw.max_seqs || tp == 0 {
             return Err(Error::Shape(format!(
                 "mixed_step: {tp} prefill tokens, {n} windows for {} sessions (at most {})",
@@ -2395,7 +2831,8 @@ impl<B: Backend> Qwen35Text<B> {
     /// `i` at verify rows `rows[i]` (start, length) after `T`. A prefill advances its session's
     /// state in place (snapshotting on the way); windows advance into each session's spec buffers
     /// (the state to roll back to stays in place) and keep their replay inputs in `bw` at their
-    /// verify rows; attention appends to each session's cache.
+    /// verify rows; attention appends to each session's cache. With scoring buffers
+    /// ([`BatchWorkspace::scoring`]) every window continues `sessions[0]`.
     #[allow(clippy::too_many_arguments)]
     fn chunk_batch(
         &self,
@@ -2484,12 +2921,14 @@ impl<B: Backend> Qwen35Text<B> {
                     norm,
                 } => {
                     let (cw, al, dt) = (w.param(*conv), w.param(*a_log), w.param(*dt_bias));
+                    // The window rows' set in `bw` (scoring buffers hold one for every layer).
+                    let rg = if bw.scoring { 0 } else { gi };
                     {
                         // Without a prefill the projections land in the replay buffers directly.
                         let (qkv_buf, ab_buf) = if tp > 0 {
                             (&mut ws.qkv, &mut ws.ab)
                         } else {
-                            (&mut bw.qkv[gi], &mut bw.ab[gi])
+                            (&mut bw.qkv[rg], &mut bw.ab[rg])
                         };
                         match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
                             Some(f) => {
@@ -2537,8 +2976,8 @@ impl<B: Backend> Qwen35Text<B> {
                     if let Some(p) = pre.as_deref_mut() {
                         if v > 0 {
                             let (qw, abw) = (c.gdn_qkv(), 2 * c.gdn_v_heads);
-                            b.copy(&ws.qkv, tp * qw, &mut bw.qkv[gi], 0, v * qw)?;
-                            b.copy(&ws.ab, tp * abw, &mut bw.ab[gi], 0, v * abw)?;
+                            b.copy(&ws.qkv, tp * qw, &mut bw.qkv[rg], 0, v * qw)?;
+                            b.copy(&ws.ab, tp * abw, &mut bw.ab[rg], 0, v * abw)?;
                         }
                         let pos0 = p.s.pos;
                         let Session {
@@ -2578,12 +3017,56 @@ impl<B: Backend> Qwen35Text<B> {
                             row0 = end;
                         }
                     }
-                    for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
+                    if bw.scoring {
+                        // Scoring windows (equal lengths, back to back from row 0; see
+                        // `score_windows`) all start from the session's state, which they only
+                        // read: one call each for every window.
                         let Session {
                             conv: s_conv,
                             ssm: s_ssm,
                             ..
-                        } = &mut **s;
+                        } = &*sessions[0];
+                        let (r0, m) = rows[0];
+                        let cs = ConvShape {
+                            tokens: m,
+                            channels: c.gdn_qkv(),
+                            width: c.conv_width,
+                            row0: r0,
+                        };
+                        let gs = GdnShape {
+                            tokens: m,
+                            k_heads: c.gdn_k_heads,
+                            v_heads: c.gdn_v_heads,
+                            k_dim: c.gdn_k_dim,
+                            v_dim: c.gdn_v_dim,
+                            row0: r0,
+                        };
+                        b.conv1d_silu_windows(
+                            &bw.qkv[0],
+                            cw,
+                            &s_conv[gi],
+                            &mut bw.conv_out[0],
+                            cs,
+                            rows.len(),
+                        )?;
+                        b.gated_delta_net_windows(
+                            &bw.conv_out[0],
+                            &bw.ab[0],
+                            al,
+                            dt,
+                            &s_ssm[gi],
+                            &mut ws.o,
+                            gs,
+                            rows.len(),
+                        )?;
+                    }
+                    for (i, &(r0, m)) in rows.iter().enumerate().filter(|_| !bw.scoring) {
+                        // Windows read the session's state and write scratch.
+                        let Session {
+                            conv: s_conv,
+                            ssm: s_ssm,
+                            ..
+                        } = &*sessions[i];
                         let (sc, ss) = ws.spec_state.as_mut().expect("ensure_spec_state ran");
                         let cs = ConvShape {
                             tokens: m,
@@ -2600,18 +3083,18 @@ impl<B: Backend> Qwen35Text<B> {
                             row0: r0,
                         };
                         b.conv1d_silu_from(
-                            &bw.qkv[gi],
+                            &bw.qkv[rg],
                             cw,
                             &s_conv[gi],
                             sc,
-                            &mut bw.conv_out[gi],
+                            &mut bw.conv_out[rg],
                             cs,
                         )?;
                         // Window outputs go to the workspace's rows after the prefill.
                         let o = if tp > 0 { &mut bw.o } else { &mut ws.o };
                         b.gated_delta_net_out(
-                            &bw.conv_out[gi],
-                            &bw.ab[gi],
+                            &bw.conv_out[rg],
+                            &bw.ab[rg],
                             al,
                             dt,
                             &s_ssm[gi],
@@ -2786,7 +3269,11 @@ impl<B: Backend> Qwen35Text<B> {
             let pos0 = p.s.pos;
             self.attend_rows(b, ws, &mut p.s.kv[ai], kv_format, tp, pos0, rope)?;
         }
-        for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
+        if bw.scoring {
+            self.attend_windows(b, ws, &mut *sessions[0], ai, rows)?;
+        }
+        for (i, &(r0, m)) in rows.iter().enumerate().filter(|_| !bw.scoring) {
+            let s = &mut *sessions[i];
             let r = tp + r0;
             b.copy(&ws.qn, r * qd, &mut bw.q, 0, m * qd)?;
             b.copy(&ws.kn, r * kd, &mut bw.k, 0, m * kd)?;
@@ -2828,6 +3315,74 @@ impl<B: Backend> Qwen35Text<B> {
         b.sigmoid_mul(&mut ws.attn, &ws.g, t * qd)?;
         b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
         Ok(())
+    }
+
+    /// Attention of layer `ai` for scoring windows (equal lengths, back to back from row 0 of
+    /// `ws`; see `score_windows`) over the session's prompt: every window is rotated at the
+    /// positions after the prompt and stored at its own cache rows after it (window `i` from
+    /// `s.pos + i * len`), then all attend in one call, each to the prompt and its own rows.
+    fn attend_windows(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        s: &mut Session<B>,
+        ai: usize,
+        rows: &[(usize, usize)],
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let (len, t) = (rows[0].1, rows.len() * rows[0].1);
+        let pos0 = s.pos;
+        let rope_pos0 = u32::try_from(pos0 as i64 + s.rope_delta)
+            .map_err(|_| Error::Shape("rotary position out of range".into()))?;
+        // Row j of every window sits at position pos0 + j: the same on every axis (text).
+        let row_pos: Vec<u32> = (0..t).map(|r| rope_pos0 + (r % len) as u32).collect();
+        let positions = row_pos.repeat(3);
+        let rope = |heads| RopePosShape {
+            tokens: t,
+            heads,
+            head_dim: c.head_dim,
+            rotary_dim: c.rotary_dim,
+            theta: c.rope_theta,
+            axes: 3,
+            layout: RopeLayout::Interleaved,
+        };
+        b.rope_positions(&mut ws.qn, &positions, rope(c.heads))?;
+        b.rope_positions(&mut ws.kn, &positions, rope(c.kv_heads))?;
+        let kv_format = s.kv_format;
+        let (kc, vc) = &mut s.kv[ai];
+        let store = KvStoreShape {
+            tokens: t,
+            kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            pos0,
+            format: kv_format,
+        };
+        b.kv_store(&ws.kn, &ws.v, kc, vc, store)?;
+        let shape = AttnShape {
+            tokens: t,
+            heads: c.heads,
+            kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            pos0,
+            kv: KvFormat::F32,
+        };
+        if kv_format == KvFormat::F32 {
+            return b.attention_windows(&ws.qn, kc, vc, &mut ws.attn, shape, len);
+        }
+        // The rows the cache represents (the windows' too, as they were stored), in f32.
+        let need = (pos0 + t) * c.kv_dim();
+        if ws.kv_f32.as_ref().is_none_or(|(k, _)| b.len(k) < need) {
+            let cap = need.next_power_of_two();
+            ws.kv_f32 = Some((b.alloc(cap)?, b.alloc(cap)?));
+        }
+        let (kf, vf) = ws.kv_f32.as_mut().expect("allocated above");
+        let all = KvStoreShape {
+            tokens: pos0 + t,
+            pos0: 0,
+            ..store
+        };
+        b.kv_load(kc, vc, kf, vf, all)?;
+        b.attention_windows(&ws.qn, kf, vf, &mut ws.attn, shape, len)
     }
 
     /// Final norm and output head for the last advanced row, into `ws.logits`.

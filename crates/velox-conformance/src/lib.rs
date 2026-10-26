@@ -7,10 +7,12 @@
 
 use velox_core::backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
-    CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape,
-    LinearDst, LinearPart, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    CopySpec, DilatedConvShape, DynConvShape, ExpertBank, ExpertMatrix, FullAttnShape,
+    GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape, LinearDst, LinearPart,
+    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
+    RowGateShape, WeightView,
 };
-use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
+use velox_core::format::{align256, decode_rows, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::kv::{decode_cache, encode_cache, KvFormat};
 use velox_core::model::{HostLayer, Stack};
 use velox_core::quant::{
@@ -20,6 +22,8 @@ use velox_core::rng::Rng;
 use velox_core::state::STATE_ROW;
 use velox_core::{ModelSpec, Op, Result, StateFormat};
 use velox_cpu::CpuBackend;
+
+mod qwen4;
 
 #[derive(Clone, Debug)]
 pub struct CaseResult {
@@ -976,6 +980,45 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `log_softmax_gather` against the f64 host reference: ids inside and past `limit`, and a NaN
+    /// at id 1 of every row; with `dead` the first row holds no finite value, so all its ids read
+    /// -inf. Every -inf must come back as -inf; the finite values go through the error metric.
+    fn log_softmax_gather(
+        &mut self,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+        dead: bool,
+    ) -> Result<()> {
+        let mut x = self.rng.vec(rows * row_len, 8.0);
+        for r in 0..rows {
+            x[r * row_len + 1] = f32::NAN;
+        }
+        if dead {
+            x[..row_len].fill(f32::NEG_INFINITY);
+        }
+        let want = CpuBackend.log_softmax_gather(&x, rows, row_len, limit, ids)?;
+        let xd = self.b.upload(&x)?;
+        let got = self.b.log_softmax_gather(&xd, rows, row_len, limit, ids)?;
+        let inf = |v: &f32| *v == f32::NEG_INFINITY;
+        let same_inf =
+            got.len() == want.len() && got.iter().zip(&want).all(|(g, w)| inf(g) == inf(w));
+        let finite =
+            |v: &[f32]| -> Vec<f32> { v.iter().map(|x| if inf(x) { 0.0 } else { *x }).collect() };
+        let mut got = finite(&got);
+        if !same_inf {
+            got.push(f32::NAN);
+        }
+        let name = format!(
+            "log_softmax_gather rows={rows} len={row_len} limit={limit} ids={}{}",
+            ids.len(),
+            if dead { " dead" } else { "" }
+        );
+        self.record(name, Some(Op::LogSoftmaxGather), &got, &finite(&want), 1e-5);
+        Ok(())
+    }
+
     fn embed(&mut self, fmt: WeightFormat, n: usize, k: usize, ids: &[u32]) -> Result<()> {
         let bytes = random_weight(&mut self.rng, fmt, n, k);
         let wc = CpuBackend.upload_bytes(&bytes)?;
@@ -1748,6 +1791,126 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `conv1d_silu_windows` / `gated_delta_net_windows`: `windows` scoring windows of `tokens`
+    /// rows from `row0`, every one from the same states, which must stay as they were.
+    fn gdn_windows(
+        &mut self,
+        k_heads: usize,
+        v_heads: usize,
+        dk: usize,
+        tokens: usize,
+        windows: usize,
+        row0: usize,
+    ) -> Result<()> {
+        let gs = GdnShape {
+            tokens,
+            k_heads,
+            v_heads,
+            k_dim: dk,
+            v_dim: dk,
+            row0,
+        };
+        let rows = row0 + windows * tokens;
+        let (state_len, out_len) = (v_heads * dk * dk, rows * v_heads * dk);
+        let qkv = self.rng.vec(rows * gs.qkv_width(), 1.0);
+        let ab = self.rng.vec(rows * 2 * v_heads, 2.0);
+        let (a_log, dt_bias) = (self.rng.vec(v_heads, 1.0), self.rng.vec(v_heads, 1.0));
+        let s0 = self.rng.vec(state_len, 0.1);
+        let mut want = vec![0.0; out_len];
+        CpuBackend
+            .gated_delta_net_windows(&qkv, &ab, &a_log, &dt_bias, &s0, &mut want, gs, windows)?;
+        let (qd, abd) = (self.b.upload(&qkv)?, self.b.upload(&ab)?);
+        let (ad, dd, sd) = (
+            self.b.upload(&a_log)?,
+            self.b.upload(&dt_bias)?,
+            self.b.upload(&s0)?,
+        );
+        let mut od = self.b.alloc(out_len)?;
+        self.b
+            .gated_delta_net_windows(&qd, &abd, &ad, &dd, &sd, &mut od, gs, windows)?;
+        let skip = row0 * v_heads * dk;
+        let mut got = fetch(self.b, &od, out_len)?.split_off(skip);
+        got.extend(fetch(self.b, &sd, state_len)?);
+        let mut want = want.split_off(skip);
+        want.extend_from_slice(&s0);
+        let name = format!(
+            "gated_delta_net_windows heads {k_heads}/{v_heads} d {dk} ({windows} x {tokens} tokens at row {row0}) + state_in"
+        );
+        self.record(name, Some(Op::GatedDeltaNetWindows), &got, &want, 1e-4);
+
+        let (channels, width) = (gs.qkv_width(), 4);
+        let cs = ConvShape {
+            tokens,
+            channels,
+            width,
+            row0,
+        };
+        let w = self.rng.vec(width * channels, 0.5);
+        let c0 = self.rng.vec((width - 1) * channels, 1.0);
+        let mut want = vec![0.0; rows * channels];
+        CpuBackend.conv1d_silu_windows(&qkv, &w, &c0, &mut want, cs, windows)?;
+        let (wd, cd) = (self.b.upload(&w)?, self.b.upload(&c0)?);
+        let mut yd = self.b.alloc(rows * channels)?;
+        self.b
+            .conv1d_silu_windows(&qd, &wd, &cd, &mut yd, cs, windows)?;
+        let skip = row0 * channels;
+        let mut got = fetch(self.b, &yd, rows * channels)?.split_off(skip);
+        got.extend(fetch(self.b, &cd, c0.len())?);
+        let mut want = want.split_off(skip);
+        want.extend_from_slice(&c0);
+        let name = format!(
+            "conv1d_silu_windows c={channels} w={width} ({windows} x {tokens} tokens at row {row0}) + state_in"
+        );
+        self.record(name, Some(Op::Conv1dSiluWindows), &got, &want, 1e-5);
+        Ok(())
+    }
+
+    /// `attention_windows`: `windows` windows of `window` query rows over a `prefix`-row prefix,
+    /// f32 keys and values; the reference rounds its inputs as the backend reports.
+    fn attention_windows(
+        &mut self,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        prefix: usize,
+        window: usize,
+        windows: usize,
+    ) -> Result<()> {
+        let s = AttnShape {
+            tokens: windows * window,
+            heads,
+            kv_heads,
+            head_dim,
+            pos0: prefix,
+            kv: KvFormat::F32,
+        };
+        let q_len = s.tokens * heads * head_dim;
+        let kv_len = s.kv_len() * kv_heads * head_dim;
+        let q = self.rng.vec(q_len, 2.0);
+        let k = self.rng.vec(kv_len, 2.0);
+        let v = self.rng.vec(kv_len, 1.0);
+        let precision = self.b.attention_windows_precision(s);
+        let (mut qr, mut kr, mut vr) = (q.clone(), k.clone(), v.clone());
+        round_attention_inputs(&mut qr, &mut kr, &mut vr, s, precision);
+        let mut want = vec![0.0; q_len];
+        CpuBackend.attention_windows(&qr, &kr, &vr, &mut want, s, window)?;
+        let (qd, kd, vd) = (self.b.upload(&q)?, self.b.upload(&k)?, self.b.upload(&v)?);
+        let mut od = self.b.alloc(q_len)?;
+        self.b
+            .attention_windows(&qd, &kd, &vd, &mut od, s, window)?;
+        let got = fetch(self.b, &od, q_len)?;
+        let (tag, tol) = match precision {
+            AttnPrecision::Exact => ("", 2e-4),
+            AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+            AttnPrecision::F16 => (" f16", 2e-3),
+        };
+        let name = format!(
+            "attention_windows h={heads}/{kv_heads} d={head_dim} prefix={prefix} {windows} x {window}{tag}"
+        );
+        self.record(name, Some(Op::AttentionWindows), &got, &want, tol);
+        Ok(())
+    }
+
     /// `gdn_replay`: `layers` GDN layers advanced over the first `keep` rows of a `window`-row
     /// window from its recorded inputs and conv outputs; the conv and recurrent states must equal
     /// running `conv1d_silu` and `gated_delta_net` over those rows. The window starts at row
@@ -1884,6 +2047,447 @@ impl<B: Backend> Suite<'_, B> {
             &want,
             1e-5,
         );
+        Ok(())
+    }
+
+    fn rms_norm_groups(&mut self, rows: usize, groups: usize, dim: usize) -> Result<()> {
+        let n = rows * groups * dim;
+        let (x, w) = (self.rng.vec(n, 2.0), self.rng.vec(groups * dim, 1.5));
+        let mut want = vec![0.0; n];
+        CpuBackend.rms_norm_groups(&x, &w, &mut want, rows, groups, dim, 1e-6)?;
+        let (xd, wd) = (self.b.upload(&x)?, self.b.upload(&w)?);
+        let mut yd = self.b.alloc(n)?;
+        self.b
+            .rms_norm_groups(&xd, &wd, &mut yd, rows, groups, dim, 1e-6)?;
+        let got = fetch(self.b, &yd, n)?;
+        let name = format!("rms_norm_groups {rows}x{groups}x{dim}");
+        self.record(name, Some(Op::RmsNormGroups), &got, &want, 1e-5);
+        Ok(())
+    }
+
+    /// The hyper-connection elementwise ops: `silu`, `hc_mix`, `hc_combine` (injection logits
+    /// read from a column range of a wider row), `ple_gate`, `sigmoid_scale_rows`.
+    fn hyper_connections(&mut self, rows: usize, streams: usize, dim: usize) -> Result<()> {
+        let wide = rows * streams * dim;
+        let tag = format!("{rows}x{streams}x{dim}");
+        // silu over a length that is not a multiple of any block size.
+        let x = self.rng.vec(wide + 3, 6.0);
+        let mut want = x.clone();
+        CpuBackend.silu(&mut want, wide + 3)?;
+        let mut xd = self.b.upload(&x)?;
+        self.b.silu(&mut xd, wide + 3)?;
+        let got = fetch(self.b, &xd, wide + 3)?;
+        self.record(
+            format!("silu {}", wide + 3),
+            Some(Op::Silu),
+            &got,
+            &want,
+            1e-6,
+        );
+
+        let (xn, gate) = (self.rng.vec(wide, 2.0), self.rng.vec(wide, 4.0));
+        let mut want = vec![0.0; rows * dim];
+        CpuBackend.hc_mix(&xn, &gate, &mut want, rows, streams, dim)?;
+        let (xnd, gd) = (self.b.upload(&xn)?, self.b.upload(&gate)?);
+        let mut od = self.b.alloc(rows * dim)?;
+        self.b.hc_mix(&xnd, &gd, &mut od, rows, streams, dim)?;
+        let got = fetch(self.b, &od, rows * dim)?;
+        self.record(format!("hc_mix {tag}"), Some(Op::HcMix), &got, &want, 1e-5);
+
+        let ld = streams + 5;
+        let s = HcCombineShape {
+            rows,
+            streams,
+            dim,
+            inject_ld: ld,
+            inject_col: 3,
+        };
+        let (res0, y, inj) = (
+            self.rng.vec(wide, 2.0),
+            self.rng.vec(rows * dim, 1.0),
+            self.rng.vec(rows * ld, 3.0),
+        );
+        let mut want = res0.clone();
+        CpuBackend.hc_combine(&mut want, &y, &inj, s)?;
+        let mut rd = self.b.upload(&res0)?;
+        let (yd, id) = (self.b.upload(&y)?, self.b.upload(&inj)?);
+        self.b.hc_combine(&mut rd, &yd, &id, s)?;
+        let got = fetch(self.b, &rd, wide)?;
+        self.record(
+            format!("hc_combine {tag}"),
+            Some(Op::HcCombine),
+            &got,
+            &want,
+            1e-5,
+        );
+
+        let (key, q, value) = (
+            self.rng.vec(wide, 1.5),
+            self.rng.vec(wide, 1.5),
+            self.rng.vec(rows * dim, 1.0),
+        );
+        let mut want = vec![0.0; wide];
+        CpuBackend.ple_gate(&key, &q, &value, &mut want, rows, streams, dim)?;
+        let (kd, qd, vd) = (
+            self.b.upload(&key)?,
+            self.b.upload(&q)?,
+            self.b.upload(&value)?,
+        );
+        let mut od = self.b.alloc(wide)?;
+        self.b
+            .ple_gate(&kd, &qd, &vd, &mut od, rows, streams, dim)?;
+        let got = fetch(self.b, &od, wide)?;
+        self.record(
+            format!("ple_gate {tag}"),
+            Some(Op::PleGate),
+            &got,
+            &want,
+            1e-5,
+        );
+
+        // One gate per row from column 2 of a [rows, 7] projection.
+        let s = RowGateShape {
+            rows,
+            dim,
+            gate_offset: 2,
+            gate_stride: 7,
+        };
+        let (x, g) = (self.rng.vec(rows * dim, 2.0), self.rng.vec(rows * 7, 4.0));
+        let mut want = x.clone();
+        CpuBackend.sigmoid_scale_rows(&mut want, &g, s)?;
+        let mut xd = self.b.upload(&x)?;
+        let gd = self.b.upload(&g)?;
+        self.b.sigmoid_scale_rows(&mut xd, &gd, s)?;
+        let got = fetch(self.b, &xd, rows * dim)?;
+        let name = format!("sigmoid_scale_rows {rows}x{dim}");
+        self.record(name, Some(Op::SigmoidScaleRows), &got, &want, 1e-6);
+        Ok(())
+    }
+
+    /// Two calls so the dilated history carries over; outputs and final state are compared.
+    fn conv1d_dilated(
+        &mut self,
+        channels: usize,
+        width: usize,
+        dilation: usize,
+        chunks: [usize; 2],
+    ) -> Result<()> {
+        let hist = (width - 1) * dilation;
+        let w = self.rng.vec(width * channels, 0.5);
+        let state0 = self.rng.vec(hist * channels, 1.0);
+        let (wd, mut sd) = (self.b.upload(&w)?, self.b.upload(&state0)?);
+        let mut sc = state0;
+        for (i, tokens) in chunks.into_iter().enumerate() {
+            let s = DilatedConvShape {
+                tokens,
+                channels,
+                width,
+                dilation,
+            };
+            let x = self.rng.vec(tokens * channels, 1.0);
+            let mut want = vec![0.0; tokens * channels];
+            CpuBackend.conv1d_dilated_silu(&x, &w, &mut sc, &mut want, s)?;
+            let xd = self.b.upload(&x)?;
+            let mut od = self.b.alloc(tokens * channels)?;
+            self.b.conv1d_dilated_silu(&xd, &wd, &mut sd, &mut od, s)?;
+            let mut got = fetch(self.b, &od, tokens * channels)?;
+            got.extend(fetch(self.b, &sd, hist * channels)?);
+            want.extend_from_slice(&sc);
+            let name = format!(
+                "conv1d_dilated_silu c={channels} w={width} dil={dilation} call {i} ({tokens} tokens) + state"
+            );
+            self.record(name, Some(Op::Conv1dDilatedSilu), &got, &want, 1e-5);
+        }
+        Ok(())
+    }
+
+    /// `moe_route` with counts: ids, weights and the counts compared (ids as numbers).
+    fn moe_route(&mut self, rows: usize, row_len: usize, experts: usize, k: usize) -> Result<()> {
+        let s = MoeRouteShape {
+            rows,
+            row_len,
+            experts,
+            k,
+        };
+        let logits = self.rng.vec(rows * row_len, 4.0);
+        let counts0 = vec![1.0f32; experts];
+        let (mut ids, mut w, mut counts) =
+            (vec![0.0; rows * k], vec![0.0; rows * k], counts0.clone());
+        CpuBackend.moe_route(&logits, &mut ids, &mut w, Some(&mut counts), s)?;
+        let ld = self.b.upload(&logits)?;
+        let (mut idd, mut wd) = (self.b.alloc(rows * k)?, self.b.alloc(rows * k)?);
+        let mut cd = self.b.upload(&counts0)?;
+        self.b.moe_route(&ld, &mut idd, &mut wd, Some(&mut cd), s)?;
+        let as_num = |v: Vec<f32>| -> Vec<f32> { v.iter().map(|x| x.to_bits() as f32).collect() };
+        let mut got = as_num(fetch(self.b, &idd, rows * k)?);
+        got.extend(fetch(self.b, &wd, rows * k)?);
+        got.extend(fetch(self.b, &cd, experts)?);
+        let mut want = as_num(ids);
+        want.extend(w);
+        want.extend(counts);
+        let name = format!("moe_route {rows}x{row_len} experts={experts} k={k} + counts");
+        self.record(name, Some(Op::MoeRoute), &got, &want, 1e-6);
+        Ok(())
+    }
+
+    /// `moe_experts` over a random bank: `gate_fmt` for gate and up, `down_fmt` for down, some
+    /// experts resident in slots (mapped in a shuffled order), the rest read from records.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &mut self,
+        gate_fmt: WeightFormat,
+        down_fmt: WeightFormat,
+        experts: usize,
+        width: usize,
+        hidden: usize,
+        rows: usize,
+        k: usize,
+        policy: ActPolicy,
+    ) -> Result<()> {
+        let gb = gate_fmt.payload_bytes(width, hidden);
+        let db = down_fmt.payload_bytes(hidden, width);
+        let record_bytes = (2 * gb + db).div_ceil(16) * 16;
+        let mut records = vec![0u8; experts * record_bytes];
+        for rec in records.chunks_exact_mut(record_bytes) {
+            rec[..gb].copy_from_slice(&random_weight(&mut self.rng, gate_fmt, width, hidden));
+            rec[gb..2 * gb].copy_from_slice(&random_weight(&mut self.rng, gate_fmt, width, hidden));
+            rec[2 * gb..2 * gb + db].copy_from_slice(&random_weight(
+                &mut self.rng,
+                down_fmt,
+                hidden,
+                width,
+            ));
+        }
+        // Every third expert gets a slot, in reverse order.
+        let resident: Vec<usize> = (0..experts).filter(|e| e % 3 == 1).rev().collect();
+        // Slots a little wider than records, as a pool shared by banks of several sizes is.
+        let slot_bytes = record_bytes + 48;
+        let mut slots = vec![0u8; resident.len().max(1) * slot_bytes];
+        let mut map = vec![f32::from_bits(-1i32 as u32); experts];
+        for (i, &e) in resident.iter().enumerate() {
+            slots[i * slot_bytes..i * slot_bytes + record_bytes]
+                .copy_from_slice(&records[e * record_bytes..(e + 1) * record_bytes]);
+            map[e] = f32::from_bits(i as u32);
+        }
+        // k distinct experts per row (5 is coprime to every bank size used).
+        let mut ids = Vec::with_capacity(rows * k);
+        let mut weights = Vec::with_capacity(rows * k);
+        for r in 0..rows {
+            let start = (r * 7 + (self.rng.next_u64() % experts as u64) as usize) % experts;
+            let w: Vec<f32> = (0..k).map(|_| self.rng.uniform().abs() + 0.1).collect();
+            let sum: f32 = w.iter().sum();
+            for (j, wj) in w.into_iter().enumerate() {
+                ids.push(f32::from_bits(((start + 5 * j) % experts) as u32));
+                weights.push(wj / sum);
+            }
+        }
+        // Small inputs keep both chained products of order one, where the metric is meaningful.
+        let x = self.rng.vec(rows * hidden, 0.1);
+        let mat = |format, offset, rows, k| ExpertMatrix {
+            format,
+            offset,
+            rows,
+            k,
+        };
+        let (gate, up, down) = (
+            mat(gate_fmt, 0, width, hidden),
+            mat(gate_fmt, gb, width, hidden),
+            mat(down_fmt, 2 * gb, hidden, width),
+        );
+        let (rd, sd, md) = (
+            self.b.upload_bytes_host(&records)?,
+            self.b.upload_bytes(&slots)?,
+            self.b.upload(&map)?,
+        );
+        let bank = ExpertBank {
+            records: &rd,
+            slots: &sd,
+            map: &md,
+            experts,
+            slot_count: resident.len(),
+            slot_bytes,
+            record_bytes,
+            gate,
+            up,
+            down,
+            act: policy,
+        };
+        let act = self.b.moe_experts_act(&bank, rows);
+        let want = moe_reference(
+            &records,
+            record_bytes,
+            (gate, up, down),
+            &ids,
+            &weights,
+            &x,
+            k,
+            act,
+        )?;
+        let (xd, idd, wd) = (
+            self.b.upload(&x)?,
+            self.b.upload(&ids)?,
+            self.b.upload(&weights)?,
+        );
+        let mut yd = self.b.alloc(rows * hidden)?;
+        let mut scratch = self.b.alloc(self.b.moe_scratch_len(&bank, rows, k))?;
+        self.b
+            .moe_experts(&xd, &idd, &wd, &bank, &mut yd, &mut scratch, rows, k)?;
+        let got = fetch(self.b, &yd, rows * hidden)?;
+        let name = format!(
+            "moe_experts {}/{} experts={experts} [{width},{hidden}] rows={rows} k={k}{}",
+            gate_fmt.name(),
+            down_fmt.name(),
+            if act == ActQuant::Exact {
+                ""
+            } else {
+                " (rounded)"
+            }
+        );
+        if permitted(act, policy) && act != ActQuant::Exact {
+            // The SwiGLU product is rounded again from values the device computes in f32: a value
+            // on an int8 rounding boundary may land one code apart from the oracle's. Relative L2
+            // error tolerates such isolated codes; a wrong expert, row or scale is O(1).
+            let (num, den) = got
+                .iter()
+                .zip(&want)
+                .fold((0f64, 0f64), |(n, d), (&g, &w)| {
+                    let e = f64::from(g) - f64::from(w);
+                    (n + e * e, d + f64::from(w) * f64::from(w))
+                });
+            let rel = if num.is_nan() {
+                f64::INFINITY
+            } else {
+                (num / den.max(1e-30)).sqrt()
+            };
+            self.record(
+                name + ", relative L2",
+                Some(Op::MoeExperts),
+                &[rel as f32],
+                &[0.0],
+                1e-3,
+            );
+        } else if permitted(act, policy) {
+            self.record(name, Some(Op::MoeExperts), &got, &want, 5e-4);
+        } else {
+            let name = name + " (rounding not permitted)";
+            self.record(name, Some(Op::MoeExperts), &[f32::NAN], &[0.0], 0.0);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_pool(
+        &mut self,
+        block0: usize,
+        blocks: usize,
+        ratio: usize,
+        dim: usize,
+        rotary_dim: usize,
+    ) -> Result<()> {
+        let s = QsaPoolShape {
+            block0,
+            blocks,
+            ratio,
+            dim,
+            rotary_dim,
+            theta: 1e7,
+            eps: 1e-6,
+        };
+        let end = block0 + blocks;
+        let raw = self.rng.vec(end * ratio * dim, 2.0);
+        let w = self.rng.vec(dim, 1.5);
+        let pooled0 = self.rng.vec(end * dim, 1.0);
+        let mut want = pooled0.clone();
+        CpuBackend.qsa_pool(&raw, &w, &mut want, s)?;
+        let (rd, wd) = (self.b.upload(&raw)?, self.b.upload(&w)?);
+        let mut pd = self.b.upload(&pooled0)?;
+        self.b.qsa_pool(&rd, &wd, &mut pd, s)?;
+        let got = fetch(self.b, &pd, end * dim)?;
+        let name =
+            format!("qsa_pool blocks {block0}+{blocks} ratio={ratio} dim={dim} rot={rotary_dim}");
+        // Normalised values of a few units rotated by f32 angles of up to ~300 rad.
+        self.record(name, Some(Op::QsaPool), &got, &want, 5e-5);
+        Ok(())
+    }
+
+    fn qsa_select(&mut self, s: QsaSelectShape) -> Result<()> {
+        let blocks = s.complete_blocks(s.tokens - 1);
+        let q = self.rng.vec(s.tokens * s.heads * s.dim, 1.0);
+        let pooled = self.rng.vec(blocks.max(1) * s.dim, 1.0);
+        let len = s.tokens * s.sel_len();
+        let mut want = vec![0.0; len];
+        let mut scratch = vec![0.0; (s.tokens * blocks).max(1)];
+        CpuBackend.qsa_select(&q, &pooled, &mut want, &mut scratch, s)?;
+        let (qd, pd) = (self.b.upload(&q)?, self.b.upload(&pooled)?);
+        let mut sd = self.b.alloc(len)?;
+        let mut scd = self.b.alloc((s.tokens * blocks).max(1))?;
+        self.b.qsa_select(&qd, &pd, &mut sd, &mut scd, s)?;
+        let as_num =
+            |v: Vec<f32>| -> Vec<f32> { v.iter().map(|x| x.to_bits() as i32 as f32).collect() };
+        let got = as_num(fetch(self.b, &sd, len)?);
+        let name = format!(
+            "qsa_select t={} h={} d={} pos0={} ratio={} budget={}",
+            s.tokens, s.heads, s.dim, s.pos0, s.ratio, s.budget
+        );
+        self.record(name, Some(Op::QsaSelect), &got, &as_num(want), 0.0);
+        Ok(())
+    }
+
+    /// `attention_sparse` over a cache in `s.kv`, each token selecting a random subset of the
+    /// positions it sees (in shuffled order, -1 entries mixed in).
+    fn attention_sparse(&mut self, s: AttnShape, sel_len: usize) -> Result<()> {
+        let d = s.head_dim;
+        let q_len = s.tokens * s.heads * d;
+        let rows = (s.kv_len() + 3) * s.kv_heads;
+        let q = self.rng.vec(q_len, 2.0);
+        let kb = encode_cache(s.kv, &self.rng.vec(rows * d, 2.0), d, false);
+        let vb = encode_cache(s.kv, &self.rng.vec(rows * d, 1.0), d, true);
+        let mut sel = Vec::with_capacity(s.tokens * sel_len);
+        for t in 0..s.tokens {
+            let visible = s.pos0 + t + 1;
+            let mut row: Vec<i32> = (0..visible as i32)
+                .filter(|_| !self.rng.next_u64().is_multiple_of(3))
+                .take(sel_len - 1)
+                .collect();
+            row.push(visible as i32 - 1);
+            row.dedup();
+            row.resize(sel_len, -1);
+            row.rotate_left(t % sel_len);
+            sel.extend(row.into_iter().map(|p| f32::from_bits(p as u32)));
+        }
+        let (mut kr, mut vr) = (
+            decode_cache(s.kv, &kb, rows, d, false),
+            decode_cache(s.kv, &vb, rows, d, true),
+        );
+        let f32_shape = AttnShape {
+            kv: KvFormat::F32,
+            ..s
+        };
+        let precision = self.b.attention_precision(s);
+        let mut qr = q.clone();
+        round_attention_inputs(&mut qr, &mut kr, &mut vr, f32_shape, precision);
+        let mut want = vec![0.0; q_len];
+        CpuBackend.attention_sparse(&qr, &kr, &vr, &sel, sel_len, &mut want, f32_shape)?;
+        let (qd, kd, vd, sd) = (
+            self.b.upload(&q)?,
+            self.b.upload_bytes(&kb)?,
+            self.b.upload_bytes(&vb)?,
+            self.b.upload(&sel)?,
+        );
+        let mut od = self.b.alloc(q_len)?;
+        self.b
+            .attention_sparse(&qd, &kd, &vd, &sd, sel_len, &mut od, s)?;
+        let got = fetch(self.b, &od, q_len)?;
+        let (tag, tol) = match precision {
+            AttnPrecision::Exact => ("", 2e-4),
+            AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+            AttnPrecision::F16 => (" f16", 2e-3),
+        };
+        let name = format!(
+            "attention_sparse {} t={} h={}/{} d={} pos0={} sel={sel_len}{tag}",
+            s.kv, s.tokens, s.heads, s.kv_heads, s.head_dim, s.pos0
+        );
+        self.record(name, Some(Op::AttentionSparse), &got, &want, tol);
         Ok(())
     }
 
@@ -2051,6 +2655,57 @@ impl<B: Backend> Suite<'_, B> {
     }
 }
 
+/// The routed experts' sum with every projection input rounded as `act` (x for gate and up, the
+/// SwiGLU product for down), exact products otherwise: the oracle `moe_experts` is checked against.
+#[allow(clippy::too_many_arguments)]
+fn moe_reference(
+    records: &[u8],
+    record_bytes: usize,
+    (gate, up, down): (ExpertMatrix, ExpertMatrix, ExpertMatrix),
+    ids: &[f32],
+    weights: &[f32],
+    x: &[f32],
+    k: usize,
+    act: ActQuant,
+) -> Result<Vec<f32>> {
+    let (hidden, width) = (gate.k, gate.rows);
+    let rows = x.len() / hidden;
+    let dot = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&p, &q)| f64::from(p) * f64::from(q))
+            .sum()
+    };
+    let mut y = vec![0.0f32; rows * hidden];
+    for r in 0..rows {
+        let mut xq = x[r * hidden..(r + 1) * hidden].to_vec();
+        quantize_activations(&mut xq, hidden, act);
+        let mut acc = vec![0f64; hidden];
+        for j in 0..k {
+            let e = ids[r * k + j].to_bits() as usize;
+            let rec = &records[e * record_bytes..(e + 1) * record_bytes];
+            let dec =
+                |m: &ExpertMatrix| decode_rows(m.format, &rec[m.offset..], m.rows, m.k, 0, m.rows);
+            let (g, u, dn) = (dec(&gate)?, dec(&up)?, dec(&down)?);
+            let mut h: Vec<f32> = (0..width)
+                .map(|i| {
+                    let a = dot(&xq, &g[i * hidden..(i + 1) * hidden]);
+                    (a / (1.0 + (-a).exp()) * dot(&xq, &u[i * hidden..(i + 1) * hidden])) as f32
+                })
+                .collect();
+            quantize_activations(&mut h, width, act);
+            let w = f64::from(weights[r * k + j]);
+            for (c, a) in acc.iter_mut().enumerate() {
+                *a += w * dot(&h, &dn[c * width..(c + 1) * width]);
+            }
+        }
+        for (c, a) in acc.into_iter().enumerate() {
+            y[r * hidden + c] = a as f32;
+        }
+    }
+    Ok(y)
+}
+
 pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     let mut s = Suite {
         b,
@@ -2090,6 +2745,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 12)?;
     s.linear(WeightFormat::Bf16, 1280, 1024, 0, 1280, 16)?;
     s.linear(WeightFormat::Bf16, 300, 1024, 40, 200, 3)?;
+    // K a multiple of 16 but not 32 at prefill widths (Qwen3-VL's ViT fc2, K = 4304), on their
+    // own seed so the cases after them keep their data.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x4304));
+    s.linear(WeightFormat::Bf16, 300, 80, 8, 280, 70)?;
+    s.linear(WeightFormat::Bf16, 1152, 4304, 0, 1152, 130)?;
+    s.rng = rng;
     s.linear(WeightFormat::Nvfp4, 256, 128, 0, 256, 1)?;
     s.linear(WeightFormat::Nvfp4, 384, 192, 128, 200, 5)?;
     // Activation policies: tuned kernels may round inputs to FP8 / NVFP4 where the artifact allows.
@@ -2163,6 +2824,40 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         64,
         ActPolicy::A16Only,
     )?;
+    // A DFlash2 drafter's NVFP4 MLP (Qwen3.6-35B-A3B: hidden 2048, width 6144) at every block
+    // width a draft window can have, on its own seed so the cases after it keep their data.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0xdf1a_2048));
+    for m in 1..=9 {
+        s.linear_act(
+            WeightFormat::Nvfp4,
+            6144,
+            2048,
+            0,
+            6144,
+            m,
+            ActPolicy::A16Only,
+        )?;
+        s.linear_act(
+            WeightFormat::Nvfp4,
+            2048,
+            6144,
+            0,
+            2048,
+            m,
+            ActPolicy::A16Only,
+        )?;
+        s.linear_swiglu_with(
+            WeightFormat::Nvfp4,
+            2048,
+            6144,
+            0,
+            m,
+            false,
+            false,
+            ActPolicy::A16Only,
+        )?;
+    }
+    s.rng = rng;
     // Batched drafting with A16-only NVFP4 weights (draft model, proposal head): 17..96 rows.
     for m in [21, 42, 48, 96] {
         s.linear_act(
@@ -2262,6 +2957,20 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.top_k(7, 131_072, 130_001, 12, true)?;
     s.top_k(2, 20_000, 20_000, 32, true)?;
     s.top_k(2, 20_000, 20_000, 33, true)?;
+    // System One scoring: rating digits over the Qwen head, ids past the public vocabulary, NaN.
+    // On their own seed, so the cases after them keep their data.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x5157));
+    s.log_softmax_gather(
+        2,
+        248_320,
+        248_077,
+        &[0, 1, 15, 24, 248_076, 248_077, 248_319],
+        false,
+    )?;
+    s.log_softmax_gather(16, 248_320, 248_077, &[15, 16, 17, 18, 19], false)?;
+    s.log_softmax_gather(3, 5000, 4097, &[7, 4096, 4097], true)?;
+    s.log_softmax_gather(1, 50, 50, &(0..50).collect::<Vec<u32>>(), false)?;
+    s.rng = rng;
     s.argmax_to(248_320, 248_077, false)?;
     s.argmax_to(5000, 4097, true)?;
     s.argmax_to(50, 50, false)?;
@@ -2492,6 +3201,18 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.state_from(16, 48, 128, 8)?;
     s.state_from(2, 6, 64, 3)?;
     s.state_from(2, 4, 128, 20)?;
+    // System One scoring windows: Qwen3.8's GDN heads, short and long windows, a row offset; on
+    // their own seed.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x5158));
+    s.gdn_windows(16, 48, 128, 6, 40, 0)?;
+    s.gdn_windows(2, 6, 64, 1, 3, 5)?;
+    s.gdn_windows(2, 4, 128, 20, 3, 0)?;
+    s.attention_windows(24, 4, 256, 300, 6, 20)?;
+    s.attention_windows(24, 4, 256, 611, 5, 40)?;
+    s.attention_windows(8, 2, 128, 37, 3, 7)?;
+    s.attention_windows(4, 4, 64, 0, 5, 2)?;
+    s.attention_windows(16, 2, 64, 1_500, 1, 3)?;
+    s.rng = rng;
     s.gdn_replay(3, 8, 5, 0)?;
     s.gdn_replay(2, 8, 1, 0)?;
     s.gdn_replay(2, 12, 12, 0)?;
@@ -2680,6 +3401,25 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.embed(f, 12, 512, &[11, 0, 5])?;
         s.linear_swiglu(f, 512, 24, 0, 2, false, true)?;
     }
+    // Blocks of 64 / 32 values: K a multiple of the block but not of 256, odd row views, decode,
+    // verify and tiled widths.
+    {
+        use velox_core::ggml::GgmlType::{Iq4Nl, Q2_0, Q8_0};
+        for (t, k) in [
+            (Q2_0, 640),
+            (Q2_0, 64),
+            (Iq4Nl, 160),
+            (Iq4Nl, 32),
+            (Q8_0, 96),
+        ] {
+            let f = WeightFormat::Ggml(t);
+            s.linear(f, 37, k, 5, 29, 1)?;
+            s.linear(f, 41, k, 3, 33, 8)?;
+            s.linear(f, 45, k, 7, 31, 20)?;
+            s.embed(f, 9, k, &[8, 0, 3])?;
+            s.linear_swiglu(f, k, 7, 0, 3, false, true)?;
+        }
+    }
     // The dense MLP's own K (gate/up 5120, down 17408) at decode and verify widths.
     s.linear(
         WeightFormat::Ggml(velox_core::ggml::GgmlType::Iq3S),
@@ -2701,6 +3441,154 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.transpose_heads(1, 16, 3, 128)?;
     s.transpose_heads(37, 16, 3, 128)?;
     s.transpose_heads(5, 2, 3, 7)?;
+    // Qwen4-Exp (docs/qwen4_exp.md): hyper-connection streams (decode, prefill, odd widths),
+    // PLE's dilated convolution across two calls, MoE routing and experts, the QSA indexer.
+    s.rms_norm_groups(1, 4, 2560)?;
+    s.rms_norm_groups(37, 4, 2560)?;
+    s.rms_norm_groups(5, 3, 70)?;
+    s.hyper_connections(1, 4, 2560)?;
+    s.hyper_connections(33, 4, 512)?;
+    s.hyper_connections(3, 3, 70)?;
+    s.conv1d_dilated(10240, 4, 3, [1, 1])?;
+    s.conv1d_dilated(96, 4, 3, [17, 2])?;
+    s.conv1d_dilated(33, 3, 2, [1, 5])?;
+    s.moe_route(1, 513, 512, 10)?;
+    s.moe_route(70, 513, 512, 10)?;
+    s.moe_route(9, 40, 37, 32)?;
+    s.moe_route(3, 16, 16, 1)?;
+    {
+        use velox_core::ggml::GgmlType::{Iq2S, Iq2Xxs, Q4K};
+        use WeightFormat::{Bf16, Ggml, Nvfp4};
+        let a8 = ActPolicy::AllowA8;
+        // Decode, a verify window and a prefill chunk where experts take several 64-row tiles.
+        s.moe_experts(Ggml(Iq2S), Ggml(Q4K), 24, 512, 256, 1, 10, a8)?;
+        s.moe_experts(Ggml(Iq2Xxs), Ggml(Q4K), 24, 512, 256, 8, 6, a8)?;
+        s.moe_experts(Ggml(Iq2S), Ggml(Q4K), 12, 256, 512, 130, 4, a8)?;
+        // Odd widths (partial tiles everywhere) and bf16 records.
+        s.moe_experts(Bf16, Bf16, 7, 40, 70, 5, 3, ActPolicy::A16Only)?;
+        // Qwen3.8-Flash-Next IQ2_XS geometry: IQ2_S / IQ2_XXS / IQ1_M gate and up, Q2_0 down,
+        // at decode, verify and prefill widths.
+        use velox_core::ggml::GgmlType::{Iq1M, Q2_0};
+        s.moe_experts(Ggml(Iq2S), Ggml(Q2_0), 24, 640, 2560, 1, 10, a8)?;
+        s.moe_experts(Ggml(Iq2Xxs), Ggml(Q2_0), 24, 640, 2560, 8, 10, a8)?;
+        s.moe_experts(Ggml(Iq1M), Ggml(Q2_0), 24, 640, 2560, 3, 10, a8)?;
+        s.moe_experts(Ggml(Iq2S), Ggml(Q2_0), 24, 640, 2560, 40, 10, a8)?;
+        // Qwen3.6-35B-A3B: NVFP4 experts (width 512, hidden 2048, top-8) and its MTP head's
+        // bf16 experts, at decode, verify and prefill widths.
+        for rows in [1, 3, 40] {
+            s.moe_experts(Nvfp4, Nvfp4, 16, 512, 2048, rows, 8, ActPolicy::A16Only)?;
+        }
+        s.moe_experts(Bf16, Bf16, 16, 512, 2048, 2, 8, ActPolicy::A16Only)?;
+        // TEMP (local only): NVFP4 experts under AllowA8, as ExpertCache::bank hands them.
+        for rows in [1, 2, 3, 4, 16, 17, 40, 130] {
+            s.moe_experts(Nvfp4, Nvfp4, 16, 512, 2048, rows, 8, a8)?;
+        }
+        s.moe_experts(Nvfp4, Nvfp4, 300, 256, 512, 70, 10, a8)?;
+        // The MTP head's IQ4_NL experts at decode, verify and prefill widths.
+        use velox_core::ggml::GgmlType::Iq4Nl;
+        for rows in [1, 2, 4, 16, 40] {
+            s.moe_experts(Ggml(Iq4Nl), Ggml(Iq4Nl), 24, 640, 2560, rows, 10, a8)?;
+        }
+    }
+    for (block0, blocks, ratio, dim, rot) in
+        [(0, 1, 4, 128, 64), (5, 70, 4, 128, 64), (2, 9, 3, 40, 40)]
+    {
+        s.qsa_pool(block0, blocks, ratio, dim, rot)?;
+    }
+    for (tokens, pos0, budget) in [
+        // Dense (every block fits the budget), a decode past the budget, a prefill crossing it.
+        (5, 0, 64),
+        (1, 900, 256),
+        (40, 230, 128),
+        (3, 2100, 2048),
+    ] {
+        let sh = QsaSelectShape {
+            tokens,
+            heads: 4,
+            dim: 128,
+            pos0,
+            ratio: 4,
+            budget,
+        };
+        s.qsa_select(sh)?;
+    }
+    s.qsa_select(QsaSelectShape {
+        tokens: 7,
+        heads: 3,
+        dim: 40,
+        pos0: 61,
+        ratio: 3,
+        budget: 30,
+    })?;
+    for kv in [
+        KvFormat::F32,
+        KvFormat::Bf16,
+        KvFormat::Fp8,
+        KvFormat::Nvfp4,
+    ] {
+        for (tokens, pos0, sel_len) in [(1, 300, 67), (9, 40, 23)] {
+            let sh = AttnShape {
+                tokens,
+                heads: 24,
+                kv_heads: 2,
+                head_dim: 256,
+                pos0,
+                kv,
+            };
+            s.attention_sparse(sh, sel_len)?;
+        }
+    }
+    s.attention_sparse(
+        AttnShape {
+            tokens: 4,
+            heads: 6,
+            kv_heads: 3,
+            head_dim: 40,
+            pos0: 17,
+            kv: KvFormat::F32,
+        },
+        9,
+    )?;
+    // Qwen3.8-Flash-Next's bf16 projections at their real shapes (hyper-connection low rank,
+    // injection, router + shared gate, GDN gates, PLE) at decode, verify and prefill widths.
+    for (n, k) in [
+        (320, 10240),
+        (10240, 320),
+        (4, 10240),
+        (513, 2560),
+        (96, 2560),
+        (10240, 2560),
+    ] {
+        for m in [1, 8, 70] {
+            s.linear(WeightFormat::Bf16, n, k, 0, n, m)?;
+        }
+    }
+    // GGML projections with K = 2560 (not a multiple of 1024) at decode and prefill widths, A8.
+    {
+        use velox_core::ggml::GgmlType::{Iq3S, Iq4Xs, Q4K};
+        for t in [Iq4Xs, Q4K, Iq3S] {
+            // IQ4_XS's large weights take the portable f32 GEMM past 2e-4 at prefill widths.
+            let ms: &[usize] = if t == Iq4Xs {
+                &[1, 3, 8]
+            } else {
+                &[1, 3, 8, 70, 300]
+            };
+            for &m in ms {
+                s.linear_act(
+                    WeightFormat::Ggml(t),
+                    96,
+                    2560,
+                    0,
+                    96,
+                    m,
+                    ActPolicy::AllowA8,
+                )?;
+            }
+        }
+    }
+    // Its own seed: the synthetic model must not change when cases are added before it.
+    let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
+    s.results.extend(stack);
     Ok(s.results)
 }
 

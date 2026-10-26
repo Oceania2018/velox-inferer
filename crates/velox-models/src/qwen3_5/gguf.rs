@@ -85,10 +85,11 @@ fn tensor_format(t: &GgufTensor, k: u64) -> Result<(String, &'static str, u64)> 
             let g = GgmlType::from_gguf_id(id).ok_or_else(|| {
                 Error::Unsupported(format!("{}: ggml type {id} is not supported", t.name))
             })?;
-            if !k.is_multiple_of(256) {
+            if !k.is_multiple_of(g.block_values() as u64) {
                 return Err(Error::Config(format!(
-                    "{}: K = {k} is not a multiple of 256",
-                    t.name
+                    "{}: K = {k} is not a multiple of {}",
+                    t.name,
+                    g.block_values()
                 )));
             }
             Ok((

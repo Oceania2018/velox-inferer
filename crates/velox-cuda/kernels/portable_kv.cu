@@ -877,6 +877,86 @@ VELOX_API int velox_portable_kv_load(const unsigned char* k_cache, const unsigne
     }
 }
 
+// ---- attention_sparse ----
+
+namespace {
+// One warp per (token, head) over the cache positions its selection lists (negative entries skipped).
+template <int FMT, int PER>
+__global__ void kvq_sparse_kernel(const float* __restrict__ q, const unsigned char* __restrict__ k,
+                                  const unsigned char* __restrict__ v, const float* __restrict__ sel, int sel_len,
+                                  float* __restrict__ out, int heads, int kv_heads, int head_dim, float scale,
+                                  float norm) {
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const int kvh = h / (heads / kv_heads);
+    const size_t q_off = (static_cast<size_t>(t) * heads + h) * head_dim;
+    const size_t rb = static_cast<size_t>(kv_row_bytes(FMT, head_dim));
+    float qr[PER], acc[PER];
+    kvq_load_query<FMT, PER>(q + q_off, true, head_dim, lane, scale, norm, qr);
+#pragma unroll
+    for (int p = 0; p < PER; ++p) acc[p] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    const float* list = sel + static_cast<size_t>(t) * sel_len;
+    for (int i = 0; i < sel_len; ++i) {
+        const int j = static_cast<int>(__float_as_uint(list[i]));
+        if (j < 0) continue;
+        const size_t row = (static_cast<size_t>(j) * kv_heads + kvh) * rb;
+        float kx[PER], vx[PER];
+        kv_load_lane<FMT, PER>(k + row, head_dim, lane, kx);
+        kv_load_lane<FMT, PER>(v + row, head_dim, lane, vx);
+        float s = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) s += qr[p] * kx[p];
+        s = velox_warp_sum(s);
+        const float m_new = fmaxf(m, s);
+        const float corr = expf(m - m_new), pj = expf(s - m_new);
+        l = l * corr + pj;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) acc[p] = acc[p] * corr + pj * vx[p];
+        m = m_new;
+    }
+#pragma unroll
+    for (int p = 0; p < PER; ++p) acc[p] = l > 0.0f ? acc[p] / l : 0.0f;
+    if (KvRot<FMT>::v) kv_hadamard<PER>(acc, lane, norm);
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int d = lane + p * VELOX_WARP;
+        if (d < head_dim) out[q_off + d] = acc[p];
+    }
+}
+
+template <int FMT>
+int kvq_sparse(const float* q, const unsigned char* k, const unsigned char* v, const float* sel, int sel_len,
+               float* out, int tokens, int heads, int kv_heads, int head_dim, float scale, float norm) {
+    const dim3 grid(heads, tokens);
+    if (head_dim <= 32)
+        kvq_sparse_kernel<FMT, 1><<<grid, VELOX_WARP>>>(q, k, v, sel, sel_len, out, heads, kv_heads, head_dim, scale, norm);
+    else if (head_dim <= 64)
+        kvq_sparse_kernel<FMT, 2><<<grid, VELOX_WARP>>>(q, k, v, sel, sel_len, out, heads, kv_heads, head_dim, scale, norm);
+    else if (head_dim <= 128)
+        kvq_sparse_kernel<FMT, 4><<<grid, VELOX_WARP>>>(q, k, v, sel, sel_len, out, heads, kv_heads, head_dim, scale, norm);
+    else
+        kvq_sparse_kernel<FMT, 8><<<grid, VELOX_WARP>>>(q, k, v, sel, sel_len, out, heads, kv_heads, head_dim, scale, norm);
+    return velox_launch_status();
+}
+}  // namespace
+
+VELOX_API int velox_portable_attention_sparse(const float* q, const unsigned char* k, const unsigned char* v,
+                                              const float* sel, int sel_len, float* out, int tokens, int heads,
+                                              int kv_heads, int head_dim, float scale, int format, float norm) {
+    if (tokens > 65535 || head_dim > 256) return VELOX_ERR_UNSUPPORTED;
+    switch (format) {
+        case VELOX_KV_F32:
+            return kvq_sparse<VELOX_KV_F32>(q, k, v, sel, sel_len, out, tokens, heads, kv_heads, head_dim, scale, norm);
+        case VELOX_KV_BF16:
+            return kvq_sparse<VELOX_KV_BF16>(q, k, v, sel, sel_len, out, tokens, heads, kv_heads, head_dim, scale, norm);
+        case VELOX_KV_FP8:
+            return kvq_sparse<VELOX_KV_FP8>(q, k, v, sel, sel_len, out, tokens, heads, kv_heads, head_dim, scale, norm);
+        case VELOX_KV_NVFP4:
+            return kvq_sparse<VELOX_KV_NVFP4>(q, k, v, sel, sel_len, out, tokens, heads, kv_heads, head_dim, scale, norm);
+        default: return VELOX_ERR_UNSUPPORTED;
+    }
+}
+
 // ---- recurrent-state checkpoints: `state_pack` / `state_unpack` ----
 // Formats and their exact encoding are specified in velox-core/src/state.rs; these are bit-exact
 // with `state::pack` / `state::unpack`. Either side may be mapped host memory (a context-store

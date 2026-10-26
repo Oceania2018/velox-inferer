@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde_json::json;
 use velox_core::{Backend, Error, KvFormat, Result, StateFormat};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{Qwen35Text, TextConfig, TextWeights};
+use velox_models::qwen3_5::{ExpertPolicy, Qwen35Text, TextConfig, TextWeights};
 use velox_weights::Artifact;
 
 use crate::args::Args;
@@ -38,6 +38,9 @@ enum Input {
 }
 
 fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Result<ExitCode> {
+    if a.get("gguf").is_some() {
+        return crate::qwen4::generate(b, a, on_phase);
+    }
     let path = a
         .get("artifact")
         .ok_or_else(|| Error::Config("--artifact is required".into()))?;
@@ -108,8 +111,25 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
         w.host_bytes as f64 / 1e9,
         t0.elapsed().as_secs_f64()
     );
-    let model = Qwen35Text::new(cfg, w);
+    let mut model = Qwen35Text::new(cfg, w);
     let mut ws = model.workspace(b, chunk)?;
+    // A DFlash2 drafter is loaded per prompt after this: keep its weights' room free too.
+    let drafter_mib = if a.get("dflash").is_some() {
+        component_bytes(&art, "dflash2/") >> 20
+    } else {
+        0
+    };
+    enable_experts(b, &mut model, a, 1536 + drafter_mib as usize)?;
+
+    let report_experts = |model: &Qwen35Text<B>| {
+        if let Some(r) = model.expert_report() {
+            eprintln!(
+                "experts   {:.1}% of selections from device slots so far, {} moves",
+                100.0 * r.hit_rate(),
+                r.moves
+            );
+        }
+    };
     // --state-quant f32,bf16,...: formats compared by `state_quant` (f32 first: the noise floor).
     let state_formats = match a.get("state-quant") {
         Some(list) => {
@@ -127,6 +147,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
     let mut state_rows: Vec<StateQuantRow> = Vec::new();
 
     for (n, input) in inputs.into_iter().enumerate() {
+        report_experts(&model);
         let (prompt, ids) = match input {
             Input::Prompt(p) => {
                 let text = fe.template.render(
@@ -265,6 +286,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             println!("text      {text:?}");
         }
     }
+    report_experts(&model);
     if let Some(formats) = &state_formats {
         state_quant_summary(formats, &state_rows);
     }
@@ -703,4 +725,61 @@ fn dflash_generate<B: Backend>(
     println!("ids       {out:?}");
     println!("text      {:?}", fe.decode(&out)?);
     Ok(())
+}
+
+/// Readies a MoE model's routed experts: device slots for the most selected ones in the memory
+/// left after `margin_mib` (`--vram-margin-mib`; room for what is still to be allocated), or
+/// `--expert-slots`. A dense model is left as is.
+pub(crate) fn enable_experts<B: Backend>(
+    b: &B,
+    model: &mut Qwen35Text<B>,
+    a: &Args,
+    margin_mib: usize,
+) -> Result<()> {
+    let slot = model.expert_slot_bytes();
+    if slot == 0 {
+        return Ok(());
+    }
+    b.synchronize()?;
+    let free = b.mem_info().map_or(0, |(free, _)| free);
+    let margin: usize = a.parse("vram-margin-mib", margin_mib)?;
+    let slots =
+        (free.saturating_sub(margin << 20) / slot).min(a.parse("expert-slots", usize::MAX)?);
+    let policy = ExpertPolicy {
+        interval: a.parse("cache-interval", ExpertPolicy::default().interval)?,
+        moves: a.parse("cache-moves", ExpertPolicy::default().moves)?,
+        reads: a.parse("cache-score-reads", u8::from(ExpertPolicy::default().reads))? != 0,
+        ..ExpertPolicy::default()
+    };
+    model.enable_experts(b, slots, policy)?;
+    let total = model.cfg.layers.len() * model.cfg_experts();
+    eprintln!(
+        "expert cache: {slots} slots of {:.2} MiB ({:.2} GB, {:.1}% of {total} experts)",
+        slot as f64 / (1 << 20) as f64,
+        (slots * slot) as f64 / 1e9,
+        100.0 * slots as f64 / total.max(1) as f64,
+    );
+    Ok(())
+}
+
+/// Bytes of the objects bound under `prefix` (each object once).
+fn component_bytes(art: &Artifact, prefix: &str) -> u64 {
+    let mut ids = std::collections::BTreeSet::new();
+    for (name, b) in art.directory["bindings"].as_object().into_iter().flatten() {
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if let Some(id) = b["object"].as_str() {
+            ids.insert(id.to_string());
+        }
+        for p in b["parts"].as_array().into_iter().flatten() {
+            if let Some(id) = p["object"].as_str() {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids.iter()
+        .filter_map(|id| art.object(id))
+        .map(|o| o.bytes)
+        .sum()
 }

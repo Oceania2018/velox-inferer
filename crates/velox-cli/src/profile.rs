@@ -8,8 +8,9 @@ use std::time::Instant;
 
 use velox_core::backend::{
     ActQuant, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
-    DynConvShape, FullAttnShape, GdnShape, GeluKind, KvStoreShape, LinearDst, NormKind,
-    RopePosShape, RopeShape, WeightView,
+    DilatedConvShape, DynConvShape, ExpertBank, FullAttnShape, GdnShape, GeluKind, HcCombineShape,
+    KvStoreShape, LinearDst, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopePosShape,
+    RopeShape, RowGateShape, WeightView,
 };
 use velox_core::{DeviceProfile, Op, Result, StateFormat};
 
@@ -486,6 +487,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_precision(s)
     }
+    fn attention_windows_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
+        self.inner.attention_windows_precision(s)
+    }
     fn attention_full_precision(&self, s: FullAttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_full_precision(s)
     }
@@ -607,6 +611,61 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         self.time("top_k", || self.inner.top_k(x, rows, row_len, limit, k))
     }
+    fn log_softmax_gather(
+        &self,
+        x: &B::Buffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        self.time("log_softmax_gather", || {
+            self.inner.log_softmax_gather(x, rows, row_len, limit, ids)
+        })
+    }
+    fn conv1d_silu_windows(
+        &self,
+        x: &B::Buffer,
+        w: &B::Buffer,
+        si: &B::Buffer,
+        out: &mut B::Buffer,
+        s: ConvShape,
+        windows: usize,
+    ) -> Result<()> {
+        self.time("conv1d_silu_windows", || {
+            self.inner.conv1d_silu_windows(x, w, si, out, s, windows)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_windows(
+        &self,
+        qkv: &B::Buffer,
+        ab: &B::Buffer,
+        a_log: &B::Buffer,
+        dt_bias: &B::Buffer,
+        si: &B::Buffer,
+        out: &mut B::Buffer,
+        s: GdnShape,
+        windows: usize,
+    ) -> Result<()> {
+        self.time("gated_delta_net_windows", || {
+            self.inner
+                .gated_delta_net_windows(qkv, ab, a_log, dt_bias, si, out, s, windows)
+        })
+    }
+    fn attention_windows(
+        &self,
+        q: &B::Buffer,
+        k: &B::Buffer,
+        v: &B::Buffer,
+        out: &mut B::Buffer,
+        s: AttnShape,
+        window: usize,
+    ) -> Result<()> {
+        self.time("attention_windows", || {
+            self.inner.attention_windows(q, k, v, out, s, window)
+        })
+    }
     fn rope_positions(&self, x: &mut B::Buffer, p: &[u32], s: RopePosShape) -> Result<()> {
         self.time("rope_positions", || self.inner.rope_positions(x, p, s))
     }
@@ -637,6 +696,159 @@ impl<B: Backend> Backend for Profiled<B> {
         self.time("attention_block", || {
             self.inner
                 .attention_block(q, k_ctx, v_ctx, k_blk, v_blk, out, s)
+        })
+    }
+    fn write_at(&self, dst: &mut B::Buffer, offset: usize, data: &[f32]) -> Result<()> {
+        self.time("write_at", || self.inner.write_at(dst, offset, data))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_groups(
+        &self,
+        x: &B::Buffer,
+        weight: &B::Buffer,
+        y: &mut B::Buffer,
+        rows: usize,
+        groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        self.time("rms_norm_groups", || {
+            self.inner
+                .rms_norm_groups(x, weight, y, rows, groups, dim, eps)
+        })
+    }
+    fn silu(&self, x: &mut B::Buffer, len: usize) -> Result<()> {
+        self.time("silu", || self.inner.silu(x, len))
+    }
+    fn hc_mix(
+        &self,
+        xn: &B::Buffer,
+        gate: &B::Buffer,
+        out: &mut B::Buffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()> {
+        self.time("hc_mix", || {
+            self.inner.hc_mix(xn, gate, out, rows, streams, dim)
+        })
+    }
+    fn hc_combine(
+        &self,
+        res: &mut B::Buffer,
+        y: &B::Buffer,
+        inject: &B::Buffer,
+        s: HcCombineShape,
+    ) -> Result<()> {
+        self.time("hc_combine", || self.inner.hc_combine(res, y, inject, s))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gate(
+        &self,
+        key_n: &B::Buffer,
+        q_n: &B::Buffer,
+        value: &B::Buffer,
+        out: &mut B::Buffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()> {
+        self.time("ple_gate", || {
+            self.inner
+                .ple_gate(key_n, q_n, value, out, rows, streams, dim)
+        })
+    }
+    fn conv1d_dilated_silu(
+        &self,
+        x: &B::Buffer,
+        weight: &B::Buffer,
+        state: &mut B::Buffer,
+        out: &mut B::Buffer,
+        s: DilatedConvShape,
+    ) -> Result<()> {
+        self.time("conv1d_dilated_silu", || {
+            self.inner.conv1d_dilated_silu(x, weight, state, out, s)
+        })
+    }
+    fn sigmoid_scale_rows(
+        &self,
+        x: &mut B::Buffer,
+        gate: &B::Buffer,
+        s: RowGateShape,
+    ) -> Result<()> {
+        self.time("sigmoid_scale_rows", || {
+            self.inner.sigmoid_scale_rows(x, gate, s)
+        })
+    }
+    fn moe_route(
+        &self,
+        logits: &B::Buffer,
+        ids: &mut B::Buffer,
+        weights: &mut B::Buffer,
+        counts: Option<&mut B::Buffer>,
+        s: MoeRouteShape,
+    ) -> Result<()> {
+        self.time("moe_route", || {
+            self.inner.moe_route(logits, ids, weights, counts, s)
+        })
+    }
+    fn moe_scratch_len(&self, bank: &ExpertBank<'_, B::Buffer>, rows: usize, k: usize) -> usize {
+        self.inner.moe_scratch_len(bank, rows, k)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &self,
+        x: &B::Buffer,
+        ids: &B::Buffer,
+        weights: &B::Buffer,
+        bank: &ExpertBank<'_, B::Buffer>,
+        y: &mut B::Buffer,
+        scratch: &mut B::Buffer,
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        self.time("moe_experts", || {
+            self.inner
+                .moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+        })
+    }
+    fn moe_experts_act(&self, bank: &ExpertBank<'_, B::Buffer>, rows: usize) -> ActQuant {
+        self.inner.moe_experts_act(bank, rows)
+    }
+    fn qsa_pool(
+        &self,
+        raw: &B::Buffer,
+        weight: &B::Buffer,
+        pooled: &mut B::Buffer,
+        s: QsaPoolShape,
+    ) -> Result<()> {
+        self.time("qsa_pool", || self.inner.qsa_pool(raw, weight, pooled, s))
+    }
+    fn qsa_select(
+        &self,
+        q: &B::Buffer,
+        pooled: &B::Buffer,
+        sel: &mut B::Buffer,
+        scratch: &mut B::Buffer,
+        s: QsaSelectShape,
+    ) -> Result<()> {
+        self.time("qsa_select", || {
+            self.inner.qsa_select(q, pooled, sel, scratch, s)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sparse(
+        &self,
+        q: &B::Buffer,
+        k: &B::Buffer,
+        v: &B::Buffer,
+        sel: &B::Buffer,
+        sel_len: usize,
+        out: &mut B::Buffer,
+        s: AttnShape,
+    ) -> Result<()> {
+        self.time("attention_sparse", || {
+            self.inner.attention_sparse(q, k, v, sel, sel_len, out, s)
         })
     }
 }

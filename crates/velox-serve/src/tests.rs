@@ -99,8 +99,87 @@ fn models_health_metrics() {
     ] {
         assert!(metrics.lines().any(|l| l == line), "{line}\n{metrics}");
     }
-    // The daemon's System One probe must read "unsupported".
+    // Without scoring, the daemon's System One probe must read "unsupported".
     assert_eq!(http(port, "POST", "/v1/systemone", "{}").0, 404);
+}
+
+/// Scores the first candidate at -0.1 and the others at -3, after the prompt or after each
+/// branch.
+struct Scoring;
+
+impl ChatEngine for Scoring {
+    fn architecture(&self) -> &str {
+        "Scoring"
+    }
+
+    fn generate(&self, _: &Value, _: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
+        Err(ApiError::not_implemented("scoring only"))
+    }
+
+    fn scores(&self) -> bool {
+        true
+    }
+
+    fn score(&self, queries: &[ScoreQuery<'_>]) -> Result<Vec<ScoreOutcome>, ApiError> {
+        Ok(queries
+            .iter()
+            .map(|q| {
+                let row = (0..q.candidates.len()).map(|i| if i == 0 { -0.1 } else { -3.0 });
+                ScoreOutcome {
+                    logprobs: (0..q.branches.len().max(1))
+                        .flat_map(|_| row.clone())
+                        .collect(),
+                    prompt_tokens: 50,
+                    cached_tokens: 40,
+                    queue_ms: 0.0,
+                }
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn systemone_answers_every_question() {
+    let port = start(Box::new(Scoring));
+    // The daemon's probe: an empty body is a 400 from a server that has the endpoint.
+    let (s, body) = http(port, "POST", "/v1/systemone", "{}");
+    assert_eq!(s, 400);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"],
+        "missing required field: model"
+    );
+    let req = json!({
+        "model": "m",
+        "state": "s",
+        "questions": {
+            "pick": {"type": "choice", "instructions": "?", "criteria": {"a": null, "b": null}},
+            "similar": {"type": "rank", "instructions": "?", "criteria": {"x": "1", "y": "2"}},
+        },
+    });
+    let (s, body) = http(port, "POST", "/v1/systemone", &req.to_string());
+    assert_eq!(s, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["model"], "m");
+    assert_eq!(v["answers"]["pick"]["choice"], "a");
+    assert_eq!(v["answers"]["similar"]["type"], "rank");
+    assert_eq!(
+        v["usage"],
+        json!({"input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 3})
+    );
+    let mut wrong = req.clone();
+    wrong["model"] = "other".into();
+    assert_eq!(
+        http(port, "POST", "/v1/systemone", &wrong.to_string()).0,
+        404
+    );
+    assert_eq!(http(port, "GET", "/v1/systemone", "").0, 405);
+    let (_, metrics) = http(port, "GET", "/metrics", "");
+    assert!(
+        metrics
+            .lines()
+            .any(|l| l == "velox_prompt_tokens_total 100"),
+        "{metrics}"
+    );
 }
 
 #[test]
