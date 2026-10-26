@@ -2527,9 +2527,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 12)?;
     s.linear(WeightFormat::Bf16, 1280, 1024, 0, 1280, 16)?;
     s.linear(WeightFormat::Bf16, 300, 1024, 40, 200, 3)?;
-    // K a multiple of 16 but not 32 at prefill widths (Qwen3-VL's ViT fc2, K = 4304).
+    // K a multiple of 16 but not 32 at prefill widths (Qwen3-VL's ViT fc2, K = 4304), on their
+    // own seed so the cases after them keep their data.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x4304));
     s.linear(WeightFormat::Bf16, 300, 80, 8, 280, 70)?;
     s.linear(WeightFormat::Bf16, 1152, 4304, 0, 1152, 130)?;
+    s.rng = rng;
     s.linear(WeightFormat::Nvfp4, 256, 128, 0, 256, 1)?;
     s.linear(WeightFormat::Nvfp4, 384, 192, 128, 200, 5)?;
     // Activation policies: tuned kernels may round inputs to FP8 / NVFP4 where the artifact allows.
