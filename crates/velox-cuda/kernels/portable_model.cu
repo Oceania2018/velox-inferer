@@ -19,9 +19,9 @@
 #define VELOX_FMT_Q8 7
 #define VELOX_FMT_IQ3_XXS 8
 // GGML block types: base + position in velox_core::ggml::GgmlType::ALL
-// (q2_k, q4_k, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, q2_0, iq4_nl, q6_k, q8_0).
+// (q2_k, q4_k, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, q2_0, iq4_nl, q6_k, q8_0, iq1_s).
 #define VELOX_FMT_GGML_BASE 16
-#define VELOX_FMT_GGML_END 29
+#define VELOX_FMT_GGML_END 30
 
 namespace {
 
@@ -134,6 +134,7 @@ __host__ __device__ __forceinline__ int ggml_block_bytes(int t) {
         case 9: return 18;
         case 10: return 18;
         case 11: return 210;
+        case 13: return 50;
         default: return 34;
     }
 }
@@ -239,8 +240,15 @@ __device__ __forceinline__ float ggml_value(const uint8_t* __restrict__ x, int v
         const int q = static_cast<int>((quarter < 2 ? lo & 0xf : lo >> 4) | (hi << 4)) - 32;
         const float sc = static_cast<float>(static_cast<int8_t>(x[192 + 8 * n + l2 / 16 + 2 * quarter]));
         return ggml_f16(x + 208) * sc * static_cast<float>(q);
-    } else {  // Q8_0 (32 values): d | qs[32] (int8)
+    } else if (T == 12) {  // Q8_0 (32 values): d | qs[32] (int8)
         return static_cast<float>(static_cast<int8_t>(x[2 + v])) * ggml_f16(x);
+    } else {  // IQ1_S: d | qs[32] | qh[8] (u16: index bits 0..11, sub-scale 12..14, delta sign 15)
+        const uint32_t qh = ggml_u16(x + 34 + 2 * ib);
+        const float dl = ggml_f16(x) * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
+        const uint32_t idx = x[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+        const float delta = qh & 0x8000 ? -0.125f : 0.125f;
+        const float g = static_cast<float>(static_cast<int8_t>(ggml_byte(kIq1SGrid[idx], jj)));
+        return dl * (g + delta);
     }
 }
 
@@ -262,7 +270,8 @@ __device__ float ggml_at(const WDesc& d, long long row, long long col) {
         case 9: return ggml_value<9>(x, v);
         case 10: return ggml_value<10>(x, v);
         case 11: return ggml_value<11>(x, v);
-        default: return ggml_value<12>(x, v);
+        case 12: return ggml_value<12>(x, v);
+        default: return ggml_value<13>(x, v);
     }
 }
 
@@ -1547,7 +1556,8 @@ int launch_gemv_ggml(const float* x, const WDesc& d, long long row_begin, int ro
         case 9: return launch_gemv_ggml_t<9>(x, d, row_begin, rows, m, y);
         case 10: return launch_gemv_ggml_t<10>(x, d, row_begin, rows, m, y);
         case 11: return launch_gemv_ggml_t<11>(x, d, row_begin, rows, m, y);
-        default: return launch_gemv_ggml_t<12>(x, d, row_begin, rows, m, y);
+        case 12: return launch_gemv_ggml_t<12>(x, d, row_begin, rows, m, y);
+        default: return launch_gemv_ggml_t<13>(x, d, row_begin, rows, m, y);
     }
 }
 
