@@ -74,7 +74,17 @@ where
     );
     let engine_cfg = EngineConfig {
         capacity: a.parse("max-context", 32768)?,
-        chunk: a.parse("prefill-chunk", 512)?,
+        // MoE models with experts in system RAM read each one once per chunk. Qwen3.6-35B-A3B CUA
+        // replay, 1024 -> 2048: prefill p50 1.40 -> 1.19 s, decode 128 -> 122 tok/s (fewer expert
+        // slots), end to end 2.34 -> 2.08 s; 3072 and 4096 lose more slots than they save.
+        chunk: a.parse(
+            "prefill-chunk",
+            if matches!(cfg.ffn, velox_models::qwen3_5::FfnConfig::Moe(_)) {
+                2048
+            } else {
+                512
+            },
+        )?,
         default_max_tokens: a.parse("default-max-tokens", 4096)?,
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
         // --force-tool-call on|off (default off): requests that offer tools answer with a tool

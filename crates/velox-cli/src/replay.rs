@@ -502,6 +502,7 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     // Tool-call agreement with the recorded run: counts, and click distances (0..1000 units).
     let (mut n_valid, mut n_name, mut n_args, mut n_compared) = (0usize, 0usize, 0usize, 0usize);
     let (mut dists, mut n_points) = (Vec::new(), 0usize);
+    let mut retries = 0usize;
     let wall = Instant::now();
     for st in steps {
         let mut req = st.request;
@@ -519,7 +520,16 @@ pub fn run(a: &Args) -> Result<ExitCode> {
         req["stream"] = true.into();
         req["stream_options"] = json!({"include_usage": true});
         let body = serde_json::to_vec(&req).expect("serialisable");
-        let m = stream_chat(&ep, &body)?;
+        // A transport error (the connection dropped, os error 11) is retried once; the step's
+        // timings are then the retry's.
+        let m = match stream_chat(&ep, &body) {
+            Err(Error::Backend(e)) if e.starts_with("http: ") => {
+                eprintln!("step {:3}: retrying after {e}", st.index);
+                retries += 1;
+                stream_chat(&ep, &body)?
+            }
+            r => r?,
+        };
 
         // Decode speed comes only from the server's timings: tool-call answers arrive in one
         // burst at the end, so a client-side TTFT-to-end rate is meaningless.
@@ -585,6 +595,7 @@ pub fn run(a: &Args) -> Result<ExitCode> {
         "endpoint": endpoint_url,
         "session": dir.file_name().map(|n| n.to_string_lossy().to_string()),
         "wall_s": wall.elapsed().as_secs_f64(),
+        "retries": retries,
         "summary": {"ttft_ms": stats(&mut ttfts), "total_ms": stats(&mut totals),"server_prefill_ms": stats(&mut srv_prefill), "server_decode_tps": stats(&mut srv_decode), "recorded_latency_ms": stats(&mut rec_lat),
             "tool_calls": {
                 "steps": rows.len(),
