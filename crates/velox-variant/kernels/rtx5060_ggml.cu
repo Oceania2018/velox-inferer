@@ -1254,7 +1254,11 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
                      float* __restrict__ y, long long ldy, int mode) {
     constexpr int BB = block_bytes(T);
     constexpr int NT = kQ2Tokens / 8;
-    constexpr bool kHalves = Traits<T>::G != 1;
+    // Q2_K: code q <= 3 times its 4-bit scale stays <= 45, so the per-16 scales fold into the
+    // codes and a sub-block is one k32 mma accumulating straight into the super-block's int32
+    // sums (two k16 mmas issue at the k32 rate on this GPU, and the per-tile rescaling goes).
+    constexpr bool kFold = T == kQ2K;
+    constexpr bool kHalves = Traits<T>::G != 1 && !kFold;
     constexpr bool kOff = T == kQ2K || T == kQ4K;
     __shared__ __align__(16) int8_t act[2][kQ2Tokens * kQ2S];
     __shared__ float sxs[2][kQ2Tokens];
@@ -1349,6 +1353,12 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
             int sca[2], mna[2], scb[2], mnb[2];
             int_scales<T>(xa, sb, sca, mna, dma);
             int_scales<T>(xb, sb, scb, mnb, dmb);
+            if constexpr (kFold) {  // bytes q * sc <= 45: one multiply per word, no carries
+                pa.x = static_cast<int>(static_cast<uint32_t>(pa.x) * static_cast<uint32_t>(sca[0]));
+                pa.y = static_cast<int>(static_cast<uint32_t>(pa.y) * static_cast<uint32_t>(sca[1]));
+                pb.x = static_cast<int>(static_cast<uint32_t>(pb.x) * static_cast<uint32_t>(scb[0]));
+                pb.y = static_cast<int>(static_cast<uint32_t>(pb.y) * static_cast<uint32_t>(scb[1]));
+            }
             if constexpr (kOff) {
                 if (sb == t) ma[0] = half2_bits(mna[0], mna[1]), ma[1] = half2_bits(mnb[0], mnb[1]);
                 if (sb == t + 4) ma[2] = half2_bits(mna[0], mna[1]), ma[3] = half2_bits(mnb[0], mnb[1]);
@@ -1361,7 +1371,9 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
                 for (int h2 = 0; h2 < 2; ++h2) {
                     const int n = 2 * np + h2;
                     const uint32_t b0 = bf[2 * h2], b1 = bf[2 * h2 + 1];
-                    if constexpr (kHalves) {
+                    if constexpr (kFold) {
+                        mma_k32(ia[n], pa.x, pb.x, pa.y, pb.y, b0, b1);
+                    } else if constexpr (kHalves) {
                         int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
                         mma_k16(c0, pa.x, pb.x, b0);
                         mma_k16(c1, pa.y, pb.y, b1);
