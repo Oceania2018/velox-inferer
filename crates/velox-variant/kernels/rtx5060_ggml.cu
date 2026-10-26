@@ -273,10 +273,13 @@ constexpr int kWarps = 4;
 
 // Output store: mode 0 writes v; mode 1 (the up projection of a SwiGLU whose gate projection
 // already wrote y) writes silu(y) * v.
+// Output store. mode 0: y = v; 1 (up after gate): y = silu(y) * v; 2 (gate after up): y = silu(v) * y.
 __device__ __forceinline__ void put(float* y, float v, int mode) {
-    if (mode) {
+    if (mode == 1) {
         const float gte = *y;
         v *= gte / (1.0f + __expf(-gte));
+    } else if (mode == 2) {
+        v = v / (1.0f + __expf(-v)) * *y;
     }
     *y = v;
 }
@@ -1795,11 +1798,12 @@ extern "C" int velox_5060_q8_view(const void* blob, int m, long long k, int layo
 
 // y[t * ldy + r] = W[row_begin + r, :] . x[t, :] on int8 tensor cores for a GGML weight of `type`,
 // from int8 activations (ActQuant::Int8G256, layout 0): the last velox_5060_q8_quantize when `blob`
-// is null, else a caller blob (an int8 twin). mode 1 writes silu(y) * that. k % 1024 == 0.
+// is null, else a caller blob (an int8 twin). mode 1 writes silu(y) * that, mode 2 silu(that) * y.
+// k % 1024 == 0.
 VELOX_API int velox_5060_linear_ggml_q8(const void* blob, int m, const uint8_t* w, int type, long long k,
                                         long long row_begin, int rows, float* y, long long ldy, int mode) {
     // Rows of a 4-byte multiple: blocks are copied from the aligned address at or below them.
-    if (m < 1 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || type < 0 || (type > 8 && type != kIq1S) || mode < 0 || mode > 1 ||
+    if (m < 1 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || type < 0 || (type > 8 && type != kIq1S) || mode < 0 || mode > 2 ||
         (k % 1024 != 0 && (k / 256 * block_bytes(type)) % 4 != 0) || reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const int8_t* xq;

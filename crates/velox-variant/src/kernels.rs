@@ -603,14 +603,26 @@ fn q8_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
         // The prefill kernel copies each block from the 4-byte aligned address at or below it,
         // which stays inside the row when rows are 4-byte multiples.
         let aligned = w.k % 1024 == 0 || t.row_bytes(w.k) % 4 == 0;
-        return (ggml_served(t) && m >= GGML_Q8_MIN_M && aligned)
-            .then(|| 16 + ggml_index(t));
+        return (ggml_served(t) && m >= GGML_Q8_MIN_M && aligned).then(|| 16 + ggml_index(t));
     }
     match w.format {
         WeightFormat::Iq3Xxs if m >= IQ3_Q8_MIN_M => Some(3),
         WeightFormat::Q4G64 if m >= RS_Q8_MIN_M => Some(4),
         WeightFormat::Q5G64 if m >= RS_Q8_MIN_M => Some(5),
         _ => None,
+    }
+}
+
+/// Gate / up for `ggml_swiglu_q8`: both on the int8 prefill kernels, GGML (formats from 16) and
+/// at most one IQ3_XXS (3).
+fn ggml_q8_pair(
+    gate: &WeightView<'_, CudaBuffer>,
+    up: &WeightView<'_, CudaBuffer>,
+    m: usize,
+) -> bool {
+    match (q8_format(gate, m), q8_format(up, m)) {
+        (Some(g), Some(u)) => (g >= 16 || u >= 16) && (g >= 16 || g == 3) && (u >= 16 || u == 3),
+        _ => false,
     }
 }
 
@@ -806,9 +818,11 @@ impl GgmlAct {
 pub struct Rtx5060Kernels;
 
 impl Rtx5060Kernels {
-    /// SwiGLU over separate GGML gate / up parents at prefill widths: the gate GEMM into `out`, the
-    /// up GEMM with silu(out) * up in its epilogue, both from one int8 quantization of `x` (or from
-    /// `x` itself when `twin` is set: an int8 twin in layout 0).
+    /// SwiGLU over separate gate / up parents at prefill widths, GGML and at most one of them
+    /// IQ3_XXS (GGUF imports keep GGML blocks but turn IQ3_XXS planar): one GEMM into `out`, the
+    /// GGML one second with SwiGLU in its epilogue (gate first: silu(out) * up; up first: silu(gate)
+    /// * out), both from one int8 quantization of `x` (or from `x` itself when `twin` is set: an
+    /// int8 twin in layout 0).
     fn ggml_swiglu_q8(
         &self,
         x: &CudaBuffer,
@@ -833,25 +847,52 @@ impl Rtx5060Kernels {
                 std::ptr::null()
             }
         };
-        for (w, f, mode) in [(gate, fg, 0), (up, fu, 1)] {
+        let order = if fu == 3 {
+            [(up, fu, 0), (gate, fg, 2)]
+        } else {
+            [(gate, fg, 0), (up, fu, 1)]
+        };
+        for (w, f, mode) in order {
+            let (wp, rb) = (w.buf.as_ptr().cast::<u8>(), w.row_begin as i64);
             // SAFETY: out holds m * rows values (checked by the caller); the activations match m, k.
-            status(
-                unsafe {
-                    velox_5060_linear_ggml_q8(
+            let code = unsafe {
+                match (f, twin) {
+                    (3, Some(())) => velox_5060_linear_iq3_q8_from(
                         blob,
                         mi,
-                        w.buf.as_ptr().cast::<u8>(),
+                        wp,
+                        w.parent_rows as i64,
+                        k,
+                        rb,
+                        rows,
+                        out.as_mut_ptr(),
+                        rows as i64,
+                    ),
+                    (3, None) => velox_5060_linear_iq3_q8_pre(
+                        mi,
+                        wp,
+                        w.parent_rows as i64,
+                        k,
+                        rb,
+                        rows,
+                        out.as_mut_ptr(),
+                        rows as i64,
+                    ),
+                    _ => velox_5060_linear_ggml_q8(
+                        blob,
+                        mi,
+                        wp,
                         f - 16,
                         k,
-                        w.row_begin as i64,
+                        rb,
                         rows,
                         out.as_mut_ptr(),
                         rows as i64,
                         mode,
-                    )
-                },
-                "rtx5060 linear_swiglu ggml q8",
-            )?;
+                    ),
+                }
+            };
+            status(code, "rtx5060 linear_swiglu ggml q8")?;
         }
         Ok(())
     }
@@ -869,7 +910,13 @@ extern "C" {
         y: *mut f32,
         ldy: i64,
     ) -> i32;
-    fn velox_5060_moe_grouped_scratch(rows: i32, k: i32, width: i32, hidden: i32, experts: i32) -> i64;
+    fn velox_5060_moe_grouped_scratch(
+        rows: i32,
+        k: i32,
+        width: i32,
+        hidden: i32,
+        experts: i32,
+    ) -> i64;
     #[allow(clippy::too_many_arguments)]
     fn velox_5060_moe_grouped(
         x: *const f32,
@@ -1003,9 +1050,8 @@ fn moe_types(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> Option<(i32, i32
         return None;
     }
     // The kernels stage rows with 4-byte loads.
-    let aligned = |m: &velox_core::ExpertMatrix| {
-        m.format.payload_bytes(1, m.k) % 4 == 0 && m.offset % 4 == 0
-    };
+    let aligned =
+        |m: &velox_core::ExpertMatrix| m.format.payload_bytes(1, m.k) % 4 == 0 && m.offset % 4 == 0;
     if !(aligned(&bank.gate) && aligned(&bank.up) && aligned(&bank.down)) {
         return None;
     }
@@ -1074,7 +1120,12 @@ impl CudaKernels for Rtx5060Kernels {
         if moe_types(bank, rows).is_none() {
             return portable;
         }
-        let (r, kk, w, h) = (rows as i32, k as i32, bank.width() as i32, bank.hidden() as i32);
+        let (r, kk, w, h) = (
+            rows as i32,
+            k as i32,
+            bank.width() as i32,
+            bank.hidden() as i32,
+        );
         // SAFETY: pure size computations.
         let bytes = unsafe {
             if rows <= MOE_DECODE_MAX {
@@ -1736,7 +1787,7 @@ impl CudaKernels for Rtx5060Kernels {
         if self.linear_swiglu_act(gate, up, m) != Some(ActQuant::Int8G256) || layout != 0 {
             return Err(Error::Unsupported("linear_swiglu_q8 views".into()));
         }
-        if matches!(gate.format, WeightFormat::Ggml(_)) {
+        if ggml_q8_pair(gate, up, m) {
             return self.ggml_swiglu_q8(xq, Some(()), gate, up, out, m);
         }
         // SAFETY: CudaBackend::linear_swiglu_q8 checked the twin, views and output extents.
@@ -1956,13 +2007,9 @@ impl CudaKernels for Rtx5060Kernels {
         up: &WeightView<'_, CudaBuffer>,
         m: usize,
     ) -> Option<ActQuant> {
-        // GGML gate / up at prefill widths: the int8 prefill kernel, one quantization, the up GEMM's
-        // epilogue forming silu(gate) * up in place.
-        if gate.k == up.k
-            && gate.rows == up.rows
-            && q8_format(gate, m).is_some_and(|f| f >= 16)
-            && q8_format(up, m).is_some_and(|f| f >= 16)
-        {
+        // GGML gate / up at prefill widths (one of them may be IQ3_XXS): the int8 prefill kernels,
+        // one quantization, the GGML GEMM's epilogue forming silu(gate) * up in place.
+        if gate.k == up.k && gate.rows == up.rows && ggml_q8_pair(gate, up, m) {
             return Some(ActQuant::Int8G256);
         }
         // GGML gate / up (GGUF imports): one Int8G32 quantization, the gate GEMM into `out`, the up
@@ -2010,7 +2057,7 @@ impl CudaKernels for Rtx5060Kernels {
                 act.run(gate, tg, m, out.as_mut_ptr(), gate.rows, 0)?;
                 return act.run(up, tu, m, out.as_mut_ptr(), gate.rows, 1);
             }
-            Some(ActQuant::Int8G256) if matches!(gate.format, WeightFormat::Ggml(_)) => {
+            Some(ActQuant::Int8G256) if ggml_q8_pair(gate, up, m) => {
                 return self.ggml_swiglu_q8(x, None, gate, up, out, m);
             }
             Some(ActQuant::Int8G256) => velox_5060_linear_swiglu_iq3_q8,
