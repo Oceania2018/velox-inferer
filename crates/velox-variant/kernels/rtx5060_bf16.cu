@@ -4,7 +4,9 @@
 // hyper-connection, PLE and router projections are bf16 [320, 10240], [10240, 320], [10240, 2560].
 //
 // Block: 128 tokens x 64 weight rows, 8 warps (4 along tokens x 2 along rows, 32 x 32 each), K in
-// steps of 32 double-buffered: weights by cp.async, activations converted through registers.
+// steps of 32 double-buffered: weights by cp.async, activations converted through registers. A K
+// that is a multiple of 16 but not 32 (Qwen3-VL's ViT fc2, K = 4304) zero-fills the last step's
+// upper half, which adds exact zeros.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -51,13 +53,19 @@ __global__ void __launch_bounds__(kThreads)
     // Weights: 64 rows x 32 values = 256 chunks of 16 bytes, one per thread.
     const int br = threadIdx.x / 4, bc = (threadIdx.x % 4) * 8;
     const __nv_bfloat16* wsrc = w + static_cast<long long>(min(n0 + br, rows - 1)) * k + bc;
+    auto load_b = [&](int buf, int k0) {
+        if (k0 + bc < k)
+            cp16(&s.b[buf][br][bc], wsrc + k0);
+        else
+            *reinterpret_cast<int4*>(&s.b[buf][br][bc]) = make_int4(0, 0, 0, 0);
+    };
     // Activations: 128 rows x 32 floats = 1024 float4, four per thread.
     float4 ra[4];
     auto load_a = [&](int k0) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int idx = threadIdx.x + i * kThreads, r = idx / 8, c = (idx % 8) * 4;
-            ra[i] = m0 + r < m ? *reinterpret_cast<const float4*>(x + static_cast<long long>(m0 + r) * k + k0 + c)
+            ra[i] = m0 + r < m && k0 + c < k ? *reinterpret_cast<const float4*>(x + static_cast<long long>(m0 + r) * k + k0 + c)
                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
     };
@@ -73,9 +81,9 @@ __global__ void __launch_bounds__(kThreads)
     // Tensor-core accumulation is not IEEE-exact over long K: the mma accumulators restart every
     // 1024 values and fold into `tot` with ordinary f32 adds.
     float acc[2][4][4] = {}, tot[2][4][4] = {};
-    const int steps = k / kBK;
+    const int steps = (k + kBK - 1) / kBK;
     load_a(0);
-    cp16(&s.b[0][br][bc], wsrc);
+    load_b(0, 0);
     cp_commit();
     store_a(0);
     for (int st = 0; st < steps; ++st) {
@@ -83,7 +91,7 @@ __global__ void __launch_bounds__(kThreads)
         cp_wait0();
         __syncthreads();
         if (st + 1 < steps) {
-            cp16(&s.b[cur ^ 1][br][bc], wsrc + (st + 1) * kBK);
+            load_b(cur ^ 1, (st + 1) * kBK);
             cp_commit();
             load_a((st + 1) * kBK);
         }
@@ -133,11 +141,11 @@ __global__ void __launch_bounds__(kThreads)
 
 }  // namespace
 
-// y[t * ldy + r] = bf16(x[t]) . W[row_begin + r] for bf16 weights of K values per row (k % 32 == 0,
+// y[t * ldy + r] = bf16(x[t]) . W[row_begin + r] for bf16 weights of K values per row (k % 16 == 0,
 // 16-byte aligned rows). VELOX_ERR_UNSUPPORTED otherwise.
 VELOX_API int velox_5060_linear_bf16_mma(const float* x, int m, const uint16_t* w, long long k, long long row_begin,
                                          int rows, float* y, long long ldy) {
-    if (m < 1 || rows < 1 || k % kBK != 0 || k > (1 << 30) || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
+    if (m < 1 || rows < 1 || k % 16 != 0 || k > (1 << 30) || reinterpret_cast<uintptr_t>(x) % 16 != 0 ||
         reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const dim3 grid((m + kBM - 1) / kBM, (rows + kBN - 1) / kBN);

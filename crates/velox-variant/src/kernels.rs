@@ -558,9 +558,10 @@ fn bf16_skinny(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
         && w.k % 32 == 0
 }
 
-/// bf16 weights of many rows at prefill widths: bf16 tensor cores (rtx5060_bf16.cu).
+/// bf16 weights of many rows at prefill widths: bf16 tensor cores (rtx5060_bf16.cu; K a multiple
+/// of 16, as Qwen3-VL's ViT fc2 with K = 4304).
 fn bf16_mma(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
-    w.format == WeightFormat::Bf16 && m >= BF16_MMA_MIN_M && w.k % 32 == 0 && !bf16_skinny(w, m)
+    w.format == WeightFormat::Bf16 && m >= BF16_MMA_MIN_M && w.k % 16 == 0 && !bf16_skinny(w, m)
 }
 
 const BF16_MMA_MIN_M: usize = 64;
