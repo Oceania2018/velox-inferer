@@ -1472,8 +1472,17 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
     constexpr bool kSplit = T == kIq2S || T == kIq2Xs || T == kIq1M;  // IQ1_M: |code| 9 * 15
     constexpr bool kHalves = Traits<T>::G != 1 && !kFold && !kSplit;
     constexpr bool kOff = T == kQ2K || T == kQ4K;
-    // 128 tokens double the int32 sums; the sub-block unroll that measured best per type.
-    constexpr int kUnroll = TOK == 64 ? kPreSbUnroll : T == kIq1M || T == kIq2S ? 2 : T == kIq2Xs || T == kIq2Xxs ? 4 : 8;
+    // Sub-block decode software-pipelined behind the previous sub-block's mmas (below) on the
+    // 128-token tile for IQ2_XXS, IQ3_S, IQ1_S and IQ2_S, and on the 64-token tile for IQ4_XS /
+    // Q4_K, which keep it at every width; elsewhere it measured slower or the same. The unroll
+    // that measured best per case.
+    constexpr bool kPipe = TOK == 128 ? T == kIq2Xxs || T == kIq3S || T == kIq1S || T == kIq2S
+                                      : T == kIq4Xs || T == kQ4K;
+    constexpr int kUnroll = TOK == 64       ? (T == kIq4Xs ? 2 : kPreSbUnroll)
+                            : T == kIq2Xxs || T == kIq3S          ? 1
+                            : T == kIq2S || T == kIq1S || T == kIq1M ? 2
+                            : T == kIq2Xs                            ? 4
+                                                                     : 8;
     __shared__ __align__(16) int8_t act[2][TOK * kQ2S];
     __shared__ float sxs[2][TOK];
     // Each warp's 16 rows of the super-block, copied from the 4-byte aligned address at or below it
@@ -1560,9 +1569,14 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
         // 8 + 2t, 9 + 2t (sub-block 4 + t) of rows g, g + 8.
         uint32_t ma[4] = {0u, 0u, 0u, 0u};
         float2 dma, dmb;
-#pragma unroll kUnroll
-        for (int sb = 0; sb < 8; ++sb) {
+        struct Frag {
             int2 pa, pb, la, lb;
+            int sca[2], scb[2];
+        };
+        // Sub-block sb's A fragments and integer scales (Q2_K / Q4_K: also the minimum operand
+        // when sb is one of this lane's).
+        auto decode_sb = [&](int sb, Frag& f) {
+            int2 pa, pb, la = make_int2(0, 0), lb = make_int2(0, 0);
             if constexpr (kSplit) {  // filled from the scales below
             } else if constexpr (T == kIq4Xs) {  // words t, t + 4 from one lookup
                 pa = pair<T>(xa, sb, t, sg, sks);
@@ -1590,6 +1604,21 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
                 if (sb == t) ma[0] = half2_bits(mna[0], mna[1]), ma[1] = half2_bits(mnb[0], mnb[1]);
                 if (sb == t + 4) ma[2] = half2_bits(mna[0], mna[1]), ma[3] = half2_bits(mnb[0], mnb[1]);
             }
+            f = Frag{pa, pb, la, lb, {sca[0], sca[1]}, {scb[0], scb[1]}};
+        };
+        // Software-pipelined: sub-block sb + 1 decodes in the same basic block as sb's mmas, so
+        // the scheduler interleaves the ALU work with the tensor pipe instead of every warp
+        // alternating between the two (ncu, IQ2_S: tensor pipe 55% busy, math-pipe throttle the
+        // top stall). The last iteration decodes sub-block 7 again rather than branch.
+        Frag fc;
+        if constexpr (kPipe) decode_sb(0, fc);
+#pragma unroll kUnroll
+        for (int sb = 0; sb < 8; ++sb) {
+            Frag fn;
+            if constexpr (kPipe) decode_sb(min(sb + 1, 7), fn);
+            else decode_sb(sb, fc);
+            const int2 pa = fc.pa, pb = fc.pb, la = fc.la, lb = fc.lb;
+            const int sca[2] = {fc.sca[0], fc.sca[1]}, scb[2] = {fc.scb[0], fc.scb[1]};
 #pragma unroll
             for (int np = 0; np < NT / 2; ++np) {
                 uint32_t bf[4];
@@ -1621,6 +1650,7 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
                     }
                 }
             }
+            if constexpr (kPipe) fc = fn;
         }
         if constexpr (kSplit) {
 #pragma unroll
