@@ -173,8 +173,11 @@ where
     };
     let mut model = Qwen35Text::new(cfg, w);
     // The engine's sessions and workspaces are allocated after this: a larger default margin
-    // (1.5 GiB peaks at 15.5 of 16 GB on the Qwen3.6-35B-A3B CUA replay; 1 GiB left 0.4 GB).
-    crate::generate::enable_experts(&b, &mut model, a, 1536)?;
+    // (1.5 GiB at 1024-token prefill chunks peaks at 15.5 of 16 GB on the Qwen3.6-35B-A3B CUA
+    // replay; 1 GiB left 0.4 GB), growing with the chunk (about 0.55 GiB per 1024 tokens).
+    let chunk = engine_cfg.chunk.max(1024);
+    let margin = 1536 + (chunk - 1024) * 9 / 16;
+    crate::generate::enable_experts(&b, &mut model, a, margin)?;
     Ok(Box::new(QwenEngine::new(
         b, model, vision, dflash, fe, engine_cfg,
     )?))
