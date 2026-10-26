@@ -778,9 +778,28 @@ impl<B: Backend> Suite<'_, B> {
         split: bool,
         policy: ActPolicy,
     ) -> Result<()> {
+        self.linear_swiglu_pair(fmt, fmt, k, width, begin, m, swap, split, policy)
+    }
+
+    /// [`Self::linear_swiglu_with`] with the up rows in `up_fmt` (a separate parent when it
+    /// differs from the gate's format).
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_pair(
+        &mut self,
+        fmt: WeightFormat,
+        up_fmt: WeightFormat,
+        k: usize,
+        width: usize,
+        begin: usize,
+        m: usize,
+        swap: bool,
+        split: bool,
+        policy: ActPolicy,
+    ) -> Result<()> {
+        let split = split || up_fmt != fmt;
         let n = (begin + 2 * width + 16).div_ceil(128) * 128; // nvfp4 needs whole 128-row tiles
         let bytes = random_weight(&mut self.rng, fmt, n, k);
-        let bytes2 = random_weight(&mut self.rng, fmt, n, k);
+        let bytes2 = random_weight(&mut self.rng, up_fmt, n, k);
         let x = self.rng.vec(m * k, 1.0);
         let (gb, ub) = if swap {
             (begin + width, begin)
@@ -791,7 +810,7 @@ impl<B: Backend> Suite<'_, B> {
         let gate = WeightView::full(&wd, fmt, n, k)
             .rows(gb, width)
             .with_act(policy);
-        let up = WeightView::full(if split { &wd2 } else { &wd }, fmt, n, k)
+        let up = WeightView::full(if split { &wd2 } else { &wd }, up_fmt, n, k)
             .rows(ub, width)
             .with_act(policy);
         let act = self.b.linear_swiglu_act(&gate, &up, m);
@@ -811,7 +830,7 @@ impl<B: Backend> Suite<'_, B> {
         let up_parent = if split { &wc2 } else { &wc };
         CpuBackend.linear(
             &xq,
-            &WeightView::full(up_parent, fmt, n, k).rows(ub, width),
+            &WeightView::full(up_parent, up_fmt, n, k).rows(ub, width),
             &mut u,
             m,
         )?;
@@ -835,10 +854,12 @@ impl<B: Backend> Suite<'_, B> {
         } else {
             ""
         };
-        let name = format!(
-            "linear_swiglu {} [{width}x2,{k}] from {begin} m={m}{layout}{tag}",
-            fmt.name()
-        );
+        let fmts = if up_fmt == fmt {
+            fmt.name().to_string()
+        } else {
+            format!("{}+{}", fmt.name(), up_fmt.name())
+        };
+        let name = format!("linear_swiglu {fmts} [{width}x2,{k}] from {begin} m={m}{layout}{tag}");
         if permitted(act, policy) {
             self.record(name, Some(Op::LinearSwiglu), &got, &g, 2e-4);
         } else {
@@ -3602,6 +3623,17 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
                     ActPolicy::AllowA8,
                 )?;
             }
+        }
+    }
+    // SwiGLU with gate and up in different formats, as GGUF imports produce them (IQ3_XXS planar
+    // next to GGML blocks), at prefill widths.
+    {
+        use velox_core::ggml::GgmlType::{Iq2S, Q2K};
+        let (iq3, a8) = (WeightFormat::Iq3Xxs, ActPolicy::AllowA8);
+        let (iq2s, q2k) = (WeightFormat::Ggml(Iq2S), WeightFormat::Ggml(Q2K));
+        for m in [70, 600] {
+            s.linear_swiglu_pair(iq3, iq2s, 512, 40, 0, m, false, true, a8)?;
+            s.linear_swiglu_pair(q2k, iq3, 512, 40, 0, m, false, true, a8)?;
         }
     }
     // Its own seed: the synthetic model must not change when cases are added before it.
