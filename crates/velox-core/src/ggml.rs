@@ -25,11 +25,12 @@ pub enum GgmlType {
     Iq4Nl,
     Q6K,
     Q8_0,
+    Iq1S,
 }
 
 impl GgmlType {
     /// Kernel format codes are positions here (`VELOX_FMT_GGML_BASE + i`): append new types.
-    pub const ALL: [GgmlType; 13] = [
+    pub const ALL: [GgmlType; 14] = [
         GgmlType::Q2K,
         GgmlType::Q4K,
         GgmlType::Iq1M,
@@ -43,6 +44,7 @@ impl GgmlType {
         GgmlType::Iq4Nl,
         GgmlType::Q6K,
         GgmlType::Q8_0,
+        GgmlType::Iq1S,
     ];
 
     /// Container format name (with layout `ggml_block_v1`).
@@ -61,6 +63,7 @@ impl GgmlType {
             GgmlType::Iq4Nl => "ggml_iq4_nl",
             GgmlType::Q6K => "ggml_q6_k",
             GgmlType::Q8_0 => "ggml_q8_0",
+            GgmlType::Iq1S => "ggml_iq1_s",
         }
     }
 
@@ -79,6 +82,7 @@ impl GgmlType {
             GgmlType::Iq3S => 21,
             GgmlType::Iq2S => 22,
             GgmlType::Iq4Xs => 23,
+            GgmlType::Iq1S => 19,
             GgmlType::Iq1M => 29,
             GgmlType::Q8_0 => 8,
             GgmlType::Q6K => 14,
@@ -116,6 +120,7 @@ impl GgmlType {
             GgmlType::Iq4Nl => 18,
             GgmlType::Q6K => 210,
             GgmlType::Q8_0 => 34,
+            GgmlType::Iq1S => 50,
         }
     }
 
@@ -333,6 +338,26 @@ pub fn decode_block(t: GgmlType, x: &[u8], y: &mut [f32]) {
                     for j in 0..8 {
                         let g = f32::from(grid_byte(grid, j) as i8);
                         y[32 * ib + 8 * l + j] = dl * (g + delta[l]);
+                    }
+                }
+            }
+        }
+        GgmlType::Iq1S => {
+            // d | qs[32] | qh[8] (u16 per 32 values: 3 high index bits for each 8-value group,
+            // a 3-bit sub-scale in bits 12..14 and the sign of the delta in bit 15)
+            let d = f16(x, 0);
+            const DELTA: f32 = 0.125;
+            for ib in 0..8 {
+                let qh = u16_at(x, 34 + 2 * ib);
+                let dl = d * f32::from(2 * ((qh >> 12) & 7) + 1);
+                let delta = if qh & 0x8000 != 0 { -DELTA } else { DELTA };
+                for l in 0..4 {
+                    let idx =
+                        usize::from(x[2 + 4 * ib + l]) | (usize::from((qh >> (3 * l)) & 7) << 8);
+                    let grid = IQ1S_GRID[idx];
+                    for j in 0..8 {
+                        let g = f32::from(grid_byte(grid, j) as i8);
+                        y[32 * ib + 8 * l + j] = dl * (g + delta);
                     }
                 }
             }
@@ -4442,7 +4467,7 @@ mod tests {
     ];
 
     #[allow(clippy::type_complexity)]
-    const REFERENCE: [(GgmlType, [f64; 3], [f32; 23]); 13] = [
+    const REFERENCE: [(GgmlType, [f64; 3], [f32; 23]); 14] = [
         (
             GgmlType::Q2K,
             [91.46250915527344, 139.38955688476562, 11687.497291564941],
@@ -4821,6 +4846,35 @@ mod tests {
                 -2.802978515625,
             ],
         ),
+        (
+            GgmlType::Iq1S,
+            [-9.81292724609375, 83.32762908935547, -3138.3485260009766],
+            [
+                -0.011224746704101562,
+                -0.011224746704101562,
+                -0.10102272033691406,
+                0.07857322692871094,
+                -0.011224746704101562,
+                -0.011224746704101562,
+                0.07857322692871094,
+                -0.10102272033691406,
+                -0.011224746704101562,
+                0.015714645385742188,
+                0.015714645385742188,
+                0.011224746704101562,
+                -0.07857322692871094,
+                -0.024694442749023438,
+                -0.024694442749023438,
+                -0.07857322692871094,
+                -0.07857322692871094,
+                -0.03367424011230469,
+                0.02532958984375,
+                -0.59271240234375,
+                -0.22796630859375,
+                -0.07598876953125,
+                0.39007568359375,
+            ],
+        ),
     ];
 
     #[test]
@@ -4866,5 +4920,7 @@ mod tests {
         assert_eq!(GgmlType::Q8_0.block_bytes() * 8, 8 * 32 + 16);
         assert_eq!(GgmlType::Iq4Nl.block_bytes() * 8, 4 * 32 + 16);
         assert_eq!(GgmlType::Q2_0.block_bytes() * 8, 2 * 64 + 16);
+        // IQ1_S 1.5625.
+        assert_eq!(GgmlType::Iq1S.block_bytes() * 8, 256 + 144);
     }
 }
