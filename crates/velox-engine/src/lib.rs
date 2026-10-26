@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use velox_core::{Backend, Error as CoreError, KvFormat};
+use velox_core::{Backend, Error as CoreError, KvFormat, StateFormat};
 use velox_frontend::image::{
     decode_data_url, preprocess, smart_resize, ImagePatches, MERGE, PATCH, TEMPORAL,
 };
@@ -76,6 +76,10 @@ pub struct EngineConfig {
     pub host_context_bytes: usize,
     /// LRFU decay per request of the context store (0: least recently used).
     pub lrfu_lambda: f64,
+    /// Storage format of the recurrent states the context store keeps (ninfer
+    /// `--host-state-dtype`): bf16 holds twice as many prefixes as f32 in the same RAM, nvfp4
+    /// about 5.5 times; lanes always run on f32 state.
+    pub host_state_format: StateFormat,
     /// NVMe tier below the context store (see `disk`); 0 disables it.
     pub disk_context_bytes: u64,
     /// Directory of the NVMe tier's files (a private subdirectory is created and removed).
@@ -651,7 +655,12 @@ where
         } else {
             None
         };
-        let mut store = ContextStore::new(cfg.host_context_bytes, cfg.lrfu_lambda, disk);
+        let mut store = ContextStore::new(
+            cfg.host_context_bytes,
+            cfg.lrfu_lambda,
+            disk,
+            cfg.host_state_format,
+        );
         // Opt-in (VELOX_PINNER=1): under WSL/WDDM, pinning on another thread stalled the device
         // (6-agent replays 74-79 s against 37-44 s) more than pinning on the engine thread costs.
         if store.enabled() && std::env::var("VELOX_PINNER").is_ok_and(|v| v == "1") {

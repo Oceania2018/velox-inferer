@@ -12,7 +12,7 @@ use velox_core::backend::{
 };
 use velox_core::format::decode_rows;
 use velox_core::kv::{decode_cache, decode_row, encode_row, KvFormat};
-use velox_core::{check, DeviceProfile, Op, Result};
+use velox_core::{check, DeviceProfile, Op, Result, StateFormat};
 
 #[derive(Default, Clone, Copy)]
 pub struct CpuBackend;
@@ -359,6 +359,28 @@ impl Backend for CpuBackend {
             }
         }
         Ok(())
+    }
+
+    fn state_pack(
+        &self,
+        src: &Vec<f32>,
+        dst: &mut Vec<f32>,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()> {
+        check::state_pack(src.len(), dst.len(), n, fmt)?;
+        velox_core::state::pack(fmt, &src[..n], as_bytes_mut(dst))
+    }
+
+    fn state_unpack(
+        &self,
+        src: &Vec<f32>,
+        dst: &mut Vec<f32>,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()> {
+        check::state_unpack(src.len(), dst.len(), n, fmt)?;
+        velox_core::state::unpack(fmt, as_bytes(src), &mut dst[..n])
     }
 
     fn copy2d(&self, src: &Vec<f32>, dst: &mut Vec<f32>, s: Copy2dShape) -> Result<()> {

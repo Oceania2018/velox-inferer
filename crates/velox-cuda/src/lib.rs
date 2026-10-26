@@ -16,7 +16,7 @@ use velox_core::backend::{
     GRAPH_STATIC,
 };
 use velox_core::{
-    check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, VariantInfo,
+    check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, StateFormat, VariantInfo,
 };
 
 pub mod portable;
@@ -698,6 +698,29 @@ pub trait CudaKernels: Send + Sync {
         s: KvStoreShape,
     ) -> Result<()> {
         portable::kv_load(k_cache, v_cache, k, v, s)
+    }
+
+    /// Packs a recurrent state; see [`Backend::state_pack`]. Must be bit-exact with
+    /// `velox_core::state::pack`.
+    fn state_pack(
+        &self,
+        src: &CudaBuffer,
+        dst: &mut CudaBuffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()> {
+        portable::state_pack(src, dst, n, fmt)
+    }
+
+    /// Unpacks a recurrent state; see [`Backend::state_unpack`].
+    fn state_unpack(
+        &self,
+        src: &CudaBuffer,
+        dst: &mut CudaBuffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()> {
+        portable::state_unpack(src, dst, n, fmt)
     }
 
     /// `state_in`: advance from this state instead of `state` (which receives the result).
@@ -2535,6 +2558,30 @@ impl Backend for CudaBackend {
         check::kv_load(k_cache.len, v_cache.len, k.len, v.len, &s)?;
         self.timed("kv_load", || {
             self.kernels.kv_load(k_cache, v_cache, k, v, s)
+        })
+    }
+
+    fn state_pack(
+        &self,
+        src: &CudaBuffer,
+        dst: &mut CudaBuffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()> {
+        check::state_pack(src.len, dst.len, n, fmt)?;
+        self.timed("state_pack", || self.kernels.state_pack(src, dst, n, fmt))
+    }
+
+    fn state_unpack(
+        &self,
+        src: &CudaBuffer,
+        dst: &mut CudaBuffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()> {
+        check::state_unpack(src.len, dst.len, n, fmt)?;
+        self.timed("state_unpack", || {
+            self.kernels.state_unpack(src, dst, n, fmt)
         })
     }
 
