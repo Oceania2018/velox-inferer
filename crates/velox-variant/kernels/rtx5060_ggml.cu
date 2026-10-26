@@ -511,6 +511,32 @@ __device__ __forceinline__ int word(const uint8_t* __restrict__ x, int ib, int w
     }
 }
 
+// IQ2_XS / IQ2_S word wi of sub-block ib as its 4 grid magnitudes (bytes 8, 25 or 43) and sign bits.
+template <int T>
+__device__ __forceinline__ uint2 mag_sign(const uint8_t* __restrict__ x, int ib, int wi, const uint32_t* sg,
+                                          const uint8_t* sks) {
+    const int l = wi / 2, half = wi % 2;
+    if constexpr (T == kIq2Xs) {
+        const uint32_t q = u16_at(x + 2 + 2 * (4 * ib + l));
+        return make_uint2(sg[2 * (q & 511) + half], (sks[q >> 9] >> (4 * half)) & 0xf);
+    } else {  // IQ2_S
+        const uint32_t idx = x[2 + 4 * ib + l] | ((static_cast<uint32_t>(x[66 + ib]) << (8 - 2 * l)) & 0x300);
+        return make_uint2(static_cast<uint32_t>(grid64(sg, idx) >> (32 * half)), (x[34 + 4 * ib + l] >> (4 * half)) & 0xf);
+    }
+}
+
+// Codes magnitude * sc (<= 43 * 31) of one word split as 16 hi + lo: hi <= 83 and lo <= 15 are
+// int8 planes, each signed per byte (a zero byte too, so per-byte adds instead of signed4's carry).
+__device__ __forceinline__ void split_planes(uint2 ms, uint32_t sc, int& hi, int& lo) {
+    const uint32_t p02 = (ms.x & 0x00ff00ffu) * sc;         // values 0 and 2 as 16-bit lanes
+    const uint32_t p13 = ((ms.x >> 8) & 0x00ff00ffu) * sc;  // values 1 and 3
+    const uint32_t h = ((p02 >> 4) & 0x00ff00ffu) | (((p13 >> 4) & 0x00ff00ffu) << 8);
+    const uint32_t l = (p02 & 0x000f000fu) | ((p13 & 0x000f000fu) << 8);
+    const uint32_t b = (ms.y * 0x00204081u) & 0x01010101u, mask = b * 0xffu;
+    hi = static_cast<int>(__vadd4(h ^ mask, b));
+    lo = static_cast<int>(__vadd4(l ^ mask, b));
+}
+
 // Whether a type's lanes take words 2t and 2t + 1 (one 8-value group) in their k-slots t and t + 4.
 // K may be permuted freely as long as A and B agree; 16-value scales need the natural order.
 template <int T>
@@ -1258,7 +1284,11 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
     // codes and a sub-block is one k32 mma accumulating straight into the super-block's int32
     // sums (two k16 mmas issue at the k32 rate on this GPU, and the per-tile rescaling goes).
     constexpr bool kFold = T == kQ2K;
-    constexpr bool kHalves = Traits<T>::G != 1 && !kFold;
+    // IQ2_XS / IQ2_S: magnitude * scale reaches 1333, so the scaled codes go out as two int8 planes
+    // (16 hi + lo), each one k32 mma per sub-block into its own super-block sums: the tensor-core
+    // time of the two k16 mmas, without the per-tile rescale.
+    constexpr bool kSplit = T == kIq2S || T == kIq2Xs;
+    constexpr bool kHalves = Traits<T>::G != 1 && !kFold && !kSplit;
     constexpr bool kOff = T == kQ2K || T == kQ4K;
     __shared__ __align__(16) int8_t act[2][kQ2Tokens * kQ2S];
     __shared__ float sxs[2][kQ2Tokens];
@@ -1334,6 +1364,9 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
         int ia[NT][4];
 #pragma unroll
         for (int n = 0; n < NT; ++n) ia[n][0] = ia[n][1] = ia[n][2] = ia[n][3] = 0;
+        int il[kSplit ? NT : 1][4];
+#pragma unroll
+        for (int n = 0; n < (kSplit ? NT : 1); ++n) il[n][0] = il[n][1] = il[n][2] = il[n][3] = 0;
         // The minimum term sum_h mn[row][h] * xs[token][h] over the super-block's 16 halves is a
         // 16 x 16 x 8 product per token tile: one f16 mma (exact: mins <= 63, sums <= 2032, f32
         // accumulation). Lane (g, t) holds the A operand's halves 2t, 2t + 1 (sub-block t) and
@@ -1342,8 +1375,9 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
         float2 dma, dmb;
 #pragma unroll kPreSbUnroll
         for (int sb = 0; sb < 8; ++sb) {
-            int2 pa, pb;
-            if constexpr (T == kIq4Xs) {  // words t, t + 4 from one lookup
+            int2 pa, pb, la, lb;
+            if constexpr (kSplit) {  // filled from the scales below
+            } else if constexpr (T == kIq4Xs) {  // words t, t + 4 from one lookup
                 pa = pair<T>(xa, sb, t, sg, sks);
                 pb = pair<T>(xb, sb, t, sg, sks);
             } else {
@@ -1353,6 +1387,12 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
             int sca[2], mna[2], scb[2], mnb[2];
             int_scales<T>(xa, sb, sca, mna, dma);
             int_scales<T>(xb, sb, scb, mnb, dmb);
+            if constexpr (kSplit) {  // pa / pb take the hi planes, la / lb the lo planes
+                split_planes(mag_sign<T>(xa, sb, t, sg, sks), sca[0], pa.x, la.x);
+                split_planes(mag_sign<T>(xa, sb, t + 4, sg, sks), sca[1], pa.y, la.y);
+                split_planes(mag_sign<T>(xb, sb, t, sg, sks), scb[0], pb.x, lb.x);
+                split_planes(mag_sign<T>(xb, sb, t + 4, sg, sks), scb[1], pb.y, lb.y);
+            }
             if constexpr (kFold) {  // bytes q * sc <= 45: one multiply per word, no carries
                 pa.x = static_cast<int>(static_cast<uint32_t>(pa.x) * static_cast<uint32_t>(sca[0]));
                 pa.y = static_cast<int>(static_cast<uint32_t>(pa.y) * static_cast<uint32_t>(sca[1]));
@@ -1371,7 +1411,10 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
                 for (int h2 = 0; h2 < 2; ++h2) {
                     const int n = 2 * np + h2;
                     const uint32_t b0 = bf[2 * h2], b1 = bf[2 * h2 + 1];
-                    if constexpr (kFold) {
+                    if constexpr (kSplit) {
+                        mma_k32(ia[n], pa.x, pb.x, pa.y, pb.y, b0, b1);
+                        mma_k32(il[n], la.x, lb.x, la.y, lb.y, b0, b1);
+                    } else if constexpr (kFold) {
                         mma_k32(ia[n], pa.x, pb.x, pa.y, pb.y, b0, b1);
                     } else if constexpr (kHalves) {
                         int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
@@ -1391,6 +1434,12 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
                     }
                 }
             }
+        }
+        if constexpr (kSplit) {
+#pragma unroll
+            for (int n = 0; n < NT; ++n)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) ia[n][j] = 16 * ia[n][j] + il[n][j];
         }
         // Super-block epilogue: d per row (rows g, g + 8), the activation scale per token.
 #pragma unroll
