@@ -607,6 +607,39 @@ fn compressed_tensors_checkpoint_imports_exactly() {
 }
 
 #[test]
+fn proposal_head_takes_the_listed_lm_head_rows() {
+    let dir = std::env::temp_dir().join(format!(
+        "velox-hf-{}",
+        velox_weights::hex(&velox_weights::new_artifact_id())
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = checkpoint(&dir);
+    let out = dir.join("model.vi");
+    let ids = [5u32, 0, (V - 1) as u32];
+    import_with(&dir, &out, None, false, Some(&ids), &mut |_| {}).unwrap();
+    let art = Artifact::open(&out).unwrap();
+    let (format, rows, k, values) = decoded(&art, "proposal/head");
+    assert_eq!(
+        (format, rows, k),
+        (WeightFormat::Fp8RowBf16, ids.len(), H as usize)
+    );
+    assert_eq!(
+        values,
+        fp8_ref(&c, "lm_head", H as usize, ids.iter().map(|&t| t as usize))
+    );
+    let raw = art
+        .read_object(&object_of(&art, "proposal/token_ids"))
+        .unwrap();
+    let got: Vec<u32> = raw
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32)
+        .collect();
+    assert_eq!(got, ids);
+    assert!(import_with(&dir, &out, None, false, Some(&[V as u32]), &mut |_| {}).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn text_config_takes_the_moe_architecture() {
     let v = text_config(&json!({
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],

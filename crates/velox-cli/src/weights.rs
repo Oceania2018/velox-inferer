@@ -160,10 +160,32 @@ pub fn import_hf(a: &Args) -> Result<ExitCode> {
     let dflash = a.get("dflash").map(Path::new);
     // `--dflash-nvfp4`: the drafter's matrices as NVFP4 (smaller and faster to draft with).
     let dflash_nvfp4 = a.get("dflash-nvfp4").is_some();
-    let r =
-        velox_models::qwen3_5::hf::import_with(dir, output, dflash, dflash_nvfp4, &mut |line| {
-            eprintln!("[import] {line}")
-        })?;
+    // `--proposal-ids <file>`: little-endian i32 token ids for an MTP draft vocabulary head.
+    let proposal = match a.get("proposal-ids") {
+        Some(p) => {
+            let raw =
+                std::fs::read(p).map_err(|e| velox_core::Error::Config(format!("{p}: {e}")))?;
+            if raw.is_empty() || raw.len() % 4 != 0 {
+                return Err(velox_core::Error::Config(format!(
+                    "{p}: expected little-endian i32 token ids"
+                )));
+            }
+            Some(
+                raw.chunks_exact(4)
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32)
+                    .collect::<Vec<u32>>(),
+            )
+        }
+        None => None,
+    };
+    let r = velox_models::qwen3_5::hf::import_with(
+        dir,
+        output,
+        dflash,
+        dflash_nvfp4,
+        proposal.as_deref(),
+        &mut |line| eprintln!("[import] {line}"),
+    )?;
     for (format, objects, bytes) in &r.formats {
         println!("  {format:<22} {objects:>6} objects {:>7.2} GB", gb(*bytes));
     }
