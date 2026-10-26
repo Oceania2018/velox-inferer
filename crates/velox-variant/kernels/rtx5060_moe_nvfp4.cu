@@ -75,7 +75,7 @@ __device__ __forceinline__ void cp_wait() {
 // memory goes through cp.async (the caller commits and waits); mapped system RAM through plain
 // 16-byte loads, a batch held in registers before the stores: cp.async reads of mapped host memory
 // stream ~6x slower over PCIe (2.9 vs 17.8 GB/s measured at decode).
-template <class At>
+template <int B = 8, class At>
 __device__ __forceinline__ void copy16(int total, int tid, int nt, bool device, At at) {
     if (device) {
         for (int i = tid; i < total; i += nt) {
@@ -86,7 +86,6 @@ __device__ __forceinline__ void copy16(int total, int tid, int nt, bool device, 
         }
         return;
     }
-    constexpr int B = 8;
     for (int i0 = tid; i0 < total; i0 += B * nt) {
         uint4 v[B];
 #pragma unroll
@@ -392,13 +391,14 @@ __global__ void __launch_bounds__(kDecThreads)
 // PCIe streams start early and overlap the device slots' blocks.
 __global__ void __launch_bounds__(1024)
     nv_sort_kernel(const float* __restrict__ ids, const float* __restrict__ map, int pairs, int experts,
-                   int* __restrict__ offsets, int* __restrict__ list) {
+                   int* __restrict__ offsets, int* __restrict__ list, int* __restrict__ ctr = nullptr) {
     extern __shared__ int cnt[];  // counts, then cursors
     __shared__ int wsum[32];
     __shared__ int nact[2];
     int* cur = cnt + experts;
     int* act = offsets + experts + 1;
     if (threadIdx.x < 2) nact[threadIdx.x] = 0;
+    if (ctr && threadIdx.x < 2) ctr[threadIdx.x] = 0;  // prefill's system RAM job counters
     for (int e = threadIdx.x; e < experts; e += blockDim.x) cnt[e] = 0;
     __syncthreads();
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
@@ -498,19 +498,193 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-// NM = 2: gate and up of expert blockIdx.y against x rows (act rows p / k), h[p] = silu(g) * u as
-// bf16 in nv_perm order (down's activations). NM = 1: down against h rows p, o[p][r] f32.
-// A block owns rows {128 t + 32 q + 16 j + i} (warp q, i < 16) of an [n, K] matrix.
+// System RAM experts at prefill widths: a job is (expert, 4 S weight rows {128 t + 32 q + s0 + s},
+// q < 4, s < S). Its weights cross PCIe once, whole K, into shared memory (plain loads, see
+// copy16); the four warps then multiply them against all the expert's pairs from there, so an
+// expert's bytes are read once however many pairs chose it. Weights are the mma A operand (m16
+// tiles of the job's rows), activations the B operand straight from global memory: in nv_perm
+// order a lane's B values of a 32-value chunk are the bf16 pairs at 2 t4 + {0, 8, 16, 24}.
+template <int NM, int S>
+__host__ __device__ __forceinline__ int host_job_smem(int K) {
+    return NM * (4 * S * (K / 2 + 16) + K / 64 * (S * 16 + 16) + 16);
+}
+
+template <int NM, int S, int NT, int HB>
+__device__ __forceinline__ void nv_host_jobs(const NvDesc& d, int n, int K, const int* __restrict__ offsets,
+                                             const int* __restrict__ list, int k, const __nv_bfloat16* __restrict__ act,
+                                             __nv_bfloat16* __restrict__ hb, float* __restrict__ o, int* ctr,
+                                             uint8_t* sm) {
+    constexpr int R = 4 * S, MT = R / 16;
+    const int* routed = offsets + d.experts + 1;
+    const int* hl = routed + 2 + d.experts;
+    const int jpe = n / 128 * (32 / S), jobs = routed[1] * jpe;
+    const long long half = K / 2, so = nv_align256(static_cast<long long>(n) * half);
+    const int ktot = K / 64, RS = K / 2 + 16, SS = S * 16 + 16, mat = R * RS + ktot * SS + 16;
+    const int lane = threadIdx.x % VELOX_WARP, warp = threadIdx.x / VELOX_WARP, g = lane / 4, t4 = lane % 4;
+    __shared__ int sjob;
+    for (;;) {
+        __syncthreads();  // the previous job is done with shared memory
+        if (threadIdx.x == 0) sjob = atomicAdd(ctr, 1);
+        __syncthreads();
+        const int job = sjob;
+        if (job >= jobs) return;
+        const int e = hl[job / jpe], rg = job % jpe, t = rg / (32 / S), s0 = (rg % (32 / S)) * S;
+        const int begin = offsets[e], count = offsets[e + 1] - begin;
+        const uint8_t* rec = d.records + static_cast<long long>(e) * d.record_bytes;
+        const uint8_t* a[NM];
+        int lead[NM], pr[NM], ps[NM], pm[NM + 1];
+        pm[0] = 0;
+#pragma unroll
+        for (int mm = 0; mm < NM; ++mm) {
+            const uint8_t* base = rec + d.off[NM == 2 ? mm : 2];
+            lead[mm] = static_cast<int>(reinterpret_cast<uintptr_t>(base) & 15);
+            a[mm] = base - lead[mm];
+            pr[mm] = (lead[mm] + K / 2 + 15) / 16;
+            ps[mm] = (lead[mm] + S * 16 + 15) / 16;
+            pm[mm + 1] = pm[mm] + R * pr[mm] + ktot * ps[mm] + 1;
+        }
+        copy16<HB>(pm[NM], threadIdx.x, blockDim.x, false, [&](int i, uint8_t*& dst, const uint8_t*& src) {
+            const int mm = NM == 2 && i >= pm[1] ? 1 : 0;
+            i -= pm[mm];
+            uint8_t* mb = sm + mm * mat;
+            if (i < R * pr[mm]) {
+                const int ri = i / pr[mm], c = i % pr[mm];
+                const long long row = static_cast<long long>(t) * 128 + (ri / S) * 32 + s0 + ri % S;
+                dst = mb + ri * RS + 16 * c;
+                src = a[mm] + row * half + 16 * c;
+            } else if ((i -= R * pr[mm]) < ktot * ps[mm]) {
+                const int kt = i / ps[mm], c = i % ps[mm];
+                dst = mb + R * RS + kt * SS + 16 * c;
+                src = a[mm] + so + (static_cast<long long>(t) * ktot + kt) * 512 + s0 * 16 + 16 * c;
+            } else {
+                dst = mb + R * RS + ktot * SS;
+                src = a[mm] + so + n * half / 8;
+            }
+        });
+        __syncthreads();
+        float dv[NM];
+#pragma unroll
+        for (int mm = 0; mm < NM; ++mm) dv[mm] = *reinterpret_cast<const float*>(sm + mm * mat + R * RS + ktot * SS + lead[mm]);
+        const int ntiles = (count + 7) / 8;
+        for (int tb = warp; tb < ntiles; tb += 4 * NT) {  // the warp's n8 tiles tb, tb + 4, ...
+            float acc[NM][MT][NT][4];
+            const __nv_bfloat16* xr[NT];
+#pragma unroll
+            for (int i = 0; i < NT; ++i) {
+                const int tk = min((tb + 4 * i) * 8 + g, count - 1);
+                const int p = list[begin + tk];
+                xr[i] = act + static_cast<long long>(NM == 2 ? p / k : p) * K + 2 * t4;
+#pragma unroll
+                for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+                    for (int mi = 0; mi < MT; ++mi) acc[mm][mi][i][0] = acc[mm][mi][i][1] = acc[mm][mi][i][2] = acc[mm][mi][i][3] = 0.0f;
+            }
+            const int nti = min(NT, (ntiles - tb + 3) / 4);
+#pragma unroll 2
+            for (int c = 0; c < K / 32; ++c) {
+                uint32_t bx[NT][4];
+#pragma unroll
+                for (int i = 0; i < NT; ++i)
+                    if (i < nti) {
+                        const __nv_bfloat16* xp = xr[i] + c * 32;
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) bx[i][u] = __ldg(reinterpret_cast<const unsigned int*>(xp + 8 * u));
+                    }
+                const int gl = c * 2 + (t4 >> 1);
+#pragma unroll
+                for (int mm = 0; mm < NM; ++mm) {
+                    const uint8_t* mb = sm + mm * mat;
+                    const uint8_t* sp = mb + R * RS + (gl >> 2) * SS + lead[mm] + (gl & 3);
+#pragma unroll
+                    for (int mi = 0; mi < MT; ++mi) {
+                        const int ri0 = mi * 16 + g, ri1 = ri0 + 8;
+                        const uint32_t w0 = *reinterpret_cast<const uint32_t*>(mb + ri0 * RS + lead[mm] + c * 16 + 4 * t4);
+                        const uint32_t w1 = *reinterpret_cast<const uint32_t*>(mb + ri1 * RS + lead[mm] + c * 16 + 4 * t4);
+                        uint32_t v0[4], v1[4];
+                        e2m1x4_bf16(w0 & 0xffff, v0[0], v0[1]);
+                        e2m1x4_bf16(w0 >> 16, v0[2], v0[3]);
+                        e2m1x4_bf16(w1 & 0xffff, v1[0], v1[1]);
+                        e2m1x4_bf16(w1 >> 16, v1[2], v1[3]);
+                        const __nv_bfloat16 s0b = __float2bfloat16_rn(e4m3(sp[(ri0 % S) * 16 + (ri0 / S) * 4]));
+                        const __nv_bfloat16 s1b = __float2bfloat16_rn(e4m3(sp[(ri1 % S) * 16 + (ri1 / S) * 4]));
+                        const __nv_bfloat162 sc0 = __halves2bfloat162(s0b, s0b), sc1 = __halves2bfloat162(s1b, s1b);
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const __nv_bfloat162 x0 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&v0[u]), sc0);
+                            const __nv_bfloat162 x1 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&v1[u]), sc1);
+                            v0[u] = *reinterpret_cast<const uint32_t*>(&x0);
+                            v1[u] = *reinterpret_cast<const uint32_t*>(&x1);
+                        }
+                        const uint32_t a_s0[4] = {v0[0], v1[0], v0[1], v1[1]};
+                        const uint32_t a_s1[4] = {v0[2], v1[2], v0[3], v1[3]};
+#pragma unroll
+                        for (int i = 0; i < NT; ++i)
+                            if (i < nti) {
+                                mma_bf16(acc[mm][mi][i], a_s0, bx[i][0], bx[i][1]);
+                                mma_bf16(acc[mm][mi][i], a_s1, bx[i][2], bx[i][3]);
+                            }
+                    }
+                }
+            }
+            // C: c0, c1 = weight row g of the m16 tile, tokens 2 t4 and 2 t4 + 1 of the n8 tile;
+            // c2, c3 = row g + 8.
+#pragma unroll
+            for (int i = 0; i < NT; ++i) {
+                if (i >= nti) break;
+#pragma unroll
+                for (int u = 0; u < 2; ++u) {
+                    const int tk = (tb + 4 * i) * 8 + 2 * t4 + u;
+                    if (tk >= count) continue;
+                    const long long p = list[begin + tk];
+#pragma unroll
+                    for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+                        for (int hh = 0; hh < 2; ++hh) {
+                            const int ri = mi * 16 + g + 8 * hh;
+                            const int r = t * 128 + (ri / S) * 32 + s0 + ri % S;
+                            const float v0 = acc[0][mi][i][2 * hh + u] / dv[0];
+                            if constexpr (NM == 2) {
+                                const float v1 = acc[NM - 1][mi][i][2 * hh + u] / dv[NM - 1];
+                                hb[p * n + nv_unperm(r)] = __float2bfloat16_rn(v0 / (1.0f + __expf(-v0)) * v1);
+                            } else {
+                                o[p * n + r] = v0;
+                            }
+                        }
+                }
+            }
+        }
+    }
+}
+
+// Weight slots per quarter of a system RAM job (4 S rows) and n8 token tiles per warp pass.
+template <int NM>
+struct HostJob {
+    static constexpr int S = NM == 2 ? 4 : 16, NT = NM == 2 ? 4 : 2, B = NM == 2 ? 19 : 10;
+};
+
+// NM = 2: gate and up against x rows (act rows p / k), h[p] = silu(g) * u as bf16 in nv_perm order
+// (down's activations). NM = 1: down against h rows p, o[p][r] f32. Blocks along y: the first `hy`
+// rows of blocks take system RAM jobs (nv_host_jobs, shared counter *ctr); the next routed[0] the
+// experts in device slots, one expert per row; the rest join the system RAM jobs, which they reach
+// only after every device block has started. So PCIe streams from the kernel's start while the
+// device experts are multiplied, and every SM helps with the system RAM arithmetic at the end.
+// A device block owns rows {128 t + 32 q + 16 j + i} (warp q, i < 16) of an [n, K] matrix.
 template <int NM>
 __global__ void __launch_bounds__(128)
     nv_mma_kernel(NvDesc d, int n, int K, const int* __restrict__ offsets, const int* __restrict__ list, int k,
-                  const __nv_bfloat16* __restrict__ act, __nv_bfloat16* __restrict__ hb, float* __restrict__ o) {
+                  const __nv_bfloat16* __restrict__ act, __nv_bfloat16* __restrict__ hb, float* __restrict__ o, int hy,
+                  int* ctr) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
     auto& S = *reinterpret_cast<MmaSmem<NM>*>(smem_raw);
     const int* routed = offsets + d.experts + 1;
-    const int gi = blockIdx.y, nd = routed[0];
-    if (gi >= nd + routed[1]) return;
-    const int e = routed[gi < routed[1] ? 2 + d.experts + gi : 2 + gi - routed[1]], begin = offsets[e], count = offsets[e + 1] - begin;
+    const int nd = routed[0];
+    const int gi = static_cast<int>(blockIdx.y) - hy;
+    if (gi < 0 || gi >= nd) {
+        if (routed[1] > 0)
+            nv_host_jobs<NM, HostJob<NM>::S, HostJob<NM>::NT, HostJob<NM>::B>(d, n, K, offsets, list, k, act, hb, o, ctr, smem_raw);
+        return;
+    }
+    const int e = routed[2 + gi], begin = offsets[e], count = offsets[e + 1] - begin;
     const int t = blockIdx.x / 2, j = blockIdx.x % 2;
     const int lane = threadIdx.x % VELOX_WARP, warp = threadIdx.x / VELOX_WARP, g = lane / 4, q4 = lane % 4;
     bool dev;
@@ -661,14 +835,22 @@ __global__ void nv_sum_kernel(const float* __restrict__ o, const float* __restri
     }
 }
 
+// Blocks dedicated to the system RAM jobs of the prefill kernels (rounded up to whole rows of
+// blocks), so PCIe streams from the start; measured flat from 8 to 96 on the 5060 Ti, since the
+// blocks past the device experts join in anyway.
+constexpr int kPrefillHostBlocks = 24;
+
 template <int NM>
 int mma_launch(const NvDesc& d, int groups, int n, int K, const int* offsets, const int* list, int k, const __nv_bfloat16* act,
-               __nv_bfloat16* hb, float* o) {
-    static const cudaError_t attr = cudaFuncSetAttribute(nv_mma_kernel<NM>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                         static_cast<int>(sizeof(MmaSmem<NM>)));
+               __nv_bfloat16* hb, float* o, int* ctr) {
+    using HJ = HostJob<NM>;
+    const int smem = max(static_cast<int>(sizeof(MmaSmem<NM>)), host_job_smem<NM, HJ::S>(K));
+    if (smem > 96 * 1024 || n % 128 != 0 || K % 64 != 0) return VELOX_ERR_UNSUPPORTED;
+    static const cudaError_t attr = cudaFuncSetAttribute(nv_mma_kernel<NM>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
     if (attr != cudaSuccess) return static_cast<int>(attr);
-    const dim3 grid(n / 64, static_cast<unsigned>(groups));
-    nv_mma_kernel<NM><<<grid, 128, sizeof(MmaSmem<NM>)>>>(d, n, K, offsets, list, k, act, hb, o);
+    const int bx = n / 64, hy = (kPrefillHostBlocks + bx - 1) / bx;
+    const dim3 grid(bx, static_cast<unsigned>(groups + hy));
+    nv_mma_kernel<NM><<<grid, 128, smem>>>(d, n, K, offsets, list, k, act, hb, o, hy, ctr);
     return velox_launch_status();
 }
 
@@ -1048,7 +1230,7 @@ VELOX_API long long velox_5060_moe_nvfp4_scratch(int rows, int k, int width, int
     if (mode == 3)
         return nv_round(2LL * kSplit * rows * hidden) + nv_round(2LL * kSplit * pairs * width) + route +
                nv_round(4 * pairs * hidden);
-    return nv_round(2LL * rows * hidden) + nv_round(2 * pairs * width) + route + nv_round(4 * pairs * hidden);
+    return nv_round(2LL * rows * hidden) + nv_round(2 * pairs * width) + route + nv_round(4 * pairs * hidden) + 64;
 }
 
 // moe_experts for NVFP4 gate, up and down matrices at the given record offsets. mode 0: a GEMV
@@ -1082,10 +1264,11 @@ VELOX_API int velox_5060_moe_nvfp4(const float* x, const float* ids, const float
     int* offsets = reinterpret_cast<int*>(p += nv_round(2 * pairs * width));
     int* list = reinterpret_cast<int*>(p += nv_round(4LL * (3 * experts + 3)));
     float* o = reinterpret_cast<float*>(p += nv_round(4 * pairs));
-    nv_sort_kernel<<<1, 1024, 2 * experts * sizeof(int)>>>(ids, d.map, static_cast<int>(pairs), experts, offsets, list);
+    int* ctr = reinterpret_cast<int*>(p += nv_round(4 * pairs * hidden));
+    nv_sort_kernel<<<1, 1024, 2 * experts * sizeof(int)>>>(ids, d.map, static_cast<int>(pairs), experts, offsets, list, ctr);
     nv_to_bf16_perm<<<velox_grid_1d(xs, threads), threads>>>(x, xs, hidden, xb);
-    if (int e = mma_launch<2>(d, static_cast<int>(groups), width, hidden, offsets, list, k, xb, hb, nullptr)) return e;
-    if (int e = mma_launch<1>(d, static_cast<int>(groups), hidden, width, offsets, list, k, hb, nullptr, o)) return e;
+    if (int e = mma_launch<2>(d, static_cast<int>(groups), width, hidden, offsets, list, k, xb, hb, nullptr, ctr)) return e;
+    if (int e = mma_launch<1>(d, static_cast<int>(groups), hidden, width, offsets, list, k, hb, nullptr, o, ctr + 1)) return e;
     nv_sum_kernel<<<velox_grid_1d(xs, threads), threads>>>(o, wts, rows, k, hidden, ids, experts, y);
     return velox_launch_status();
 }
