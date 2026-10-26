@@ -17,6 +17,7 @@ pub mod plan;
 pub mod profile;
 pub mod quant;
 pub mod rng;
+pub mod state;
 pub mod variant;
 
 pub use backend::{
@@ -32,4 +33,5 @@ pub use kv::KvFormat;
 pub use op::Op;
 pub use plan::{MemoryPlan, ModelSpec, PlanPolicy, PlanRequest};
 pub use profile::{DeviceProfile, FormFactor, GpuArch, HwCaps, Vendor};
+pub use state::StateFormat;
 pub use variant::VariantInfo;

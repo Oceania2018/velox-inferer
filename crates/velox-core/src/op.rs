@@ -51,6 +51,8 @@ pub enum Op {
     QsaPool,
     QsaSelect,
     AttentionSparse,
+    StatePack,
+    StateUnpack,
 }
 
 impl Op {
@@ -99,6 +101,8 @@ impl Op {
         Op::QsaPool,
         Op::QsaSelect,
         Op::AttentionSparse,
+        Op::StatePack,
+        Op::StateUnpack,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -147,6 +151,8 @@ impl Op {
             Op::QsaPool => "qsa_pool",
             Op::QsaSelect => "qsa_select",
             Op::AttentionSparse => "attention_sparse",
+            Op::StatePack => "state_pack",
+            Op::StateUnpack => "state_unpack",
         }
     }
 }

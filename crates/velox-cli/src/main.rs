@@ -89,6 +89,8 @@ COMMANDS:
       [--mtp <sidecar GGUF>] [--mtp-drafts 2] (MTP speculative greedy, drafts per verify)
       [--show-top N] (logprobs of the N best first tokens) [--assistant-prefix <text>]
       [--ple-threads 32] (parallel reads of the PLE n-gram table)
+      [--state-quant bf16,nvfp4 [--split-tail 256]] (resume from a recurrent state stored in
+      each format vs exact: storage error, greedy divergence, logit deltas)
   serve                  OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
@@ -98,6 +100,7 @@ COMMANDS:
       --force-tool-call on|off (off)  requests offering tools answer with a tool call only
       --stream-content on|off (on)    streaming requests get their text as it is generated
       --kv-format <fmt>     attention KV cache storage: f32 | bf16 | fp8 | nvfp4 (f32)
+      --host-state-dtype <fmt>  context-store recurrent states: f32 | bf16 | nvfp4 (bf16)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
       --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
   replay                  Replay a recorded agent session against an OpenAI-compatible server
