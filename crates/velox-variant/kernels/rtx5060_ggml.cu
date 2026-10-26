@@ -1383,7 +1383,11 @@ int launch_pre(const int8_t* xq, const float* sx, int stride, int m, const uint8
 // scale goes to f32 (see the integer factors above). Block: 8 warps = 128 rows x 64 tokens, or
 // 128 tokens for long prompts (launch_pre2).
 
-constexpr int kQ2S = 256 + 16;  // staged token row bytes
+constexpr int kQ2S = 256;  // staged token row bytes
+
+// Byte offset of 16-byte chunk c of staged token row r: chunks XOR-swizzled by the row's low bits,
+// so the 8 rows an ldmatrix phase reads at one chunk hit 8 distinct bank groups without padding.
+__device__ __forceinline__ int act_at(int r, int c) { return r * kQ2S + ((c ^ (r & 7)) << 4); }
 #ifndef VELOX_GGML_PRE_UNROLL
 #define VELOX_GGML_PRE_UNROLL 8
 #endif
@@ -1468,8 +1472,8 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
     constexpr bool kSplit = T == kIq2S || T == kIq2Xs || T == kIq1M;  // IQ1_M: |code| 9 * 15
     constexpr bool kHalves = Traits<T>::G != 1 && !kFold && !kSplit;
     constexpr bool kOff = T == kQ2K || T == kQ4K;
-    // 128 tokens double the int32 sums: a shorter unroll keeps them in registers (measured best).
-    constexpr int kUnroll = TOK == 64 ? kPreSbUnroll : T == kQ2K || T == kIq1S ? 2 : 4;
+    // 128 tokens double the int32 sums; the sub-block unroll that measured best per type.
+    constexpr int kUnroll = TOK == 64 ? kPreSbUnroll : T == kIq1M ? 2 : T == kIq2Xs || T == kIq2Xxs ? 4 : 8;
     __shared__ __align__(16) int8_t act[2][TOK * kQ2S];
     __shared__ float sxs[2][TOK];
     // Each warp's 16 rows of the super-block, copied from the 4-byte aligned address at or below it
@@ -1502,7 +1506,7 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
         for (int i = threadIdx.x; i < TOK * 16; i += blockDim.x) {
             const int r = i >> 4, c = i & 15;
             const int tok = min(t0 + r, m - 1);
-            cp_async16(&act[buf][r * kQ2S + c * 16], xq + static_cast<long long>(tok) * k + kb * 256 + c * 16);
+            cp_async16(&act[buf][act_at(r, c)], xq + static_cast<long long>(tok) * k + kb * 256 + c * 16);
         }
         // This warp's rows (one commit group with the activations).
         const long long boff = static_cast<long long>(kb) * BB;
@@ -1530,7 +1534,7 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
         if constexpr (kOff) {  // code sums per (token, 16 values) of this super-block
             for (int e = threadIdx.x; e < TOK * 16; e += blockDim.x) {
                 const int r = e >> 4, h = e & 15;
-                const int4 v = *reinterpret_cast<const int4*>(&act[cur][r * kQ2S + h * 16]);
+                const int4 v = *reinterpret_cast<const int4*>(&act[cur][act_at(r, h)]);
                 int z = __dp4a(v.x, 0x01010101, 0);
                 z = __dp4a(v.y, 0x01010101, z);
                 z = __dp4a(v.z, 0x01010101, z);
@@ -1586,7 +1590,7 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
 #pragma unroll
             for (int np = 0; np < NT / 2; ++np) {
                 uint32_t bf[4];
-                ldsm_x4(bf, &act[cur][(np * 16 + b_row) * kQ2S + sb * 32 + b_col]);
+                ldsm_x4(bf, &act[cur][act_at(np * 16 + b_row, 2 * sb + (b_col >> 4))]);
 #pragma unroll
                 for (int h2 = 0; h2 < 2; ++h2) {
                     const int n = 2 * np + h2;
@@ -1677,8 +1681,8 @@ int launch_pre2_cfg(const int8_t* xq, const float* sx, int stride, int m, const 
 #endif
 
 // Long prompts take a 128-token tile where 8 warps fit in shared memory: a warp's decoded A
-// fragments feed twice the mmas (m = 1024: IQ1_M -20%, IQ1_S -14%, IQ2_S / IQ2_XS -8%, Q2_K -7%,
-// IQ2_XXS -4%). IQ3_S, IQ4_XS and Q4_K would need 4 warps, which measured slower than 64 tokens.
+// fragments feed twice the mmas. IQ4_XS and Q4_K would need 4 warps, which measured slower than
+// 64 tokens.
 template <int T>
 int launch_pre2(const int8_t* xq, const float* sx, int stride, int m, const uint8_t* w, long long row_bytes,
                 long long rb, int rows, int k, float* y, long long ldy, int mode) {
