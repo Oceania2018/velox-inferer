@@ -3589,7 +3589,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             let ms: &[usize] = if t == Iq4Xs {
                 &[1, 3, 8]
             } else {
-                &[1, 3, 8, 70, 300]
+                &[1, 3, 8, 70, 300, 600]
             };
             for &m in ms {
                 s.linear_act(
