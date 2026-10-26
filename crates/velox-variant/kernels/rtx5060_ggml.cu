@@ -18,7 +18,7 @@
 namespace {
 
 // velox_core::ggml::GgmlType::ALL order (main's VELOX_FMT_GGML_BASE + T).
-enum : int { kQ2K = 0, kQ4K, kIq1M, kIq2Xxs, kIq2Xs, kIq2S, kIq3Xxs, kIq3S, kIq4Xs, kQ2_0, kIq4Nl };
+enum : int { kQ2K = 0, kQ4K, kIq1M, kIq2Xxs, kIq2Xs, kIq2S, kIq3Xxs, kIq3S, kIq4Xs, kQ2_0, kIq4Nl, kQ6K, kQ8_0, kIq1S };
 
 __host__ __device__ constexpr int block_bytes(int t) {
     return t == kQ2K      ? 84
@@ -31,6 +31,7 @@ __host__ __device__ constexpr int block_bytes(int t) {
            : t == kIq3S   ? 110
            : t == kQ2_0   ? 18
            : t == kIq4Nl  ? 18
+           : t == kIq1S   ? 50
                           : 136;
 }
 
@@ -46,7 +47,7 @@ __host__ __device__ constexpr int sub_per_block() {
 template <int T>
 struct Traits {
     static constexpr int G = (T == kQ2K || T == kIq2Xs || T == kIq2S) ? 2 : T == kIq1M ? 4 : 1;
-    static constexpr bool kOff = T == kQ2K || T == kQ4K || T == kIq1M || T == kQ2_0;
+    static constexpr bool kOff = T == kQ2K || T == kQ4K || T == kIq1M || T == kQ2_0 || T == kIq1S;
 };
 
 template <int T>
@@ -213,6 +214,18 @@ __device__ __forceinline__ Sub<T> decode(const uint8_t* __restrict__ x, int ib) 
                 r.w[2 * i + h] = static_cast<int>((b & 0x03u) | ((b & 0x0cu) << 6) | ((b & 0x30u) << 12) |
                                                   ((b & 0xc0u) << 18));
             }
+        }
+    } else if constexpr (T == kIq1S) {  // d | qs[32] | qh u16[8]: one scale and one delta per 32 values
+        const uint32_t qh = u16_at(x + 34 + 2 * ib);
+        const float dl = f16_at(x) * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
+        r.s[0] = dl;
+        r.o[0] = dl * (qh & 0x8000 ? -0.125f : 0.125f);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t idx = x[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+            const uint64_t g = __ldg(&kIq1SGrid[idx]);  // int8 values -1, 0, 1
+            r.w[2 * l] = static_cast<int>(static_cast<uint32_t>(g));
+            r.w[2 * l + 1] = static_cast<int>(static_cast<uint32_t>(g >> 32));
         }
     } else {  // IQ1_M: qs[32] | qh[16] | scales[8]
         const uint32_t s0 = u16_at(x + 48), s1 = u16_at(x + 50), s2 = u16_at(x + 52), s3 = u16_at(x + 54);
@@ -850,7 +863,7 @@ int launch_mma(const uint8_t* w, long long row_bytes, long long rb, int rows, in
 template <int T>
 int launch_any(const uint8_t* w, long long row_bytes, long long rb, int rows, int subs, const int8_t* xq,
                const float* xd, int m, float* y, long long ldy, int mode) {
-    if constexpr (T != kIq1M && T != kIq4Nl) {
+    if constexpr (T != kIq1M && T != kIq4Nl && T != kIq1S) {
         if (m >= mma_min_m())
             return launch_mma<T>(w, row_bytes, rb, rows, subs, reinterpret_cast<const uint8_t*>(xq), m, y, ldy,
                                  mode);
@@ -898,6 +911,28 @@ __device__ __forceinline__ void qdecode(const uint8_t* __restrict__ x, int ib, i
                                         float2& dm) {
     mn[0] = mn[1] = 0;
     dm.y = 0.0f;
+    if constexpr (T == kIq1S) {  // codes 8 g +- 1 over 8, one integer scale (2 s + 1) per 32 values
+        dm.x = f16_at(x) * 0.125f;
+        const uint32_t qh = u16_at(x + 34 + 2 * ib);
+        sc[0] = sc[1] = 2 * static_cast<int>((qh >> 12) & 7) + 1;
+        const int dl = qh & 0x8000 ? -1 : 1;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t idx = x[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+            const uint64_t g = __ldg(&kIq1SGrid[idx]);
+#pragma unroll
+            for (int hw = 0; hw < 2; ++hw) {
+                uint32_t v = 0;
+#pragma unroll
+                for (int bb = 0; bb < 4; ++bb) {
+                    const int gv = static_cast<int8_t>((g >> (8 * (4 * hw + bb))) & 0xff);
+                    v |= (static_cast<uint32_t>(8 * gv + dl) & 0xffu) << (8 * bb);
+                }
+                wd[2 * l + hw] = static_cast<int>(v);
+            }
+        }
+        return;
+    }
     if constexpr (T == kIq1M) {
         const uint32_t s0 = u16_at(x + 48), s1 = u16_at(x + 50), s2 = u16_at(x + 52), s3 = u16_at(x + 54);
         const uint32_t dbits = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
@@ -1428,7 +1463,8 @@ VELOX_API int velox_5060_linear_ggml_from(const int8_t* xq, const float* xd, int
         return launch_any<kIq4Nl>(w, k / 32 * block_bytes(kIq4Nl), row_begin, rows, static_cast<int>(k / 32), xq, xd,
                                   m, y, ldy, mode);
     }
-    if (m < 1 || m > 65536 || rows <= 0 || k % 256 != 0 || type < 0 || type > 8) return VELOX_ERR_UNSUPPORTED;
+    if (m < 1 || m > 65536 || rows <= 0 || k % 256 != 0 || type < 0 || (type > 8 && type != kIq1S))
+        return VELOX_ERR_UNSUPPORTED;
     const long long row_bytes = k / 256 * block_bytes(type);
     // K % 1024 for the tensor-core path; dp4a (fewer tokens) needs only 16-byte rows.
     const bool dp4a_rows = m < mma_min_m() && row_bytes % 16 == 0;
@@ -1445,6 +1481,7 @@ VELOX_API int velox_5060_linear_ggml_from(const int8_t* xq, const float* xd, int
         case kIq2S: return launch_any<kIq2S>(w, row_bytes, row_begin, rows, subs, xq, xd, m, y, ldy, mode);
         case kIq3Xxs: return launch_any<kIq3Xxs>(w, row_bytes, row_begin, rows, subs, xq, xd, m, y, ldy, mode);
         case kIq3S: return launch_any<kIq3S>(w, row_bytes, row_begin, rows, subs, xq, xd, m, y, ldy, mode);
+        case kIq1S: return launch_any<kIq1S>(w, row_bytes, row_begin, rows, subs, xq, xd, m, y, ldy, mode);
         default: return launch_any<kIq4Xs>(w, row_bytes, row_begin, rows, subs, xq, xd, m, y, ldy, mode);
     }
 }
@@ -1458,7 +1495,7 @@ extern "C" int velox_5060_q8_view(const void* blob, int m, long long k, int layo
 VELOX_API int velox_5060_linear_ggml_q8(const void* blob, int m, const uint8_t* w, int type, long long k,
                                         long long row_begin, int rows, float* y, long long ldy, int mode) {
     // Rows of a 4-byte multiple: blocks are copied from the aligned address at or below them.
-    if (m < 1 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || type < 0 || type > 8 || mode < 0 || mode > 1 ||
+    if (m < 1 || rows <= 0 || k % 256 != 0 || k > (1ll << 30) || type < 0 || (type > 8 && type != kIq1S) || mode < 0 || mode > 1 ||
         (k % 1024 != 0 && (k / 256 * block_bytes(type)) % 4 != 0) || reinterpret_cast<uintptr_t>(w) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const int8_t* xq;
@@ -1476,6 +1513,7 @@ VELOX_API int velox_5060_linear_ggml_q8(const void* blob, int m, const uint8_t* 
         case kIq2S: return launch_pre2<kIq2S>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         case kIq3Xxs: return launch_pre2<kIq3Xxs>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         case kIq3S: return launch_pre2<kIq3S>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
+        case kIq1S: return launch_pre<kIq1S>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
         default: return launch_pre2<kIq4Xs>(xq, sx, stride, m, w, row_bytes, row_begin, rows, ki, y, ldy, mode);
     }
 }

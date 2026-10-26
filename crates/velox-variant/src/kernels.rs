@@ -712,10 +712,10 @@ const GGML_Q8_MIN_M: usize = 17;
 const GGML_MMA_MIN_M: usize = 5;
 
 /// Types rtx5060_ggml.cu decodes at every width: the first nine of `GgmlType::ALL` (q2_k ..
-/// iq4_xs). IQ4_NL runs its dp4a kernel up to 16 tokens (`ggml_mmvq`) and the MoE kernels; Q2_0
+/// iq4_xs) and IQ1_S (dp4a up to 16 tokens, the int8 prefill kernel above). IQ4_NL runs its dp4a kernel up to 16 tokens (`ggml_mmvq`) and the MoE kernels; Q2_0
 /// only the MoE kernels; the rest (q6_k, q8_0) the portable kernels.
 fn ggml_served(t: velox_core::ggml::GgmlType) -> bool {
-    ggml_index(t) < 9
+    ggml_index(t) < 9 || t == velox_core::ggml::GgmlType::Iq1S
 }
 
 fn ggml_index(t: velox_core::ggml::GgmlType) -> i32 {
