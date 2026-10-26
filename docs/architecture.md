@@ -17,7 +17,7 @@ velox-cli ──► velox-conformance ──► velox-cpu (oracle)
 | `velox-variant` | The build's hardware variant: tuned kernels and per-SKU policy | **hardware branches** |
 | `velox-conformance` | Op and end-to-end cases compared against the oracle | main |
 | `velox-weights` | `.vi` / `.ninfer` reader, validator and converter | main |
-| `velox-serve` | OpenAI-compatible HTTP API over a `ChatEngine` | main |
+| `velox-serve` | OpenAI-compatible HTTP API and System One decisions ([systemone.md](systemone.md)) over a `ChatEngine` | main |
 | `velox-cli` | `velox` binary: devices, plan, selftest, bench, inspect, convert, serve, replay | main |
 
 ## Three layers of hardware specificity

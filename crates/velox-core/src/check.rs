@@ -242,6 +242,76 @@ pub fn gdn(
     )
 }
 
+/// The rows of `windows` windows of `tokens` rows each from `row0`, as one shape's `tokens`.
+fn window_rows(windows: usize, tokens: usize, what: &str) -> Result<usize> {
+    if windows == 0 {
+        return Err(Error::Shape(format!("{what}: no windows")));
+    }
+    product(&[windows, tokens])
+}
+
+/// `Backend::conv1d_silu_windows`: `windows` windows of `s.tokens` rows from `s.row0`.
+pub fn conv1d_windows(
+    x: usize,
+    weight: usize,
+    state: usize,
+    out: usize,
+    s: &ConvShape,
+    windows: usize,
+) -> Result<()> {
+    let tokens = window_rows(windows, s.tokens, "conv1d_silu_windows")?;
+    conv1d(x, weight, state, out, &ConvShape { tokens, ..*s })
+}
+
+/// `Backend::gated_delta_net_windows`: `windows` windows of `s.tokens` rows from `s.row0`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_windows(
+    qkv: usize,
+    ab: usize,
+    a_log: usize,
+    dt_bias: usize,
+    state: usize,
+    out: usize,
+    s: &GdnShape,
+    windows: usize,
+) -> Result<()> {
+    let tokens = window_rows(windows, s.tokens, "gated_delta_net_windows")?;
+    gdn(
+        qkv,
+        ab,
+        a_log,
+        dt_bias,
+        state,
+        out,
+        &GdnShape { tokens, ..*s },
+    )
+}
+
+/// `Backend::attention_windows`: f32 keys and values, `s.tokens` query rows in windows of
+/// `window` rows over a prefix of `s.pos0` positions.
+pub fn attention_windows(
+    q: usize,
+    k: usize,
+    v: usize,
+    out: usize,
+    s: &AttnShape,
+    window: usize,
+) -> Result<()> {
+    if s.kv != KvFormat::F32 {
+        return Err(Error::Shape(format!(
+            "attention_windows reads f32 keys and values, not {}",
+            s.kv
+        )));
+    }
+    if window == 0 || !s.tokens.is_multiple_of(window) {
+        return Err(Error::Shape(format!(
+            "attention_windows: {} rows are not whole windows of {window}",
+            s.tokens
+        )));
+    }
+    attention(q, k, v, out, s)
+}
+
 /// One layer of `Backend::gdn_replay`.
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_replay_layer(
@@ -784,6 +854,25 @@ pub fn top_k(x: usize, rows: usize, row_len: usize, limit: usize, k: usize) -> R
         )));
     }
     need("top_k input", x, rows * row_len)
+}
+
+/// Most ids one `log_softmax_gather` call reads per row (System One scores at most ten levels or
+/// 26 options).
+pub const GATHER_MAX: usize = 256;
+
+pub fn log_softmax_gather(
+    x: usize,
+    rows: usize,
+    row_len: usize,
+    limit: usize,
+    ids: usize,
+) -> Result<()> {
+    if limit == 0 || limit > row_len || ids == 0 || ids > GATHER_MAX {
+        return Err(Error::Shape(format!(
+            "log_softmax_gather: {ids} ids (1..={GATHER_MAX}), limit {limit}, row_len {row_len}"
+        )));
+    }
+    need("log_softmax_gather input", x, rows * row_len)
 }
 
 #[cfg(test)]

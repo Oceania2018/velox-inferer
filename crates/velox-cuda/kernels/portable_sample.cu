@@ -332,3 +332,70 @@ VELOX_API int velox_portable_fetch_u32_wait(int slot, unsigned int* out) {
     *out = g_fetch.host[slot];
     return 0;
 }
+
+namespace {
+
+// Block-wide maximum for blockDim.x a multiple of VELOX_WARP and at most 1024 (see
+// velox_block_sum). Every thread gets the result.
+__device__ __forceinline__ float block_max(float v, float* scratch) {
+    const int lane = threadIdx.x % VELOX_WARP;
+    const int warp = threadIdx.x / VELOX_WARP;
+    v = velox_warp_max(v);
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    v = lane < static_cast<int>(blockDim.x) / VELOX_WARP ? scratch[lane] : -INFINITY;
+    v = velox_warp_max(v);
+    __syncthreads();
+    return v;
+}
+
+// One block per row: the maximum of the first `limit` values, then the sum of exp(x - max) (NaN
+// counts as -inf), then x[id] - max - log(sum) for each of the n ids.
+__global__ void __launch_bounds__(1024) log_softmax_gather_rows(const float* __restrict__ x, long long row_len,
+                                                                int limit, const unsigned int* __restrict__ ids,
+                                                                int n, float* __restrict__ out) {
+    __shared__ float scratch[VELOX_WARP];
+    const float* xr = x + static_cast<long long>(blockIdx.x) * row_len;
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < limit; j += blockDim.x) m = fmaxf(m, rank_key(xr[j]));
+    m = block_max(m, scratch);
+    const bool finite = isfinite(m);
+    float s = 0.0f;
+    if (finite)
+        for (int j = threadIdx.x; j < limit; j += blockDim.x) s += expf(rank_key(xr[j]) - m);
+    s = velox_block_sum(s, scratch);
+    const float log_z = m + logf(s);
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const unsigned int id = ids[j];
+        out[static_cast<long long>(blockIdx.x) * n + j] =
+            finite && id < static_cast<unsigned int>(limit) ? rank_key(xr[id]) - log_z : -INFINITY;
+    }
+}
+
+Scratch g_gather;
+HostStage g_gather_host;
+
+}  // namespace
+
+// Log-softmax over the first `limit` values of each of `rows` rows, read at the n host ids and
+// written to host_out as [rows, n]. One upload of the ids and one download of the results.
+VELOX_API int velox_portable_log_softmax_gather(const float* x, int rows, long long row_len, int limit,
+                                                const unsigned int* host_ids, int n, float* host_out) {
+    if (rows <= 0 || rows > 65535 || n <= 0 || limit <= 0 || row_len < limit) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_gather.mu);
+    const size_t id_bytes = static_cast<size_t>(n) * 4, out_bytes = static_cast<size_t>(rows) * n * 4;
+    uint8_t* base = g_gather.get(id_bytes + out_bytes);
+    uint8_t* stage = g_gather_host.get(id_bytes + out_bytes);
+    if (!base || !stage) return static_cast<int>(cudaErrorMemoryAllocation);
+    unsigned int* ids = reinterpret_cast<unsigned int*>(base);
+    float* out = reinterpret_cast<float*>(base + id_bytes);
+    memcpy(stage, host_ids, id_bytes);
+    if (cudaError_t e = cudaMemcpyAsync(ids, stage, id_bytes, cudaMemcpyHostToDevice, 0)) return static_cast<int>(e);
+    log_softmax_gather_rows<<<rows, 1024>>>(x, row_len, limit, ids, n, out);
+    if (const int e = velox_launch_status()) return e;
+    if (cudaError_t e = cudaMemcpyAsync(stage + id_bytes, out, out_bytes, cudaMemcpyDeviceToHost, 0))
+        return static_cast<int>(e);
+    if (cudaError_t e = cudaStreamSynchronize(0)) return static_cast<int>(e);
+    memcpy(host_out, stage + id_bytes, out_bytes);
+    return 0;
+}

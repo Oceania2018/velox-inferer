@@ -410,6 +410,9 @@ pub struct AttnConfig {
     pub tokens: Vec<usize>,
     pub formats: Vec<velox_core::KvFormat>,
     pub iters: usize,
+    /// Non-zero: time `attention_windows` (scoring windows of this many rows over a `pos0`
+    /// prefix, f32 keys and values) instead.
+    pub window: usize,
 }
 
 /// Times `attention` over a random cache of `pos0 + tokens` positions in each KV format, and
@@ -418,6 +421,59 @@ pub fn run_attn<B: Backend>(b: &B, c: &AttnConfig) -> Result<()> {
     use velox_core::kv::encode_cache;
     let mut rng = Rng::new(17);
     let d = c.head_dim;
+    if c.window > 0 {
+        println!(
+            "attention_windows heads {}/{} d {} prefix {} window {}  on {}",
+            c.heads,
+            c.kv_heads,
+            d,
+            c.pos0,
+            c.window,
+            b.describe()
+        );
+        for &tokens in &c.tokens {
+            let tokens = tokens.div_ceil(c.window) * c.window;
+            let rows = (c.pos0 + tokens) * c.kv_heads * d;
+            let (k, v) = (
+                b.upload(&rng.vec(rows, 2.0))?,
+                b.upload(&rng.vec(rows, 1.0))?,
+            );
+            let q = b.upload(&rng.vec(tokens * c.heads * d, 2.0))?;
+            let mut out = b.alloc(tokens * c.heads * d)?;
+            let s = velox_core::AttnShape {
+                tokens,
+                heads: c.heads,
+                kv_heads: c.kv_heads,
+                head_dim: d,
+                pos0: c.pos0,
+                kv: velox_core::KvFormat::F32,
+            };
+            for _ in 0..3 {
+                b.attention_windows(&q, &k, &v, &mut out, s, c.window)?;
+            }
+            b.synchronize()?;
+            let mut samples = Vec::with_capacity(c.iters);
+            for _ in 0..c.iters {
+                let t0 = Instant::now();
+                b.attention_windows(&q, &k, &v, &mut out, s, c.window)?;
+                b.synchronize()?;
+                samples.push(t0.elapsed().as_secs_f64());
+            }
+            let best = samples.iter().copied().fold(f64::INFINITY, f64::min);
+            let t = median(samples);
+            // Query-key pairs: every row sees the prefix and its window's rows up to itself.
+            let pairs =
+                (tokens * c.pos0 + tokens / c.window * c.window * (c.window + 1) / 2) * c.heads;
+            println!(
+                "  {:>4} windows ({tokens} rows) {:>8.1} us (min {:>8.1})  {:>6.1} TFLOP/s",
+                tokens / c.window,
+                t * 1e6,
+                best * 1e6,
+                4.0 * (pairs * d) as f64 / t / 1e12
+            );
+        }
+        return Ok(());
+    }
     println!(
         "attention heads {}/{} d {} pos0 {}  on {}",
         c.heads,

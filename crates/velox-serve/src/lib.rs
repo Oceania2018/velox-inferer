@@ -2,11 +2,14 @@
 //!
 //! Endpoints: `GET /health`, `GET /v1/models`, `GET /metrics` (Prometheus text, including the
 //! `velox_max_concurrency` gauge llm-inference-daemon probes), `POST /v1/chat/completions`
-//! (JSON or SSE stream). Responses carry llama.cpp-style `timings` like ninfer's, so the replay
-//! gate and the daemon read both engines the same way.
+//! (JSON or SSE stream), and `POST /v1/systemone` (ninfer's System One decisions, see
+//! [`systemone`]) when the engine scores. Responses carry llama.cpp-style `timings` like
+//! ninfer's, so the replay gate and the daemon read both engines the same way.
 //!
 //! The API layer is engine-agnostic: it validates and frames requests and hands them to a
 //! [`ChatEngine`]. Model execution lives behind that trait.
+
+pub mod systemone;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -14,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// An OpenAI-style error: HTTP status, `type` and `code`.
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +78,31 @@ pub struct Outcome {
     pub first_token: Option<Instant>,
 }
 
+/// Result of a scoring request ([`ChatEngine::score`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreOutcome {
+    /// Log-probability of each candidate, in request order; with branches, branch-major
+    /// (`[branch][candidate]`).
+    pub logprobs: Vec<f32>,
+    pub prompt_tokens: u64,
+    /// Prompt tokens served from the prefix cache.
+    pub cached_tokens: u64,
+    /// Engine-side wait from hand-off until the request's prefill began.
+    pub queue_ms: f64,
+}
+
+/// One scoring prompt of [`ChatEngine::score`]: a chat request whose prompt ends inside its final
+/// assistant message (`request.messages`, rendered as a continuation; nothing is generated), the
+/// `candidates` texts (one token each) whose log-probabilities are read after it, and optional
+/// `branches` (a few tokens each), each appended to the prompt on its own with the candidates
+/// scored after every branch.
+#[derive(Clone, Copy, Debug)]
+pub struct ScoreQuery<'a> {
+    pub request: &'a Value,
+    pub candidates: &'a [String],
+    pub branches: &'a [String],
+}
+
 pub trait ChatEngine: Send + Sync {
     /// The architecture of the loaded model, e.g. "Qwen3_5ForCausalLM".
     fn architecture(&self) -> &str;
@@ -84,6 +112,17 @@ pub trait ChatEngine: Send + Sync {
     /// Housekeeping after a response has been delivered, while no request may be waiting (e.g.
     /// preparing memory the next one would otherwise allocate). Returns promptly once one is.
     fn idle(&self) {}
+    /// Whether [`Self::score`] is implemented. Without it `POST /v1/systemone` answers 404,
+    /// which llm-inference-daemon's probe reads as "unsupported".
+    fn scores(&self) -> bool {
+        false
+    }
+    /// Scores each query (see [`ScoreQuery`]), in order; the first error fails the call. The
+    /// queries of one System One request share the start of their prompts (system, state,
+    /// images), which an engine can feed once.
+    fn score(&self, _queries: &[ScoreQuery<'_>]) -> Result<Vec<ScoreOutcome>, ApiError> {
+        Err(ApiError::not_implemented("this engine does not score"))
+    }
 }
 
 /// Engine for a model whose execution path velox does not implement yet. Loading, health,
@@ -347,8 +386,18 @@ impl Server {
                 self.engine.idle();
                 r
             }
+            ("POST", "/v1/systemone") if self.engine.scores() => {
+                let r = self.systemone(&mut w, &req.body);
+                let _ = w.flush();
+                let _ = w.shutdown(std::net::Shutdown::Write);
+                self.engine.idle();
+                r
+            }
             (_, "/health" | "/v1/models" | "/metrics" | "/v1/chat/completions") => {
                 respond_json(&mut w, 405, &ApiError::invalid("method not allowed").body())
+            }
+            (_, "/v1/systemone") if self.engine.scores() => {
+                respond_json(&mut w, 405, &json!({"error": "method not allowed"}))
             }
             _ => respond_json(
                 &mut w,
@@ -442,6 +491,87 @@ impl Server {
             t_req.elapsed().as_secs_f64() * 1e3,
             e.message
         );
+    }
+
+    /// `POST /v1/systemone`: the questions are scored one after another on one lane, as
+    /// independent engine requests (a shared state and system prompt hit the prefix cache after
+    /// the first). Any failure fails the request; errors are `{"error": "<message>"}` as the spec
+    /// has them.
+    fn systemone(&self, w: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+        let t_req = Instant::now();
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let fail = |w: &mut TcpStream, e: ApiError| {
+            self.count_error(&e, t_req);
+            respond_json(w, e.status, &json!({"error": e.message}))
+        };
+        let parsed = serde_json::from_slice::<Value>(body)
+            .map_err(|e| ApiError::invalid(format!("body is not JSON: {e}")))
+            .and_then(|v| systemone::parse(&v));
+        let req = match parsed {
+            Ok(r) => r,
+            Err(e) => return fail(w, e),
+        };
+        if req.model != self.cfg.model_id {
+            return fail(
+                w,
+                ApiError {
+                    status: 404,
+                    kind: "invalid_request_error",
+                    code: "model_not_found",
+                    message: format!("model '{}' not found", req.model),
+                },
+            );
+        }
+        let t_lane = Instant::now();
+        let _lane = self.lanes.acquire();
+        let t0 = Instant::now();
+        let mut answers = Map::new();
+        let (mut input, mut cached, mut output, mut queue_ms) = (0u64, 0u64, 0u64, 0.0);
+        let queries: Vec<ScoreQuery<'_>> = req
+            .questions
+            .iter()
+            .map(|q| ScoreQuery {
+                request: &q.request,
+                candidates: &q.candidates,
+                branches: &q.branches,
+            })
+            .collect();
+        let outcomes = match self.engine.score(&queries) {
+            Ok(o) => o,
+            Err(e) => return fail(w, e),
+        };
+        for (q, o) in req.questions.iter().zip(&outcomes) {
+            match systemone::answer(q, &o.logprobs) {
+                Ok(a) => answers.insert(q.name.clone(), a),
+                Err(e) => return fail(w, e),
+            };
+            input += o.prompt_tokens;
+            cached += o.cached_tokens.min(o.prompt_tokens);
+            output += systemone::output_tokens(q);
+            queue_ms += o.queue_ms;
+        }
+        self.prompt_tokens.fetch_add(input, Ordering::Relaxed);
+        self.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+        {
+            let mut l = self.latency.lock().unwrap();
+            l.queue
+                .observe((t0 - t_lane).as_secs_f64() + queue_ms / 1e3);
+            l.duration.observe(t_req.elapsed().as_secs_f64());
+        }
+        respond_json(
+            w,
+            200,
+            &json!({
+                "model": req.model,
+                "answers": answers,
+                // cached_input_tokens is the part of input_tokens served from the prefix cache.
+                "usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": cached,
+                    "output_tokens": output,
+                },
+            }),
+        )
     }
 
     fn chat(&self, w: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {

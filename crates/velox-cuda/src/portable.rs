@@ -151,6 +151,45 @@ extern "C" {
         v_dim: i32,
         pp: *const i64,
     ) -> i32;
+    fn velox_portable_conv1d_silu_windows(
+        x: *const f32,
+        w: *const f32,
+        state_in: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        windows: i32,
+        channels: i32,
+        width: i32,
+        pp: *const i64,
+    ) -> i32;
+    fn velox_portable_gated_delta_net_windows(
+        qkv: *const f32,
+        ab: *const f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state_in: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        windows: i32,
+        k_heads: i32,
+        v_heads: i32,
+        k_dim: i32,
+        v_dim: i32,
+        pp: *const i64,
+    ) -> i32;
+    fn velox_portable_attention_windows(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        window: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
+    ) -> i32;
 }
 
 /// Format codes shared with the kernels (`VELOX_FMT_*` in portable_model.cu).
@@ -905,6 +944,124 @@ pub fn gated_delta_net_out(
     )
 }
 
+/// [`velox_core::Backend::conv1d_silu_windows`].
+pub fn conv1d_silu_windows(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    state_in: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: ConvShape,
+    windows: usize,
+) -> Result<()> {
+    check::conv1d_windows(
+        x.len(),
+        weight.len(),
+        state_in.len(),
+        out.len(),
+        &s,
+        windows,
+    )?;
+    let Some(pp) = graph_params(&[state_in.as_ptr() as i64, 0])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above; no state is written.
+    status(
+        unsafe {
+            velox_portable_conv1d_silu_windows(
+                x.as_ptr().add(s.row0 * s.channels),
+                weight.as_ptr(),
+                state_in.as_ptr(),
+                out.as_mut_ptr().add(s.row0 * s.channels),
+                to_i32("tokens", s.tokens)?,
+                to_i32("windows", windows)?,
+                to_i32("channels", s.channels)?,
+                to_i32("width", s.width)?,
+                pp,
+            )
+        },
+        "portable conv1d_silu_windows",
+    )
+}
+
+/// [`velox_core::Backend::gated_delta_net_windows`].
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_net_windows(
+    qkv: &CudaBuffer,
+    ab: &CudaBuffer,
+    a_log: &CudaBuffer,
+    dt_bias: &CudaBuffer,
+    state_in: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: GdnShape,
+    windows: usize,
+) -> Result<()> {
+    check::gdn_windows(
+        qkv.len(),
+        ab.len(),
+        a_log.len(),
+        dt_bias.len(),
+        state_in.len(),
+        out.len(),
+        &s,
+        windows,
+    )?;
+    let Some(pp) = graph_params(&[state_in.as_ptr() as i64, 0])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above; no state is written.
+    status(
+        unsafe {
+            velox_portable_gated_delta_net_windows(
+                qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                ab.as_ptr().add(s.row0 * 2 * s.v_heads),
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                state_in.as_ptr(),
+                out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
+                to_i32("tokens", s.tokens)?,
+                to_i32("windows", windows)?,
+                to_i32("k_heads", s.k_heads)?,
+                to_i32("v_heads", s.v_heads)?,
+                to_i32("k_dim", s.k_dim)?,
+                to_i32("v_dim", s.v_dim)?,
+                pp,
+            )
+        },
+        "portable gated_delta_net_windows",
+    )
+}
+
+/// [`velox_core::Backend::attention_windows`].
+pub fn attention_windows(
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: AttnShape,
+    window: usize,
+) -> Result<()> {
+    check::attention_windows(q.len(), k.len(), v.len(), out.len(), &s, window)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_attention_windows(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                out.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("window", window)?,
+                to_i32("heads", s.heads)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                to_i32("pos0", s.pos0)?,
+                s.scale(),
+            )
+        },
+        "portable attention_windows",
+    )
+}
+
 /// Shapes validated by the caller (`check::gdn_replay_layer` per layer).
 pub fn gdn_replay(
     layers: &mut [GdnReplayLayer<'_, CudaBuffer>],
@@ -1181,6 +1338,48 @@ pub fn top_k(
                 .collect()
         })
         .collect())
+}
+
+extern "C" {
+    fn velox_portable_log_softmax_gather(
+        x: *const f32,
+        rows: i32,
+        row_len: i64,
+        limit: i32,
+        ids: *const u32,
+        n: i32,
+        out: *mut f32,
+    ) -> i32;
+}
+
+pub fn log_softmax_gather(
+    x: &CudaBuffer,
+    rows: usize,
+    row_len: usize,
+    limit: usize,
+    ids: &[u32],
+) -> Result<Vec<f32>> {
+    check::log_softmax_gather(x.len(), rows, row_len, limit, ids.len())?;
+    let mut out = vec![0f32; rows * ids.len()];
+    if rows == 0 {
+        return Ok(out);
+    }
+    // SAFETY: x holds rows * row_len values (checked); out holds rows * ids.len() entries.
+    status(
+        unsafe {
+            velox_portable_log_softmax_gather(
+                x.as_ptr(),
+                to_i32("rows", rows)?,
+                row_len as i64,
+                to_i32("limit", limit)?,
+                ids.as_ptr(),
+                to_i32("ids", ids.len())?,
+                out.as_mut_ptr(),
+            )
+        },
+        "portable log_softmax_gather",
+    )?;
+    Ok(out)
 }
 
 extern "C" {

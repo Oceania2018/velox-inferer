@@ -765,6 +765,53 @@ pub trait CudaKernels: Send + Sync {
         portable::gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, out, s)
     }
 
+    /// [`Backend::conv1d_silu_windows`].
+    fn conv1d_silu_windows(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        state_in: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: ConvShape,
+        windows: usize,
+    ) -> Result<()> {
+        portable::conv1d_silu_windows(x, weight, state_in, out, s, windows)
+    }
+
+    /// [`Backend::gated_delta_net_windows`].
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_windows(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+        windows: usize,
+    ) -> Result<()> {
+        portable::gated_delta_net_windows(qkv, ab, a_log, dt_bias, state_in, out, s, windows)
+    }
+
+    /// The operand precision of `attention_windows`; see [`Backend::attention_windows_precision`].
+    fn attention_windows_precision(&self, _s: AttnShape) -> AttnPrecision {
+        AttnPrecision::Exact
+    }
+
+    /// [`Backend::attention_windows`].
+    fn attention_windows(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: AttnShape,
+        window: usize,
+    ) -> Result<()> {
+        portable::attention_windows(q, k, v, out, s, window)
+    }
+
     fn gdn_replay(
         &self,
         layers: &mut [GdnReplayLayer<'_, CudaBuffer>],
@@ -830,6 +877,17 @@ pub trait CudaKernels: Send + Sync {
         k: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         portable::top_k(x, rows, row_len, limit, k)
+    }
+
+    fn log_softmax_gather(
+        &self,
+        x: &CudaBuffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        portable::log_softmax_gather(x, rows, row_len, limit, ids)
     }
 
     fn concat_cols(
@@ -1332,6 +1390,20 @@ impl Backend for CudaBackend {
         k: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         self.timed("top_k", || self.kernels.top_k(x, rows, row_len, limit, k))
+    }
+
+    fn log_softmax_gather(
+        &self,
+        x: &CudaBuffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        self.timed("log_softmax_gather", || {
+            self.kernels
+                .log_softmax_gather(x, rows, row_len, limit, ids)
+        })
     }
 
     fn concat_cols(
@@ -2533,6 +2605,10 @@ impl Backend for CudaBackend {
         self.kernels.attention_precision(s)
     }
 
+    fn attention_windows_precision(&self, s: AttnShape) -> AttnPrecision {
+        self.kernels.attention_windows_precision(s)
+    }
+
     fn kv_store(
         &self,
         k: &CudaBuffer,
@@ -2699,6 +2775,59 @@ impl Backend for CudaBackend {
         self.staged("gated_delta_net verify", || {
             self.kernels
                 .gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, out, s)
+        })
+    }
+
+    fn conv1d_silu_windows(
+        &self,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        state_in: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: ConvShape,
+        windows: usize,
+    ) -> Result<()> {
+        self.staged("conv1d_silu_windows", || {
+            self.kernels
+                .conv1d_silu_windows(x, weight, state_in, out, s, windows)
+        })
+    }
+
+    fn gated_delta_net_windows(
+        &self,
+        qkv: &CudaBuffer,
+        ab: &CudaBuffer,
+        a_log: &CudaBuffer,
+        dt_bias: &CudaBuffer,
+        state_in: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: GdnShape,
+        windows: usize,
+    ) -> Result<()> {
+        self.staged("gated_delta_net_windows", || {
+            self.kernels
+                .gated_delta_net_windows(qkv, ab, a_log, dt_bias, state_in, out, s, windows)
+        })
+    }
+
+    fn attention_windows(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: AttnShape,
+        window: usize,
+    ) -> Result<()> {
+        check::attention_windows(q.len, k.len, v.len, out.len, &s, window)?;
+        if graph_mode() == GraphMode::Replay {
+            // The prefix length is a per-call value the kernel does not stage.
+            return Err(Error::Backend(
+                "attention_windows in a replayed graph step".into(),
+            ));
+        }
+        self.timed("attention_windows", || {
+            self.kernels.attention_windows(q, k, v, out, s, window)
         })
     }
 

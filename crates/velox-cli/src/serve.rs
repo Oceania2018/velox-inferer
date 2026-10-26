@@ -152,6 +152,17 @@ where
         mtp_drafts: a.parse("mtp-drafts", 7)?,
         dflash_drafts,
         kv_format: KvFormat::parse(a.get("kv-format").unwrap_or("f32"))?,
+        // --score-branch-rows N (ninfer's name and default: 100; 0 rejects rank questions):
+        // System One rank candidates scored per forward pass, at most 256.
+        score_rows: match a.parse("score-branch-rows", 100)? {
+            n if n <= velox_serve::systemone::MAX_RANK_CANDIDATES => n,
+            n => {
+                return Err(Error::Config(format!(
+                    "--score-branch-rows {n}: at most {}",
+                    velox_serve::systemone::MAX_RANK_CANDIDATES
+                )))
+            }
+        },
     };
     let vision = if art.components().contains_key("vision")
         && a.get("vision").is_none_or(|v| v != "false")

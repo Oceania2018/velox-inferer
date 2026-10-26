@@ -60,6 +60,7 @@ COMMANDS:
   bench-attn              Time causal attention over a KV cache in each storage format
       --heads <n> --kv-heads <n> --head-dim <n>  default 24/4, 256 (Qwen3.8)
       --pos0 <n> (16384) --tokens <list> (1,8,16) --kv-format <list> (f32,bf16,fp8,nvfp4) --iters <n> (50)
+      --window <n>          time attention_windows (System One scoring windows, f32 K/V) instead
   bench-verify            Time batched speculative verify rounds against one sequence at a time
       --artifact <path> --batch <n> (3) --window <n> (12) --context <n> (13000) --rounds <n> (40)
       [--keep <n>] [--kv-format nvfp4] [--prefill <n>] (mixed rounds) [--only batched]
@@ -92,6 +93,7 @@ COMMANDS:
       [--state-quant bf16,nvfp4 [--split-tail 256]] (resume from a recurrent state stored in
       each format vs exact: storage error, greedy divergence, logit deltas)
   serve                  OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
+                         and ninfer's System One decisions (/v1/systemone)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
       --model-id <id>       default: artifact metadata name
@@ -103,7 +105,8 @@ COMMANDS:
       --host-state-dtype <fmt>  context-store recurrent states: f32 | bf16 | nvfp4 (bf16)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
       --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
-  replay                  Replay a recorded agent session against an OpenAI-compatible server
+      --score-branch-rows <n>  System One rank candidates per forward pass (100; 0 rejects rank)
+  replay                 Replay a recorded agent session against an OpenAI-compatible server
       --session <dir>       directory with session.json and screenshots/
       --endpoint <url>      e.g. http://127.0.0.1:8010 (default)
       --out <file>          JSON report (default target/replay/<label>.json)
@@ -481,6 +484,7 @@ fn bench_attn(a: &Args) -> Result<ExitCode> {
         tokens,
         formats,
         iters: a.parse("iters", 50)?,
+        window: a.parse("window", 0)?,
     };
     let sel = select::backend(a)?;
     match &sel {

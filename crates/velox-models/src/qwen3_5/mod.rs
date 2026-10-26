@@ -269,6 +269,9 @@ pub struct BatchWorkspace<B: Backend> {
     max_seqs: usize,
     /// Rows of one sequence's window, at most (the drafter's drafts plus the pending token).
     window: usize,
+    /// Branch-scoring buffers ([`Qwen35Text::score_workspace`]): every window continues one
+    /// session and nothing is replayed, so a single set of GDN rows serves every layer.
+    scoring: bool,
     /// Per GDN layer, `[max_seqs * window, *]` rows: what each sequence's commit replays.
     qkv: Vec<B::Buffer>,
     conv_out: Vec<B::Buffer>,
@@ -1733,6 +1736,19 @@ impl<B: Backend> Qwen35Text<B> {
             .unwrap_or_default())
     }
 
+    /// Log-probabilities (over the first `limit` ids) of `targets` after the last advanced row.
+    pub fn last_logprobs(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        targets: &[u32],
+        limit: usize,
+    ) -> Result<Vec<f32>> {
+        self.head(b, ws)?;
+        let v = self.cfg.vocab;
+        b.log_softmax_gather(&ws.logits, 1, v, limit.min(v), targets)
+    }
+
     /// Gated attention mixer of one layer: `ws.h` (normed input, `t` rows) to `ws.y`, appending
     /// K/V at cache rows `pos0..` of `kv`.
     #[allow(clippy::too_many_arguments)]
@@ -2363,6 +2379,7 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(BatchWorkspace {
             max_seqs,
             window,
+            scoring: false,
             qkv: per_layer(c.gdn_qkv())?,
             conv_out: per_layer(c.gdn_qkv())?,
             ab: per_layer(2 * c.gdn_v_heads)?,
@@ -2395,6 +2412,11 @@ impl<B: Backend> Qwen35Text<B> {
     ) -> Result<Vec<Vec<Vec<(u32, f32)>>>> {
         self.expert_tick(b, windows.iter().map(|w| w.len()).sum())?;
         let n = windows.len();
+        if bw.scoring {
+            return Err(Error::Config(
+                "verify_batch on branch-scoring buffers".into(),
+            ));
+        }
         if n != sessions.len() || n == 0 || n > bw.max_seqs {
             return Err(Error::Shape(format!(
                 "verify_batch: {n} windows for {} sessions (at most {})",
@@ -2547,6 +2569,129 @@ impl<B: Backend> Qwen35Text<B> {
         Ok(())
     }
 
+    /// Buffers for [`Self::score_windows`]: `max_seqs * window` rows per forward pass (`window` at
+    /// most [`VERIFY_MAX`]), in windows of any length up to that. Scoring never commits, so one
+    /// set of GDN rows serves every layer (ninfer's throwaway ReplaySSM records) and no per-row
+    /// logits are kept: about `max_seqs * window * 2 * gdn_qkv` floats.
+    pub fn score_workspace(
+        &self,
+        b: &B,
+        max_seqs: usize,
+        window: usize,
+    ) -> Result<BatchWorkspace<B>> {
+        let c = &self.cfg;
+        let window = window.clamp(1, VERIFY_MAX);
+        let rows = max_seqs.max(1) * window;
+        Ok(BatchWorkspace {
+            max_seqs: max_seqs.max(1),
+            window,
+            scoring: true,
+            qkv: vec![b.alloc(rows * c.gdn_qkv())?],
+            conv_out: vec![b.alloc(rows * c.gdn_qkv())?],
+            ab: vec![b.alloc(rows * 2 * c.gdn_v_heads)?],
+            // Only verify_batch and mixed_step use these (scoring windows attend from the
+            // workspace's rows; see `attend_windows`).
+            q: b.alloc(1)?,
+            k: b.alloc(1)?,
+            v: b.alloc(1)?,
+            attn: b.alloc(1)?,
+            hidden: b.alloc(1)?,
+            logits: b.alloc(1)?,
+            o: b.alloc(1)?,
+        })
+    }
+
+    /// Scores continuations of `s`'s prompt without changing the session: each of `windows` (at
+    /// most `sw`'s rows) is fed from `s.pos` as if it were the only one, and the log-probabilities
+    /// (over the first `limit` ids) of `targets` after its last token are returned, window-major.
+    /// As many windows as `sw`'s rows hold (padded to the longest) share a forward pass, so every
+    /// weight is read once per pass rather than once per window, and each op takes every window of
+    /// the pass in one call. The GDN layers read the session's state and write scratch; window `i`'s
+    /// keys and values are written to the cache rows from `s.pos + i * longest` (rows past the
+    /// prompt hold nothing afterwards, as after a rejected verify). `ws`'s rows are overwritten.
+    #[allow(clippy::too_many_arguments)]
+    pub fn score_windows(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut Workspace<B>,
+        sw: &mut BatchWorkspace<B>,
+        windows: &[&[u32]],
+        targets: &[u32],
+        limit: usize,
+    ) -> Result<Vec<f32>> {
+        let (c, w) = (&self.cfg, &self.w);
+        if !sw.scoring {
+            return Err(Error::Config(
+                "score_windows needs score_workspace buffers".into(),
+            ));
+        }
+        // The buffers hold `max_seqs * window` rows, in windows of any length.
+        let cap = (sw.max_seqs * sw.window).min(ws.max_tokens);
+        let longest = windows.iter().map(|w| w.len()).max().unwrap_or(0);
+        if windows.iter().any(|w| w.is_empty()) || longest == 0 || longest > cap {
+            return Err(Error::Shape(format!(
+                "score_windows takes 1..={cap} tokens per window"
+            )));
+        }
+        if s.pos == 0 {
+            return Err(Error::Config("score_windows needs a prompt".into()));
+        }
+        if s.pos + longest > s.capacity {
+            return Err(Error::Config(format!(
+                "{} + {longest} tokens exceed session capacity {}",
+                s.pos, s.capacity
+            )));
+        }
+        // Window i's keys and values go to cache rows s.pos + i * longest.
+        let per_pass = (cap / longest).min((s.capacity - s.pos) / longest);
+        s.prepare_kv(b, s.pos, s.pos + per_pass.min(windows.len()) * longest)?;
+        let mut out = Vec::with_capacity(windows.len() * targets.len());
+        for group in windows.chunks(per_pass) {
+            // Every window is padded to the longest (repeating its last token), so the windows
+            // of a pass are one shape for the batched kernels: tokens after a window's last one
+            // do not change that row (attention and the recurrences are causal).
+            let n = group.len();
+            let mut ids = Vec::with_capacity(n * longest);
+            let mut last = Vec::with_capacity(n);
+            for win in group {
+                last.push(ids.len() + win.len() - 1);
+                ids.extend_from_slice(win);
+                ids.resize(ids.len() + longest - win.len(), win[win.len() - 1]);
+            }
+            let rows: Vec<(usize, usize)> = (0..n).map(|i| (i * longest, longest)).collect();
+            self.expert_tick(b, ids.len())?;
+            // Eager: a pass is a few launches per layer (the windows batched in each op).
+            self.chunk_batch(b, None, &[], &mut [&mut *s], ws, sw, &ids, &rows)?;
+            // Each window's last row, final-normed, through the output head; the head's rows hold
+            // VERIFY_MAX at a time.
+            for part in last.chunks(VERIFY_MAX.min(ws.max_tokens)) {
+                for (j, &row) in part.iter().enumerate() {
+                    b.copy(&ws.x, row * c.hidden, &mut ws.h, j * c.hidden, c.hidden)?;
+                }
+                let g = part.len();
+                b.rms_norm(
+                    &ws.h,
+                    w.param(w.final_norm),
+                    &mut ws.hidden,
+                    g,
+                    c.hidden,
+                    c.eps,
+                    NormKind::Offset,
+                )?;
+                b.linear(&ws.hidden, &w.view(&w.head), &mut ws.logits_rows, g)?;
+                out.extend(b.log_softmax_gather(
+                    &ws.logits_rows,
+                    g,
+                    c.vocab,
+                    limit.min(c.vocab),
+                    targets,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
     /// One forward pass carrying a prefill chunk of one sequence and speculative verify windows of
     /// others (see [`Self::verify_batch`]): the chunk takes rows `0 .. T` of the workspace and
     /// window `i` the rows after it (plus the earlier windows' lengths). Projections and MLPs run
@@ -2573,6 +2718,9 @@ impl<B: Backend> Qwen35Text<B> {
         let (c, w) = (&self.cfg, &self.w);
         let n = windows.len();
         let tp = prefill.ids.len();
+        if bw.scoring {
+            return Err(Error::Config("mixed_step on branch-scoring buffers".into()));
+        }
         if n != sessions.len() || n > bw.max_seqs || tp == 0 {
             return Err(Error::Shape(format!(
                 "mixed_step: {tp} prefill tokens, {n} windows for {} sessions (at most {})",
@@ -2683,7 +2831,8 @@ impl<B: Backend> Qwen35Text<B> {
     /// `i` at verify rows `rows[i]` (start, length) after `T`. A prefill advances its session's
     /// state in place (snapshotting on the way); windows advance into each session's spec buffers
     /// (the state to roll back to stays in place) and keep their replay inputs in `bw` at their
-    /// verify rows; attention appends to each session's cache.
+    /// verify rows; attention appends to each session's cache. With scoring buffers
+    /// ([`BatchWorkspace::scoring`]) every window continues `sessions[0]`.
     #[allow(clippy::too_many_arguments)]
     fn chunk_batch(
         &self,
@@ -2772,12 +2921,14 @@ impl<B: Backend> Qwen35Text<B> {
                     norm,
                 } => {
                     let (cw, al, dt) = (w.param(*conv), w.param(*a_log), w.param(*dt_bias));
+                    // The window rows' set in `bw` (scoring buffers hold one for every layer).
+                    let rg = if bw.scoring { 0 } else { gi };
                     {
                         // Without a prefill the projections land in the replay buffers directly.
                         let (qkv_buf, ab_buf) = if tp > 0 {
                             (&mut ws.qkv, &mut ws.ab)
                         } else {
-                            (&mut bw.qkv[gi], &mut bw.ab[gi])
+                            (&mut bw.qkv[rg], &mut bw.ab[rg])
                         };
                         match qkvz.as_ref().filter(|_| t <= FUSE_MAX_TOKENS) {
                             Some(f) => {
@@ -2825,8 +2976,8 @@ impl<B: Backend> Qwen35Text<B> {
                     if let Some(p) = pre.as_deref_mut() {
                         if v > 0 {
                             let (qw, abw) = (c.gdn_qkv(), 2 * c.gdn_v_heads);
-                            b.copy(&ws.qkv, tp * qw, &mut bw.qkv[gi], 0, v * qw)?;
-                            b.copy(&ws.ab, tp * abw, &mut bw.ab[gi], 0, v * abw)?;
+                            b.copy(&ws.qkv, tp * qw, &mut bw.qkv[rg], 0, v * qw)?;
+                            b.copy(&ws.ab, tp * abw, &mut bw.ab[rg], 0, v * abw)?;
                         }
                         let pos0 = p.s.pos;
                         let Session {
@@ -2866,12 +3017,56 @@ impl<B: Backend> Qwen35Text<B> {
                             row0 = end;
                         }
                     }
-                    for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
+                    if bw.scoring {
+                        // Scoring windows (equal lengths, back to back from row 0; see
+                        // `score_windows`) all start from the session's state, which they only
+                        // read: one call each for every window.
                         let Session {
                             conv: s_conv,
                             ssm: s_ssm,
                             ..
-                        } = &mut **s;
+                        } = &*sessions[0];
+                        let (r0, m) = rows[0];
+                        let cs = ConvShape {
+                            tokens: m,
+                            channels: c.gdn_qkv(),
+                            width: c.conv_width,
+                            row0: r0,
+                        };
+                        let gs = GdnShape {
+                            tokens: m,
+                            k_heads: c.gdn_k_heads,
+                            v_heads: c.gdn_v_heads,
+                            k_dim: c.gdn_k_dim,
+                            v_dim: c.gdn_v_dim,
+                            row0: r0,
+                        };
+                        b.conv1d_silu_windows(
+                            &bw.qkv[0],
+                            cw,
+                            &s_conv[gi],
+                            &mut bw.conv_out[0],
+                            cs,
+                            rows.len(),
+                        )?;
+                        b.gated_delta_net_windows(
+                            &bw.conv_out[0],
+                            &bw.ab[0],
+                            al,
+                            dt,
+                            &s_ssm[gi],
+                            &mut ws.o,
+                            gs,
+                            rows.len(),
+                        )?;
+                    }
+                    for (i, &(r0, m)) in rows.iter().enumerate().filter(|_| !bw.scoring) {
+                        // Windows read the session's state and write scratch.
+                        let Session {
+                            conv: s_conv,
+                            ssm: s_ssm,
+                            ..
+                        } = &*sessions[i];
                         let (sc, ss) = ws.spec_state.as_mut().expect("ensure_spec_state ran");
                         let cs = ConvShape {
                             tokens: m,
@@ -2888,18 +3083,18 @@ impl<B: Backend> Qwen35Text<B> {
                             row0: r0,
                         };
                         b.conv1d_silu_from(
-                            &bw.qkv[gi],
+                            &bw.qkv[rg],
                             cw,
                             &s_conv[gi],
                             sc,
-                            &mut bw.conv_out[gi],
+                            &mut bw.conv_out[rg],
                             cs,
                         )?;
                         // Window outputs go to the workspace's rows after the prefill.
                         let o = if tp > 0 { &mut bw.o } else { &mut ws.o };
                         b.gated_delta_net_out(
-                            &bw.conv_out[gi],
-                            &bw.ab[gi],
+                            &bw.conv_out[rg],
+                            &bw.ab[rg],
                             al,
                             dt,
                             &s_ssm[gi],
@@ -3074,7 +3269,11 @@ impl<B: Backend> Qwen35Text<B> {
             let pos0 = p.s.pos;
             self.attend_rows(b, ws, &mut p.s.kv[ai], kv_format, tp, pos0, rope)?;
         }
-        for (s, &(r0, m)) in sessions.iter_mut().zip(rows) {
+        if bw.scoring {
+            self.attend_windows(b, ws, &mut *sessions[0], ai, rows)?;
+        }
+        for (i, &(r0, m)) in rows.iter().enumerate().filter(|_| !bw.scoring) {
+            let s = &mut *sessions[i];
             let r = tp + r0;
             b.copy(&ws.qn, r * qd, &mut bw.q, 0, m * qd)?;
             b.copy(&ws.kn, r * kd, &mut bw.k, 0, m * kd)?;
@@ -3116,6 +3315,74 @@ impl<B: Backend> Qwen35Text<B> {
         b.sigmoid_mul(&mut ws.attn, &ws.g, t * qd)?;
         b.linear(&ws.attn, &w.view(output), &mut ws.y, t)?;
         Ok(())
+    }
+
+    /// Attention of layer `ai` for scoring windows (equal lengths, back to back from row 0 of
+    /// `ws`; see `score_windows`) over the session's prompt: every window is rotated at the
+    /// positions after the prompt and stored at its own cache rows after it (window `i` from
+    /// `s.pos + i * len`), then all attend in one call, each to the prompt and its own rows.
+    fn attend_windows(
+        &self,
+        b: &B,
+        ws: &mut Workspace<B>,
+        s: &mut Session<B>,
+        ai: usize,
+        rows: &[(usize, usize)],
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let (len, t) = (rows[0].1, rows.len() * rows[0].1);
+        let pos0 = s.pos;
+        let rope_pos0 = u32::try_from(pos0 as i64 + s.rope_delta)
+            .map_err(|_| Error::Shape("rotary position out of range".into()))?;
+        // Row j of every window sits at position pos0 + j: the same on every axis (text).
+        let row_pos: Vec<u32> = (0..t).map(|r| rope_pos0 + (r % len) as u32).collect();
+        let positions = row_pos.repeat(3);
+        let rope = |heads| RopePosShape {
+            tokens: t,
+            heads,
+            head_dim: c.head_dim,
+            rotary_dim: c.rotary_dim,
+            theta: c.rope_theta,
+            axes: 3,
+            layout: RopeLayout::Interleaved,
+        };
+        b.rope_positions(&mut ws.qn, &positions, rope(c.heads))?;
+        b.rope_positions(&mut ws.kn, &positions, rope(c.kv_heads))?;
+        let kv_format = s.kv_format;
+        let (kc, vc) = &mut s.kv[ai];
+        let store = KvStoreShape {
+            tokens: t,
+            kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            pos0,
+            format: kv_format,
+        };
+        b.kv_store(&ws.kn, &ws.v, kc, vc, store)?;
+        let shape = AttnShape {
+            tokens: t,
+            heads: c.heads,
+            kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            pos0,
+            kv: KvFormat::F32,
+        };
+        if kv_format == KvFormat::F32 {
+            return b.attention_windows(&ws.qn, kc, vc, &mut ws.attn, shape, len);
+        }
+        // The rows the cache represents (the windows' too, as they were stored), in f32.
+        let need = (pos0 + t) * c.kv_dim();
+        if ws.kv_f32.as_ref().is_none_or(|(k, _)| b.len(k) < need) {
+            let cap = need.next_power_of_two();
+            ws.kv_f32 = Some((b.alloc(cap)?, b.alloc(cap)?));
+        }
+        let (kf, vf) = ws.kv_f32.as_mut().expect("allocated above");
+        let all = KvStoreShape {
+            tokens: pos0 + t,
+            pos0: 0,
+            ..store
+        };
+        b.kv_load(kc, vc, kf, vf, all)?;
+        b.attention_windows(&ws.qn, kf, vf, &mut ws.attn, shape, len)
     }
 
     /// Final norm and output head for the last advanced row, into `ws.logits`.

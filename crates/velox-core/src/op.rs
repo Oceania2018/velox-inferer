@@ -53,6 +53,10 @@ pub enum Op {
     AttentionSparse,
     StatePack,
     StateUnpack,
+    LogSoftmaxGather,
+    Conv1dSiluWindows,
+    GatedDeltaNetWindows,
+    AttentionWindows,
 }
 
 impl Op {
@@ -103,6 +107,10 @@ impl Op {
         Op::AttentionSparse,
         Op::StatePack,
         Op::StateUnpack,
+        Op::LogSoftmaxGather,
+        Op::Conv1dSiluWindows,
+        Op::GatedDeltaNetWindows,
+        Op::AttentionWindows,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -153,6 +161,10 @@ impl Op {
             Op::AttentionSparse => "attention_sparse",
             Op::StatePack => "state_pack",
             Op::StateUnpack => "state_unpack",
+            Op::LogSoftmaxGather => "log_softmax_gather",
+            Op::Conv1dSiluWindows => "conv1d_silu_windows",
+            Op::GatedDeltaNetWindows => "gated_delta_net_windows",
+            Op::AttentionWindows => "attention_windows",
         }
     }
 }
