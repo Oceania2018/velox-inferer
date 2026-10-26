@@ -58,6 +58,19 @@ extern "C" {
         pos0: i32,
         scale: f32,
     ) -> i32;
+    fn velox_5060_attention_windows(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        window: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
+    ) -> i32;
     fn velox_5060_attention_verify_nvfp4(
         q: *const f32,
         k: *const u8,
@@ -1272,6 +1285,55 @@ impl CudaKernels for Rtx5060Kernels {
                 )
             },
             "rtx5060 attention prefill",
+        )
+    }
+
+    /// Scoring windows take the flash schedule where `attention` does, over f16 operands: E4M3
+    /// scores move the candidate distributions a window is read for.
+    fn attention_windows_precision(&self, s: AttnShape) -> AttnPrecision {
+        if s.kv == KvFormat::F32
+            && s.tokens >= FLASH_MIN_TOKENS
+            && s.head_dim == 256
+            && s.heads % s.kv_heads == 0
+            && s.kv_len() <= i32::MAX as usize
+        {
+            AttnPrecision::F16
+        } else {
+            AttnPrecision::Exact
+        }
+    }
+
+    fn attention_windows(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: AttnShape,
+        window: usize,
+    ) -> Result<()> {
+        if self.attention_windows_precision(s) == AttnPrecision::Exact {
+            return portable::attention_windows(q, k, v, out, s, window);
+        }
+        velox_core::check::attention_windows(q.len(), k.len(), v.len(), out.len(), &s, window)?;
+        // SAFETY: extents validated above.
+        status(
+            unsafe {
+                velox_5060_attention_windows(
+                    q.as_ptr(),
+                    k.as_ptr(),
+                    v.as_ptr(),
+                    out.as_mut_ptr(),
+                    to_i32("tokens", s.tokens)?,
+                    to_i32("window", window)?,
+                    to_i32("heads", s.heads)?,
+                    to_i32("kv_heads", s.kv_heads)?,
+                    to_i32("head_dim", s.head_dim)?,
+                    to_i32("pos0", s.pos0)?,
+                    s.scale(),
+                )
+            },
+            "rtx5060 attention windows",
         )
     }
 
