@@ -3401,6 +3401,18 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.embed(f, 12, 512, &[11, 0, 5])?;
         s.linear_swiglu(f, 512, 24, 0, 2, false, true)?;
     }
+    // Dense GGML under AllowA8 with K a multiple of 1024, where hardware variants run their wide
+    // kernels (int8 activations: dp4a up to 16 tokens, tensor cores above): IQ1_S, whose scale and
+    // delta cover 32 values, over odd row views and every token width.
+    {
+        let f = WeightFormat::Ggml(velox_core::ggml::GgmlType::Iq1S);
+        let a8 = ActPolicy::AllowA8;
+        for m in [1, 3, 8, 16, 17, 70, 200] {
+            s.linear_act(f, 140, 2048, 5, 100, m, a8)?;
+        }
+        s.linear_swiglu_with(f, 2048, 40, 0, 8, false, false, a8)?;
+        s.linear_swiglu_with(f, 2048, 40, 0, 70, false, true, a8)?;
+    }
     // Blocks of 64 / 32 values: K a multiple of the block but not of 256, odd row views, decode,
     // verify and tiled widths.
     {
