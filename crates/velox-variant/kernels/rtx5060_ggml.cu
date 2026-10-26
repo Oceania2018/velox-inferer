@@ -1473,7 +1473,7 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
     constexpr bool kHalves = Traits<T>::G != 1 && !kFold && !kSplit;
     constexpr bool kOff = T == kQ2K || T == kQ4K;
     // 128 tokens double the int32 sums; the sub-block unroll that measured best per type.
-    constexpr int kUnroll = TOK == 64 ? kPreSbUnroll : T == kIq1M ? 2 : T == kIq2Xs || T == kIq2Xxs ? 4 : 8;
+    constexpr int kUnroll = TOK == 64 ? kPreSbUnroll : T == kIq1M || T == kIq2S ? 2 : T == kIq2Xs || T == kIq2Xxs ? 4 : 8;
     __shared__ __align__(16) int8_t act[2][TOK * kQ2S];
     __shared__ float sxs[2][TOK];
     // Each warp's 16 rows of the super-block, copied from the 4-byte aligned address at or below it
@@ -1517,9 +1517,12 @@ __global__ void __launch_bounds__(WARPS * VELOX_WARP)
             cp_async4(&wst[warp][buf][r][c],
                       src + static_cast<uint32_t>(min(r, last)) * static_cast<uint32_t>(row_bytes) + 4u * c);
         }
-        cp_async_commit();
+        // The token scales too: a plain load here would stall these warps on global latency at
+        // every super-block, and the block barrier the rest.
         if (threadIdx.x < TOK)
-            sxs[buf][threadIdx.x] = sx[static_cast<long long>(kb) * stride + min(t0 + static_cast<int>(threadIdx.x), m - 1)];
+            cp_async4(&sxs[buf][threadIdx.x],
+                      sx + static_cast<long long>(kb) * stride + min(t0 + static_cast<int>(threadIdx.x), m - 1));
+        cp_async_commit();
     };
     float acc[NT][4];
 #pragma unroll
