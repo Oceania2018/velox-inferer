@@ -658,3 +658,80 @@ fn text_config_takes_the_moe_architecture() {
     assert_eq!(v["architectures"][0], MOE_ARCHITECTURE);
     assert!(v.get("intermediate_size").is_none());
 }
+
+/// Branch scoring against each branch fed alone: per window, `score_windows` returns the
+/// log-softmax the plain forward gives after it, and the session still holds the prompt after.
+#[test]
+fn score_windows_match_each_window_fed_alone() {
+    use crate::qwen3_5::{ExpertPolicy, Qwen35Text};
+    use velox_core::backend::log_softmax_gather_row;
+
+    let dir = std::env::temp_dir().join(format!(
+        "velox-hf-{}",
+        velox_weights::hex(&velox_weights::new_artifact_id())
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    checkpoint(&dir);
+    let out = dir.join("model.vi");
+    import(&dir, &out, &mut |_| {}).unwrap();
+    let art = Artifact::open(&out).unwrap();
+    let cfg = TextConfig::from_json(&art.components()["text"]["config"]).unwrap();
+    let b = CpuBackend;
+    let w = TextWeights::load_opts(&b, &art, &cfg, false, &[], |_| {}).unwrap();
+    let mut model = Qwen35Text::new(cfg, w);
+    model
+        .enable_experts(&b, 0, ExpertPolicy::default())
+        .unwrap();
+    let mut ws = model.workspace(&b, 32).unwrap();
+    // An encoded cache too (bf16: the test model's heads are too narrow for fp8 and nvfp4): the
+    // windows attend over the rows it represents.
+    for fmt in [velox_core::KvFormat::F32, velox_core::KvFormat::Bf16] {
+        let mut s = model.session_with(&b, 64, fmt).unwrap();
+        let prompt: Vec<u32> = (0..19).map(|i| (i * 37 + 11) % V as u32).collect();
+        model
+            .advance(&b, &mut s, &mut ws, &prompt, None, &[])
+            .unwrap();
+        let at_prompt = s.checkpoint(&b).unwrap();
+
+        let windows: Vec<Vec<u32>> = vec![
+            vec![7],
+            vec![7, 200, 3],
+            vec![7, 1, 2, 3, 4, 5],
+            vec![9, 9],
+            (1..=10).collect(),
+        ];
+        let targets = [0u32, 5, 17, (V - 1) as u32];
+        let mut want = Vec::new();
+        for win in &windows {
+            s.restore(&b, &at_prompt).unwrap();
+            model.advance(&b, &mut s, &mut ws, win, None, &[]).unwrap();
+            let logits = model.logits(&b, &mut ws).unwrap();
+            want.extend(log_softmax_gather_row(&logits[..V as usize], &targets));
+        }
+        s.restore(&b, &at_prompt).unwrap();
+        // Twelve rows per pass: pass boundaries fall between windows, and the 10-token window
+        // has a pass of its own.
+        let mut sw = model.score_workspace(&b, 2, 6).unwrap();
+        let refs: Vec<&[u32]> = windows.iter().map(|w| &w[..]).collect();
+        let got = model
+            .score_windows(&b, &mut s, &mut ws, &mut sw, &refs, &targets, V as usize)
+            .unwrap();
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= 1e-4 * (1.0 + w.abs()), "{fmt}: {g} vs {w}");
+        }
+
+        // The next token sees the prompt's state, exactly as from the checkpoint.
+        assert_eq!(s.pos, prompt.len());
+        model
+            .advance(&b, &mut s, &mut ws, &[42], None, &[])
+            .unwrap();
+        let after = model.logits(&b, &mut ws).unwrap();
+        s.restore(&b, &at_prompt).unwrap();
+        model
+            .advance(&b, &mut s, &mut ws, &[42], None, &[])
+            .unwrap();
+        assert_eq!(after, model.logits(&b, &mut ws).unwrap(), "{fmt}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

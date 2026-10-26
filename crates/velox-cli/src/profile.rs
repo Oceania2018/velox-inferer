@@ -487,6 +487,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_precision(s)
     }
+    fn attention_windows_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
+        self.inner.attention_windows_precision(s)
+    }
     fn attention_full_precision(&self, s: FullAttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_full_precision(s)
     }
@@ -607,6 +610,61 @@ impl<B: Backend> Backend for Profiled<B> {
         k: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         self.time("top_k", || self.inner.top_k(x, rows, row_len, limit, k))
+    }
+    fn log_softmax_gather(
+        &self,
+        x: &B::Buffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        self.time("log_softmax_gather", || {
+            self.inner.log_softmax_gather(x, rows, row_len, limit, ids)
+        })
+    }
+    fn conv1d_silu_windows(
+        &self,
+        x: &B::Buffer,
+        w: &B::Buffer,
+        si: &B::Buffer,
+        out: &mut B::Buffer,
+        s: ConvShape,
+        windows: usize,
+    ) -> Result<()> {
+        self.time("conv1d_silu_windows", || {
+            self.inner.conv1d_silu_windows(x, w, si, out, s, windows)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_windows(
+        &self,
+        qkv: &B::Buffer,
+        ab: &B::Buffer,
+        a_log: &B::Buffer,
+        dt_bias: &B::Buffer,
+        si: &B::Buffer,
+        out: &mut B::Buffer,
+        s: GdnShape,
+        windows: usize,
+    ) -> Result<()> {
+        self.time("gated_delta_net_windows", || {
+            self.inner
+                .gated_delta_net_windows(qkv, ab, a_log, dt_bias, si, out, s, windows)
+        })
+    }
+    fn attention_windows(
+        &self,
+        q: &B::Buffer,
+        k: &B::Buffer,
+        v: &B::Buffer,
+        out: &mut B::Buffer,
+        s: AttnShape,
+        window: usize,
+    ) -> Result<()> {
+        self.time("attention_windows", || {
+            self.inner.attention_windows(q, k, v, out, s, window)
+        })
     }
     fn rope_positions(&self, x: &mut B::Buffer, p: &[u32], s: RopePosShape) -> Result<()> {
         self.time("rope_positions", || self.inner.rope_positions(x, p, s))

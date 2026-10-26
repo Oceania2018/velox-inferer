@@ -1056,6 +1056,123 @@ pub trait Backend {
     ) -> Result<()> {
         self.gated_delta_net_from(qkv, ab, a_log, dt_bias, state_in, scratch, out, shape)
     }
+    /// Scoring windows: [`Self::conv1d_silu_from`] over each of `windows` windows of
+    /// `shape.tokens` rows (window `w` at rows `shape.row0 + w * shape.tokens` of `x` and `out`),
+    /// every one from `state_in`, which is not written; no state after a window is kept.
+    fn conv1d_silu_windows(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        state_in: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: ConvShape,
+        windows: usize,
+    ) -> Result<()> {
+        crate::check::conv1d_windows(
+            self.len(x),
+            self.len(weight),
+            self.len(state_in),
+            self.len(out),
+            &shape,
+            windows,
+        )?;
+        let mut scratch = self.alloc(self.len(state_in))?;
+        for w in 0..windows {
+            let s = ConvShape {
+                row0: shape.row0 + w * shape.tokens,
+                ..shape
+            };
+            self.conv1d_silu_from(x, weight, state_in, &mut scratch, out, s)?;
+        }
+        Ok(())
+    }
+    /// Scoring windows: [`Self::gated_delta_net_out`] over each of `windows` windows of
+    /// `shape.tokens` rows (window `w` at rows `shape.row0 + w * shape.tokens` of `qkv`, `ab` and
+    /// `out`), every one from `state_in`, which is not written.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_windows(
+        &self,
+        qkv: &Self::Buffer,
+        ab: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        state_in: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: GdnShape,
+        windows: usize,
+    ) -> Result<()> {
+        crate::check::gdn_windows(
+            self.len(qkv),
+            self.len(ab),
+            self.len(a_log),
+            self.len(dt_bias),
+            self.len(state_in),
+            self.len(out),
+            &shape,
+            windows,
+        )?;
+        let mut scratch = self.alloc(self.len(state_in))?;
+        for w in 0..windows {
+            let s = GdnShape {
+                row0: shape.row0 + w * shape.tokens,
+                ..shape
+            };
+            self.gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, &mut scratch, out, s)?;
+        }
+        Ok(())
+    }
+    /// Scoring windows over a shared prefix, f32 keys and values (`shape.kv` is
+    /// [`KvFormat::F32`]): `q` and `out` are `[shape.tokens, heads, head_dim]` in windows of
+    /// `window` rows; `k` and `v` hold the prefix at rows `0 .. shape.pos0` and window `w`'s rows
+    /// at `shape.pos0 + w * window ..`. Row `j` of window `w` (query row `w * window + j`, at
+    /// position `pos0 + j`) attends to the prefix and to rows `0 ..= j` of its window, as
+    /// [`Self::attention`] over the prefix followed by that window alone would. Rounds its
+    /// operands as [`Self::attention_windows_precision`] reports for `shape`.
+    fn attention_windows(
+        &self,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: AttnShape,
+        window: usize,
+    ) -> Result<()> {
+        crate::check::attention_windows(
+            self.len(q),
+            self.len(k),
+            self.len(v),
+            self.len(out),
+            &shape,
+            window,
+        )?;
+        // Each window alone after a copy of the prefix.
+        let (p, kv_row, q_row) = (
+            shape.pos0,
+            shape.kv_heads * shape.head_dim,
+            shape.heads * shape.head_dim,
+        );
+        let mut kw = self.alloc((p + window) * kv_row)?;
+        let mut vw = self.alloc((p + window) * kv_row)?;
+        let mut qw = self.alloc(window * q_row)?;
+        let mut ow = self.alloc(window * q_row)?;
+        if p > 0 {
+            self.copy(k, 0, &mut kw, 0, p * kv_row)?;
+            self.copy(v, 0, &mut vw, 0, p * kv_row)?;
+        }
+        for w in 0..shape.tokens / window {
+            let r = w * window;
+            self.copy(k, (p + r) * kv_row, &mut kw, p * kv_row, window * kv_row)?;
+            self.copy(v, (p + r) * kv_row, &mut vw, p * kv_row, window * kv_row)?;
+            self.copy(q, r * q_row, &mut qw, 0, window * q_row)?;
+            let s = AttnShape {
+                tokens: window,
+                ..shape
+            };
+            self.attention(&qw, &kw, &vw, &mut ow, s)?;
+            self.copy(&ow, 0, out, r * q_row, window * q_row)?;
+        }
+        Ok(())
+    }
     /// Advances several GDN layers over the first `gdn.tokens` rows of a window whose conv outputs
     /// are known (a speculative window replayed after a partial accept): each layer's conv state
     /// as [`Self::conv1d_silu`] and its recurrent state as [`Self::gated_delta_net`] would leave
@@ -1203,6 +1320,12 @@ pub trait Backend {
     fn attention_precision(&self, _shape: AttnShape) -> AttnPrecision {
         AttnPrecision::Exact
     }
+    /// The operand precision `attention_windows` uses for this shape (its windows are read as
+    /// distributions over a few candidates, so a backend may keep more precision than for
+    /// `attention`).
+    fn attention_windows_precision(&self, _shape: AttnShape) -> AttnPrecision {
+        AttnPrecision::Exact
+    }
     /// The operand precision `attention_full` uses for this shape.
     fn attention_full_precision(&self, _shape: FullAttnShape) -> AttnPrecision {
         AttnPrecision::Exact
@@ -1283,6 +1406,18 @@ pub trait Backend {
         limit: usize,
         k: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>>;
+    /// Log-softmax over the first `limit` values of each row of `x` (`[rows, row_len]`), read at
+    /// `ids` and returned to the host as `[rows, ids.len()]`: `x[r][id] - log(sum(exp(x[r][..limit])))`.
+    /// NaN counts as -inf. An id at or past `limit`, and every id of a row without a finite value,
+    /// reads -inf.
+    fn log_softmax_gather(
+        &self,
+        x: &Self::Buffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+    ) -> Result<Vec<f32>>;
     /// Rotary embedding with explicit per-axis positions (`[axes, tokens]`, host); see
     /// [`RopePosShape`].
     fn rope_positions(
@@ -1675,4 +1810,29 @@ pub fn top_k_row(row: &[f32], k: usize) -> Vec<(u32, f32)> {
     }
     idx.sort_unstable_by(better);
     idx.into_iter().map(|i| (i, key(row[i as usize]))).collect()
+}
+
+/// [`Backend::log_softmax_gather`] of one row (the values up to `limit`), accumulated in f64.
+pub fn log_softmax_gather_row(row: &[f32], ids: &[u32]) -> Vec<f32> {
+    let key = |v: f32| {
+        if v.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            v as f64
+        }
+    };
+    let peak = row
+        .iter()
+        .map(|&v| key(v))
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !peak.is_finite() {
+        return vec![f32::NEG_INFINITY; ids.len()];
+    }
+    let log_z = peak + row.iter().map(|&v| (key(v) - peak).exp()).sum::<f64>().ln();
+    ids.iter()
+        .map(|&id| match row.get(id as usize) {
+            Some(&v) => (key(v) - log_z) as f32,
+            None => f32::NEG_INFINITY,
+        })
+        .collect()
 }

@@ -980,6 +980,45 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `log_softmax_gather` against the f64 host reference: ids inside and past `limit`, and a NaN
+    /// at id 1 of every row; with `dead` the first row holds no finite value, so all its ids read
+    /// -inf. Every -inf must come back as -inf; the finite values go through the error metric.
+    fn log_softmax_gather(
+        &mut self,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+        dead: bool,
+    ) -> Result<()> {
+        let mut x = self.rng.vec(rows * row_len, 8.0);
+        for r in 0..rows {
+            x[r * row_len + 1] = f32::NAN;
+        }
+        if dead {
+            x[..row_len].fill(f32::NEG_INFINITY);
+        }
+        let want = CpuBackend.log_softmax_gather(&x, rows, row_len, limit, ids)?;
+        let xd = self.b.upload(&x)?;
+        let got = self.b.log_softmax_gather(&xd, rows, row_len, limit, ids)?;
+        let inf = |v: &f32| *v == f32::NEG_INFINITY;
+        let same_inf =
+            got.len() == want.len() && got.iter().zip(&want).all(|(g, w)| inf(g) == inf(w));
+        let finite =
+            |v: &[f32]| -> Vec<f32> { v.iter().map(|x| if inf(x) { 0.0 } else { *x }).collect() };
+        let mut got = finite(&got);
+        if !same_inf {
+            got.push(f32::NAN);
+        }
+        let name = format!(
+            "log_softmax_gather rows={rows} len={row_len} limit={limit} ids={}{}",
+            ids.len(),
+            if dead { " dead" } else { "" }
+        );
+        self.record(name, Some(Op::LogSoftmaxGather), &got, &finite(&want), 1e-5);
+        Ok(())
+    }
+
     fn embed(&mut self, fmt: WeightFormat, n: usize, k: usize, ids: &[u32]) -> Result<()> {
         let bytes = random_weight(&mut self.rng, fmt, n, k);
         let wc = CpuBackend.upload_bytes(&bytes)?;
@@ -1749,6 +1788,126 @@ impl<B: Backend> Suite<'_, B> {
         want_y.extend_from_slice(&c0);
         let name = format!("conv1d_silu_from c={channels} w={width} ({tokens} tokens) + states");
         self.record(name, Some(Op::Conv1dSilu), &got, &want_y, 1e-5);
+        Ok(())
+    }
+
+    /// `conv1d_silu_windows` / `gated_delta_net_windows`: `windows` scoring windows of `tokens`
+    /// rows from `row0`, every one from the same states, which must stay as they were.
+    fn gdn_windows(
+        &mut self,
+        k_heads: usize,
+        v_heads: usize,
+        dk: usize,
+        tokens: usize,
+        windows: usize,
+        row0: usize,
+    ) -> Result<()> {
+        let gs = GdnShape {
+            tokens,
+            k_heads,
+            v_heads,
+            k_dim: dk,
+            v_dim: dk,
+            row0,
+        };
+        let rows = row0 + windows * tokens;
+        let (state_len, out_len) = (v_heads * dk * dk, rows * v_heads * dk);
+        let qkv = self.rng.vec(rows * gs.qkv_width(), 1.0);
+        let ab = self.rng.vec(rows * 2 * v_heads, 2.0);
+        let (a_log, dt_bias) = (self.rng.vec(v_heads, 1.0), self.rng.vec(v_heads, 1.0));
+        let s0 = self.rng.vec(state_len, 0.1);
+        let mut want = vec![0.0; out_len];
+        CpuBackend
+            .gated_delta_net_windows(&qkv, &ab, &a_log, &dt_bias, &s0, &mut want, gs, windows)?;
+        let (qd, abd) = (self.b.upload(&qkv)?, self.b.upload(&ab)?);
+        let (ad, dd, sd) = (
+            self.b.upload(&a_log)?,
+            self.b.upload(&dt_bias)?,
+            self.b.upload(&s0)?,
+        );
+        let mut od = self.b.alloc(out_len)?;
+        self.b
+            .gated_delta_net_windows(&qd, &abd, &ad, &dd, &sd, &mut od, gs, windows)?;
+        let skip = row0 * v_heads * dk;
+        let mut got = fetch(self.b, &od, out_len)?.split_off(skip);
+        got.extend(fetch(self.b, &sd, state_len)?);
+        let mut want = want.split_off(skip);
+        want.extend_from_slice(&s0);
+        let name = format!(
+            "gated_delta_net_windows heads {k_heads}/{v_heads} d {dk} ({windows} x {tokens} tokens at row {row0}) + state_in"
+        );
+        self.record(name, Some(Op::GatedDeltaNetWindows), &got, &want, 1e-4);
+
+        let (channels, width) = (gs.qkv_width(), 4);
+        let cs = ConvShape {
+            tokens,
+            channels,
+            width,
+            row0,
+        };
+        let w = self.rng.vec(width * channels, 0.5);
+        let c0 = self.rng.vec((width - 1) * channels, 1.0);
+        let mut want = vec![0.0; rows * channels];
+        CpuBackend.conv1d_silu_windows(&qkv, &w, &c0, &mut want, cs, windows)?;
+        let (wd, cd) = (self.b.upload(&w)?, self.b.upload(&c0)?);
+        let mut yd = self.b.alloc(rows * channels)?;
+        self.b
+            .conv1d_silu_windows(&qd, &wd, &cd, &mut yd, cs, windows)?;
+        let skip = row0 * channels;
+        let mut got = fetch(self.b, &yd, rows * channels)?.split_off(skip);
+        got.extend(fetch(self.b, &cd, c0.len())?);
+        let mut want = want.split_off(skip);
+        want.extend_from_slice(&c0);
+        let name = format!(
+            "conv1d_silu_windows c={channels} w={width} ({windows} x {tokens} tokens at row {row0}) + state_in"
+        );
+        self.record(name, Some(Op::Conv1dSiluWindows), &got, &want, 1e-5);
+        Ok(())
+    }
+
+    /// `attention_windows`: `windows` windows of `window` query rows over a `prefix`-row prefix,
+    /// f32 keys and values; the reference rounds its inputs as the backend reports.
+    fn attention_windows(
+        &mut self,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        prefix: usize,
+        window: usize,
+        windows: usize,
+    ) -> Result<()> {
+        let s = AttnShape {
+            tokens: windows * window,
+            heads,
+            kv_heads,
+            head_dim,
+            pos0: prefix,
+            kv: KvFormat::F32,
+        };
+        let q_len = s.tokens * heads * head_dim;
+        let kv_len = s.kv_len() * kv_heads * head_dim;
+        let q = self.rng.vec(q_len, 2.0);
+        let k = self.rng.vec(kv_len, 2.0);
+        let v = self.rng.vec(kv_len, 1.0);
+        let precision = self.b.attention_windows_precision(s);
+        let (mut qr, mut kr, mut vr) = (q.clone(), k.clone(), v.clone());
+        round_attention_inputs(&mut qr, &mut kr, &mut vr, s, precision);
+        let mut want = vec![0.0; q_len];
+        CpuBackend.attention_windows(&qr, &kr, &vr, &mut want, s, window)?;
+        let (qd, kd, vd) = (self.b.upload(&q)?, self.b.upload(&k)?, self.b.upload(&v)?);
+        let mut od = self.b.alloc(q_len)?;
+        self.b
+            .attention_windows(&qd, &kd, &vd, &mut od, s, window)?;
+        let got = fetch(self.b, &od, q_len)?;
+        let (tag, tol) = match precision {
+            AttnPrecision::Exact => ("", 2e-4),
+            AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+            AttnPrecision::F16 => (" f16", 2e-3),
+        };
+        let name = format!(
+            "attention_windows h={heads}/{kv_heads} d={head_dim} prefix={prefix} {windows} x {window}{tag}"
+        );
+        self.record(name, Some(Op::AttentionWindows), &got, &want, tol);
         Ok(())
     }
 
@@ -2798,6 +2957,20 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.top_k(7, 131_072, 130_001, 12, true)?;
     s.top_k(2, 20_000, 20_000, 32, true)?;
     s.top_k(2, 20_000, 20_000, 33, true)?;
+    // System One scoring: rating digits over the Qwen head, ids past the public vocabulary, NaN.
+    // On their own seed, so the cases after them keep their data.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x5157));
+    s.log_softmax_gather(
+        2,
+        248_320,
+        248_077,
+        &[0, 1, 15, 24, 248_076, 248_077, 248_319],
+        false,
+    )?;
+    s.log_softmax_gather(16, 248_320, 248_077, &[15, 16, 17, 18, 19], false)?;
+    s.log_softmax_gather(3, 5000, 4097, &[7, 4096, 4097], true)?;
+    s.log_softmax_gather(1, 50, 50, &(0..50).collect::<Vec<u32>>(), false)?;
+    s.rng = rng;
     s.argmax_to(248_320, 248_077, false)?;
     s.argmax_to(5000, 4097, true)?;
     s.argmax_to(50, 50, false)?;
@@ -3028,6 +3201,18 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.state_from(16, 48, 128, 8)?;
     s.state_from(2, 6, 64, 3)?;
     s.state_from(2, 4, 128, 20)?;
+    // System One scoring windows: Qwen3.8's GDN heads, short and long windows, a row offset; on
+    // their own seed.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x5158));
+    s.gdn_windows(16, 48, 128, 6, 40, 0)?;
+    s.gdn_windows(2, 6, 64, 1, 3, 5)?;
+    s.gdn_windows(2, 4, 128, 20, 3, 0)?;
+    s.attention_windows(24, 4, 256, 300, 6, 20)?;
+    s.attention_windows(24, 4, 256, 611, 5, 40)?;
+    s.attention_windows(8, 2, 128, 37, 3, 7)?;
+    s.attention_windows(4, 4, 64, 0, 5, 2)?;
+    s.attention_windows(16, 2, 64, 1_500, 1, 3)?;
+    s.rng = rng;
     s.gdn_replay(3, 8, 5, 0)?;
     s.gdn_replay(2, 8, 1, 0)?;
     s.gdn_replay(2, 12, 12, 0)?;

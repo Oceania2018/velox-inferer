@@ -5,9 +5,9 @@
 //! change its numerics.
 
 use velox_core::backend::{
-    top_k_row, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
-    DilatedConvShape, DynConvShape, ExpertBank, ExpertMatrix, FullAttnShape, GdnShape, GeluKind,
-    HcCombineShape, KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape,
+    log_softmax_gather_row, top_k_row, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
+    Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank, ExpertMatrix, FullAttnShape, GdnShape,
+    GeluKind, HcCombineShape, KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape,
     RopePosShape, RopeShape, RowGateShape, WeightView,
 };
 use velox_core::format::decode_rows;
@@ -734,6 +734,20 @@ impl Backend for CpuBackend {
         check::top_k(x.len(), rows, row_len, limit, k)?;
         Ok((0..rows)
             .map(|r| top_k_row(&x[r * row_len..r * row_len + limit], k))
+            .collect())
+    }
+
+    fn log_softmax_gather(
+        &self,
+        x: &Vec<f32>,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        check::log_softmax_gather(x.len(), rows, row_len, limit, ids.len())?;
+        Ok((0..rows)
+            .flat_map(|r| log_softmax_gather_row(&x[r * row_len..r * row_len + limit], ids))
             .collect())
     }
 

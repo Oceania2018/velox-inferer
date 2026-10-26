@@ -484,7 +484,8 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __r
 
 // Few tokens (decode, verify): one thread per channel runs the window over its inputs and advances
 // the state itself (each thread reads its channel's state before writing it, so state may alias
-// state_in).
+// state_in). Grid y counts scoring windows: window y reads and writes its own `tokens` rows, all
+// from state_in, and a null state keeps none.
 constexpr int kConvSmallTokens = 32;
 __global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                          const float* state_in, float* state, float* __restrict__ out, int tokens,
@@ -495,6 +496,8 @@ __global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const floa
     }
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
+    x += static_cast<size_t>(blockIdx.y) * tokens * channels;
+    out += static_cast<size_t>(blockIdx.y) * tokens * channels;
     float win[kMaxConvWidth], wt[kMaxConvWidth];
 #pragma unroll
     for (int j = 0; j < kMaxConvWidth; ++j) {
@@ -518,6 +521,7 @@ __global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const floa
         for (int j = 0; j < kMaxConvWidth - 1; ++j)
             if (j == width - 2) win[j] = in;
     }
+    if (state == nullptr) return;
 #pragma unroll
     for (int j = 0; j < kMaxConvWidth - 1; ++j)
         if (j < width - 1) state[static_cast<size_t>(j) * channels + c] = win[j];
@@ -709,7 +713,8 @@ __device__ __forceinline__ void gdn_rows_shared(const float* __restrict__ qkv, c
     }
 }
 
-// Grid: heads x row groups.
+// Grid: heads x row groups x scoring windows (window z reads and writes its own `tokens` rows,
+// all from state_in; its callers pass a null state).
 template <int PER>
 __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
                                             const float* __restrict__ a_log, const float* __restrict__ dt_bias,
@@ -719,6 +724,12 @@ __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const
     if (pp != nullptr) {  // staged by a graph step: [state_in, state_out]
         state_in = reinterpret_cast<const float*>(pp[0]);
         state = reinterpret_cast<float*>(pp[1]);
+    }
+    if (blockIdx.z > 0) {
+        const size_t rows = static_cast<size_t>(blockIdx.z) * tokens;
+        qkv += rows * (2 * k_heads * k_dim + v_heads * v_dim);
+        ab += rows * 2 * v_heads;
+        if (out != nullptr) out += rows * v_heads * v_dim;
     }
     const int warps = blockDim.x / VELOX_WARP;
     const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
@@ -1763,6 +1774,39 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
 #define VELOX_GDN(PER)                                                                                     \
     gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state_in, state, out, tokens, k_heads, \
                                                       v_heads, k_dim, v_dim, pp)
+    if (k_dim <= 32) VELOX_GDN(1);
+    else if (k_dim <= 64) VELOX_GDN(2);
+    else if (k_dim <= 128) VELOX_GDN(4);
+    else if (k_dim <= 256) VELOX_GDN(8);
+    else return VELOX_ERR_UNSUPPORTED;
+#undef VELOX_GDN
+    return velox_launch_status();
+}
+
+// Scoring windows: `windows` windows of `tokens` rows each (window w at row w * tokens of x and
+// out), every one from state_in; no state is written. pp: as velox_portable_conv1d_silu.
+VELOX_API int velox_portable_conv1d_silu_windows(const float* x, const float* w, const float* state_in, float* out,
+                                                 int tokens, int windows, int channels, int width,
+                                                 const long long* pp) {
+    if (width > kMaxConvWidth || windows > 65535) return VELOX_ERR_UNSUPPORTED;
+    conv1d_silu_small_kernel<<<dim3((channels + 127) / 128, windows), 128>>>(x, w, state_in, nullptr, out, tokens,
+                                                                             channels, width, pp);
+    return velox_launch_status();
+}
+
+// Scoring windows: `windows` windows of `tokens` rows each (window w at row w * tokens of qkv, ab
+// and out), every one from state_in; no state is written. pp: as velox_portable_gated_delta_net.
+VELOX_API int velox_portable_gated_delta_net_windows(const float* qkv, const float* ab, const float* a_log,
+                                                     const float* dt_bias, const float* state_in, float* out,
+                                                     int tokens, int windows, int k_heads, int v_heads, int k_dim,
+                                                     int v_dim, const long long* pp) {
+    if (windows > 65535) return VELOX_ERR_UNSUPPORTED;
+    constexpr int kWarps = kGdnRowsWarps;
+    const int rows_per_block = tokens <= kGdnRowsMaxT ? kGdnRowsPerBlock : kWarps;
+    const dim3 grid(v_heads, (v_dim + rows_per_block - 1) / rows_per_block, windows), block(kWarps * VELOX_WARP);
+#define VELOX_GDN(PER)                                                                                     \
+    gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state_in, nullptr, out, tokens, \
+                                                      k_heads, v_heads, k_dim, v_dim, pp)
     if (k_dim <= 32) VELOX_GDN(1);
     else if (k_dim <= 64) VELOX_GDN(2);
     else if (k_dim <= 128) VELOX_GDN(4);
