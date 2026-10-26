@@ -1096,7 +1096,7 @@ fn text_prefix(st: &SafeTensors) -> Result<&'static str> {
 /// Writes `out` from the HF checkpoint in `dir`: text stack, MTP head (when present) and the
 /// tokenizer, chat template and generation config. `progress` gets a line per written gigabyte.
 pub fn import(dir: &Path, out: &Path, progress: &mut dyn FnMut(&str)) -> Result<ImportReport> {
-    import_with(dir, out, None, false, progress)
+    import_with(dir, out, None, false, None, progress)
 }
 
 /// Tensor-name prefix of the DFlash2 drafter's checkpoint inside the merged tensor set.
@@ -1105,12 +1105,15 @@ const DFLASH: &str = "dflash::";
 /// [`import`], adding the DFlash2 drafter checkpoint in `dflash` (a `DFlash2DraftModel`
 /// conditioned on this target) as the `dflash2` component when given; `dflash_nvfp4` encodes
 /// its MLP as NVFP4 (drafts only steer speed, never results; quantising attention, the conv
-/// kernels or the selector too collapses acceptance).
+/// kernels or the selector too collapses acceptance). `proposal` (token ids) adds a draft
+/// vocabulary head: those rows of `lm_head`, as stored, bound as `proposal/head` with the ids as
+/// `proposal/token_ids` (MTP then drafts over them only; verification keeps the full head).
 pub fn import_with(
     dir: &Path,
     out: &Path,
     dflash: Option<&Path>,
     dflash_nvfp4: bool,
+    proposal: Option<&[u32]>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<ImportReport> {
     let hf_cfg = read_json(&dir.join("config.json"))?;
@@ -1144,6 +1147,31 @@ pub fn import_with(
     b.linear("lm_head", "text/output_head")?;
     check_k(&b, "text/token_embedding", c.hidden as u64)?;
     check_k(&b, "text/output_head", c.hidden as u64)?;
+    if let Some(ids) = proposal {
+        if ids.is_empty() || ids.iter().any(|&t| t as usize >= c.vocab) {
+            return Err(Error::Config(format!(
+                "proposal token ids must be non-empty and below the vocabulary ({})",
+                c.vocab
+            )));
+        }
+        let n = ids.len() as u64;
+        b.stacked(
+            "proposal_head",
+            &[RowSrc {
+                weight: "lm_head.weight".into(),
+                sel: Sel::Perm(ids.to_vec()),
+            }],
+            &[("proposal/head", 0, n)],
+        )?;
+        let bytes = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
+        let id = b.push(
+            "proposal/token_ids".into(),
+            tensor_entry(json!([n]), "int32", "contiguous_le_v1"),
+            vec![Piece::Data(bytes)],
+        );
+        b.bindings
+            .insert("proposal/token_ids".into(), json!({ "object": id }));
+    }
     b.vector("text/final_norm", &format!("{pre}norm.weight"), c.hidden)?;
     for (i, kind) in c.layers.iter().enumerate() {
         block(
