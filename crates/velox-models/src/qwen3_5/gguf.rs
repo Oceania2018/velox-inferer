@@ -184,20 +184,20 @@ impl<'a> Builder<'a> {
             }
         } else {
             match perm {
-            Some(p) => {
-                if p.len() as u64 != n {
-                    return Err(Error::Config(format!(
-                        "{name}: row permutation of {}",
-                        p.len()
-                    )));
+                Some(p) => {
+                    if p.len() as u64 != n {
+                        return Err(Error::Config(format!(
+                            "{name}: row permutation of {}",
+                            p.len()
+                        )));
+                    }
+                    Src::Rows {
+                        at: t.offset,
+                        row_bytes,
+                        perm: p,
+                    }
                 }
-                Src::Rows {
-                    at: t.offset,
-                    row_bytes,
-                    perm: p,
-                }
-            }
-            None => Src::Raw(t.offset),
+                None => Src::Raw(t.offset),
             }
         };
         let id = self.push(format!("gguf/{name}"), entry, bytes, src);
