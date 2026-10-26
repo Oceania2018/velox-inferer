@@ -3402,10 +3402,13 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.linear_swiglu(f, 512, 24, 0, 2, false, true)?;
     }
     // Dense GGML under AllowA8 with K a multiple of 1024, where hardware variants run their wide
-    // kernels (int8 activations: dp4a up to 16 tokens, tensor cores above): IQ1_S, whose scale and
-    // delta cover 32 values, over odd row views and every token width.
-    {
-        let f = WeightFormat::Ggml(velox_core::ggml::GgmlType::Iq1S);
+    // kernels (int8 activations: dp4a up to 16 tokens, tensor cores above), for every type with
+    // 256-value blocks: odd row views at decode, verify and prefill widths, and fused SwiGLUs.
+    for t in velox_core::ggml::GgmlType::ALL {
+        if t.block_values() != 256 {
+            continue;
+        }
+        let f = WeightFormat::Ggml(t);
         let a8 = ActPolicy::AllowA8;
         for m in [1, 3, 8, 16, 17, 70, 200] {
             s.linear_act(f, 140, 2048, 5, 100, m, a8)?;
