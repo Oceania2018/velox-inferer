@@ -1380,9 +1380,10 @@ int launch_pre(const int8_t* xq, const float* sx, int stride, int m, const uint8
 // a 64-token tile amortizes; the token tile's int8 activations stream through a two-stage cp.async
 // ring and reach the mma as B through ldmatrix. Per sub-block the int32 product times the row's
 // integer scale accumulates in int32; per super-block that times d and the token's activation
-// scale goes to f32 (see the integer factors above). Block: 8 warps = 128 rows x 64 tokens.
+// scale goes to f32 (see the integer factors above). Block: 8 warps = 128 rows x 64 tokens, or
+// 128 tokens for long prompts (launch_pre2).
 
-constexpr int kQ2Warps = 8, kQ2Tokens = 64, kQ2S = 256 + 16;
+constexpr int kQ2S = 256 + 16;  // staged token row bytes
 #ifndef VELOX_GGML_PRE_UNROLL
 #define VELOX_GGML_PRE_UNROLL 8
 #endif
@@ -1450,13 +1451,13 @@ __device__ __forceinline__ void int_scales(const uint8_t* __restrict__ x, int ib
     }
 }
 
-template <int T>
-__global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
+template <int T, int TOK, int WARPS>
+__global__ void __launch_bounds__(WARPS * VELOX_WARP)
     ggml_pre2_kernel(const int8_t* __restrict__ xq, const float* __restrict__ sx, int stride, int m,
                      const uint8_t* __restrict__ w, long long row_bytes, long long row_begin, int rows, int k,
                      float* __restrict__ y, long long ldy, int mode) {
     constexpr int BB = block_bytes(T);
-    constexpr int NT = kQ2Tokens / 8;
+    constexpr int NT = TOK / 8;
     // Q2_K: code q <= 3 times its 4-bit scale stays <= 45, so the per-16 scales fold into the
     // codes and a sub-block is one k32 mma accumulating straight into the super-block's int32
     // sums (two k16 mmas issue at the k32 rate on this GPU, and the per-tile rescaling goes).
@@ -1467,16 +1468,18 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
     constexpr bool kSplit = T == kIq2S || T == kIq2Xs || T == kIq1M;  // IQ1_M: |code| 9 * 15
     constexpr bool kHalves = Traits<T>::G != 1 && !kFold && !kSplit;
     constexpr bool kOff = T == kQ2K || T == kQ4K;
-    __shared__ __align__(16) int8_t act[2][kQ2Tokens * kQ2S];
-    __shared__ float sxs[2][kQ2Tokens];
+    // 128 tokens double the int32 sums: a shorter unroll keeps them in registers (measured best).
+    constexpr int kUnroll = TOK == 64 ? kPreSbUnroll : T == kQ2K || T == kIq1S ? 2 : 4;
+    __shared__ __align__(16) int8_t act[2][TOK * kQ2S];
+    __shared__ float sxs[2][TOK];
     // Each warp's 16 rows of the super-block, copied from the 4-byte aligned address at or below it
     // (blocks are 2-byte aligned; row ends are 4-byte aligned, so the copy stays inside the row).
     // Odd word stride: the 8 rows a decode load touches hit 8 banks.
     constexpr int kWW = (BB + 2 + 3) / 4 | 1;
-    __shared__ uint32_t wst[kQ2Warps][2][16][kWW];
+    __shared__ uint32_t wst[WARPS][2][16][kWW];
     // Code sums per (token, 16 values) as f16 (exact: |sum| <= 2032), row stride 9 words: the B
     // operand of the minimum term's f16 mma.
-    __shared__ __align__(16) __half xs[kOff ? kQ2Tokens : 1][18];
+    __shared__ __align__(16) __half xs[kOff ? TOK : 1][18];
     __shared__ uint32_t sg[Grid<T>::kWords];
     __shared__ uint8_t sks[128];
     if constexpr (Grid<T>::kWords > 1) {
@@ -1487,8 +1490,8 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
         if (threadIdx.x < 128) sks[threadIdx.x] = kKsignsIq2xs[threadIdx.x];
     }
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
-    const int t0 = blockIdx.x * kQ2Tokens;
-    const int r0 = blockIdx.y * (16 * kQ2Warps) + warp * 16;
+    const int t0 = blockIdx.x * TOK;
+    const int r0 = blockIdx.y * (16 * WARPS) + warp * 16;
     // A warp past the last row stages the last row (its results are not stored): its own rows
     // would be outside the weights.
     const uint8_t* tile = w + (row_begin + min(r0, rows - 1)) * row_bytes;
@@ -1496,7 +1499,7 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
     const int b_row = (lane & 7) + ((lane >> 4) << 3), b_col = ((lane >> 3) & 1) << 4;
     const int blocks = k / 256;
     auto stage = [&](int buf, int kb) {
-        for (int i = threadIdx.x; i < kQ2Tokens * 16; i += blockDim.x) {
+        for (int i = threadIdx.x; i < TOK * 16; i += blockDim.x) {
             const int r = i >> 4, c = i & 15;
             const int tok = min(t0 + r, m - 1);
             cp_async16(&act[buf][r * kQ2S + c * 16], xq + static_cast<long long>(tok) * k + kb * 256 + c * 16);
@@ -1511,7 +1514,7 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
                       src + static_cast<uint32_t>(min(r, last)) * static_cast<uint32_t>(row_bytes) + 4u * c);
         }
         cp_async_commit();
-        if (threadIdx.x < kQ2Tokens)
+        if (threadIdx.x < TOK)
             sxs[buf][threadIdx.x] = sx[static_cast<long long>(kb) * stride + min(t0 + static_cast<int>(threadIdx.x), m - 1)];
     };
     float acc[NT][4];
@@ -1525,7 +1528,7 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
         cp_async_wait1();
         __syncthreads();
         if constexpr (kOff) {  // code sums per (token, 16 values) of this super-block
-            for (int e = threadIdx.x; e < kQ2Tokens * 16; e += blockDim.x) {
+            for (int e = threadIdx.x; e < TOK * 16; e += blockDim.x) {
                 const int r = e >> 4, h = e & 15;
                 const int4 v = *reinterpret_cast<const int4*>(&act[cur][r * kQ2S + h * 16]);
                 int z = __dp4a(v.x, 0x01010101, 0);
@@ -1550,7 +1553,7 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
         // 8 + 2t, 9 + 2t (sub-block 4 + t) of rows g, g + 8.
         uint32_t ma[4] = {0u, 0u, 0u, 0u};
         float2 dma, dmb;
-#pragma unroll kPreSbUnroll
+#pragma unroll kUnroll
         for (int sb = 0; sb < 8; ++sb) {
             int2 pa, pb, la, lb;
             if constexpr (kSplit) {  // filled from the scales below
@@ -1651,13 +1654,39 @@ __global__ void __launch_bounds__(kQ2Warps * VELOX_WARP)
         }
 }
 
+// Static shared bytes of ggml_pre2_kernel<T, TOK, WARPS> (the per-block limit is 99 KiB).
+template <int T>
+constexpr int pre2_smem(int tok, int warps) {
+    const int ww = (block_bytes(T) + 2 + 3) / 4 | 1;
+    return 2 * tok * kQ2S + 2 * tok * 4 + warps * 2 * 16 * ww * 4 + (T == kQ2K || T == kQ4K ? tok * 36 : 4) +
+           Grid<T>::kWords * 4 + 128;
+}
+
+template <int T, int TOK, int WARPS>
+int launch_pre2_cfg(const int8_t* xq, const float* sx, int stride, int m, const uint8_t* w, long long row_bytes,
+                    long long rb, int rows, int k, float* y, long long ldy, int mode) {
+    const dim3 grid((m + TOK - 1) / TOK, (rows + 16 * WARPS - 1) / (16 * WARPS));
+    if (grid.y > 65535) return VELOX_ERR_UNSUPPORTED;
+    ggml_pre2_kernel<T, TOK, WARPS>
+        <<<grid, WARPS * VELOX_WARP>>>(xq, sx, stride, m, w, row_bytes, rb, rows, k, y, ldy, mode);
+    return velox_launch_status();
+}
+
+#ifndef VELOX_GGML_PRE_WIDE_M
+#define VELOX_GGML_PRE_WIDE_M 512
+#endif
+
+// Long prompts take a 128-token tile where 8 warps fit in shared memory: a warp's decoded A
+// fragments feed twice the mmas (m = 1024: IQ1_M -20%, IQ1_S -14%, IQ2_S / IQ2_XS -8%, Q2_K -7%,
+// IQ2_XXS -4%). IQ3_S, IQ4_XS and Q4_K would need 4 warps, which measured slower than 64 tokens.
 template <int T>
 int launch_pre2(const int8_t* xq, const float* sx, int stride, int m, const uint8_t* w, long long row_bytes,
                 long long rb, int rows, int k, float* y, long long ldy, int mode) {
-    const dim3 grid((m + kQ2Tokens - 1) / kQ2Tokens, (rows + 16 * kQ2Warps - 1) / (16 * kQ2Warps));
-    if (grid.y > 65535) return VELOX_ERR_UNSUPPORTED;
-    ggml_pre2_kernel<T><<<grid, kQ2Warps * VELOX_WARP>>>(xq, sx, stride, m, w, row_bytes, rb, rows, k, y, ldy, mode);
-    return velox_launch_status();
+    if constexpr (pre2_smem<T>(128, 8) <= 99 * 1024) {
+        if (m >= VELOX_GGML_PRE_WIDE_M)
+            return launch_pre2_cfg<T, 128, 8>(xq, sx, stride, m, w, row_bytes, rb, rows, k, y, ldy, mode);
+    }
+    return launch_pre2_cfg<T, 64, 8>(xq, sx, stride, m, w, row_bytes, rb, rows, k, y, ldy, mode);
 }
 
 VeloxScratch g_act;
