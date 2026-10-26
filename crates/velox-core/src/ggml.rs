@@ -478,6 +478,30 @@ pub fn random_block(
     }
 }
 
+/// One GGML IQ3_XXS block (98 bytes) as velox's planar `iq3_xxs` (`iq3_xxs_planar_v1`): its 96 code
+/// bytes and its binary16 scale. The two encodings hold the same bits, so the decoded values are
+/// identical: grid byte (sub-block s, group l, half h) moves from `2 + 8 s + 2 l + h` to
+/// `16 l + 2 s + h`, and each sub-block's u32 (four 7-bit sign indices, a 4-bit scale) spreads
+/// over the four u64 lanes at 64.. (lane l: the 7-bit sign index of group l of every sub-block s at
+/// bit 7 s, the scales of sub-blocks 2 l and 2 l + 1 in bits 56..59 and 60..63).
+pub fn iq3_xxs_to_planar(block: &[u8]) -> ([u8; 96], [u8; 2]) {
+    let mut code = [0u8; 96];
+    let mut lanes = [0u64; 4];
+    for s in 0..8 {
+        let aux = u32_at(block, 66 + 4 * s);
+        for l in 0..4 {
+            code[16 * l + 2 * s] = block[2 + 8 * s + 2 * l];
+            code[16 * l + 2 * s + 1] = block[3 + 8 * s + 2 * l];
+            lanes[l] |= u64::from((aux >> (7 * l)) & 127) << (7 * s);
+        }
+        lanes[s / 2] |= u64::from(aux >> 28) << (56 + 4 * (s % 2));
+    }
+    for (l, lane) in lanes.iter().enumerate() {
+        code[64 + 8 * l..72 + 8 * l].copy_from_slice(&lane.to_le_bytes());
+    }
+    (code, [block[0], block[1]])
+}
+
 /// llama.cpp `iq2xxs_grid` (ggml-common.h, MIT).
 pub const IQ2XXS_GRID: [u64; 256] = [
     0x0808080808080808,
@@ -4922,5 +4946,32 @@ mod tests {
         assert_eq!(GgmlType::Q2_0.block_bytes() * 8, 2 * 64 + 16);
         // IQ1_S 1.5625.
         assert_eq!(GgmlType::Iq1S.block_bytes() * 8, 256 + 144);
+    }
+
+    #[test]
+    fn iq3_xxs_planar_decodes_the_same_values() {
+        // 3 rows x 512 values of random blocks with sane scales, re-laid out as iq3_xxs_planar_v1.
+        let (n, k) = (3usize, 512usize);
+        let blocks_per_row = k / 256;
+        let mut ggml = Vec::new();
+        for r in 0..n {
+            ggml.extend(blocks(GgmlType::Iq3Xxs, 100 + r as u64));
+        }
+        let nb = n * blocks_per_row;
+        let codes = (nb * 96).div_ceil(256) * 256;
+        let mut planar = vec![0u8; codes + 2 * nb];
+        for b in 0..nb {
+            let (code, d) = iq3_xxs_to_planar(&ggml[b * 98..(b + 1) * 98]);
+            planar[b * 96..(b + 1) * 96].copy_from_slice(&code);
+            planar[codes + 2 * b..codes + 2 * b + 2].copy_from_slice(&d);
+        }
+        let mut want = Vec::new();
+        decode_rows_into(GgmlType::Iq3Xxs, &ggml, k, 0, n, &mut want);
+        for r in 0..n {
+            for c in 0..k {
+                let got = crate::format::iq3_xxs_at(&planar, n, k, r, c);
+                assert_eq!(got.to_bits(), want[r * k + c].to_bits(), "row {r} col {c}");
+            }
+        }
     }
 }

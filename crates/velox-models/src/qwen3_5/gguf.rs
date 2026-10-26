@@ -23,6 +23,7 @@
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
+use velox_core::format::WeightFormat;
 use velox_core::ggml::GgmlType;
 use velox_core::{Error, Result};
 use velox_weights::gguf::{Gguf, GgufTensor};
@@ -49,7 +50,20 @@ enum Src {
     },
     /// Bytes computed here (small vectors).
     Data(Vec<u8>),
+    /// A GGML IQ3_XXS matrix at this file offset re-laid out as velox's planar `iq3_xxs`
+    /// (velox_core::ggml::iq3_xxs_to_planar): `n` rows of `blocks` blocks, output row `i` from
+    /// input row `perm[i]` (identity when `None`).
+    Iq3Planar {
+        at: u64,
+        n: u64,
+        blocks: u64,
+        perm: Option<Vec<u32>>,
+    },
 }
+
+/// GGUF type id of IQ3_XXS, imported as velox's planar `iq3_xxs` (the same bits; its native
+/// kernels run it) instead of `ggml_iq3_xxs`.
+const GGUF_IQ3_XXS: u32 = 18;
 
 struct Out {
     /// The directory entry without `offset` / `bytes`.
@@ -136,12 +150,40 @@ impl<'a> Builder<'a> {
             )));
         };
         let (format, layout, row_bytes) = tensor_format(t, k)?;
+        // IQ3_XXS linears become planar iq3_xxs (lossless); the token embedding keeps its blocks.
+        let planar = t.ggml_type == GGUF_IQ3_XXS && name != "token_embd.weight";
+        let (format, layout, bytes) = if planar {
+            let f = WeightFormat::Iq3Xxs;
+            (
+                f.name().to_string(),
+                f.layout(),
+                f.payload_bytes(n as usize, k as usize) as u64,
+            )
+        } else {
+            (format, layout, n * row_bytes)
+        };
         let mut entry = Map::new();
         entry.insert("kind".into(), "tensor".into());
         entry.insert("shape".into(), json!([n, k]));
         entry.insert("format".into(), format.clone().into());
         entry.insert("layout".into(), layout.into());
-        let src = match perm {
+        if let Some(p) = &perm {
+            if p.len() as u64 != n {
+                return Err(Error::Config(format!(
+                    "{name}: row permutation of {}",
+                    p.len()
+                )));
+            }
+        }
+        let src = if planar {
+            Src::Iq3Planar {
+                at: t.offset,
+                n,
+                blocks: k / 256,
+                perm,
+            }
+        } else {
+            match perm {
             Some(p) => {
                 if p.len() as u64 != n {
                     return Err(Error::Config(format!(
@@ -156,8 +198,9 @@ impl<'a> Builder<'a> {
                 }
             }
             None => Src::Raw(t.offset),
+            }
         };
-        let id = self.push(format!("gguf/{name}"), entry, n * row_bytes, src);
+        let id = self.push(format!("gguf/{name}"), entry, bytes, src);
         for &(binding, r0, rows) in parts {
             if r0 + rows > n {
                 return Err(Error::Config(format!(
@@ -498,8 +541,9 @@ pub fn import(
         }
     }
     // Uses: the donor's for kept parameters; for the new text matrices, the donor's
-    // (parameter, input) pairs with a policy for the new encoding: A8 for GGML blocks (llama.cpp
-    // runs them on 8-bit activations), A16 otherwise.
+    // (parameter, input) pairs with a policy for the new encoding: A8 for GGML blocks and the
+    // IQ3_XXS ones re-laid out as planar iq3_xxs (llama.cpp runs them on 8-bit activations), A16
+    // otherwise.
     let mut uses = Vec::new();
     for u in d.directory["uses"].as_array().into_iter().flatten() {
         let Some(param) = u["parameter"].as_str() else {
@@ -516,7 +560,7 @@ pub fn import(
             }
             uses.push(u.clone());
         } else if let Some((_, f)) = formats.iter().find(|(b, _)| b == param) {
-            let policy = if f.starts_with("ggml_") {
+            let policy = if f.starts_with("ggml_") || f == WeightFormat::Iq3Xxs.name() {
                 "AllowA8"
             } else {
                 "A16Only"
@@ -644,6 +688,53 @@ pub fn import(
                 Src::Donor(off) => d.read_range(off + rel, dst)?,
                 Src::Raw(off) => g.read_at(off + rel, dst)?,
                 Src::Data(v) => dst.copy_from_slice(&v[rel as usize..rel as usize + dst.len()]),
+                Src::Iq3Planar {
+                    at: base,
+                    n,
+                    blocks,
+                    perm,
+                } => {
+                    // Codes of every block (96 bytes, row-major), padding to 256, then each block's
+                    // binary16 scale: both from the GGUF row holding the block, read once.
+                    let ggml_row = blocks * 98;
+                    let codes = n * blocks * 96;
+                    let scales = codes.div_ceil(256) * 256;
+                    let mut row = vec![0u8; ggml_row as usize];
+                    let mut loaded = u64::MAX;
+                    let mut load = |r: u64, row: &mut Vec<u8>| -> velox_weights::Result<()> {
+                        if loaded != r {
+                            let src = perm.as_ref().map_or(r, |p| u64::from(p[r as usize]));
+                            g.read_at(base + src * ggml_row, row)?;
+                            loaded = r;
+                        }
+                        Ok(())
+                    };
+                    let mut p = rel;
+                    let stop = rel + dst.len() as u64;
+                    while p < stop {
+                        let at = (p - rel) as usize;
+                        if p < codes {
+                            let b = p / 96;
+                            load(b / blocks, &mut row)?;
+                            let c = ((b % blocks) * 98) as usize;
+                            let (code, _) = velox_core::ggml::iq3_xxs_to_planar(&row[c..c + 98]);
+                            let o = (p % 96) as usize;
+                            let take = (96 - o).min((stop - p) as usize);
+                            dst[at..at + take].copy_from_slice(&code[o..o + take]);
+                            p += take as u64;
+                        } else if p < scales {
+                            p = scales.min(stop); // padding (zero-filled)
+                        } else {
+                            let b = (p - scales) / 2;
+                            load(b / blocks, &mut row)?;
+                            let c = ((b % blocks) * 98) as usize;
+                            let o = ((p - scales) % 2) as usize;
+                            let take = (2 - o).min((stop - p) as usize);
+                            dst[at..at + take].copy_from_slice(&row[c + o..c + o + take]);
+                            p += take as u64;
+                        }
+                    }
+                }
                 Src::Rows {
                     at: base,
                     row_bytes,
