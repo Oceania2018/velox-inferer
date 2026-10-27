@@ -1459,6 +1459,8 @@ impl CudaKernels for Rtx5060Kernels {
                 ),
                 None => Err(Error::Unsupported("int8 linear shape".into())),
             },
+            // linear_act never reports it: this kernel set has no q8_1 (32-value group) path.
+            ActQuant::Int8G32 => Err(Error::Unsupported("rtx5060 linear int8 g32".into())),
             ActQuant::Bf16 => {
                 if bf16_skinny(w, m) {
                     return status(
