@@ -1383,8 +1383,8 @@ int launch_pre(const int8_t* xq, const float* sx, int stride, int m, const uint8
 // a 64-token tile amortizes; the token tile's int8 activations stream through a two-stage cp.async
 // ring and reach the mma as B through ldmatrix. Per sub-block the int32 product times the row's
 // integer scale accumulates in int32; per super-block that times d and the token's activation
-// scale goes to f32 (see the integer factors above). Block: 8 warps = 128 rows x 64 tokens, or
-// 128 tokens for long prompts (launch_pre2).
+// scale goes to f32 (see the integer factors above). Block: 8 warps = 128 rows x 64 or 128 tokens
+// (launch_pre2).
 
 constexpr int kQ2S = 256;  // staged token row bytes
 
@@ -1712,18 +1712,24 @@ int launch_pre2_cfg(const int8_t* xq, const float* sx, int stride, int m, const 
     return velox_launch_status();
 }
 
-#ifndef VELOX_GGML_PRE_WIDE_M
-#define VELOX_GGML_PRE_WIDE_M 512
-#endif
-
-// Long prompts take a 128-token tile where 8 warps fit in shared memory: a warp's decoded A
-// fragments feed twice the mmas. IQ4_XS and Q4_K would need 4 warps, which measured slower than
-// 64 tokens.
+// The 128-token tile where 8 warps fit in shared memory (IQ4_XS and Q4_K would need 4 warps, which
+// measured slower): a warp's decoded A fragments feed twice the mmas. Both tiles run one block per
+// SM, so a launch takes about waves x tokens per block, and a full 128-token block costs about
+// 0.83 of two 64-token ones (bench-linear, m = 768). The tile with the lower estimate wins: 64
+// tokens where a ragged last tile or a short grid (few 128-row tiles) would waste the wide one.
 template <int T>
 int launch_pre2(const int8_t* xq, const float* sx, int stride, int m, const uint8_t* w, long long row_bytes,
                 long long rb, int rows, int k, float* y, long long ldy, int mode) {
     if constexpr (pre2_smem<T>(128, 8) <= 99 * 1024) {
-        if (m >= VELOX_GGML_PRE_WIDE_M)
+        static const int sms = [] {
+            int dev = 0, n = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+            return n > 0 ? n : 1;
+        }();
+        const long long tiles = (rows + 127) / 128;
+        auto waves = [&](int tok) { return (tiles * ((m + tok - 1) / tok) + sms - 1) / sms; };
+        if (waves(128) * 128 * 83 < waves(64) * 64 * 100)
             return launch_pre2_cfg<T, 128, 8>(xq, sx, stride, m, w, row_bytes, rb, rows, k, y, ldy, mode);
     }
     return launch_pre2_cfg<T, 64, 8>(xq, sx, stride, m, w, row_bytes, rb, rows, k, y, ldy, mode);
