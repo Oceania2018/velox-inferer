@@ -72,7 +72,7 @@ Quantized tensors keep their GGML blocks byte for byte as format `ggml_<type>` w
 `q4_k`, `q6_k`, `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_xs`, and the
 smaller blocks `q2_0` (64 values), `iq4_nl` and `q8_0` (32 values). The reference decoders follow
 ggml's `dequantize_row_*` and are checked against gguf-py (`q2_0`, which gguf-py lacks, against a
-port of the C reference). GGUF `F32` and `BF16` tensors import as `fp32` / `bf16`; `F16` is not
+port of the C reference). IQ3_XXS matrices are the exception: GGML IQ3_XXS and velox's planar `iq3_xxs` hold the same bits, so the importer re-lays those blocks out losslessly (`velox_core::ggml::iq3_xxs_to_planar`, decoded values identical) and the native IQ3_XXS kernels serve them; the token embedding keeps its blocks. GGUF `F32` and `BF16` tensors import as `fp32` / `bf16`; `F16` is not
 supported (velox has no f16 weight format). The importer only moves whole rows, which is
 exact for every type, to undo llama.cpp's conversion rewrites:
 
