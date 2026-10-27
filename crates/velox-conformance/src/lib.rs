@@ -2772,6 +2772,14 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 300, 80, 8, 280, 70)?;
     s.linear(WeightFormat::Bf16, 1152, 4304, 0, 1152, 130)?;
     s.rng = rng;
+    // Prefill widths over at most 128 rows (the skinny kernel; the GDN a | b projection is
+    // [96, 5120]): split K, ragged tokens, rows and K, a row view; on their own seed.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x5c1e));
+    s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 600)?;
+    s.linear(WeightFormat::Bf16, 130, 1024, 3, 98, 1100)?;
+    s.linear(WeightFormat::Bf16, 40, 300, 0, 40, 70)?;
+    s.linear(WeightFormat::F32, 20, 520, 0, 20, 64)?;
+    s.rng = rng;
     s.linear(WeightFormat::Nvfp4, 256, 128, 0, 256, 1)?;
     s.linear(WeightFormat::Nvfp4, 384, 192, 128, 200, 5)?;
     // Activation policies: tuned kernels may round inputs to FP8 / NVFP4 where the artifact allows.
@@ -3005,6 +3013,14 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.embed(WeightFormat::Q5G64, 20, 200, &[19, 0])?;
     s.embed(WeightFormat::Q4G64, 30, 256, &[29, 0, 7, 7])?;
     s.embed(WeightFormat::Q8G32, 10, 96, &[9, 3])?;
+    // 16-byte reads per thread (FP8 rows with K a multiple of 16, bf16 rows with K a multiple of
+    // 8), including a partial last slice, on their own seed.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0xe3bd));
+    s.embed(WeightFormat::Fp8RowBf16, 40, 5120, &[39, 0, 17, 17, 5])?;
+    s.embed(WeightFormat::Fp8RowBf16, 9, 2064, &[8, 1])?;
+    s.embed(WeightFormat::Bf16, 12, 1032, &[11, 0, 4])?;
+    s.embed_from(WeightFormat::Fp8RowBf16, 30, 5120, &[29, 2, 2])?;
+    s.rng = rng;
     s.add_rms_norm(8, 5120, NormKind::Offset)?;
     s.rms_norm_gated(8 * 48, 128, NormKind::Plain)?;
     s.rms_norm_gated(5, 96, NormKind::Offset)?;
@@ -3360,6 +3376,23 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     for m in [1, 8] {
         s.linear_swiglu(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false)?;
         s.linear(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m)?;
+    }
+    // IQ3_XXS under AllowA8 at decode and verify widths (kernel sets may run int8 decode kernels):
+    // ragged token tiles, a row view starting mid-tile, separate SwiGLU parents, the MLP's own K,
+    // and int8 twins of a norm's output.
+    for m in [2, 5, 8, 16] {
+        s.linear_act(WeightFormat::Iq3Xxs, 160, 768, 16, 128, m, a8)?;
+        s.linear_swiglu_with(WeightFormat::Iq3Xxs, 512, 40, 0, m, false, false, a8)?;
+    }
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 768, 24, 8, 13, false, true, a8)?;
+    for m in [1, 8, 16] {
+        s.linear_swiglu_with(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false, a8)?;
+        s.linear_act(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m, a8)?;
+    }
+    {
+        use WeightFormat::Iq3Xxs;
+        s.twins_q8(8, 5120, &[(Iq3Xxs, 32)], Some((Iq3Xxs, 256)))?;
+        s.twins_q8(16, 17408, &[(Iq3Xxs, 32)], None)?;
     }
     // A4 at batched-verify widths (several lanes' windows: 17..64 tokens), wide and narrow K
     // stages, row views starting one scale tile in.

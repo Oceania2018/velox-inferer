@@ -398,6 +398,86 @@ linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, i
     }
 }
 
+// Skinny y[m, rows] = x . W^T for many tokens and few rows (rows <= 16 * TN, e.g. the GDN a | b
+// projection, 96 rows): a block covers every output row for 64 tokens, so x is read once rather
+// than once per 64 rows. Each thread keeps 8 x TN sums and reads its operands as float4 / float2
+// (5 shared loads per 48 FMAs at TN = 6), capped at 128 registers: four blocks per SM hide the
+// global loads better than unbounded registers do (61 against 87 us for [96, 5120] at m = 2048 on
+// an RTX 5090). Split K fills the GPU as in linear_tiled_kernel. x rows
+// are read as float4: k must be a multiple of 4 and x 16-byte aligned.
+constexpr int kSkM = 64, kSkK = 32, kSkThreads = 128;
+
+// W[row, col] for the formats the skinny kernel takes (f32, bf16), decoded inline: weight_at would
+// bring every GGML decoder into the kernel and its registers. FP8 rows re-reading their scale per
+// element ran slower than the tiled kernel, so they stay there.
+template <int FMT>
+__device__ __forceinline__ float skinny_w(const WDesc& d, long long row, long long col) {
+    if (FMT == VELOX_FMT_F32) return reinterpret_cast<const float*>(d.base)[row * d.k + col];
+    return bf16_to_f32(reinterpret_cast<const uint16_t*>(d.base)[row * d.k + col]);
+}
+
+template <int TN, int FMT>
+__global__ void __launch_bounds__(kSkThreads, 4)
+linear_skinny_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m, float* __restrict__ y,
+                     long long k_split) {
+    constexpr int BN = 16 * TN;
+    const long long k_begin = blockIdx.z * k_split;
+    const long long k_end = k_begin + k_split < w.k ? k_begin + k_split : w.k;
+    y += static_cast<size_t>(blockIdx.z) * m * rows;
+    // [k][token] and [k][row]: pitches keep float4 / float2 reads aligned.
+    __shared__ __align__(16) float Xs[kSkK][kSkM + 4];
+    __shared__ __align__(16) float Ws[kSkK][BN + 2];
+    const int t = threadIdx.x;
+    const int m0 = blockIdx.y * kSkM;
+    const int ty = t / 16, tx = t % 16;  // tokens ty * 8.., rows tx * TN..
+    float acc[8][TN] = {};
+    for (long long k0 = k_begin; k0 < k_end; k0 += kSkK) {
+        // x tile: 8 threads read one token's 32 K values as float4.
+#pragma unroll
+        for (int i = 0; i < kSkM * kSkK / 4 / kSkThreads; ++i) {
+            const int e = i * kSkThreads + t, r = e / 8, c = (e % 8) * 4;
+            const long long kk = k0 + c;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (m0 + r < m && kk < k_end) v = *reinterpret_cast<const float4*>(x + static_cast<size_t>(m0 + r) * w.k + kk);
+            Xs[c][r] = v.x, Xs[c + 1][r] = v.y, Xs[c + 2][r] = v.z, Xs[c + 3][r] = v.w;
+        }
+#pragma unroll
+        for (int i = 0; i < BN * kSkK / kSkThreads; ++i) {
+            const int e = i * kSkThreads + t, r = e / kSkK, c = e % kSkK;
+            const long long kk = k0 + c;
+            Ws[c][r] = (r < rows && kk < k_end) ? skinny_w<FMT>(w, row_begin + r, kk) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int kk = 0; kk < kSkK; ++kk) {
+            float a[8], b[TN];
+            const float4 a0 = *reinterpret_cast<const float4*>(&Xs[kk][ty * 8]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&Xs[kk][ty * 8 + 4]);
+            a[0] = a0.x, a[1] = a0.y, a[2] = a0.z, a[3] = a0.w, a[4] = a1.x, a[5] = a1.y, a[6] = a1.z, a[7] = a1.w;
+#pragma unroll
+            for (int j = 0; j < TN; j += 2) {
+                const float2 v = *reinterpret_cast<const float2*>(&Ws[kk][tx * TN + j]);
+                b[j] = v.x, b[j + 1] = v.y;
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = m0 + ty * 8 + i;
+        if (r >= m) continue;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int c = tx * TN + j;
+            if (c < rows) y[static_cast<size_t>(r) * rows + c] = acc[i][j];
+        }
+    }
+}
+
 // Row-split (q4/q5/q6/q8) rows: a block stages its row's three byte ranges (codes, high plane,
 // scales; each contiguous) in shared memory with 16-byte loads, then decodes from there. The
 // table is often host-mapped, where the cost is per PCIe transaction: one round of wide loads per
@@ -457,6 +537,41 @@ __global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long lon
     for (long long c = static_cast<long long>(blockIdx.y) * blockDim.x + threadIdx.x; c < w.k;
          c += static_cast<long long>(gridDim.y) * blockDim.x)
         out[blockIdx.x * w.k + c] = valid ? weight_at(w, row, c) : 0.0f;
+}
+
+// embed_kernel for FP8-row and bf16 tables with 16-byte aligned rows: each thread reads 16 bytes (16
+// FP8 codes or 8 bf16 values). A host-mapped table is read per PCIe transaction, and byte-wide
+// reads left 2048 FP8 rows of 5120 at 4.7 ms on an RTX 5090.
+template <int FMT>
+__global__ void embed_vec_kernel(const uint32_t* __restrict__ ids, WDesc w, long long row_begin, float* __restrict__ out) {
+    constexpr int per = FMT == VELOX_FMT_BF16 ? 8 : 16;  // values per 16-byte load
+    const long long row = row_begin + ids[blockIdx.x];
+    const bool valid = row >= 0 && row < w.n;
+    const long long c0 = (static_cast<long long>(blockIdx.y) * blockDim.x + threadIdx.x) * per;
+    if (c0 >= w.k) return;
+    float v[per] = {};
+    if (valid) {
+        if (FMT == VELOX_FMT_BF16) {
+            const uint4 q = *reinterpret_cast<const uint4*>(w.base + (row * w.k + c0) * 2);
+            const uint32_t u[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                v[2 * i] = bf16_to_f32(static_cast<uint16_t>(u[i] & 0xffff));
+                v[2 * i + 1] = bf16_to_f32(static_cast<uint16_t>(u[i] >> 16));
+            }
+        } else {
+            const uint8_t* s = w.base + align256(w.n * w.k) + 2 * row;
+            const float scale = bf16_to_f32(static_cast<uint16_t>(s[0] | (s[1] << 8)));
+            const uint4 q = *reinterpret_cast<const uint4*>(w.base + row * w.k + c0);
+            const uint32_t u[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+                v[i] = e4m3fn_to_f32(static_cast<uint8_t>(u[i / 4] >> (8 * (i % 4)))) * scale;
+        }
+    }
+    float4* o = reinterpret_cast<float4*>(out + blockIdx.x * w.k + c0);
+#pragma unroll
+    for (int i = 0; i < per / 4; ++i) o[i] = make_float4(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
 }
 
 // xb: null, or the result's bf16 twin.
@@ -1625,6 +1740,15 @@ __global__ void __launch_bounds__(kSnThreads) linear_small_n_bf16_kernel(const f
     }
 }
 
+template <int FMT>
+void launch_skinny(dim3 grid, const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y,
+                   long long k_split) {
+    if (rows <= 32) linear_skinny_kernel<2, FMT><<<grid, kSkThreads>>>(x, d, row_begin, rows, m, y, k_split);
+    else if (rows <= 64) linear_skinny_kernel<4, FMT><<<grid, kSkThreads>>>(x, d, row_begin, rows, m, y, k_split);
+    else if (rows <= 96) linear_skinny_kernel<6, FMT><<<grid, kSkThreads>>>(x, d, row_begin, rows, m, y, k_split);
+    else linear_skinny_kernel<8, FMT><<<grid, kSkThreads>>>(x, d, row_begin, rows, m, y, k_split);
+}
+
 template <int M>
 int launch_small_n(const float* x, const uint8_t* w, long long k, long long row_begin, int rows, int m, float* y) {
     linear_small_n_bf16_kernel<M><<<(rows + kSnRows - 1) / kSnRows, kSnThreads>>>(
@@ -1661,6 +1785,29 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
             linear_gemv_kernel<VELOX_FMT_FP8_ROW_BF16><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
         else
             linear_gemv_kernel<VELOX_FMT_NVFP4><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+        return velox_launch_status();
+    }
+    // Many tokens over few rows: one block row covers every output row. Above 96 rows a few hundred
+    // tokens leave too few blocks, and the tiled kernel stays faster until about 1K tokens.
+    if ((format == VELOX_FMT_BF16 || format == VELOX_FMT_F32) && m >= kSkM && (rows <= 96 || (rows <= 128 && m >= 1024)) &&
+        (m + kSkM - 1) / kSkM <= 65535 && k % 4 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0) {
+        const long long blocks = (m + kSkM - 1) / kSkM;
+        int splits = 1;
+        while (blocks * splits < 320 && k / (splits * 2) >= 256) splits *= 2;
+        const long long k_split = ((k + splits - 1) / splits + kSkK - 1) / kSkK * kSkK;
+        splits = static_cast<int>((k + k_split - 1) / k_split);
+        const dim3 grid(1, static_cast<unsigned>(blocks), splits);
+        float* out = y;
+        if (splits > 1) {
+            out = linear_split_scratch(static_cast<size_t>(splits) * m * rows);
+            if (out == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+        }
+        if (format == VELOX_FMT_BF16) launch_skinny<VELOX_FMT_BF16>(grid, x, d, row_begin, rows, m, out, k_split);
+        else launch_skinny<VELOX_FMT_F32>(grid, x, d, row_begin, rows, m, out, k_split);
+        if (splits > 1) {
+            const long long n = static_cast<long long>(m) * rows;
+            sum_splits_kernel<<<velox_grid_1d(n, 256), 256>>>(out, splits, n, y);
+        }
         return velox_launch_status();
     }
     // The tiled kernel needs enough output tiles to fill the GPU; skinny outputs (a few dozen rows,
@@ -1701,6 +1848,17 @@ VELOX_API int velox_portable_embed(const uint32_t* ids, int count, const uint8_t
             embed_rs_kernel<<<count, 256, smem>>>(ids, WDesc{w, format, n, k}, row_begin, out);
             return velox_launch_status();
         }
+    }
+    const bool aligned = reinterpret_cast<uintptr_t>(w) % 16 == 0 && reinterpret_cast<uintptr_t>(out) % 16 == 0;
+    if (aligned && format == VELOX_FMT_FP8_ROW_BF16 && k % 16 == 0 && k / 16 <= 65535L * 128) {
+        embed_vec_kernel<VELOX_FMT_FP8_ROW_BF16>
+            <<<dim3(count, static_cast<unsigned>((k / 16 + 127) / 128)), 128>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+        return velox_launch_status();
+    }
+    if (aligned && format == VELOX_FMT_BF16 && k % 8 == 0 && k / 8 <= 65535L * 128) {
+        embed_vec_kernel<VELOX_FMT_BF16>
+            <<<dim3(count, static_cast<unsigned>((k / 8 + 127) / 128)), 128>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+        return velox_launch_status();
     }
     const unsigned slices = static_cast<unsigned>((k + 255) / 256 < 65535 ? (k + 255) / 256 : 65535);
     embed_kernel<<<dim3(count, slices), 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);

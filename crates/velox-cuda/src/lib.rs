@@ -227,6 +227,9 @@ pub struct CudaBuffer {
     len: usize,
     /// Pinned, mapped system memory (see `Backend::alloc_host`) rather than device memory.
     host: bool,
+    /// A piece of the pinned [`HOST_ARENA`] (returned to it on drop) rather than an allocation
+    /// of its own.
+    pooled: bool,
     /// A reserved address range backed chunk by chunk (see `Backend::alloc_virtual`).
     vm: Option<Box<VmRange>>,
 }
@@ -261,6 +264,64 @@ static BUFFER_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 static BUFFER_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CHUNK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Pinned system memory reserved ahead of use ([`Backend::reserve_host`]): pinning costs about
+/// 0.4 ms per MB under WSL, so a server pins its context-store budget at startup and host
+/// storage asked for on the request path afterwards is carved from a slab or reused.
+static HOST_ARENA: Mutex<HostArena> = Mutex::new(HostArena {
+    slabs: Vec::new(),
+    free: Vec::new(),
+});
+
+/// Pieces are aligned like cudaHostAlloc's own allocations.
+const HOST_ALIGN: usize = 4096;
+/// Pinned per call while reserving: large single pins fail more readily under WSL.
+const HOST_SLAB: usize = 256 << 20;
+
+struct HostArena {
+    /// Pinned slabs as (base, bytes, bytes carved), never freed: the process keeps them until
+    /// it exits.
+    slabs: Vec<(usize, usize, usize)>,
+    /// Pieces dropped buffers returned, by size: states, KV pages and drafter pages are each of
+    /// one size, so storage is asked for again at the sizes it was returned at.
+    free: Vec<(usize, Vec<usize>)>,
+}
+
+impl HostArena {
+    /// A zeroed piece of `bytes` (a multiple of [`HOST_ALIGN`]) if the arena has room.
+    fn take(&mut self, bytes: usize) -> Option<*mut c_void> {
+        if let Some(ptr) = self
+            .free
+            .iter_mut()
+            .find(|(n, _)| *n == bytes)
+            .and_then(|(_, v)| v.pop())
+        {
+            // SAFETY: a piece of a live slab, `bytes` long, that no buffer owns.
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
+            return Some(ptr as *mut c_void);
+        }
+        // Slabs are zeroed when pinned and each byte is carved once, so carves need no clearing.
+        let (base, _, used) = self
+            .slabs
+            .iter_mut()
+            .find(|(_, cap, used)| *cap - *used >= bytes)?;
+        let ptr = *base + *used;
+        *used += bytes;
+        Some(ptr as *mut c_void)
+    }
+
+    fn give(&mut self, ptr: usize, bytes: usize) {
+        match self.free.iter_mut().find(|(n, _)| *n == bytes) {
+            Some((_, v)) => v.push(ptr),
+            None => self.free.push((bytes, vec![ptr])),
+        }
+    }
+
+    /// Bytes pinned and not carved yet.
+    fn room(&self) -> usize {
+        self.slabs.iter().map(|(_, cap, used)| cap - used).sum()
+    }
+}
+
 impl CudaBuffer {
     fn new(len: usize) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
@@ -281,6 +342,7 @@ impl CudaBuffer {
             ptr: ptr.cast(),
             len,
             host: false,
+            pooled: false,
             vm: None,
         })
     }
@@ -320,7 +382,12 @@ impl Drop for CudaBuffer {
             // SAFETY: ptr came from cudaMalloc (or cudaHostAlloc) and is freed exactly once.
             // Errors at teardown (e.g. after a sticky kernel fault) cannot be reported from Drop.
             unsafe {
-                if self.host {
+                if self.pooled {
+                    let bytes = (self.len * 4).next_multiple_of(HOST_ALIGN);
+                    if let Ok(mut a) = HOST_ARENA.lock() {
+                        a.give(self.ptr as usize, bytes);
+                    }
+                } else if self.host {
                     ffi::velox_cuda_free_host(self.ptr.cast());
                 } else {
                     ffi::velox_cuda_free(self.ptr.cast());
@@ -332,25 +399,63 @@ impl Drop for CudaBuffer {
 }
 
 impl CudaBuffer {
-    /// Zeroed pinned host memory the device addresses directly.
+    /// Zeroed pinned host memory the device addresses directly: a piece of the [`HOST_ARENA`]
+    /// when it has room, else pinned now.
     fn new_host(len: usize) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
+        let mut pooled = false;
         if len > 0 {
             let bytes = len
                 .checked_mul(4)
                 .ok_or_else(|| Error::Shape("allocation size overflows".into()))?;
-            // SAFETY: out-pointer to a live local.
-            status(
-                unsafe { ffi::velox_cuda_host_alloc(&mut ptr, bytes) },
-                "cudaHostAlloc (mapped)",
-            )?;
+            let piece = HOST_ARENA
+                .lock()
+                .ok()
+                .and_then(|mut a| a.take(bytes.next_multiple_of(HOST_ALIGN)));
+            match piece {
+                Some(p) => (ptr, pooled) = (p, true),
+                // SAFETY: out-pointer to a live local.
+                None => status(
+                    unsafe { ffi::velox_cuda_host_alloc(&mut ptr, bytes) },
+                    "cudaHostAlloc (mapped)",
+                )?,
+            }
         }
         Ok(CudaBuffer {
             ptr: ptr.cast(),
             len,
             host: true,
+            pooled,
             vm: None,
         })
+    }
+
+    /// Pins slabs into the [`HOST_ARENA`] until it holds `bytes` not carved yet; returns the
+    /// bytes pinned. Stops early, keeping what it pinned, when the system refuses more.
+    fn reserve_host(bytes: usize) -> usize {
+        let mut pinned = 0;
+        loop {
+            let room = HOST_ARENA.lock().map_or(0, |a| a.room());
+            if room >= bytes {
+                return pinned;
+            }
+            let n = (bytes - room).min(HOST_SLAB).next_multiple_of(HOST_ALIGN);
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            // SAFETY: out-pointer to a live local.
+            if unsafe { ffi::velox_cuda_host_alloc(&mut ptr, n) } != 0 {
+                eprintln!(
+                    "pinned host reserve: stopped at {} MiB of {} MiB",
+                    room >> 20,
+                    bytes >> 20
+                );
+                return pinned;
+            }
+            match HOST_ARENA.lock() {
+                Ok(mut a) => a.slabs.push((ptr as usize, n, 0)),
+                Err(_) => return pinned,
+            }
+            pinned += n;
+        }
     }
 }
 
@@ -2211,6 +2316,10 @@ impl Backend for CudaBackend {
         CudaBuffer::new_host(len)
     }
 
+    fn reserve_host(&self, bytes: usize) -> usize {
+        CudaBuffer::reserve_host(bytes)
+    }
+
     fn vm_chunk_len(&self) -> usize {
         vm_chunk_bytes() / 4
     }
@@ -2231,6 +2340,7 @@ impl Backend for CudaBackend {
             ptr: va.cast(),
             len,
             host: false,
+            pooled: false,
             vm: Some(Box::new(VmRange {
                 chunk_bytes: chunk,
                 mapped: vec![false; chunks],
