@@ -194,11 +194,21 @@ const SKINNY_MAX_M: usize = 96;
 /// streams them once per 64 tokens (decode, speculative verify, batched verify).
 const GGML_MAX_M: usize = 64;
 
+/// Positions `0..GGML_KERNEL_TYPES` of `GgmlType::ALL` (Q2_K .. IQ4_XS) are instantiated in
+/// `rtx5090_ggml.cu`.
+const GGML_KERNEL_TYPES: usize = 9;
+
 /// The bf16 tensor-core kernel's type code for GGML block weights at `m` tokens.
 fn ggml_type(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     match w.format {
         WeightFormat::Ggml(t) if (1..=GGML_MAX_M).contains(&m) && w.k % 1024 == 0 => {
-            velox_core::ggml::GgmlType::ALL.iter().position(|&u| u == t).map(|i| i as i32)
+            // The kernel instantiates the first `GGML_KERNEL_TYPES` format codes; the others
+            // (appended to `GgmlType::ALL` over time) take the portable kernel.
+            velox_core::ggml::GgmlType::ALL
+                .iter()
+                .position(|&u| u == t)
+                .filter(|&i| i < GGML_KERNEL_TYPES)
+                .map(|i| i as i32)
         }
         _ => None,
     }
