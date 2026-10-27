@@ -5,6 +5,7 @@
 //! fly. The functions here are the reference decoders the CPU oracle and conformance use.
 
 use crate::error::{Error, Result};
+use crate::ggml::GgmlType;
 
 /// Stored weight encodings velox executes. Each implies its storage layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,6 +29,9 @@ pub enum WeightFormat {
     /// `iq3_xxs` / `iq3_xxs_planar_v1`: llama.cpp IQ3_XXS (256-value blocks of grid codes, one
     /// binary16 scale per block), re-ordered by ninfer's converter. See [`iq3_xxs_at`].
     Iq3Xxs,
+    /// `ggml_<type>` / `ggml_block_v1`: llama.cpp super-blocks as GGUF stores them (see
+    /// [`crate::ggml`]).
+    Ggml(GgmlType),
 }
 
 /// Geometry of a `row_split_k128_v1` format: code bits, group size, base and high-bit bytes per
@@ -67,6 +71,9 @@ impl WeightFormat {
             ("q6_g64_fp16", "row_split_k128_v1") => Ok(WeightFormat::Q6G64),
             ("q8_g32_fp16", "row_split_k128_v1") => Ok(WeightFormat::Q8G32),
             ("iq3_xxs", "iq3_xxs_planar_v1") => Ok(WeightFormat::Iq3Xxs),
+            (f, "ggml_block_v1") if GgmlType::from_name(f).is_some() => {
+                Ok(WeightFormat::Ggml(GgmlType::from_name(f).unwrap()))
+            }
             _ => Err(Error::Unsupported(format!(
                 "weight format {format} / {layout}"
             ))),
@@ -84,6 +91,7 @@ impl WeightFormat {
             WeightFormat::Q6G64 => "q6_g64_fp16",
             WeightFormat::Q8G32 => "q8_g32_fp16",
             WeightFormat::Iq3Xxs => "iq3_xxs",
+            WeightFormat::Ggml(t) => t.name(),
         }
     }
 
@@ -123,6 +131,15 @@ impl WeightFormat {
                 "iq3_xxs needs K % 256 == 0, got [{n},{k}]"
             )));
         }
+        if let WeightFormat::Ggml(t) = self {
+            if !k.is_multiple_of(t.block_values()) {
+                return Err(Error::Shape(format!(
+                    "{} needs K % {} == 0, got [{n},{k}]",
+                    t.name(),
+                    t.block_values()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -137,7 +154,20 @@ impl WeightFormat {
                 let blocks = n * (k / IQ3_XXS_BLOCK);
                 align256(blocks * IQ3_XXS_CODE_BYTES) + 2 * blocks
             }
+            WeightFormat::Ggml(t) => n * t.row_bytes(k),
             q => q.row_split().map_or(0, |r| r.planes(n, k).2),
+        }
+    }
+
+    /// Container layout name.
+    pub fn layout(&self) -> &'static str {
+        match self {
+            WeightFormat::F32 | WeightFormat::Bf16 => "contiguous_le_v1",
+            WeightFormat::Fp8RowBf16 => "row_scale_v1",
+            WeightFormat::Nvfp4 => "block_scale_k16_m128x4_v1",
+            WeightFormat::Iq3Xxs => "iq3_xxs_planar_v1",
+            WeightFormat::Ggml(_) => "ggml_block_v1",
+            _ => "row_split_k128_v1",
         }
     }
 }
@@ -323,6 +353,75 @@ pub fn nvfp4_scale_offset(n: usize, g: usize, k: usize) -> usize {
         + scale_lane
 }
 
+/// Nearest non-negative E4M3FN code to `x` (saturating at 448; ties to the lower code).
+pub fn f32_to_e4m3fn(x: f32) -> u8 {
+    if !(x > 0.0) {
+        return 0;
+    }
+    // Positive finite codes 0..=0x7e are increasing in value: binary search.
+    let (mut lo, mut hi) = (0u8, 0x7eu8);
+    if x >= e4m3fn_to_f32(hi) {
+        return hi;
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if e4m3fn_to_f32(mid) <= x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if x - e4m3fn_to_f32(lo) <= e4m3fn_to_f32(hi) - x {
+        lo
+    } else {
+        hi
+    }
+}
+
+/// Encodes `[n, k]` row-major values as an `nvfp4` payload (`block_scale_k16_m128x4_v1`), as
+/// compressed-tensors' NVFP4 does: divisor `448 * 6 / amax`, per 16 values an E4M3 scale of
+/// `amax16 / 6 * divisor`, each value the nearest E2M1 code of `x * divisor / scale`. Needs
+/// `n % 128 == 0` and `k % 64 == 0`.
+pub fn encode_nvfp4(x: &[f32], n: usize, k: usize) -> Vec<u8> {
+    assert!(
+        x.len() == n * k && n % 128 == 0 && k % 64 == 0,
+        "nvfp4 shape [{n}, {k}]"
+    );
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let divisor = if amax > 0.0 { 448.0 * 6.0 / amax } else { 1.0 };
+    let scale_plane = align256(n * k / 2);
+    let mut out = vec![0u8; scale_plane + n * k / 16 + 4];
+    for r in 0..n {
+        for g in 0..k / 16 {
+            let blk = &x[r * k + g * 16..r * k + g * 16 + 16];
+            let bmax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let sc = f32_to_e4m3fn(bmax / 6.0 * divisor);
+            out[scale_plane + nvfp4_scale_offset(r, g, k)] = sc;
+            let step = e4m3fn_to_f32(sc) / divisor;
+            if step <= 0.0 {
+                continue;
+            }
+            for (j, &v) in blk.iter().enumerate() {
+                let q = (v.abs() / step).min(6.0);
+                // Nearest magnitude (ties to the lower one).
+                let mut code = 0u8;
+                for c in 1..8 {
+                    if q - MAG[c - 1] > MAG[c] - q {
+                        code = c as u8;
+                    }
+                }
+                let code = code | if v < 0.0 && code != 0 { 8 } else { 0 };
+                let col = g * 16 + j;
+                let byte = &mut out[(r * k + col) / 2];
+                *byte |= if col % 2 == 0 { code } else { code << 4 };
+            }
+        }
+    }
+    out[scale_plane + n * k / 16..].copy_from_slice(&divisor.to_le_bytes());
+    out
+}
+
 /// Decodes rows `[row_begin, row_begin + rows)` of a parent `[n, k]` matrix to f32 (`[rows, k]`).
 pub fn decode_rows(
     fmt: WeightFormat,
@@ -339,6 +438,11 @@ pub fn decode_rows(
             fmt.name(),
             payload.len()
         )));
+    }
+    if let WeightFormat::Ggml(t) = fmt {
+        let mut out = Vec::with_capacity(rows * k);
+        crate::ggml::decode_rows_into(t, payload, k, row_begin, rows, &mut out);
+        return Ok(out);
     }
     let mut out = Vec::with_capacity(rows * k);
     for r in row_begin..row_begin + rows {
@@ -375,6 +479,7 @@ pub fn decode_rows(
                 }
             }
             WeightFormat::Iq3Xxs => out.extend((0..k).map(|c| iq3_xxs_at(payload, n, k, r, c))),
+            WeightFormat::Ggml(_) => unreachable!("decoded above"),
             q => {
                 let rs = q.row_split().expect("row-split format");
                 out.extend((0..k).map(|c| row_split_at(rs, payload, n, k, r, c)));
@@ -386,6 +491,37 @@ pub fn decode_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nvfp4_encoding_round_trips_its_grid() {
+        // Values on a block's representable grid decode back exactly; others within half a step.
+        let (n, k) = (128, 64);
+        let mut x: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
+            .collect();
+        x[5] = 0.0;
+        let p = encode_nvfp4(&x, n, k);
+        assert_eq!(p.len(), WeightFormat::Nvfp4.payload_bytes(n, k));
+        let y = decode_rows(WeightFormat::Nvfp4, &p, n, k, 0, n).unwrap();
+        let again = encode_nvfp4(&y, n, k);
+        assert_eq!(
+            decode_rows(WeightFormat::Nvfp4, &again, n, k, 0, n).unwrap(),
+            y
+        );
+        for (blk, (xs, ys)) in x.chunks(16).zip(y.chunks(16)).enumerate() {
+            let amax = xs.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for (a, b) in xs.iter().zip(ys) {
+                // Half the widest E2M1 gap (2 at the top of the range) plus E4M3 scale rounding.
+                assert!(
+                    (a - b).abs() <= amax / 6.0 * 1.07 + 1e-6,
+                    "block {blk}: {a} vs {b}"
+                );
+            }
+        }
+        assert_eq!(f32_to_e4m3fn(448.0), 0x7e);
+        assert_eq!(f32_to_e4m3fn(1e9), 0x7e);
+        assert_eq!(e4m3fn_to_f32(f32_to_e4m3fn(1.0)), 1.0);
+    }
+
     use super::*;
 
     #[test]

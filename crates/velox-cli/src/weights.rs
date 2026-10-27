@@ -1,4 +1,4 @@
-//! `velox inspect` and `velox convert`.
+//! `velox inspect`, `velox convert`, `velox import-gguf` and `velox import-hf`.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -126,6 +126,80 @@ fn print_uses(art: &Artifact) -> Result<()> {
         println!("use  {param:<56} {policy:<10} {divisor}");
     }
     Ok(())
+}
+
+pub fn import_gguf(a: &Args) -> Result<ExitCode> {
+    let (gguf, donor) = (
+        Path::new(required(a, "gguf")?),
+        Path::new(required(a, "donor")?),
+    );
+    let output = Path::new(required(a, "output")?);
+    let t0 = std::time::Instant::now();
+    let r = velox_models::qwen3_5::gguf::import(gguf, donor, output, &mut |line| {
+        eprintln!("[import] {line}")
+    })?;
+    println!("text weights from the GGUF ({:.2} GB):", gb(r.text_bytes));
+    for (format, objects, bytes) in &r.text_formats {
+        println!("  {format:<14} {objects:>4} objects {:>7.2} GB", gb(*bytes));
+    }
+    println!(
+        "wrote {} ({:.2} GB, {:.2} GB from the donor) in {:.1}s; structure ok",
+        output.display(),
+        gb(r.payload_bytes),
+        gb(r.donor_bytes),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn import_hf(a: &Args) -> Result<ExitCode> {
+    let dir = Path::new(required(a, "hf-dir")?);
+    let output = Path::new(required(a, "output")?);
+    let t0 = std::time::Instant::now();
+    // `--dflash <dir>`: a DFlash2 drafter checkpoint for this target, as the dflash2 component.
+    let dflash = a.get("dflash").map(Path::new);
+    // `--dflash-nvfp4`: the drafter's matrices as NVFP4 (smaller and faster to draft with).
+    let dflash_nvfp4 = a.get("dflash-nvfp4").is_some();
+    // `--proposal-ids <file>`: little-endian i32 token ids for an MTP draft vocabulary head.
+    let proposal = match a.get("proposal-ids") {
+        Some(p) => {
+            let raw =
+                std::fs::read(p).map_err(|e| velox_core::Error::Config(format!("{p}: {e}")))?;
+            if raw.is_empty() || raw.len() % 4 != 0 {
+                return Err(velox_core::Error::Config(format!(
+                    "{p}: expected little-endian i32 token ids"
+                )));
+            }
+            Some(
+                raw.chunks_exact(4)
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32)
+                    .collect::<Vec<u32>>(),
+            )
+        }
+        None => None,
+    };
+    let r = velox_models::qwen3_5::hf::import_with(
+        dir,
+        output,
+        dflash,
+        dflash_nvfp4,
+        proposal.as_deref(),
+        &mut |line| eprintln!("[import] {line}"),
+    )?;
+    for (format, objects, bytes) in &r.formats {
+        println!("  {format:<22} {objects:>6} objects {:>7.2} GB", gb(*bytes));
+    }
+    println!(
+        "wrote {} ({:.2} GB; {} objects, {} bindings, {} uses; MTP {}) in {:.1}s; structure ok",
+        output.display(),
+        gb(r.payload_bytes),
+        r.objects,
+        r.bindings,
+        r.uses,
+        if r.mtp { "yes" } else { "no" },
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 pub fn convert(a: &Args) -> Result<ExitCode> {

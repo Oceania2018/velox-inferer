@@ -4,10 +4,13 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use velox_core::{Backend, Error, KvFormat, Result};
+use velox_core::{Backend, Error, KvFormat, Result, StateFormat};
 use velox_engine::{EngineConfig, QwenEngine};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{DFlashModel, Qwen35Text, Qwen35Vision, TextConfig, TextWeights};
+use velox_models::qwen3_5::{
+    DFlashModel, Qwen35Text, Qwen35Vision, TextConfig, TextWeights, DENSE_ARCHITECTURE,
+    MOE_ARCHITECTURE,
+};
 use velox_serve::{ChatEngine, Config, Server, UnimplementedEngine};
 use velox_weights::Artifact;
 
@@ -71,7 +74,17 @@ where
     );
     let engine_cfg = EngineConfig {
         capacity: a.parse("max-context", 32768)?,
-        chunk: a.parse("prefill-chunk", 512)?,
+        // MoE models with experts in system RAM read each one once per chunk. Qwen3.6-35B-A3B CUA
+        // replay, 1024 -> 2048: prefill p50 1.40 -> 1.19 s, decode 128 -> 122 tok/s (fewer expert
+        // slots), end to end 2.34 -> 2.08 s; 3072 and 4096 lose more slots than they save.
+        chunk: a.parse(
+            "prefill-chunk",
+            if matches!(cfg.ffn, velox_models::qwen3_5::FfnConfig::Moe(_)) {
+                2048
+            } else {
+                512
+            },
+        )?,
         default_max_tokens: a.parse("default-max-tokens", 4096)?,
         enable_thinking: a.get("enable-thinking").is_some_and(|v| v == "true"),
         // --force-tool-call on|off (default off): requests that offer tools answer with a tool
@@ -94,8 +107,9 @@ where
         skip_media_tail: a
             .get("ctx-checkpoint-skip-media-tail")
             .is_none_or(|v| v != "off"),
-        // --host-context-mib N (ninfer's name): system RAM for prefixes any request can resume.
-        host_context_bytes: a.parse::<usize>("host-context-mib", 16384)? << 20,
+        // --host-context-mib N (ninfer's name): system RAM for prefixes any request can resume,
+        // pinned at startup (default 24 GiB, as the production ninfer).
+        host_context_bytes: a.parse::<usize>("host-context-mib", 24576)? << 20,
         // --kv-paging on|off (default on): lanes' attention caches in virtual memory, backed as
         // they grow, with identical prefix chunks shared between lanes.
         kv_paging: a.get("kv-paging").is_none_or(|v| v != "off"),
@@ -119,6 +133,9 @@ where
         graph_budget: a.parse::<usize>("graph-mib", 256)? << 20,
         // --ctx-lrfu-lambda F: LRFU decay per request of that store (0: LRU).
         lrfu_lambda: a.parse("ctx-lrfu-lambda", 0.1)?,
+        // --host-state-dtype f32|bf16|nvfp4 (ninfer's name and default: bf16): storage of the
+        // recurrent states the context store keeps; lanes always run on f32 state.
+        host_state_format: StateFormat::parse(a.get("host-state-dtype").unwrap_or("bf16"))?,
         // --disk-context-mib N (default 0: off) and --disk-context-dir DIR: NVMe tier below RAM.
         disk_context_bytes: a.parse::<u64>("disk-context-mib", 0)? << 20,
         disk_context_dir: match a.get("disk-context-dir") {
@@ -136,6 +153,17 @@ where
         mtp_drafts: a.parse("mtp-drafts", 7)?,
         dflash_drafts,
         kv_format: KvFormat::parse(a.get("kv-format").unwrap_or("f32"))?,
+        // --score-branch-rows N (ninfer's name and default: 100; 0 rejects rank questions):
+        // System One rank candidates scored per forward pass, at most 256.
+        score_rows: match a.parse("score-branch-rows", 100)? {
+            n if n <= velox_serve::systemone::MAX_RANK_CANDIDATES => n,
+            n => {
+                return Err(Error::Config(format!(
+                    "--score-branch-rows {n}: at most {}",
+                    velox_serve::systemone::MAX_RANK_CANDIDATES
+                )))
+            }
+        },
     };
     let vision = if art.components().contains_key("vision")
         && a.get("vision").is_none_or(|v| v != "false")
@@ -168,7 +196,13 @@ where
     } else {
         None
     };
-    let model = Qwen35Text::new(cfg, w);
+    let mut model = Qwen35Text::new(cfg, w);
+    // The engine's sessions and workspaces are allocated after this: a larger default margin
+    // (1.5 GiB at 1024-token prefill chunks peaks at 15.5 of 16 GB on the Qwen3.6-35B-A3B CUA
+    // replay; 1 GiB left 0.4 GB), growing with the chunk (about 0.55 GiB per 1024 tokens).
+    let chunk = engine_cfg.chunk.max(1024);
+    let margin = 1536 + (chunk - 1024) * 9 / 16;
+    crate::generate::enable_experts(&b, &mut model, a, margin)?;
     Ok(Box::new(QwenEngine::new(
         b, model, vision, dflash, fe, engine_cfg,
     )?))
@@ -194,20 +228,21 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     let port: u16 = a.parse("port", 8010)?;
     let profile = crate::select::profile(a)?.map_or("unknown", |p| p.id);
 
-    let engine: Box<dyn ChatEngine> = if architecture == "Qwen3_5ForCausalLM" {
-        match crate::select::backend(a)? {
-            Selected::Cpu(b) => build(b, &art, a)?,
-            #[cfg(feature = "cuda")]
-            Selected::Cuda(b) => build(b, &art, a)?,
-        }
-    } else {
-        eprintln!(
-            "note: no velox execution path for {architecture}; chat requests will answer 501"
-        );
-        Box::new(UnimplementedEngine {
-            architecture: architecture.clone(),
-        })
-    };
+    let engine: Box<dyn ChatEngine> =
+        if architecture == DENSE_ARCHITECTURE || architecture == MOE_ARCHITECTURE {
+            match crate::select::backend(a)? {
+                Selected::Cpu(b) => build(b, &art, a)?,
+                #[cfg(feature = "cuda")]
+                Selected::Cuda(b) => build(b, &art, a)?,
+            }
+        } else {
+            eprintln!(
+                "note: no velox execution path for {architecture}; chat requests will answer 501"
+            );
+            Box::new(UnimplementedEngine {
+                architecture: architecture.clone(),
+            })
+        };
     // As many concurrent generations as engine lanes (more wait for one here).
     let cfg = Config {
         model_id: model_id.clone(),

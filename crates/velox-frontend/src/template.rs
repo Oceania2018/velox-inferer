@@ -96,6 +96,37 @@ impl ChatTemplate {
         enable_thinking: bool,
         add_generation_prompt: bool,
     ) -> Result<String> {
+        self.render_with(
+            messages,
+            tools,
+            enable_thinking,
+            add_generation_prompt,
+            false,
+        )
+    }
+
+    /// Renders `messages` so the prompt ends inside their final assistant message, which the
+    /// model then continues (ninfer's assistant prefill: `continue_final_message`, no generation
+    /// prompt). The template decides how the open turn starts; with thinking off, ninfer's
+    /// `qwen3_8.jinja` opens it with an empty think block as the generation prompt does.
+    pub fn render_continuation(&self, messages: &Value, enable_thinking: bool) -> Result<String> {
+        let last = messages.as_array().and_then(|m| m.last());
+        if last.and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant") {
+            return Err(Error::Config(
+                "assistant continuation requires a final assistant message".into(),
+            ));
+        }
+        self.render_with(messages, None, enable_thinking, false, true)
+    }
+
+    fn render_with(
+        &self,
+        messages: &Value,
+        tools: Option<&Value>,
+        enable_thinking: bool,
+        add_generation_prompt: bool,
+        continue_final_message: bool,
+    ) -> Result<String> {
         let tmpl = self
             .env
             .get_template("chat")
@@ -105,6 +136,7 @@ impl ChatTemplate {
             tools => tools.map(JValue::from_serialize),
             enable_thinking => enable_thinking,
             add_generation_prompt => add_generation_prompt,
+            continue_final_message => continue_final_message,
         };
         tmpl.render(ctx)
             .map_err(|e| Error::Config(format!("chat template: {e:#}")))
@@ -140,6 +172,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "<|im_start|>user\nhi<|im_end|>\n{\"name\": \"x\"}<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    }
+
+    #[test]
+    fn continuation_leaves_the_final_assistant_turn_open() {
+        // The continuation branch of ninfer's qwen3_8.jinja, reduced.
+        let src = "{%- for m in messages %}{%- set continuing = continue_final_message|default(false) and loop.last %}\
+                   {%- if m.role == 'assistant' and continuing and enable_thinking is false %}<|im_start|>assistant\n<think>\n\n</think>\n\n{{ m.content|trim }}\
+                   {%- else %}<|im_start|>{{ m.role }}\n{{ m.content|trim }}{% if not continuing %}<|im_end|>\n{% endif %}{% endif %}{% endfor %}\
+                   {%- if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        let t = ChatTemplate::new(src.into()).unwrap();
+        let messages = json!([
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "Answer: ("}
+        ]);
+        assert_eq!(
+            t.render_continuation(&messages, false).unwrap(),
+            "<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nq<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\nAnswer: ("
+        );
+        assert!(t
+            .render_continuation(&json!([{"role": "user", "content": "q"}]), false)
+            .is_err());
     }
 
     #[test]

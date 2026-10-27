@@ -572,7 +572,206 @@ int attention_gqa(const float* q, const float* k, const float* v, float* out, in
     return velox_launch_status();
 }
 
+// Scoring windows over a shared prefix (see Backend::attention_windows): query token t = w * window + j
+// sees the prefix keys [0, pos0) and its window's keys [pos0 + w * window, pos0 + t]. As in the GQA
+// kernel, a block owns a KV head, a split of the prefix and up to kGqaRows (token x head) rows, and
+// stages each K/V tile once for all of them; split 0 also walks the window keys of its rows.
+template <int PER, int TK>
+__global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
+    attention_windows_partial_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                     const float* __restrict__ v, float* __restrict__ part_acc,
+                                     float* __restrict__ part_ml, int tokens, int heads, int kv_heads,
+                                     int head_dim, int pos0, int window, float scale, int splits,
+                                     int split_keys) {
+    extern __shared__ float win_smem[];
+    float* ks = win_smem;
+    float* vs = win_smem + TK * head_dim;
+    const int kvh = blockIdx.x, sp = blockIdx.y, rg = blockIdx.z;
+    const int group = heads / kv_heads, rows = tokens * group;
+    const int warp = threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
+    float qr[kGqaRowsPerWarp][PER], acc[kGqaRowsPerWarp][PER], m[kGqaRowsPerWarp], l[kGqaRowsPerWarp];
+    int lo[kGqaRowsPerWarp], last[kGqaRowsPerWarp];  // the row's window keys; last -1 for a padding row
+#pragma unroll
+    for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+        const int r = rg * kGqaRows + warp * kGqaRowsPerWarp + i;
+        const int t = r / group, h = kvh * group + r % group;
+        last[i] = r < rows ? pos0 + t : -1;
+        lo[i] = pos0 + t / window * window;
+        m[i] = -INFINITY;
+        l[i] = 0.0f;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            qr[i][p] = r < rows && d < head_dim ? q[(static_cast<size_t>(t) * heads + h) * head_dim + d] * scale : 0.0f;
+            acc[i][p] = 0.0f;
+        }
+    }
+    // The block's tokens, and so the window keys any of its rows sees.
+    const int r0 = rg * kGqaRows, r1 = min(rows, r0 + kGqaRows) - 1;
+    const int t_lo = r0 / group, t_hi = r1 / group;
+    const int vec = head_dim / 4;
+    for (int part = 0; part < 2; ++part) {
+        // Part 0: this split's share of the prefix; part 1 (split 0): the window keys.
+        const int a = part == 0 ? min(sp * split_keys, pos0) : sp == 0 ? pos0 + t_lo / window * window : 0;
+        const int b = part == 0 ? min(a + split_keys, pos0) : sp == 0 ? pos0 + t_hi + 1 : 0;
+        for (int base = a; base < b; base += TK) {
+            const int n = min(TK, b - base);
+            __syncthreads();
+            for (int idx = threadIdx.x; idx < n * vec; idx += blockDim.x) {
+                const int key = idx / vec, d4 = idx % vec;
+                const size_t off = (static_cast<size_t>(base + key) * kv_heads + kvh) * head_dim;
+                reinterpret_cast<float4*>(ks)[key * vec + d4] = reinterpret_cast<const float4*>(k + off)[d4];
+                reinterpret_cast<float4*>(vs)[key * vec + d4] = reinterpret_cast<const float4*>(v + off)[d4];
+            }
+            __syncthreads();
+            if (part == 0) {
+                // Every row sees every prefix key (a padding row's results are never written):
+                // four keys of all the warp's rows at a time, so their sixteen reductions overlap.
+                int jj = 0;
+                for (; jj + 4 <= n; jj += 4) {
+                    float s[kGqaRowsPerWarp][4];
+#pragma unroll
+                    for (int i = 0; i < kGqaRowsPerWarp; ++i)
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const float* kr = ks + (jj + u) * head_dim;
+                            float x = 0.0f;
+#pragma unroll
+                            for (int p = 0; p < PER; ++p)
+                                if (lane + p * VELOX_WARP < head_dim) x += qr[i][p] * kr[lane + p * VELOX_WARP];
+                            s[i][u] = x;
+                        }
+#pragma unroll
+                    for (int o = VELOX_WARP / 2; o > 0; o >>= 1)
+#pragma unroll
+                        for (int i = 0; i < kGqaRowsPerWarp; ++i)
+#pragma unroll
+                            for (int u = 0; u < 4; ++u) s[i][u] += __shfl_xor_sync(0xffffffffu, s[i][u], o);
+#pragma unroll
+                    for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+                        const float m_new = fmaxf(fmaxf(m[i], fmaxf(s[i][0], s[i][1])), fmaxf(s[i][2], s[i][3]));
+                        const float corr = expf(m[i] - m_new);
+                        float pu[4];
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) pu[u] = expf(s[i][u] - m_new);
+                        l[i] = l[i] * corr + (pu[0] + pu[1]) + (pu[2] + pu[3]);
+#pragma unroll
+                        for (int p = 0; p < PER; ++p) {
+                            const int d = lane + p * VELOX_WARP;
+                            if (d >= head_dim) continue;
+                            float a = acc[i][p] * corr;
+#pragma unroll
+                            for (int u = 0; u < 4; ++u) a += pu[u] * vs[(jj + u) * head_dim + d];
+                            acc[i][p] = a;
+                        }
+                        m[i] = m_new;
+                    }
+                }
+                for (; jj < n; ++jj) {
+#pragma unroll
+                    for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+                        const float* kr = ks + jj * head_dim;
+                        float x = 0.0f;
+#pragma unroll
+                        for (int p = 0; p < PER; ++p)
+                            if (lane + p * VELOX_WARP < head_dim) x += qr[i][p] * kr[lane + p * VELOX_WARP];
+                        x = velox_warp_sum(x);
+                        const float m_new = fmaxf(m[i], x);
+                        const float corr = expf(m[i] - m_new), pj = expf(x - m_new);
+                        l[i] = l[i] * corr + pj;
+                        const float* vr = vs + jj * head_dim;
+#pragma unroll
+                        for (int p = 0; p < PER; ++p)
+                            if (lane + p * VELOX_WARP < head_dim)
+                                acc[i][p] = acc[i][p] * corr + pj * vr[lane + p * VELOX_WARP];
+                        m[i] = m_new;
+                    }
+                }
+                continue;
+            }
+#pragma unroll
+            for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+                // Warp-uniform: the row's own window keys.
+                const int start = max(0, lo[i] - base);
+                const int stop = min(n, last[i] - base + 1);
+                for (int jj = start; jj < stop; ++jj) {
+                    const float* kr = ks + jj * head_dim;
+                    float s = 0.0f;
+#pragma unroll
+                    for (int p = 0; p < PER; ++p)
+                        if (lane + p * VELOX_WARP < head_dim) s += qr[i][p] * kr[lane + p * VELOX_WARP];
+                    s = velox_warp_sum(s);
+                    const float m_new = fmaxf(m[i], s);
+                    const float corr = expf(m[i] - m_new), pj = expf(s - m_new);
+                    l[i] = l[i] * corr + pj;
+                    const float* vr = vs + jj * head_dim;
+#pragma unroll
+                    for (int p = 0; p < PER; ++p)
+                        if (lane + p * VELOX_WARP < head_dim)
+                            acc[i][p] = acc[i][p] * corr + pj * vr[lane + p * VELOX_WARP];
+                    m[i] = m_new;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kGqaRowsPerWarp; ++i) {
+        const int r = rg * kGqaRows + warp * kGqaRowsPerWarp + i;
+        if (r >= rows) continue;
+        const int t = r / group, h = kvh * group + r % group;
+        const size_t idx = (static_cast<size_t>(t) * heads + h) * splits + sp;
+#pragma unroll
+        for (int p = 0; p < PER; ++p) {
+            const int d = lane + p * VELOX_WARP;
+            if (d < head_dim) part_acc[idx * head_dim + d] = acc[i][p];
+        }
+        if (lane == 0) {
+            part_ml[2 * idx] = m[i];
+            part_ml[2 * idx + 1] = l[i];
+        }
+    }
+}
+
+template <int PER>
+int attention_windows(const float* q, const float* k, const float* v, float* out, int tokens, int window, int heads,
+                      int kv_heads, int head_dim, int pos0, float scale) {
+    constexpr int TK = PER >= 8 ? 16 : 32;
+    const int rgs = (tokens * (heads / kv_heads) + kGqaRows - 1) / kGqaRows;
+    // About two blocks per SM: the prefix splits when the windows alone do not fill the GPU.
+    const int want = (340 + kv_heads * rgs - 1) / (kv_heads * rgs);
+    int split_keys = (pos0 + want - 1) / want;
+    split_keys = (split_keys < 2 * TK ? 2 * TK : split_keys + TK - 1) / TK * TK;
+    const int splits = pos0 > 0 ? (pos0 + split_keys - 1) / split_keys : 1;
+    if (rgs > 65535 || splits > 65535) return VELOX_ERR_UNSUPPORTED;
+    const size_t parts = static_cast<size_t>(tokens) * heads * splits;
+    float* scratch = split_scratch(parts * (head_dim + 2));
+    if (scratch == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+    float* part_acc = scratch;
+    float* part_ml = scratch + parts * head_dim;
+    const size_t smem = static_cast<size_t>(2) * TK * head_dim * sizeof(float);
+    attention_windows_partial_kernel<PER, TK><<<dim3(kv_heads, splits, rgs), kGqaWarps * VELOX_WARP, smem>>>(
+        q, k, v, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, window, scale, splits, split_keys);
+    attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
+                                                                       splits);
+    return velox_launch_status();
+}
+
 }  // namespace
+
+// Scoring windows over a shared prefix (see Backend::attention_windows); f32 k and v hold the prefix
+// at rows 0 .. pos0 and window w at rows pos0 + w * window.
+VELOX_API int velox_portable_attention_windows(const float* q, const float* k, const float* v, float* out, int tokens,
+                                               int window, int heads, int kv_heads, int head_dim, int pos0,
+                                               float scale) {
+    if (window <= 0 || tokens % window != 0 || tokens > 65535 || head_dim % 32 != 0 || head_dim > 256 ||
+        heads % kv_heads != 0)
+        return VELOX_ERR_UNSUPPORTED;
+    if (head_dim <= 64)
+        return attention_windows<2>(q, k, v, out, tokens, window, heads, kv_heads, head_dim, pos0, scale);
+    if (head_dim <= 128)
+        return attention_windows<4>(q, k, v, out, tokens, window, heads, kv_heads, head_dim, pos0, scale);
+    return attention_windows<8>(q, k, v, out, tokens, window, heads, kv_heads, head_dim, pos0, scale);
+}
 
 // params: null, or device [pos0, k_cache, v_cache] staged by a graph step, with kv_grid >= pos0 + tokens
 // sizing the grid (only the GQA decode / verify path reads it).
@@ -990,6 +1189,28 @@ VELOX_API int velox_portable_copy2d_param(const float* src, long long src_stride
     if (rows == 0 || cols == 0) return 0;
     copy2d_param_kernel<<<velox_grid_1d(rows * cols, 256), 256>>>(src, src_stride, dst, dst_stride, rows, cols,
                                                                     params);
+    return velox_launch_status();
+}
+
+namespace {
+// y[r][j][g][:] = x[r][g][j][:] over heads of dim values: one thread per output value.
+__global__ void transpose_heads_kernel(const float* __restrict__ x, float* __restrict__ y, long long rows, int a, int b,
+                                       int dim) {
+    const long long row = static_cast<long long>(a) * b * dim, n = rows * row;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / row;
+        const int c = static_cast<int>(i % row), h = c / dim, e = c % dim;
+        const int j = h / a, g = h % a;
+        y[i] = x[r * row + (static_cast<long long>(g) * b + j) * dim + e];
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_transpose_heads(const float* x, float* y, long long rows, int a, int b, int dim) {
+    const long long n = rows * a * b * dim;
+    if (n == 0) return 0;
+    transpose_heads_kernel<<<velox_grid_1d(n, 256), 256>>>(x, y, rows, a, b, dim);
     return velox_launch_status();
 }
 

@@ -94,6 +94,18 @@ pub fn quantize_activations(x: &mut [f32], k: usize, q: ActQuant) {
                 }
             }
         }
+        ActQuant::Int8G32 => {
+            for row in x.chunks_mut(k) {
+                for group in row.chunks_mut(32) {
+                    let amax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                    let scale = amax / 127.0;
+                    for v in group {
+                        *v = (*v * inv).round_ties_even() * scale;
+                    }
+                }
+            }
+        }
         ActQuant::Int8G256 => {
             for row in x.chunks_mut(k) {
                 for group in row.chunks_mut(256) {

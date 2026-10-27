@@ -11,6 +11,7 @@ use crate::format::WeightFormat;
 use crate::kv::KvFormat;
 use crate::op::Op;
 use crate::profile::DeviceProfile;
+use crate::state::StateFormat;
 
 /// [`Backend::alloc_host`] callable from any thread: pinning system RAM is slow (about 1 ms per
 /// MiB), so a background thread can prepare it while the device works.
@@ -296,6 +297,155 @@ impl GdnShape {
     }
 }
 
+/// Causal depthwise convolution with dilation, then SiLU, over `tokens` rows of `channels`:
+/// with `u = [state; x]` (`state` holds the previous `(width - 1) * dilation` input rows, oldest
+/// first), `out[t, c] = silu(Σ_j weight[j, c] · u[t + j·dilation, c])`; tap `width - 1` is the
+/// current token. `state` is updated to the last `(width - 1) * dilation` rows of `u`. `weight`
+/// is `[width, channels]` f32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DilatedConvShape {
+    pub tokens: usize,
+    pub channels: usize,
+    pub width: usize,
+    pub dilation: usize,
+}
+
+impl DilatedConvShape {
+    /// Rows of state: the inputs the next call still reads.
+    pub fn state_rows(&self) -> usize {
+        (self.width - 1) * self.dilation
+    }
+}
+
+/// Hyper-connection write-back ([`Backend::hc_combine`]): `rows` rows of `streams` residual
+/// streams of `dim`; the injection logits of row `r` are `inject[r * inject_ld + inject_col ..]
+/// [.. streams]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HcCombineShape {
+    pub rows: usize,
+    pub streams: usize,
+    pub dim: usize,
+    pub inject_ld: usize,
+    pub inject_col: usize,
+}
+
+/// `x[r][..dim] *= sigmoid(gate[gate_offset + r * gate_stride])` for `rows` rows of `x`
+/// (`[rows, dim]`): one scalar gate per row, e.g. a column of a wider projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowGateShape {
+    pub rows: usize,
+    pub dim: usize,
+    pub gate_offset: usize,
+    pub gate_stride: usize,
+}
+
+/// MoE routing ([`Backend::moe_route`]) of `rows` rows of router logits (`[rows, row_len]`; the
+/// first `experts` columns are the experts', later columns belong to other heads of the same
+/// projection): softmax over the experts, the `k` most probable (ties to the lower id), their
+/// probabilities renormalised to sum to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeRouteShape {
+    pub rows: usize,
+    pub row_len: usize,
+    pub experts: usize,
+    pub k: usize,
+}
+
+/// One projection of an expert record: a `[rows, k]` matrix in `format` whose encoded payload
+/// starts `offset` bytes into the record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpertMatrix {
+    pub format: WeightFormat,
+    pub offset: usize,
+    pub rows: usize,
+    pub k: usize,
+}
+
+/// The routed experts of one MoE layer, each a record of `record_bytes` holding its gate and up
+/// (`[width, hidden]`) and down (`[hidden, width]`) projections.
+///
+/// `records` holds every expert (expert `e` at byte `e * record_bytes`), usually in system RAM
+/// the device reads directly ([`Backend::alloc_host`]). `slots` holds device-resident copies (slot
+/// `i` at byte `i * slot_bytes`; several layers' banks may share one pool of slots), and `map`
+/// (`[experts]`, i32 bits in f32 slots) names each expert's slot, or -1 when only `records` has
+/// it. A slot starts with an exact copy of its record, so placement never changes results.
+pub struct ExpertBank<'a, Buf> {
+    pub records: &'a Buf,
+    pub slots: &'a Buf,
+    pub map: &'a Buf,
+    pub experts: usize,
+    /// Slots in `slots` (0: no device copies).
+    pub slot_count: usize,
+    /// Stride of `slots`: at least `record_bytes`, a multiple of 16.
+    pub slot_bytes: usize,
+    pub record_bytes: usize,
+    pub gate: ExpertMatrix,
+    pub up: ExpertMatrix,
+    pub down: ExpertMatrix,
+    pub act: ActPolicy,
+}
+
+impl<Buf> ExpertBank<'_, Buf> {
+    /// Expert width (`gate.rows`).
+    pub fn width(&self) -> usize {
+        self.gate.rows
+    }
+
+    /// Model width (`gate.k`).
+    pub fn hidden(&self) -> usize {
+        self.gate.k
+    }
+}
+
+/// Pooled index keys of the QSA indexer ([`Backend::qsa_pool`]) for blocks `block0 .. block0 +
+/// blocks`: block `b` is the mean of raw keys `b·ratio .. (b + 1)·ratio` (rows of `[positions,
+/// dim]`), plain-RMS-normalised with `weight`, then rotated rotate-half over its first
+/// `rotary_dim` dims at position `b·ratio` (pair `i` by `theta^(-2i/rotary_dim)`), into row `b` of
+/// the pooled cache.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QsaPoolShape {
+    pub block0: usize,
+    pub blocks: usize,
+    pub ratio: usize,
+    pub dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f32,
+    pub eps: f32,
+}
+
+/// QSA token selection ([`Backend::qsa_select`]) for `tokens` queries at positions `pos0 + t`,
+/// each `[heads, dim]` (normalised and rotated). Query `t` sees `nc = (pos0 + t + 1) / ratio`
+/// complete blocks; block `b < nc` scores `Σ_h relu(q[t,h] · pooled[b]) / sqrt(dim)`. Its
+/// selection is the members of the `min(budget / ratio, nc)` best blocks (ties to the lower
+/// block) and the tail `nc·ratio ..= pos0 + t`, as ascending positions padded with -1 to
+/// [`Self::sel_len`] (i32 bits in f32 slots).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QsaSelectShape {
+    pub tokens: usize,
+    pub heads: usize,
+    pub dim: usize,
+    pub pos0: usize,
+    pub ratio: usize,
+    pub budget: usize,
+}
+
+impl QsaSelectShape {
+    /// Entries per query: the budget plus the longest tail.
+    pub fn sel_len(&self) -> usize {
+        self.budget + self.ratio - 1
+    }
+
+    /// Complete blocks query `t` sees.
+    pub fn complete_blocks(&self, t: usize) -> usize {
+        (self.pos0 + t + 1) / self.ratio
+    }
+
+    /// Whether every query selects every position it sees (dense causal attention).
+    pub fn dense(&self) -> bool {
+        self.complete_blocks(self.tokens - 1) <= self.budget / self.ratio
+    }
+}
+
 /// The lowest activation precision a weight's use permits (artifact `uses[].activation_policy`).
 /// The model author decides this per projection; a kernel may round activations no further.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -340,6 +490,11 @@ pub enum ActQuant {
     /// `rint(x * (127 / amax))` as int8 (the int8 tensor-core prefill paths). Needs `k % 256 == 0`;
     /// an 8-bit activation, so [`ActPolicy::AllowA8`] permits it.
     Int8G256,
+    /// Per row and 32-value group: `scale = amax / 127`, codes `rint(x * (127 / amax))` as int8,
+    /// no bf16 rounding first: llama.cpp's q8_1 activations, which its GGML block kernels (and the
+    /// GGUF quantizations' published evaluations) use. Needs `k % 32 == 0`; [`ActPolicy::AllowA8`]
+    /// permits it.
+    Int8G32,
 }
 
 /// The operand precision of an attention kernel (`attention`, `attention_full`). Like
@@ -790,6 +945,12 @@ pub trait Backend {
     fn alloc_host(&self, len: usize) -> Result<Self::Buffer> {
         self.alloc(len)
     }
+    /// Prepares `bytes` of [`Self::alloc_host`] storage ahead of use, so later allocations up to
+    /// that much do not pin memory (slow: see [`HostAlloc`]). Returns the bytes it prepared;
+    /// backends without pinned memory prepare nothing.
+    fn reserve_host(&self, _bytes: usize) -> usize {
+        0
+    }
     /// f32 slots of one physical chunk of virtual memory; 0 when the backend has none (callers
     /// then allocate whole buffers).
     fn vm_chunk_len(&self) -> usize {
@@ -900,6 +1061,123 @@ pub trait Backend {
         shape: GdnShape,
     ) -> Result<()> {
         self.gated_delta_net_from(qkv, ab, a_log, dt_bias, state_in, scratch, out, shape)
+    }
+    /// Scoring windows: [`Self::conv1d_silu_from`] over each of `windows` windows of
+    /// `shape.tokens` rows (window `w` at rows `shape.row0 + w * shape.tokens` of `x` and `out`),
+    /// every one from `state_in`, which is not written; no state after a window is kept.
+    fn conv1d_silu_windows(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        state_in: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: ConvShape,
+        windows: usize,
+    ) -> Result<()> {
+        crate::check::conv1d_windows(
+            self.len(x),
+            self.len(weight),
+            self.len(state_in),
+            self.len(out),
+            &shape,
+            windows,
+        )?;
+        let mut scratch = self.alloc(self.len(state_in))?;
+        for w in 0..windows {
+            let s = ConvShape {
+                row0: shape.row0 + w * shape.tokens,
+                ..shape
+            };
+            self.conv1d_silu_from(x, weight, state_in, &mut scratch, out, s)?;
+        }
+        Ok(())
+    }
+    /// Scoring windows: [`Self::gated_delta_net_out`] over each of `windows` windows of
+    /// `shape.tokens` rows (window `w` at rows `shape.row0 + w * shape.tokens` of `qkv`, `ab` and
+    /// `out`), every one from `state_in`, which is not written.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_net_windows(
+        &self,
+        qkv: &Self::Buffer,
+        ab: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        state_in: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: GdnShape,
+        windows: usize,
+    ) -> Result<()> {
+        crate::check::gdn_windows(
+            self.len(qkv),
+            self.len(ab),
+            self.len(a_log),
+            self.len(dt_bias),
+            self.len(state_in),
+            self.len(out),
+            &shape,
+            windows,
+        )?;
+        let mut scratch = self.alloc(self.len(state_in))?;
+        for w in 0..windows {
+            let s = GdnShape {
+                row0: shape.row0 + w * shape.tokens,
+                ..shape
+            };
+            self.gated_delta_net_out(qkv, ab, a_log, dt_bias, state_in, &mut scratch, out, s)?;
+        }
+        Ok(())
+    }
+    /// Scoring windows over a shared prefix, f32 keys and values (`shape.kv` is
+    /// [`KvFormat::F32`]): `q` and `out` are `[shape.tokens, heads, head_dim]` in windows of
+    /// `window` rows; `k` and `v` hold the prefix at rows `0 .. shape.pos0` and window `w`'s rows
+    /// at `shape.pos0 + w * window ..`. Row `j` of window `w` (query row `w * window + j`, at
+    /// position `pos0 + j`) attends to the prefix and to rows `0 ..= j` of its window, as
+    /// [`Self::attention`] over the prefix followed by that window alone would. Rounds its
+    /// operands as [`Self::attention_windows_precision`] reports for `shape`.
+    fn attention_windows(
+        &self,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: AttnShape,
+        window: usize,
+    ) -> Result<()> {
+        crate::check::attention_windows(
+            self.len(q),
+            self.len(k),
+            self.len(v),
+            self.len(out),
+            &shape,
+            window,
+        )?;
+        // Each window alone after a copy of the prefix.
+        let (p, kv_row, q_row) = (
+            shape.pos0,
+            shape.kv_heads * shape.head_dim,
+            shape.heads * shape.head_dim,
+        );
+        let mut kw = self.alloc((p + window) * kv_row)?;
+        let mut vw = self.alloc((p + window) * kv_row)?;
+        let mut qw = self.alloc(window * q_row)?;
+        let mut ow = self.alloc(window * q_row)?;
+        if p > 0 {
+            self.copy(k, 0, &mut kw, 0, p * kv_row)?;
+            self.copy(v, 0, &mut vw, 0, p * kv_row)?;
+        }
+        for w in 0..shape.tokens / window {
+            let r = w * window;
+            self.copy(k, (p + r) * kv_row, &mut kw, p * kv_row, window * kv_row)?;
+            self.copy(v, (p + r) * kv_row, &mut vw, p * kv_row, window * kv_row)?;
+            self.copy(q, r * q_row, &mut qw, 0, window * q_row)?;
+            let s = AttnShape {
+                tokens: window,
+                ..shape
+            };
+            self.attention(&qw, &kw, &vw, &mut ow, s)?;
+            self.copy(&ow, 0, out, r * q_row, window * q_row)?;
+        }
+        Ok(())
     }
     /// Advances several GDN layers over the first `gdn.tokens` rows of a window whose conv outputs
     /// are known (a speculative window replayed after a partial accept): each layer's conv state
@@ -1024,9 +1302,34 @@ pub trait Backend {
         v: &mut Self::Buffer,
         shape: KvStoreShape,
     ) -> Result<()>;
+    /// Encodes `n` values of the f32 recurrent state `src` into `dst` in `fmt`'s packed layout
+    /// (see [`crate::StateFormat`]; bit-exact with `velox_core::state::pack`). `dst` may be
+    /// storage from [`Self::alloc_host`]: a checkpoint is written straight to system RAM.
+    fn state_pack(
+        &self,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()>;
+    /// Decodes a packed state of `n` values (`src`, possibly host storage) into the f32 values it
+    /// represents (bit-exact with `velox_core::state::unpack`).
+    fn state_unpack(
+        &self,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
+        n: usize,
+        fmt: StateFormat,
+    ) -> Result<()>;
     /// The operand precision `attention` uses for this shape. For a quantized cache the rounding
     /// applies to the rows the cache represents.
     fn attention_precision(&self, _shape: AttnShape) -> AttnPrecision {
+        AttnPrecision::Exact
+    }
+    /// The operand precision `attention_windows` uses for this shape (its windows are read as
+    /// distributions over a few candidates, so a backend may keep more precision than for
+    /// `attention`).
+    fn attention_windows_precision(&self, _shape: AttnShape) -> AttnPrecision {
         AttnPrecision::Exact
     }
     /// The operand precision `attention_full` uses for this shape.
@@ -1109,6 +1412,18 @@ pub trait Backend {
         limit: usize,
         k: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>>;
+    /// Log-softmax over the first `limit` values of each row of `x` (`[rows, row_len]`), read at
+    /// `ids` and returned to the host as `[rows, ids.len()]`: `x[r][id] - log(sum(exp(x[r][..limit])))`.
+    /// NaN counts as -inf. An id at or past `limit`, and every id of a row without a finite value,
+    /// reads -inf.
+    fn log_softmax_gather(
+        &self,
+        x: &Self::Buffer,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+    ) -> Result<Vec<f32>>;
     /// Rotary embedding with explicit per-axis positions (`[axes, tokens]`, host); see
     /// [`RopePosShape`].
     fn rope_positions(
@@ -1164,8 +1479,189 @@ pub trait Backend {
     fn device_in_use(&self) -> Option<usize> {
         self.mem_info().map(|(free, total)| total - free)
     }
+    /// Head transpose: each of `rows` rows holds `a * b` heads of `dim` values, and head
+    /// `g * b + j` of `x` becomes head `j * a + g` of `y` (`y[r][j][g] = x[r][g][j]`). GGUF
+    /// imports use it to put Gated DeltaNet outputs (value heads grouped by key head) into
+    /// llama.cpp's tiled value-head order. `y` must not alias `x`.
+    fn transpose_heads(
+        &self,
+        x: &Self::Buffer,
+        y: &mut Self::Buffer,
+        rows: usize,
+        a: usize,
+        b: usize,
+        dim: usize,
+    ) -> Result<()> {
+        crate::check::transpose_heads(self.len(x), self.len(y), rows, a, b, dim)?;
+        let row = a * b * dim;
+        for g in 0..a {
+            for j in 0..b {
+                let shape = Copy2dShape {
+                    rows,
+                    cols: dim,
+                    src_offset: (g * b + j) * dim,
+                    src_stride: row,
+                    dst_offset: (j * a + g) * dim,
+                    dst_stride: row,
+                };
+                self.copy2d(x, y, shape)?;
+            }
+        }
+        Ok(())
+    }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;
+    /// Writes host values into `dst[offset ..][.. data.len()]` in stream order with queued work
+    /// (work queued before reads the old values, work queued after the new ones); `data` may be
+    /// reused as soon as this returns.
+    fn write_at(&self, dst: &mut Self::Buffer, offset: usize, data: &[f32]) -> Result<()> {
+        let src = self.upload(data)?;
+        self.copy(&src, 0, dst, offset, data.len())?;
+        // The copy reads `src`, which drops here: wait for it.
+        self.synchronize()
+    }
+    /// Plain RMS norm of `groups` consecutive groups of `dim` per row, each with its own slice of
+    /// `weight` (`[groups, dim]`): `y[r][g] = x[r][g] * rsqrt(mean(x[r][g]²) + eps) * weight[g]`
+    /// for `x`, `y` of `[rows, groups * dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rms_norm_groups(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        y: &mut Self::Buffer,
+        rows: usize,
+        groups: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()>;
+    /// `x[i] = silu(x[i])` for the first `len` elements.
+    fn silu(&self, x: &mut Self::Buffer, len: usize) -> Result<()>;
+    /// Hyper-connection mix: `out[r][d] = (1 / streams) Σ_s xn[r][s][d] · sigmoid(gate[r][s][d])`
+    /// for `xn`, `gate` of `[rows, streams, dim]` and `out` of `[rows, dim]`.
+    fn hc_mix(
+        &self,
+        xn: &Self::Buffer,
+        gate: &Self::Buffer,
+        out: &mut Self::Buffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()>;
+    /// Hyper-connection write-back: `res[r][s][d] += y[r][d] · 2 sigmoid(inject[r·ld + col + s])`
+    /// for `res` of `[rows, streams, dim]` and `y` of `[rows, dim]`; see [`HcCombineShape`].
+    fn hc_combine(
+        &self,
+        res: &mut Self::Buffer,
+        y: &Self::Buffer,
+        inject: &Self::Buffer,
+        shape: HcCombineShape,
+    ) -> Result<()>;
+    /// PLE gate: with `g = (key_n[r][s] · q_n[r][s]) / sqrt(dim)`,
+    /// `out[r][s] = value[r] · sigmoid(sign(g) sqrt(max(|g|, 1e-6)))` for `key_n`, `q_n`, `out` of
+    /// `[rows, streams, dim]` and `value` of `[rows, dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gate(
+        &self,
+        key_n: &Self::Buffer,
+        q_n: &Self::Buffer,
+        value: &Self::Buffer,
+        out: &mut Self::Buffer,
+        rows: usize,
+        streams: usize,
+        dim: usize,
+    ) -> Result<()>;
+    /// Dilated causal depthwise convolution + SiLU with a rolling state; see
+    /// [`DilatedConvShape`].
+    fn conv1d_dilated_silu(
+        &self,
+        x: &Self::Buffer,
+        weight: &Self::Buffer,
+        state: &mut Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: DilatedConvShape,
+    ) -> Result<()>;
+    /// One sigmoid gate per row; see [`RowGateShape`].
+    fn sigmoid_scale_rows(
+        &self,
+        x: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        shape: RowGateShape,
+    ) -> Result<()>;
+    /// MoE routing on the device (see [`MoeRouteShape`]): `ids[r][j]` (u32 bits in f32 slots) and
+    /// `weights[r][j]` for `j < k`, in descending probability. With `counts` (`[experts]`),
+    /// `counts[e] += 1` for every selection of expert `e`.
+    fn moe_route(
+        &self,
+        logits: &Self::Buffer,
+        ids: &mut Self::Buffer,
+        weights: &mut Self::Buffer,
+        counts: Option<&mut Self::Buffer>,
+        shape: MoeRouteShape,
+    ) -> Result<()>;
+    /// f32 slots of `scratch` [`Self::moe_experts`] needs for `rows` rows of `k` experts (at
+    /// least 1).
+    fn moe_scratch_len(
+        &self,
+        _bank: &ExpertBank<'_, Self::Buffer>,
+        _rows: usize,
+        _k: usize,
+    ) -> usize {
+        1
+    }
+    /// The routed experts' sum: `y[r] = Σ_j weights[r][j] · down_e(silu(gate_e · x[r]) ·
+    /// (up_e · x[r]))` with `e = ids[r][j]` (as [`Self::moe_route`] writes them), for `x`, `y` of
+    /// `[rows, hidden]`. Projections round their inputs as [`Self::moe_experts_act`] reports.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &self,
+        x: &Self::Buffer,
+        ids: &Self::Buffer,
+        weights: &Self::Buffer,
+        bank: &ExpertBank<'_, Self::Buffer>,
+        y: &mut Self::Buffer,
+        scratch: &mut Self::Buffer,
+        rows: usize,
+        k: usize,
+    ) -> Result<()>;
+    /// How `moe_experts` rounds the inputs of every expert projection (`x` for gate and up, the
+    /// SwiGLU product for down) at `rows` rows: `Exact`, or a rounding `bank.act` permits.
+    fn moe_experts_act(&self, _bank: &ExpertBank<'_, Self::Buffer>, _rows: usize) -> ActQuant {
+        ActQuant::Exact
+    }
+    /// QSA pooled keys of completed blocks; see [`QsaPoolShape`]. `raw` is `[positions, dim]`,
+    /// `pooled` is `[blocks, dim]`, `weight` is `[dim]`.
+    fn qsa_pool(
+        &self,
+        raw: &Self::Buffer,
+        weight: &Self::Buffer,
+        pooled: &mut Self::Buffer,
+        shape: QsaPoolShape,
+    ) -> Result<()>;
+    /// QSA selection; see [`QsaSelectShape`]. `q` is `[tokens, heads, dim]`, `pooled` holds at
+    /// least the complete blocks of the last query, `sel` is `[tokens, sel_len]` and `scratch`
+    /// at least `tokens * complete_blocks(tokens - 1)` slots.
+    fn qsa_select(
+        &self,
+        q: &Self::Buffer,
+        pooled: &Self::Buffer,
+        sel: &mut Self::Buffer,
+        scratch: &mut Self::Buffer,
+        shape: QsaSelectShape,
+    ) -> Result<()>;
+    /// [`Self::attention`] in which token `t` attends only to the cache positions listed in
+    /// `sel[t·sel_len ..][.. sel_len]` (i32 bits; negative entries are skipped), each below
+    /// `pos0 + t + 1`. Rounds its operands as [`Self::attention_precision`] reports for `shape`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sparse(
+        &self,
+        q: &Self::Buffer,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        sel: &Self::Buffer,
+        sel_len: usize,
+        out: &mut Self::Buffer,
+        shape: AttnShape,
+    ) -> Result<()>;
     /// DFlash2 dynamic grouped convolution; see [`DynConvShape`]. `out` must not alias `x`.
     fn dyn_conv(
         &self,
@@ -1320,4 +1816,29 @@ pub fn top_k_row(row: &[f32], k: usize) -> Vec<(u32, f32)> {
     }
     idx.sort_unstable_by(better);
     idx.into_iter().map(|i| (i, key(row[i as usize]))).collect()
+}
+
+/// [`Backend::log_softmax_gather`] of one row (the values up to `limit`), accumulated in f64.
+pub fn log_softmax_gather_row(row: &[f32], ids: &[u32]) -> Vec<f32> {
+    let key = |v: f32| {
+        if v.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            v as f64
+        }
+    };
+    let peak = row
+        .iter()
+        .map(|&v| key(v))
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !peak.is_finite() {
+        return vec![f32::NEG_INFINITY; ids.len()];
+    }
+    let log_z = peak + row.iter().map(|&v| (key(v) - peak).exp()).sum::<f64>().ln();
+    ids.iter()
+        .map(|&id| match row.get(id as usize) {
+            Some(&v) => (key(v) - log_z) as f32,
+            None => f32::NEG_INFINITY,
+        })
+        .collect()
 }

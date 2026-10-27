@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+#include "ggml_tables.cuh"
 #include "velox_common.cuh"
 
 // Weight formats; must match velox_cuda::portable::FORMAT_*.
@@ -17,6 +18,10 @@
 #define VELOX_FMT_Q6 6
 #define VELOX_FMT_Q8 7
 #define VELOX_FMT_IQ3_XXS 8
+// GGML block types: base + position in velox_core::ggml::GgmlType::ALL
+// (q2_k, q4_k, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, q2_0, iq4_nl, q6_k, q8_0, iq1_s).
+#define VELOX_FMT_GGML_BASE 16
+#define VELOX_FMT_GGML_END 30
 
 namespace {
 
@@ -112,8 +117,167 @@ __device__ float iq3_xxs_at(const WDesc& d, long long row, long long col) {
     return (sign8 >> (j & 7)) & 1u ? -v : v;
 }
 
+// GGML blocks (ggml_block_v1): a row is k / ggml_block_values(t) consecutive blocks of one type,
+// as velox_core::ggml documents; decoding follows ggml's dequantize_row_* operation for operation.
+// Block sizes are not multiples of 4, so multi-byte fields are assembled from bytes.
+__host__ __device__ __forceinline__ int ggml_block_bytes(int t) {
+    switch (t) {
+        case 0: return 84;
+        case 1: return 144;
+        case 2: return 56;
+        case 3: return 66;
+        case 4: return 74;
+        case 5: return 82;
+        case 6: return 98;
+        case 7: return 110;
+        case 8: return 136;
+        case 9: return 18;
+        case 10: return 18;
+        case 11: return 210;
+        case 13: return 50;
+        default: return 34;
+    }
+}
+
+// Values per block: 256 (K-quant and i-quant super-blocks), 64 (Q2_0) or 32 (IQ4_NL, Q8_0).
+__host__ __device__ __forceinline__ int ggml_block_values(int t) {
+    switch (t) {
+        case 9: return 64;
+        case 10:
+        case 12: return 32;
+        default: return 256;
+    }
+}
+
+__device__ __forceinline__ float ggml_f16(const uint8_t* p) {
+    return __half2float(__ushort_as_half(static_cast<unsigned short>(p[0] | (p[1] << 8))));
+}
+__device__ __forceinline__ uint32_t ggml_u16(const uint8_t* p) { return p[0] | (static_cast<uint32_t>(p[1]) << 8); }
+__device__ __forceinline__ uint32_t ggml_u32(const uint8_t* p) {
+    return p[0] | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+__device__ __forceinline__ uint32_t ggml_byte(uint64_t e, int j) { return static_cast<uint32_t>(e >> (8 * j)) & 0xffu; }
+__device__ __forceinline__ float ggml_sign(uint32_t signs, int j) { return (signs >> j) & 1u ? -1.0f : 1.0f; }
+
+// Value v (0 .. ggml_block_values(T) - 1) of one block x of type T (VELOX_FMT_GGML_BASE + T).
+template <int T>
+__device__ __forceinline__ float ggml_value(const uint8_t* __restrict__ x, int v) {
+    const int ib = v / 32, j = v % 32, l = j / 8, jj = j % 8;
+    if (T == 0) {  // Q2_K: scales[16] | qs[64] | d | dmin
+        const int n = v / 128, w = v % 128, sh = 2 * (w / 32), h = (w % 32) / 16;
+        const uint32_t sc = x[n * 8 + (w / 32) * 2 + h];
+        const float dl = ggml_f16(x + 80) * static_cast<float>(sc & 0xf);
+        const float ml = ggml_f16(x + 82) * static_cast<float>(sc >> 4);
+        return dl * static_cast<float>((x[16 + 32 * n + (w % 32)] >> sh) & 3) - ml;
+    } else if (T == 1) {  // Q4_K: d | dmin | scales[12] | qs[128]
+        const int c = v / 64, hi = (v % 64) / 32, s = 2 * c + hi;
+        const uint8_t* q = x + 4;
+        uint32_t sc, m;
+        if (s < 4) {
+            sc = q[s] & 63, m = q[s + 4] & 63;
+        } else {
+            sc = (q[s + 4] & 0xf) | ((q[s - 4] >> 6) << 4);
+            m = (q[s + 4] >> 4) | ((q[s] >> 6) << 4);
+        }
+        const uint32_t b = x[16 + 32 * c + v % 32];
+        const float d1 = ggml_f16(x) * static_cast<float>(sc), m1 = ggml_f16(x + 2) * static_cast<float>(m);
+        return d1 * static_cast<float>(hi ? b >> 4 : b & 0xf) - m1;
+    } else if (T == 2) {  // IQ1_M: qs[32] | qh[16] | scales[8]
+        const uint32_t s0 = ggml_u16(x + 48), s1 = ggml_u16(x + 50), s2 = ggml_u16(x + 52), s3 = ggml_u16(x + 54);
+        const uint32_t dbits = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
+        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dbits)));
+        const uint32_t w = ggml_u16(x + 48 + 2 * (ib / 2));
+        const float dl = d * static_cast<float>(2 * ((w >> (6 * (ib % 2) + (l < 2 ? 0 : 3))) & 7) + 1);
+        const uint32_t qh = x[32 + 2 * ib + l / 2];
+        const uint32_t idx = x[4 * ib + l] | ((qh << (l % 2 ? 4 : 8)) & 0x700);
+        const float delta = qh & (l % 2 ? 0x80 : 0x08) ? -0.125f : 0.125f;
+        const float g = static_cast<float>(static_cast<int8_t>(ggml_byte(kIq1SGrid[idx], jj)));
+        return dl * (g + delta);
+    } else if (T == 3) {  // IQ2_XXS: d | per 32: 4 grid bytes, u32 of 4 x 7 sign bits + scale
+        const uint32_t a1 = ggml_u32(x + 6 + 8 * ib);
+        const float db = ggml_f16(x) * (0.5f + static_cast<float>(a1 >> 28)) * 0.25f;
+        const uint64_t grid = kIq2XxsGrid[x[2 + 8 * ib + l]];
+        return db * static_cast<float>(ggml_byte(grid, jj)) * ggml_sign(kKsignsIq2xs[(a1 >> (7 * l)) & 127], jj);
+    } else if (T == 4) {  // IQ2_XS: d | qs[32] u16 | scales[8]
+        const uint32_t s = x[66 + ib];
+        const float db = ggml_f16(x) * (0.5f + static_cast<float>(l < 2 ? s & 0xf : s >> 4)) * 0.25f;
+        const uint32_t q = ggml_u16(x + 2 + 2 * (4 * ib + l));
+        return db * static_cast<float>(ggml_byte(kIq2XsGrid[q & 511], jj)) * ggml_sign(kKsignsIq2xs[q >> 9], jj);
+    } else if (T == 5) {  // IQ2_S: d | qs[32] | signs[32] | qh[8] | scales[8]
+        const uint32_t s = x[74 + ib];
+        const float db = ggml_f16(x) * (0.5f + static_cast<float>(l < 2 ? s & 0xf : s >> 4)) * 0.25f;
+        const uint32_t idx = x[2 + 4 * ib + l] | ((static_cast<uint32_t>(x[66 + ib]) << (8 - 2 * l)) & 0x300);
+        return db * static_cast<float>(ggml_byte(kIq2SGrid[idx], jj)) * ggml_sign(x[34 + 4 * ib + l], jj);
+    } else if (T == 6) {  // IQ3_XXS: d | qs[64] | 8 u32 of 4 x 7 sign bits + scale
+        const uint32_t aux = ggml_u32(x + 66 + 4 * ib);
+        const float db = ggml_f16(x) * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
+        const uint32_t grid = kIq3XxsGrid[x[2 + 8 * ib + 2 * l + jj / 4]];
+        return db * static_cast<float>(ggml_byte(grid, jj % 4)) * ggml_sign(kKsignsIq2xs[(aux >> (7 * l)) & 127], jj);
+    } else if (T == 7) {  // IQ3_S: d | qs[64] | qh[8] | signs[32] | scales[4]
+        const uint32_t s = x[106 + ib / 2];
+        const float db = ggml_f16(x) * static_cast<float>(1 + 2 * (ib % 2 ? s >> 4 : s & 0xf));
+        const uint32_t qh = x[66 + ib];
+        const uint32_t idx = jj < 4 ? x[2 + 8 * ib + 2 * l] | ((qh << (8 - 2 * l)) & 256)
+                                    : x[3 + 8 * ib + 2 * l] | ((qh << (7 - 2 * l)) & 256);
+        return db * static_cast<float>(ggml_byte(kIq3SGrid[idx], jj % 4)) * ggml_sign(x[74 + 4 * ib + l], jj);
+    } else if (T == 8) {  // IQ4_XS: d | scales_h u16 | scales_l[4] | qs[128]
+        const int ls = static_cast<int>((x[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                       (static_cast<int>((ggml_u16(x + 2) >> (2 * ib)) & 3) << 4);
+        const float dl = ggml_f16(x) * static_cast<float>(ls - 32);
+        const uint32_t b = x[8 + 16 * ib + j % 16];
+        return dl * static_cast<float>(kValuesIq4nl[j < 16 ? b & 0xf : b >> 4]);
+    } else if (T == 9) {  // Q2_0 (64 values): d | qs[16], codes 0..3 meaning -1, 0, +1, +2
+        const int q = (x[2 + v / 4] >> (2 * (v % 4))) & 3;
+        return static_cast<float>(q - 1) * ggml_f16(x);
+    } else if (T == 10) {  // IQ4_NL (32 values): d | qs[16]
+        const uint32_t b = x[2 + v % 16];
+        return ggml_f16(x) * static_cast<float>(kValuesIq4nl[v < 16 ? b & 0xf : b >> 4]);
+    } else if (T == 11) {  // Q6_K: ql[128] | qh[64] | scales[16] (int8) | d
+        const int n = v / 128, quarter = (v % 128) / 32, l2 = v % 32;
+        const uint32_t lo = x[64 * n + 32 * (quarter & 1) + l2];
+        const uint32_t hi = (x[128 + 32 * n + l2] >> (2 * quarter)) & 3;
+        const int q = static_cast<int>((quarter < 2 ? lo & 0xf : lo >> 4) | (hi << 4)) - 32;
+        const float sc = static_cast<float>(static_cast<int8_t>(x[192 + 8 * n + l2 / 16 + 2 * quarter]));
+        return ggml_f16(x + 208) * sc * static_cast<float>(q);
+    } else if (T == 12) {  // Q8_0 (32 values): d | qs[32] (int8)
+        return static_cast<float>(static_cast<int8_t>(x[2 + v])) * ggml_f16(x);
+    } else {  // IQ1_S: d | qs[32] | qh[8] (u16: index bits 0..11, sub-scale 12..14, delta sign 15)
+        const uint32_t qh = ggml_u16(x + 34 + 2 * ib);
+        const float dl = ggml_f16(x) * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
+        const uint32_t idx = x[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+        const float delta = qh & 0x8000 ? -0.125f : 0.125f;
+        const float g = static_cast<float>(static_cast<int8_t>(ggml_byte(kIq1SGrid[idx], jj)));
+        return dl * (g + delta);
+    }
+}
+
+__device__ float ggml_at(const WDesc& d, long long row, long long col) {
+    const int t = d.format - VELOX_FMT_GGML_BASE;
+    const long long bb = ggml_block_bytes(t), bv = ggml_block_values(t);
+    const uint8_t* x = d.base + (row * (d.k / bv) + col / bv) * bb;
+    const int v = static_cast<int>(col % bv);
+    switch (t) {
+        case 0: return ggml_value<0>(x, v);
+        case 1: return ggml_value<1>(x, v);
+        case 2: return ggml_value<2>(x, v);
+        case 3: return ggml_value<3>(x, v);
+        case 4: return ggml_value<4>(x, v);
+        case 5: return ggml_value<5>(x, v);
+        case 6: return ggml_value<6>(x, v);
+        case 7: return ggml_value<7>(x, v);
+        case 8: return ggml_value<8>(x, v);
+        case 9: return ggml_value<9>(x, v);
+        case 10: return ggml_value<10>(x, v);
+        case 11: return ggml_value<11>(x, v);
+        case 12: return ggml_value<12>(x, v);
+        default: return ggml_value<13>(x, v);
+    }
+}
+
 // Decoded W[row, col] of the parent matrix.
 __device__ float weight_at(const WDesc& d, long long row, long long col) {
+    if (d.format >= VELOX_FMT_GGML_BASE) return ggml_at(d, row, col);
     switch (d.format) {
         case VELOX_FMT_F32:
             return reinterpret_cast<const float*>(d.base)[row * d.k + col];
@@ -234,6 +398,86 @@ linear_tiled_kernel(const float* __restrict__ x, WDesc w, long long row_begin, i
     }
 }
 
+// Skinny y[m, rows] = x . W^T for many tokens and few rows (rows <= 16 * TN, e.g. the GDN a | b
+// projection, 96 rows): a block covers every output row for 64 tokens, so x is read once rather
+// than once per 64 rows. Each thread keeps 8 x TN sums and reads its operands as float4 / float2
+// (5 shared loads per 48 FMAs at TN = 6), capped at 128 registers: four blocks per SM hide the
+// global loads better than unbounded registers do (61 against 87 us for [96, 5120] at m = 2048 on
+// an RTX 5090). Split K fills the GPU as in linear_tiled_kernel. x rows
+// are read as float4: k must be a multiple of 4 and x 16-byte aligned.
+constexpr int kSkM = 64, kSkK = 32, kSkThreads = 128;
+
+// W[row, col] for the formats the skinny kernel takes (f32, bf16), decoded inline: weight_at would
+// bring every GGML decoder into the kernel and its registers. FP8 rows re-reading their scale per
+// element ran slower than the tiled kernel, so they stay there.
+template <int FMT>
+__device__ __forceinline__ float skinny_w(const WDesc& d, long long row, long long col) {
+    if (FMT == VELOX_FMT_F32) return reinterpret_cast<const float*>(d.base)[row * d.k + col];
+    return bf16_to_f32(reinterpret_cast<const uint16_t*>(d.base)[row * d.k + col]);
+}
+
+template <int TN, int FMT>
+__global__ void __launch_bounds__(kSkThreads, 4)
+linear_skinny_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m, float* __restrict__ y,
+                     long long k_split) {
+    constexpr int BN = 16 * TN;
+    const long long k_begin = blockIdx.z * k_split;
+    const long long k_end = k_begin + k_split < w.k ? k_begin + k_split : w.k;
+    y += static_cast<size_t>(blockIdx.z) * m * rows;
+    // [k][token] and [k][row]: pitches keep float4 / float2 reads aligned.
+    __shared__ __align__(16) float Xs[kSkK][kSkM + 4];
+    __shared__ __align__(16) float Ws[kSkK][BN + 2];
+    const int t = threadIdx.x;
+    const int m0 = blockIdx.y * kSkM;
+    const int ty = t / 16, tx = t % 16;  // tokens ty * 8.., rows tx * TN..
+    float acc[8][TN] = {};
+    for (long long k0 = k_begin; k0 < k_end; k0 += kSkK) {
+        // x tile: 8 threads read one token's 32 K values as float4.
+#pragma unroll
+        for (int i = 0; i < kSkM * kSkK / 4 / kSkThreads; ++i) {
+            const int e = i * kSkThreads + t, r = e / 8, c = (e % 8) * 4;
+            const long long kk = k0 + c;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (m0 + r < m && kk < k_end) v = *reinterpret_cast<const float4*>(x + static_cast<size_t>(m0 + r) * w.k + kk);
+            Xs[c][r] = v.x, Xs[c + 1][r] = v.y, Xs[c + 2][r] = v.z, Xs[c + 3][r] = v.w;
+        }
+#pragma unroll
+        for (int i = 0; i < BN * kSkK / kSkThreads; ++i) {
+            const int e = i * kSkThreads + t, r = e / kSkK, c = e % kSkK;
+            const long long kk = k0 + c;
+            Ws[c][r] = (r < rows && kk < k_end) ? skinny_w<FMT>(w, row_begin + r, kk) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int kk = 0; kk < kSkK; ++kk) {
+            float a[8], b[TN];
+            const float4 a0 = *reinterpret_cast<const float4*>(&Xs[kk][ty * 8]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&Xs[kk][ty * 8 + 4]);
+            a[0] = a0.x, a[1] = a0.y, a[2] = a0.z, a[3] = a0.w, a[4] = a1.x, a[5] = a1.y, a[6] = a1.z, a[7] = a1.w;
+#pragma unroll
+            for (int j = 0; j < TN; j += 2) {
+                const float2 v = *reinterpret_cast<const float2*>(&Ws[kk][tx * TN + j]);
+                b[j] = v.x, b[j + 1] = v.y;
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = m0 + ty * 8 + i;
+        if (r >= m) continue;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int c = tx * TN + j;
+            if (c < rows) y[static_cast<size_t>(r) * rows + c] = acc[i][j];
+        }
+    }
+}
+
 // Row-split (q4/q5/q6/q8) rows: a block stages its row's three byte ranges (codes, high plane,
 // scales; each contiguous) in shared memory with 16-byte loads, then decodes from there. The
 // table is often host-mapped, where the cost is per PCIe transaction: one round of wide loads per
@@ -295,6 +539,41 @@ __global__ void embed_kernel(const uint32_t* __restrict__ ids, WDesc w, long lon
         out[blockIdx.x * w.k + c] = valid ? weight_at(w, row, c) : 0.0f;
 }
 
+// embed_kernel for FP8-row and bf16 tables with 16-byte aligned rows: each thread reads 16 bytes (16
+// FP8 codes or 8 bf16 values). A host-mapped table is read per PCIe transaction, and byte-wide
+// reads left 2048 FP8 rows of 5120 at 4.7 ms on an RTX 5090.
+template <int FMT>
+__global__ void embed_vec_kernel(const uint32_t* __restrict__ ids, WDesc w, long long row_begin, float* __restrict__ out) {
+    constexpr int per = FMT == VELOX_FMT_BF16 ? 8 : 16;  // values per 16-byte load
+    const long long row = row_begin + ids[blockIdx.x];
+    const bool valid = row >= 0 && row < w.n;
+    const long long c0 = (static_cast<long long>(blockIdx.y) * blockDim.x + threadIdx.x) * per;
+    if (c0 >= w.k) return;
+    float v[per] = {};
+    if (valid) {
+        if (FMT == VELOX_FMT_BF16) {
+            const uint4 q = *reinterpret_cast<const uint4*>(w.base + (row * w.k + c0) * 2);
+            const uint32_t u[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                v[2 * i] = bf16_to_f32(static_cast<uint16_t>(u[i] & 0xffff));
+                v[2 * i + 1] = bf16_to_f32(static_cast<uint16_t>(u[i] >> 16));
+            }
+        } else {
+            const uint8_t* s = w.base + align256(w.n * w.k) + 2 * row;
+            const float scale = bf16_to_f32(static_cast<uint16_t>(s[0] | (s[1] << 8)));
+            const uint4 q = *reinterpret_cast<const uint4*>(w.base + row * w.k + c0);
+            const uint32_t u[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+                v[i] = e4m3fn_to_f32(static_cast<uint8_t>(u[i / 4] >> (8 * (i % 4)))) * scale;
+        }
+    }
+    float4* o = reinterpret_cast<float4*>(out + blockIdx.x * w.k + c0);
+#pragma unroll
+    for (int i = 0; i < per / 4; ++i) o[i] = make_float4(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
+}
+
 // xb: null, or the result's bf16 twin.
 __global__ void sigmoid_mul_kernel(float* __restrict__ x, const float* __restrict__ gate, long long len,
                                    unsigned short* __restrict__ xb) {
@@ -329,7 +608,8 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ x, const float* __r
 
 // Few tokens (decode, verify): one thread per channel runs the window over its inputs and advances
 // the state itself (each thread reads its channel's state before writing it, so state may alias
-// state_in).
+// state_in). Grid y counts scoring windows: window y reads and writes its own `tokens` rows, all
+// from state_in, and a null state keeps none.
 constexpr int kConvSmallTokens = 32;
 __global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                          const float* state_in, float* state, float* __restrict__ out, int tokens,
@@ -340,6 +620,8 @@ __global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const floa
     }
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
+    x += static_cast<size_t>(blockIdx.y) * tokens * channels;
+    out += static_cast<size_t>(blockIdx.y) * tokens * channels;
     float win[kMaxConvWidth], wt[kMaxConvWidth];
 #pragma unroll
     for (int j = 0; j < kMaxConvWidth; ++j) {
@@ -363,6 +645,7 @@ __global__ void conv1d_silu_small_kernel(const float* __restrict__ x, const floa
         for (int j = 0; j < kMaxConvWidth - 1; ++j)
             if (j == width - 2) win[j] = in;
     }
+    if (state == nullptr) return;
 #pragma unroll
     for (int j = 0; j < kMaxConvWidth - 1; ++j)
         if (j < width - 1) state[static_cast<size_t>(j) * channels + c] = win[j];
@@ -554,7 +837,8 @@ __device__ __forceinline__ void gdn_rows_shared(const float* __restrict__ qkv, c
     }
 }
 
-// Grid: heads x row groups.
+// Grid: heads x row groups x scoring windows (window z reads and writes its own `tokens` rows,
+// all from state_in; its callers pass a null state).
 template <int PER>
 __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const float* __restrict__ ab,
                                             const float* __restrict__ a_log, const float* __restrict__ dt_bias,
@@ -564,6 +848,12 @@ __global__ void gated_delta_net_rows_kernel(const float* __restrict__ qkv, const
     if (pp != nullptr) {  // staged by a graph step: [state_in, state_out]
         state_in = reinterpret_cast<const float*>(pp[0]);
         state = reinterpret_cast<float*>(pp[1]);
+    }
+    if (blockIdx.z > 0) {
+        const size_t rows = static_cast<size_t>(blockIdx.z) * tokens;
+        qkv += rows * (2 * k_heads * k_dim + v_heads * v_dim);
+        ab += rows * 2 * v_heads;
+        if (out != nullptr) out += rows * v_heads * v_dim;
     }
     const int warps = blockDim.x / VELOX_WARP;
     const int h = blockIdx.x, i = blockIdx.y * warps + threadIdx.x / VELOX_WARP, lane = threadIdx.x % VELOX_WARP;
@@ -1315,6 +1605,77 @@ int launch_gemv_vec(const float* x, const WDesc& d, long long row_begin, int row
     return velox_launch_status();
 }
 
+// Small-m linear for GGML blocks: one warp per output row, each lane decoding whole 32-value
+// sub-blocks (one scale each; a 32-value block is one sub-block) and applying them to all m rows, so each weight is read once.
+template <int T, int M>
+__global__ void __launch_bounds__(256)
+linear_gemv_ggml_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m,
+                        float* __restrict__ y) {
+    const int r = blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP;
+    const int lane = threadIdx.x % VELOX_WARP;
+    if (r >= rows) return;
+    const long long k = w.k, subs = k / 32;
+    const int spb = ggml_block_values(T) / 32;  // 32-value sub-blocks per block
+    const uint8_t* row = w.base + (row_begin + r) * (k / ggml_block_values(T)) * ggml_block_bytes(T);
+    float acc[M];
+#pragma unroll
+    for (int i = 0; i < M; ++i) acc[i] = 0.0f;
+    for (long long u = lane; u < subs; u += VELOX_WARP) {
+        const uint8_t* blk = row + (u / spb) * ggml_block_bytes(T);
+        const int v0 = static_cast<int>(u % spb) * 32;
+        float wv[32];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) wv[j] = ggml_value<T>(blk, v0 + j);
+#pragma unroll
+        for (int i = 0; i < M; ++i) {
+            if (i >= m) break;
+            const float4* xp = reinterpret_cast<const float4*>(x + static_cast<size_t>(i) * k + u * 32);
+            float s = 0.0f;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const float4 t = __ldg(xp + q);
+                s += wv[4 * q] * t.x + wv[4 * q + 1] * t.y + wv[4 * q + 2] * t.z + wv[4 * q + 3] * t.w;
+            }
+            acc[i] += s;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < M; ++i) {
+        const float s = velox_warp_sum(acc[i]);
+        if (lane == 0 && i < m) y[static_cast<size_t>(i) * rows + r] = s;
+    }
+}
+
+template <int T>
+int launch_gemv_ggml_t(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
+    constexpr int kWarps = 8;
+    const dim3 grid((rows + kWarps - 1) / kWarps);
+    if (m == 1) linear_gemv_ggml_kernel<T, 1><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else if (m == 2) linear_gemv_ggml_kernel<T, 2><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else if (m <= 4) linear_gemv_ggml_kernel<T, 4><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else linear_gemv_ggml_kernel<T, 8><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    return velox_launch_status();
+}
+
+int launch_gemv_ggml(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
+    switch (d.format - VELOX_FMT_GGML_BASE) {
+        case 0: return launch_gemv_ggml_t<0>(x, d, row_begin, rows, m, y);
+        case 1: return launch_gemv_ggml_t<1>(x, d, row_begin, rows, m, y);
+        case 2: return launch_gemv_ggml_t<2>(x, d, row_begin, rows, m, y);
+        case 3: return launch_gemv_ggml_t<3>(x, d, row_begin, rows, m, y);
+        case 4: return launch_gemv_ggml_t<4>(x, d, row_begin, rows, m, y);
+        case 5: return launch_gemv_ggml_t<5>(x, d, row_begin, rows, m, y);
+        case 6: return launch_gemv_ggml_t<6>(x, d, row_begin, rows, m, y);
+        case 7: return launch_gemv_ggml_t<7>(x, d, row_begin, rows, m, y);
+        case 8: return launch_gemv_ggml_t<8>(x, d, row_begin, rows, m, y);
+        case 9: return launch_gemv_ggml_t<9>(x, d, row_begin, rows, m, y);
+        case 10: return launch_gemv_ggml_t<10>(x, d, row_begin, rows, m, y);
+        case 11: return launch_gemv_ggml_t<11>(x, d, row_begin, rows, m, y);
+        case 12: return launch_gemv_ggml_t<12>(x, d, row_begin, rows, m, y);
+        default: return launch_gemv_ggml_t<13>(x, d, row_begin, rows, m, y);
+    }
+}
+
 template <int FMT>
 int launch_gemv_vec_m(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
     if (m == 1) return launch_gemv_vec<FMT, 1>(x, d, row_begin, rows, m, y);
@@ -1379,6 +1740,15 @@ __global__ void __launch_bounds__(kSnThreads) linear_small_n_bf16_kernel(const f
     }
 }
 
+template <int FMT>
+void launch_skinny(dim3 grid, const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y,
+                   long long k_split) {
+    if (rows <= 32) linear_skinny_kernel<2, FMT><<<grid, kSkThreads>>>(x, d, row_begin, rows, m, y, k_split);
+    else if (rows <= 64) linear_skinny_kernel<4, FMT><<<grid, kSkThreads>>>(x, d, row_begin, rows, m, y, k_split);
+    else if (rows <= 96) linear_skinny_kernel<6, FMT><<<grid, kSkThreads>>>(x, d, row_begin, rows, m, y, k_split);
+    else linear_skinny_kernel<8, FMT><<<grid, kSkThreads>>>(x, d, row_begin, rows, m, y, k_split);
+}
+
 template <int M>
 int launch_small_n(const float* x, const uint8_t* w, long long k, long long row_begin, int rows, int m, float* y) {
     linear_small_n_bf16_kernel<M><<<(rows + kSnRows - 1) / kSnRows, kSnThreads>>>(
@@ -1405,6 +1775,8 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
         if (format == VELOX_FMT_BF16) return launch_gemv_vec_m<VELOX_FMT_BF16>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_Q4 && k % 32 == 0) return launch_gemv_vec_m<VELOX_FMT_Q4>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_Q8) return launch_gemv_vec_m<VELOX_FMT_Q8>(x, d, row_begin, rows, m, y);
+        if (format >= VELOX_FMT_GGML_BASE && format < VELOX_FMT_GGML_END)
+            return launch_gemv_ggml(x, d, row_begin, rows, m, y);
     }
     if (m <= kGemvMaxM && (format == VELOX_FMT_FP8_ROW_BF16 || format == VELOX_FMT_NVFP4)) {
         constexpr int kWarps = 8;
@@ -1413,6 +1785,29 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
             linear_gemv_kernel<VELOX_FMT_FP8_ROW_BF16><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
         else
             linear_gemv_kernel<VELOX_FMT_NVFP4><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+        return velox_launch_status();
+    }
+    // Many tokens over few rows: one block row covers every output row. Above 96 rows a few hundred
+    // tokens leave too few blocks, and the tiled kernel stays faster until about 1K tokens.
+    if ((format == VELOX_FMT_BF16 || format == VELOX_FMT_F32) && m >= kSkM && (rows <= 96 || (rows <= 128 && m >= 1024)) &&
+        (m + kSkM - 1) / kSkM <= 65535 && k % 4 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0) {
+        const long long blocks = (m + kSkM - 1) / kSkM;
+        int splits = 1;
+        while (blocks * splits < 320 && k / (splits * 2) >= 256) splits *= 2;
+        const long long k_split = ((k + splits - 1) / splits + kSkK - 1) / kSkK * kSkK;
+        splits = static_cast<int>((k + k_split - 1) / k_split);
+        const dim3 grid(1, static_cast<unsigned>(blocks), splits);
+        float* out = y;
+        if (splits > 1) {
+            out = linear_split_scratch(static_cast<size_t>(splits) * m * rows);
+            if (out == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+        }
+        if (format == VELOX_FMT_BF16) launch_skinny<VELOX_FMT_BF16>(grid, x, d, row_begin, rows, m, out, k_split);
+        else launch_skinny<VELOX_FMT_F32>(grid, x, d, row_begin, rows, m, out, k_split);
+        if (splits > 1) {
+            const long long n = static_cast<long long>(m) * rows;
+            sum_splits_kernel<<<velox_grid_1d(n, 256), 256>>>(out, splits, n, y);
+        }
         return velox_launch_status();
     }
     // The tiled kernel needs enough output tiles to fill the GPU; skinny outputs (a few dozen rows,
@@ -1453,6 +1848,17 @@ VELOX_API int velox_portable_embed(const uint32_t* ids, int count, const uint8_t
             embed_rs_kernel<<<count, 256, smem>>>(ids, WDesc{w, format, n, k}, row_begin, out);
             return velox_launch_status();
         }
+    }
+    const bool aligned = reinterpret_cast<uintptr_t>(w) % 16 == 0 && reinterpret_cast<uintptr_t>(out) % 16 == 0;
+    if (aligned && format == VELOX_FMT_FP8_ROW_BF16 && k % 16 == 0 && k / 16 <= 65535L * 128) {
+        embed_vec_kernel<VELOX_FMT_FP8_ROW_BF16>
+            <<<dim3(count, static_cast<unsigned>((k / 16 + 127) / 128)), 128>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+        return velox_launch_status();
+    }
+    if (aligned && format == VELOX_FMT_BF16 && k % 8 == 0 && k / 8 <= 65535L * 128) {
+        embed_vec_kernel<VELOX_FMT_BF16>
+            <<<dim3(count, static_cast<unsigned>((k / 8 + 127) / 128)), 128>>>(ids, WDesc{w, format, n, k}, row_begin, out);
+        return velox_launch_status();
     }
     const unsigned slices = static_cast<unsigned>((k + 255) / 256 < 65535 ? (k + 255) / 256 : 65535);
     embed_kernel<<<dim3(count, slices), 256>>>(ids, WDesc{w, format, n, k}, row_begin, out);
@@ -1536,6 +1942,39 @@ VELOX_API int velox_portable_gated_delta_net(const float* qkv, const float* ab, 
 #define VELOX_GDN(PER)                                                                                     \
     gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state_in, state, out, tokens, k_heads, \
                                                       v_heads, k_dim, v_dim, pp)
+    if (k_dim <= 32) VELOX_GDN(1);
+    else if (k_dim <= 64) VELOX_GDN(2);
+    else if (k_dim <= 128) VELOX_GDN(4);
+    else if (k_dim <= 256) VELOX_GDN(8);
+    else return VELOX_ERR_UNSUPPORTED;
+#undef VELOX_GDN
+    return velox_launch_status();
+}
+
+// Scoring windows: `windows` windows of `tokens` rows each (window w at row w * tokens of x and
+// out), every one from state_in; no state is written. pp: as velox_portable_conv1d_silu.
+VELOX_API int velox_portable_conv1d_silu_windows(const float* x, const float* w, const float* state_in, float* out,
+                                                 int tokens, int windows, int channels, int width,
+                                                 const long long* pp) {
+    if (width > kMaxConvWidth || windows > 65535) return VELOX_ERR_UNSUPPORTED;
+    conv1d_silu_small_kernel<<<dim3((channels + 127) / 128, windows), 128>>>(x, w, state_in, nullptr, out, tokens,
+                                                                             channels, width, pp);
+    return velox_launch_status();
+}
+
+// Scoring windows: `windows` windows of `tokens` rows each (window w at row w * tokens of qkv, ab
+// and out), every one from state_in; no state is written. pp: as velox_portable_gated_delta_net.
+VELOX_API int velox_portable_gated_delta_net_windows(const float* qkv, const float* ab, const float* a_log,
+                                                     const float* dt_bias, const float* state_in, float* out,
+                                                     int tokens, int windows, int k_heads, int v_heads, int k_dim,
+                                                     int v_dim, const long long* pp) {
+    if (windows > 65535) return VELOX_ERR_UNSUPPORTED;
+    constexpr int kWarps = kGdnRowsWarps;
+    const int rows_per_block = tokens <= kGdnRowsMaxT ? kGdnRowsPerBlock : kWarps;
+    const dim3 grid(v_heads, (v_dim + rows_per_block - 1) / rows_per_block, windows), block(kWarps * VELOX_WARP);
+#define VELOX_GDN(PER)                                                                                     \
+    gated_delta_net_rows_kernel<PER><<<grid, block>>>(qkv, ab, a_log, dt_bias, state_in, nullptr, out, tokens, \
+                                                      k_heads, v_heads, k_dim, v_dim, pp)
     if (k_dim <= 32) VELOX_GDN(1);
     else if (k_dim <= 64) VELOX_GDN(2);
     else if (k_dim <= 128) VELOX_GDN(4);
@@ -1723,5 +2162,221 @@ VELOX_API int velox_portable_rope_positions(float* x, const uint32_t* pos, int t
     if (tokens <= 0) return 0;
     rope_positions_kernel<<<tokens, 256, rotary_dim * sizeof(float)>>>(x, pos, tokens, heads, head_dim, rotary_dim,
                                                                        theta, axes, layout);
+    return velox_launch_status();
+}
+
+// ---- MoE experts (Backend::moe_experts) ----
+//
+// Pairs p = r * k + j (row r, its j-th expert) are grouped by expert with a counting sort, then each
+// expert runs tiled GEMMs over its gathered rows, so its weights are read once per 64 rows whether
+// they sit in a device slot or in mapped system RAM. Every pair writes its own scratch row and the
+// final sum runs over j in order, so results do not depend on the grouping order.
+namespace {
+
+struct ExpertDesc {
+    const uint8_t* records;
+    const uint8_t* slots;
+    const float* map;  // i32 bits: slot of expert e, or -1
+    long long record_bytes, slot_bytes;
+    int gate_fmt, up_fmt, down_fmt;
+    long long gate_off, up_off, down_off;
+    int width, hidden;
+};
+
+__device__ __forceinline__ const uint8_t* expert_record(const ExpertDesc& d, int e) {
+    const int slot = static_cast<int>(__float_as_uint(d.map[e]));
+    return slot >= 0 ? d.slots + static_cast<long long>(slot) * d.slot_bytes
+                     : d.records + static_cast<long long>(e) * d.record_bytes;
+}
+
+__global__ void moe_count_kernel(const float* __restrict__ ids, int pairs, int experts, int* __restrict__ counts) {
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < pairs; p += gridDim.x * blockDim.x) {
+        const unsigned e = __float_as_uint(ids[p]);
+        if (e < static_cast<unsigned>(experts)) atomicAdd(counts + e, 1);
+    }
+}
+
+// Single thread: offsets[e] = sum of counts below e; cursors reset.
+__global__ void moe_scan_kernel(const int* __restrict__ counts, int* __restrict__ offsets, int* __restrict__ cursor,
+                                int experts) {
+    if (threadIdx.x != 0) return;
+    int acc = 0;
+    for (int e = 0; e < experts; ++e) {
+        offsets[e] = acc;
+        cursor[e] = 0;
+        acc += counts[e];
+    }
+    offsets[experts] = acc;
+}
+
+__global__ void moe_fill_kernel(const float* __restrict__ ids, int pairs, int experts, const int* __restrict__ offsets,
+                                int* __restrict__ cursor, int* __restrict__ list) {
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < pairs; p += gridDim.x * blockDim.x) {
+        const unsigned e = __float_as_uint(ids[p]);
+        if (e < static_cast<unsigned>(experts)) list[offsets[e] + atomicAdd(cursor + e, 1)] = p;
+    }
+}
+
+// Gate and up of expert blockIdx.y for output rows [64 blockIdx.x, +64) over its pairs, 64 at a time:
+// h[p][i] = silu(gate_i . x[p / k]) * (up_i . x[p / k]).
+__global__ void __launch_bounds__(256)
+moe_up_kernel(const float* __restrict__ x, ExpertDesc d, const int* __restrict__ offsets,
+              const int* __restrict__ list, int k, float* __restrict__ h) {
+    const int e = blockIdx.y;
+    const int begin = offsets[e], count = offsets[e + 1] - begin;
+    if (count == 0) return;
+    const uint8_t* rec = expert_record(d, e);
+    const WDesc wg{rec + d.gate_off, d.gate_fmt, d.width, d.hidden};
+    const WDesc wu{rec + d.up_off, d.up_fmt, d.width, d.hidden};
+    __shared__ float Xs[kTileK][kTile + 4];
+    __shared__ float Gs[kTileK][kTile + 4];
+    __shared__ float Us[kTileK][kTile + 4];
+    const int t = threadIdx.x, n0 = blockIdx.x * kTile;
+    const int lr = t / 4, lk = (t % 4) * 4;
+    const int ty = t / 16, tx = t % 16;
+    for (int p0 = 0; p0 < count; p0 += kTile) {
+        float ag[4][4] = {}, au[4][4] = {};
+        const int xp = p0 + lr < count ? list[begin + p0 + lr] : -1;
+        for (long long k0 = 0; k0 < d.hidden; k0 += kTileK) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const long long kk = k0 + lk + i;
+                const int wn = n0 + lr;
+                const bool kin = kk < d.hidden;
+                Xs[lk + i][lr] = (xp >= 0 && kin) ? x[static_cast<size_t>(xp / k) * d.hidden + kk] : 0.0f;
+                Gs[lk + i][lr] = (wn < d.width && kin) ? weight_at(wg, wn, kk) : 0.0f;
+                Us[lk + i][lr] = (wn < d.width && kin) ? weight_at(wu, wn, kk) : 0.0f;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int kk = 0; kk < kTileK; ++kk) {
+                float a[4], g[4], u[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    a[i] = Xs[kk][ty * 4 + i];
+                    g[i] = Gs[kk][tx * 4 + i];
+                    u[i] = Us[kk][tx * 4 + i];
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        ag[i][j] += a[i] * g[j];
+                        au[i][j] += a[i] * u[j];
+                    }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (p0 + ty * 4 + i >= count) continue;
+            const int p = list[begin + p0 + ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = n0 + tx * 4 + j;
+                if (c < d.width) {
+                    const float g = ag[i][j];
+                    h[static_cast<size_t>(p) * d.width + c] = g / (1.0f + expf(-g)) * au[i][j];
+                }
+            }
+        }
+    }
+}
+
+// Down of expert blockIdx.y for output columns [64 blockIdx.x, +64): o[p][c] = down_c . h[p].
+__global__ void __launch_bounds__(256)
+moe_down_kernel(const float* __restrict__ h, ExpertDesc d, const int* __restrict__ offsets,
+                const int* __restrict__ list, float* __restrict__ o) {
+    const int e = blockIdx.y;
+    const int begin = offsets[e], count = offsets[e + 1] - begin;
+    if (count == 0) return;
+    const WDesc wd{expert_record(d, e) + d.down_off, d.down_fmt, d.hidden, d.width};
+    __shared__ float Xs[kTileK][kTile + 4];
+    __shared__ float Ws[kTileK][kTile + 4];
+    const int t = threadIdx.x, n0 = blockIdx.x * kTile;
+    const int lr = t / 4, lk = (t % 4) * 4;
+    const int ty = t / 16, tx = t % 16;
+    for (int p0 = 0; p0 < count; p0 += kTile) {
+        float acc[4][4] = {};
+        const int xp = p0 + lr < count ? list[begin + p0 + lr] : -1;
+        for (long long k0 = 0; k0 < d.width; k0 += kTileK) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const long long kk = k0 + lk + i;
+                const int wn = n0 + lr;
+                const bool kin = kk < d.width;
+                Xs[lk + i][lr] = (xp >= 0 && kin) ? h[static_cast<size_t>(xp) * d.width + kk] : 0.0f;
+                Ws[lk + i][lr] = (wn < d.hidden && kin) ? weight_at(wd, wn, kk) : 0.0f;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int kk = 0; kk < kTileK; ++kk) {
+                float a[4], b[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    a[i] = Xs[kk][ty * 4 + i];
+                    b[i] = Ws[kk][tx * 4 + i];
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (p0 + ty * 4 + i >= count) continue;
+            const int p = list[begin + p0 + ty * 4 + i];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = n0 + tx * 4 + j;
+                if (c < d.hidden) o[static_cast<size_t>(p) * d.hidden + c] = acc[i][j];
+            }
+        }
+    }
+}
+
+__global__ void moe_combine_kernel(const float* __restrict__ o, const float* __restrict__ w, int rows, int k,
+                                   int hidden, float* __restrict__ y) {
+    const long long n = static_cast<long long>(rows) * hidden;
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / hidden, c = i % hidden;
+        float acc = 0.0f;
+        for (int j = 0; j < k; ++j) acc += w[r * k + j] * o[(r * k + j) * hidden + c];
+        y[i] = acc;
+    }
+}
+
+}  // namespace
+
+// f32 slots of scratch velox_portable_moe_experts needs.
+VELOX_API long long velox_portable_moe_scratch(int experts, int pairs, int width, int hidden) {
+    return 3LL * experts + 1 + pairs + static_cast<long long>(pairs) * (width + hidden);
+}
+
+VELOX_API int velox_portable_moe_experts(const float* x, const float* ids, const float* w, const uint8_t* records,
+                                         const uint8_t* slots, const float* map, long long record_bytes,
+                                         long long slot_bytes, int experts,
+                                         int gate_fmt, long long gate_off, int up_fmt, long long up_off, int down_fmt,
+                                         long long down_off, int width, int hidden, int rows, int k, float* y,
+                                         float* scratch) {
+    const int pairs = rows * k;
+    int* counts = reinterpret_cast<int*>(scratch);
+    int* offsets = counts + experts;
+    int* cursor = offsets + experts + 1;
+    int* list = cursor + experts;
+    float* h = scratch + 3LL * experts + 1 + pairs;
+    float* o = h + static_cast<size_t>(pairs) * width;
+    if (cudaError_t e = cudaMemsetAsync(counts, 0, sizeof(int) * experts, 0)) return static_cast<int>(e);
+    moe_count_kernel<<<velox_grid_1d(pairs, 256), 256>>>(ids, pairs, experts, counts);
+    moe_scan_kernel<<<1, 32>>>(counts, offsets, cursor, experts);
+    moe_fill_kernel<<<velox_grid_1d(pairs, 256), 256>>>(ids, pairs, experts, offsets, cursor, list);
+    const ExpertDesc d{records, slots,  map,     record_bytes, slot_bytes, gate_fmt, up_fmt,
+                       down_fmt, gate_off, up_off, down_off, width,      hidden};
+    moe_up_kernel<<<dim3((width + kTile - 1) / kTile, experts), 256>>>(x, d, offsets, list, k, h);
+    moe_down_kernel<<<dim3((hidden + kTile - 1) / kTile, experts), 256>>>(h, d, offsets, list, o);
+    moe_combine_kernel<<<velox_grid_1d(static_cast<long long>(rows) * hidden, 256), 256>>>(o, w, rows, k, hidden, y);
     return velox_launch_status();
 }

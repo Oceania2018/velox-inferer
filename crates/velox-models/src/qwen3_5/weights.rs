@@ -13,6 +13,8 @@ use velox_core::{Error, Result};
 use velox_weights::{Artifact, ObjectKind};
 
 use super::config::{FfnConfig, LayerKind, MoeConfig, TextConfig};
+use crate::experts::ExpertRecords;
+use velox_core::ExpertMatrix;
 
 /// A row view into an uploaded parent object.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -84,67 +86,15 @@ pub struct DenseFfn {
     pub gate_up: Option<WDesc>,
 }
 
-/// `experts` equally shaped matrices in one parent: expert `e` is `first` moved down by `e * stride`
-/// rows. Banks keep the stored encoding, like every other view.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ExpertBank {
-    pub first: WDesc,
-    pub experts: usize,
-    pub stride: usize,
-}
-
-impl ExpertBank {
-    /// The bank formed by per-expert views (expert order); they must share a parent, format and
-    /// shape and sit at a constant row stride.
-    pub fn from_experts(what: &str, views: &[WDesc]) -> Result<Self> {
-        let (first, rest) = views
-            .split_first()
-            .ok_or_else(|| Error::Config(format!("{what}: no experts")))?;
-        let stride = match rest.first() {
-            None => first.rows,
-            Some(d) => d.row_begin.saturating_sub(first.row_begin),
-        };
-        for (e, d) in views.iter().enumerate() {
-            let at = e
-                .checked_mul(stride)
-                .and_then(|o| o.checked_add(first.row_begin));
-            let regular = d.parent == first.parent
-                && d.format == first.format
-                && (d.n, d.k, d.rows) == (first.n, first.k, first.rows)
-                && at == Some(d.row_begin);
-            if !regular {
-                return Err(Error::Unsupported(format!(
-                    "{what}: expert {e} is not at a constant row stride of one parent"
-                )));
-            }
-        }
-        if stride < first.rows {
-            return Err(Error::Config(format!("{what}: experts overlap")));
-        }
-        Ok(ExpertBank {
-            first: WDesc {
-                act: views.iter().fold(first.act, |a, d| a.meet(d.act)),
-                ..*first
-            },
-            experts: views.len(),
-            stride,
-        })
-    }
-
-    pub fn expert(&self, e: usize) -> WDesc {
-        WDesc {
-            row_begin: self.first.row_begin + e * self.stride,
-            ..self.first
-        }
-    }
-}
-
 /// A sparse MoE FFN (`Qwen3_5MoeForCausalLM`):
 ///
 /// ```text
 /// p = softmax(router(h)); (w, ids) = top_k(p); w /= sum(w)
 /// y = sum_j w_j * down[ids_j](silu(gate[ids_j](h)) * up[ids_j](h)) + sigmoid(shared_score(h)) * shared(h)
 /// ```
+///
+/// Routed experts are `[gate | up | down]` records in system RAM ([`TextWeights::experts`]), read
+/// by the device directly or from the slots of an [`crate::experts::ExpertCache`].
 pub struct MoeFfn {
     /// `[experts, hidden]` router logits.
     pub router: WDesc,
@@ -152,12 +102,9 @@ pub struct MoeFfn {
     pub shared_score: WDesc,
     /// router and shared score as one view when adjacent in one parent (one GEMM).
     pub router_score: Option<WDesc>,
-    /// Routed experts: gate and up `[intermediate, hidden]`, down `[hidden, intermediate]`. Gate
-    /// and up may interleave in one parent (ninfer stores expert e's gate then up at rows
-    /// `2e * I` and `(2e + 1) * I`).
-    pub gate: ExpertBank,
-    pub up: ExpertBank,
-    pub down: ExpertBank,
+    /// Index of this layer's routed experts in [`TextWeights::experts`] (gate and up
+    /// `[intermediate, hidden]`, down `[hidden, intermediate]`).
+    pub experts: usize,
     pub shared: DenseFfn,
 }
 
@@ -178,6 +125,8 @@ pub struct Layer {
 pub struct TextWeights<B: Backend> {
     parents: Vec<B::Buffer>,
     params: Vec<B::Buffer>,
+    /// Routed experts of every MoE layer (and the MTP layer's), in load order.
+    pub experts: Vec<ExpertRecords<B>>,
     pub embed: WDesc,
     pub head: WDesc,
     pub final_norm: usize,
@@ -294,6 +243,7 @@ impl<B: Backend> TextWeights<B> {
         Ok(TextWeights {
             parents: l.parents,
             params: l.params,
+            experts: l.experts,
             embed,
             head,
             final_norm,
@@ -323,6 +273,7 @@ pub(crate) struct Loader<'a, B: Backend> {
     /// Activation policy per logical parameter, from the artifact's `uses`.
     policies: HashMap<String, ActPolicy>,
     params: Vec<B::Buffer>,
+    experts: Vec<ExpertRecords<B>>,
     bytes: u64,
     /// Matrices placed in system RAM (by binding name); `bytes` counts device bytes only.
     host: Vec<String>,
@@ -443,6 +394,121 @@ impl<'a, B: Backend> Loader<'a, B> {
         let entry = (self.parents.len() - 1, fmt, n, k);
         self.index.insert(id.to_string(), entry);
         Ok(entry)
+    }
+
+    /// A layer's routed experts (`moe/experts/{e}/{gate,up,down}` under `p`) as `[gate | up |
+    /// down]` records in system RAM, read from the artifact straight into place (they are never
+    /// device parents). Returns the records' index in [`TextWeights::experts`].
+    pub(crate) fn expert_records(
+        &mut self,
+        p: &dyn Fn(&str) -> String,
+        m: &MoeConfig,
+        hidden: usize,
+    ) -> Result<usize> {
+        // (payload offset, bytes) of every expert's matrix, and the role's format.
+        let role = |name: &str,
+                    rows: usize,
+                    k: usize|
+         -> Result<(WeightFormat, Vec<(u64, usize)>)> {
+            let mut format = None;
+            let mut spans = Vec::with_capacity(m.experts);
+            for e in 0..m.experts {
+                let b = p(&format!("moe/experts/{e}/{name}"));
+                let (id, range) = self.binding(&b)?;
+                let obj = self
+                    .art
+                    .object(&id)
+                    .ok_or_else(|| Error::Config(format!("missing object {id}")))?;
+                let (fmt, n, kk) = match &obj.kind {
+                    ObjectKind::Tensor {
+                        shape,
+                        format,
+                        layout,
+                    } if shape.len() == 2 => (
+                        WeightFormat::from_names(format, layout)?,
+                        shape[0] as usize,
+                        shape[1] as usize,
+                    ),
+                    other => return Err(Error::Config(format!("{b}: not a matrix: {other:?}"))),
+                };
+                // Whole objects, or row ranges of formats whose rows are contiguous bytes.
+                let (row0, nrows) = match range {
+                    None => (0, n),
+                    Some((a, z)) => ((a / kk as u64) as usize, ((z - a) / kk as u64) as usize),
+                };
+                let span = if (row0, nrows) == (0, n) {
+                    (obj.offset, fmt.payload_bytes(n, kk))
+                } else {
+                    let row = match fmt {
+                        WeightFormat::Bf16 => 2 * kk,
+                        WeightFormat::F32 => 4 * kk,
+                        WeightFormat::Ggml(t) => t.row_bytes(kk),
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "{b}: a row range of a {} parent (expert records need whole                                  objects)",
+                                fmt.name()
+                            )))
+                        }
+                    };
+                    (obj.offset + (row0 * row) as u64, nrows * row)
+                };
+                if (nrows, kk) != (rows, k) || *format.get_or_insert(fmt) != fmt {
+                    return Err(Error::Config(format!(
+                        "{b}: [{nrows}, {kk}] {}, expected [{rows}, {k}] like expert 0",
+                        fmt.name()
+                    )));
+                }
+                fmt.check_shape(rows, k)?;
+                spans.push(span);
+            }
+            Ok((format.expect("at least one expert"), spans))
+        };
+        let (wi, h) = (m.intermediate, hidden);
+        let gate = role("gate", wi, h)?;
+        let up = role("up", wi, h)?;
+        let down = role("down", h, wi)?;
+        // Each matrix starts 256-aligned in its record (kernels read scales and divisors with
+        // wide loads); records are a multiple of 16 bytes.
+        let al = |x: usize| x.div_ceil(256) * 256;
+        let offsets = [0, al(gate.1[0].1), al(gate.1[0].1) + al(up.1[0].1)];
+        let record_bytes = (offsets[2] + down.1[0].1).div_ceil(16) * 16;
+        let e = m.experts;
+        let art = self.art;
+        let fill = |bytes: &mut [u8]| -> Result<()> {
+            for x in 0..e {
+                let rec = &mut bytes[x * record_bytes..(x + 1) * record_bytes];
+                for (r, &off) in [&gate, &up, &down].into_iter().zip(&offsets) {
+                    let (at, n) = r.1[x];
+                    art.read_range(at, &mut rec[off..off + n]).map_err(werr)?;
+                }
+            }
+            Ok(())
+        };
+        let mut records = self.b.alloc_host((e * record_bytes).div_ceil(4))?;
+        match self.b.host_bytes_mut(&mut records) {
+            Some(bytes) => fill(bytes)?,
+            // A backend without directly readable host memory (the CPU oracle).
+            None => {
+                let mut v = vec![0u8; e * record_bytes];
+                fill(&mut v)?;
+                records = self.b.upload_bytes_host(&v)?;
+            }
+        }
+        self.host_bytes += (e * record_bytes) as u64;
+        let mat = |format, offset, rows, k| ExpertMatrix {
+            format,
+            offset,
+            rows,
+            k,
+        };
+        self.experts.push(ExpertRecords {
+            records,
+            record_bytes,
+            gate: mat(gate.0, 0, wi, h),
+            up: mat(up.0, offsets[1], wi, h),
+            down: mat(down.0, offsets[2], h, wi),
+        });
+        Ok(self.experts.len() - 1)
     }
 
     pub(crate) fn matrix(&mut self, name: &str) -> Result<WDesc> {
@@ -638,6 +704,7 @@ impl<'a, B: Backend> Loader<'a, B> {
             index: HashMap::new(),
             policies: read_policies(art),
             params: Vec::new(),
+            experts: Vec::new(),
             bytes: 0,
             host: Vec::new(),
             host_bytes: 0,
@@ -760,24 +827,12 @@ fn load_moe<B: Backend>(
     let shared_score = l.matrix(&p("moe/shared_score"))?;
     expect(&p("moe/router"), router.rows, m.experts)?;
     expect(&p("moe/shared_score"), shared_score.rows, 1)?;
-    let mut bank = |role: &str, rows: usize| -> Result<ExpertBank> {
-        let views = (0..m.experts)
-            .map(|e| l.matrix(&p(&format!("moe/experts/{e}/{role}"))))
-            .collect::<Result<Vec<_>>>()?;
-        let bank = ExpertBank::from_experts(&p(&format!("moe/experts/*/{role}")), &views)?;
-        expect(&p(&format!("moe/experts/0/{role}")), bank.first.rows, rows)?;
-        Ok(bank)
-    };
-    let gate = bank("gate", m.intermediate)?;
-    let up = bank("up", m.intermediate)?;
-    let down = bank("down", cfg.hidden)?;
+    let experts = l.expert_records(p, m, cfg.hidden)?;
     Ok(MoeFfn {
         router_score: fuse(&[&router, &shared_score]),
         router,
         shared_score,
-        gate,
-        up,
-        down,
+        experts,
         shared: load_swiglu(
             l,
             cfg,
@@ -862,56 +917,4 @@ pub fn fuse(parts: &[&WDesc]) -> Option<WDesc> {
         act,
         ..**first
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn view(parent: usize, row_begin: usize, rows: usize) -> WDesc {
-        WDesc {
-            parent,
-            format: WeightFormat::Q4G64,
-            n: 64,
-            k: 128,
-            row_begin,
-            rows,
-            act: ActPolicy::A16Only,
-        }
-    }
-
-    #[test]
-    fn interleaved_gate_up_form_two_banks() {
-        // ninfer's layout: expert e's gate at rows 2e*I, its up at (2e + 1)*I.
-        let i = 8;
-        let gates: Vec<_> = (0..4).map(|e| view(0, 2 * e * i, i)).collect();
-        let ups: Vec<_> = (0..4).map(|e| view(0, (2 * e + 1) * i, i)).collect();
-        let (g, u) = (
-            ExpertBank::from_experts("gate", &gates).unwrap(),
-            ExpertBank::from_experts("up", &ups).unwrap(),
-        );
-        assert_eq!((g.experts, g.stride, u.stride), (4, 2 * i, 2 * i));
-        assert_eq!(u.expert(3), ups[3]);
-    }
-
-    #[test]
-    fn irregular_experts_are_refused() {
-        let i = 8;
-        let mut v: Vec<_> = (0..3).map(|e| view(0, e * i, i)).collect();
-        assert_eq!(ExpertBank::from_experts("down", &v).unwrap().stride, i);
-        v[2].row_begin += 1;
-        assert!(ExpertBank::from_experts("down", &v).is_err());
-        v[2] = view(1, 2 * i, i);
-        assert!(ExpertBank::from_experts("down", &v).is_err());
-        let reversed: Vec<_> = (0..3).rev().map(|e| view(0, e * i, i)).collect();
-        assert!(ExpertBank::from_experts("down", &reversed).is_err());
-        let overlapping: Vec<_> = (0..3).map(|e| view(0, e * 4, i)).collect();
-        assert!(ExpertBank::from_experts("down", &overlapping).is_err());
-    }
-
-    #[test]
-    fn one_expert_is_a_bank() {
-        let b = ExpertBank::from_experts("gate", &[view(0, 16, 8)]).unwrap();
-        assert_eq!((b.experts, b.stride, b.expert(0).row_begin), (1, 8, 16));
-    }
 }

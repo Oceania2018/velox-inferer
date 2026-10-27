@@ -11,5 +11,6 @@ cuda = ["dep:velox-cuda", "velox-variant/cuda"]
 [dependencies]
 velox-core.workspace = true
 velox-cpu.workspace = true
+velox-models.workspace = true
 velox-variant.workspace = true
 velox-cuda = { workspace = true, optional = true }
