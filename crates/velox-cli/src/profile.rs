@@ -92,6 +92,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn alloc_host(&self, len: usize) -> Result<B::Buffer> {
         self.inner.alloc_host(len)
     }
+    fn reserve_host(&self, bytes: usize) -> usize {
+        self.inner.reserve_host(bytes)
+    }
     fn vm_chunk_len(&self) -> usize {
         self.inner.vm_chunk_len()
     }
