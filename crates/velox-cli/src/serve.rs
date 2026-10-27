@@ -107,8 +107,9 @@ where
         skip_media_tail: a
             .get("ctx-checkpoint-skip-media-tail")
             .is_none_or(|v| v != "off"),
-        // --host-context-mib N (ninfer's name): system RAM for prefixes any request can resume.
-        host_context_bytes: a.parse::<usize>("host-context-mib", 16384)? << 20,
+        // --host-context-mib N (ninfer's name): system RAM for prefixes any request can resume,
+        // pinned at startup (default 24 GiB, as the production ninfer).
+        host_context_bytes: a.parse::<usize>("host-context-mib", 24576)? << 20,
         // --kv-paging on|off (default on): lanes' attention caches in virtual memory, backed as
         // they grow, with identical prefix chunks shared between lanes.
         kv_paging: a.get("kv-paging").is_none_or(|v| v != "off"),
