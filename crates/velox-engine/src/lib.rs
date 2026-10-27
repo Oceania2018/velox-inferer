@@ -697,6 +697,22 @@ where
             disk,
             cfg.host_state_format,
         );
+        // Pin the store's memory before serving: until the store fills, every capture would
+        // otherwise pin fresh memory on the request path (+90 ms on a 3K-token incremental
+        // prefill, +140-600 ms on a 20K one, RTX 5090 under WSL). A sixteenth more covers the
+        // free storage the store keeps beside its entries.
+        if store.enabled() {
+            let t = Instant::now();
+            let want = cfg.host_context_bytes + cfg.host_context_bytes / 16;
+            let got = b.reserve_host(want);
+            if got > 0 {
+                eprintln!(
+                    "context store: pinned {} MiB in {:.1} s",
+                    got >> 20,
+                    t.elapsed().as_secs_f64()
+                );
+            }
+        }
         // Opt-in (VELOX_PINNER=1): under WSL/WDDM, pinning on another thread stalled the device
         // (6-agent replays 74-79 s against 37-44 s) more than pinning on the engine thread costs.
         if store.enabled() && std::env::var("VELOX_PINNER").is_ok_and(|v| v == "1") {

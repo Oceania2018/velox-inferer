@@ -945,6 +945,12 @@ pub trait Backend {
     fn alloc_host(&self, len: usize) -> Result<Self::Buffer> {
         self.alloc(len)
     }
+    /// Prepares `bytes` of [`Self::alloc_host`] storage ahead of use, so later allocations up to
+    /// that much do not pin memory (slow: see [`HostAlloc`]). Returns the bytes it prepared;
+    /// backends without pinned memory prepare nothing.
+    fn reserve_host(&self, _bytes: usize) -> usize {
+        0
+    }
     /// f32 slots of one physical chunk of virtual memory; 0 when the backend has none (callers
     /// then allocate whole buffers).
     fn vm_chunk_len(&self) -> usize {
