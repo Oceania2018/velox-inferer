@@ -3636,6 +3636,15 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             s.linear_swiglu_pair(q2k, iq3, 512, 40, 0, m, false, true, a8)?;
         }
     }
+    // GGML prefill at a width and row count where hardware variants pick their wide token tiles
+    // (enough 128-row tiles to fill a wave of blocks), with a ragged last token tile.
+    {
+        use velox_core::ggml::GgmlType::{Iq1M, Iq1S, Iq2S, Iq2Xs, Iq2Xxs, Iq3S, Q2K};
+        for t in [Q2K, Iq1M, Iq1S, Iq2Xxs, Iq2Xs, Iq2S, Iq3S] {
+            let f = WeightFormat::Ggml(t);
+            s.linear_act(f, 4616, 1024, 8, 4600, 250, ActPolicy::AllowA8)?;
+        }
+    }
     // Its own seed: the synthetic model must not change when cases are added before it.
     let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);
