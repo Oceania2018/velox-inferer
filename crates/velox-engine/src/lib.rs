@@ -23,23 +23,23 @@ use store::{ContextStore, Pinner};
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use velox_core::{Backend, Error as CoreError, KvFormat};
+use velox_core::{Backend, Error as CoreError, KvFormat, StateFormat};
 use velox_frontend::image::{
     decode_data_url, preprocess, smart_resize, ImagePatches, MERGE, PATCH, TEMPORAL,
 };
 use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
     shift_inserts, BatchWorkspace, Checkpoint, DFlashModel, DFlashState, DFlashWorkspace,
-    EmbedInsert, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
+    EmbedInsert, KvPool, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
     DRAFT_PAGE_ROWS,
 };
-use velox_serve::{ApiError, ChatEngine, Delta, Outcome};
+use velox_serve::{ApiError, ChatEngine, Delta, Outcome, ScoreOutcome, ScoreQuery};
 
 pub use prompt::{build as build_prompt, ImageRun, Prompt};
 pub use sampling::{Sampler, CANDIDATES};
@@ -53,6 +53,14 @@ pub struct EngineConfig {
     pub default_max_tokens: usize,
     /// Default for `chat_template_kwargs.enable_thinking` (ninfer `--no-thinking` = false).
     pub enable_thinking: bool,
+    /// A request that offers tools answers with a tool call only: the prompt ends in the opening
+    /// `<tool_call>` tag, so the model skips the sentence it would otherwise write first (ninfer's
+    /// tool-call grammar constraint has the same effect; the agent reads the call's own `why`).
+    pub force_tool_call: bool,
+    /// Streaming requests receive their text as it is generated (ninfer does the same), up to the
+    /// first `<tool_call>`; off: the whole answer at the end. Tool calls and reasoning always
+    /// arrive whole.
+    pub stream_content: bool,
     /// Recurrent-state checkpoints kept per lane for prefix reuse (device checkpoints).
     pub max_checkpoints: usize,
     /// Superseded history points the context store keeps per request chain for retries and
@@ -68,6 +76,10 @@ pub struct EngineConfig {
     pub host_context_bytes: usize,
     /// LRFU decay per request of the context store (0: least recently used).
     pub lrfu_lambda: f64,
+    /// Storage format of the recurrent states the context store keeps (ninfer
+    /// `--host-state-dtype`): bf16 holds twice as many prefixes as f32 in the same RAM, nvfp4
+    /// about 5.5 times; lanes always run on f32 state.
+    pub host_state_format: StateFormat,
     /// NVMe tier below the context store (see `disk`); 0 disables it.
     pub disk_context_bytes: u64,
     /// Directory of the NVMe tier's files (a private subdirectory is created and removed).
@@ -86,7 +98,25 @@ pub struct EngineConfig {
     /// sequence grows instead of at full capacity, with identical prefix chunks (system prompt,
     /// task) mapped once for every lane that holds them.
     pub kv_paging: bool,
+    /// Paged caches: tokens of attention cache in the startup pool every lane draws from (`None`:
+    /// what device memory allows after everything else, minus `vram_headroom`).
+    pub kv_capacity: Option<usize>,
+    /// Device memory left unallocated at startup (paged caches; WDDM spills to system memory
+    /// when the card fills, slowing every step several times).
+    pub vram_headroom: usize,
+    /// Device memory recorded graphs may hold; past it the least recently run are released.
+    pub graph_budget: usize,
+    /// Device memory in use once started (every process, graph budget included): the attention
+    /// pool gets what is left. Takes precedence over `vram_headroom`.
+    pub vram_budget: Option<usize>,
+    /// System One rank branches scored per forward pass (ninfer `--score-branch-rows`; 0
+    /// rejects branch scoring). Each takes about 0.5 MB of scoring buffers on Qwen3.8-27B.
+    pub score_rows: usize,
 }
+
+/// Tokens of one scoring window, at most: the prompt's last token, then a rank branch
+/// (`"<id>] "`, at most five tokens).
+const SCORE_WINDOW: usize = 1 + velox_serve::systemone::MAX_BRANCH_TOKENS;
 
 /// A sequence slot: its own KV cache and recurrent state, the keys of the tokens it holds, and
 /// checkpoints of its recurrent state.
@@ -108,6 +138,9 @@ struct Lane<B: Backend> {
     spec_stats: (usize, usize, usize),
     /// Admission clock value of the lane's latest request (least recently used lanes go first).
     last_used: u64,
+    /// The lane's latest request was a scoring request: its state is not worth keeping for
+    /// later (see `pick_lane`, `evict_heads`).
+    scored: bool,
 }
 
 /// What the worker owns: the lanes and the activation workspaces they share.
@@ -119,16 +152,51 @@ struct Lanes<B: Backend> {
     dw: Option<DFlashWorkspace<B>>,
     /// Batched-verify buffers, with more than one lane.
     bw: Option<BatchWorkspace<B>>,
+    /// Scoring buffers (System One): `score_rows` windows per pass, at least one.
+    sw: BatchWorkspace<B>,
     clock: u64,
-    /// Device checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
-    /// prefills snapshot into it instead of allocating, which would synchronize the device.
+    /// Checkpoint storage not in use, shared by the lanes (lent to the lane being admitted):
+    /// prefills snapshot into it instead of allocating, which would synchronize the device. Holds
+    /// the device checkpoints (see [`DEVICE_SPARE`]) not in a lane, and host ones up to its trim.
     spare: Vec<Checkpoint<B>>,
     /// Published prefix chunks of the lanes' paged attention caches.
     share: KvShare<B>,
+    /// The chunk sets those caches draw from, created at startup (paged caches only).
+    pool: Option<Arc<KvPool<B>>>,
 }
 
 /// Device checkpoint storage kept for reuse across lanes.
 const DEVICE_SPARE: usize = 2;
+
+/// Device checkpoints (one recurrent state each, 157 MB for Qwen3.8-27B), created at startup
+/// inside the memory budget and never more: the lanes' kept heads ([`DEVICE_HEADS`]) plus
+/// [`DEVICE_SPARE`], each at most one per lane (`budget_memory`). A prefill snapshot finding none
+/// free takes pinned host storage instead; allocating them per prefill took ~1.4 GB for seconds
+/// when six fresh prompts started together.
+
+/// Opening tag of a Qwen tool call, as the chat template writes it (see
+/// `EngineConfig::force_tool_call`).
+const TOOL_CALL_OPEN: &str = "<tool_call>\n";
+
+/// The part of a partial answer that is content whatever follows: what `parse_output` returns
+/// as content for every continuation. Held back: text from the first `<tool_call>` on, a trailing
+/// piece of a tag, surrounding whitespace (the parser trims it) and an incomplete UTF-8
+/// character. `None` once the answer has reasoning tags (reasoning is not content).
+fn streamable_content(text: &str) -> Option<&str> {
+    const TAGS: [&str; 3] = ["<tool_call>", "<think>", "</think>"];
+    if text.contains("<think>") || text.contains("</think>") {
+        return None;
+    }
+    let mut end = text.find(TAGS[0]).unwrap_or(text.len());
+    let head = &text[..end];
+    for tag in TAGS {
+        // Tags are ASCII, so `end` stays on a character boundary.
+        if let Some(k) = (1..tag.len()).rev().find(|&k| head.ends_with(&tag[..k])) {
+            end = end.min(head.len() - k);
+        }
+    }
+    Some(text[..end].trim_end_matches('\u{FFFD}').trim())
+}
 
 /// Lanes whose chain head stays in device memory (the most recently admitted); other heads move
 /// to the context store, from where their next request restores them (~5 ms over PCIe).
@@ -171,10 +239,30 @@ const STORE_GAIN: usize = 128;
 /// Tokens a disk record must cover beyond every resident source to be read back.
 const DISK_GAIN: usize = 1024;
 
+/// Paged caches: rows past a new prompt a lane keeps backed (room for its output) before the rest
+/// is returned. Without the trim every lane keeps its longest prompt ever backed, and on a 32 GB
+/// card six lanes near capacity push VRAM into WDDM's system-memory spill (decode 3x slower).
+const KV_TRIM_SLACK: usize = 4096;
+
+/// Device memory a budget keeps back for kernel scratch that grows after warm-up (grow-only
+/// buffers sized by the largest call so far; a 6-way stress run went ~0.2 GB past warm-up).
+const SCRATCH_RESERVE: usize = 256 << 20;
+
+/// Prefill snapshots by storage: a device checkpoint, a pinned state the store had ready, or
+/// one pinned on the request path (logged with device memory).
+static SNAPS_DEVICE: AtomicUsize = AtomicUsize::new(0);
+static SNAPS_HOST: AtomicUsize = AtomicUsize::new(0);
+static SNAPS_PINNED: AtomicUsize = AtomicUsize::new(0);
+
+/// How often the engine logs device memory (free, attention pool, graphs).
+const MEM_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub struct QwenEngine<B: Backend> {
     core: Arc<Core<B>>,
     queue: Arc<JobQueue>,
     worker: Option<JoinHandle<()>>,
+    /// Recent scoring answers (see `ScoreCache`).
+    results: ScoreCache,
 }
 
 /// The model and request handling shared by the HTTP threads and the worker.
@@ -202,6 +290,19 @@ fn core(e: CoreError) -> ApiError {
         code: "engine_error",
         message: e.to_string(),
     }
+}
+
+/// Keeps at most `max` host checkpoints in `spare` and every device one: device checkpoints
+/// are a fixed set (see [`DEVICE_SPARE`]), so dropping one would only shrink it.
+fn trim_spare<B: Backend>(spare: &mut Vec<Checkpoint<B>>, max: usize) {
+    let mut host = 0;
+    spare.retain(|c| {
+        if !c.on_host() {
+            return true;
+        }
+        host += 1;
+        host <= max
+    });
 }
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
@@ -269,10 +370,16 @@ pub fn normalize_request(req: &Value) -> Result<Normalized, ApiError> {
                     .filter_map(|p| p.get("text").and_then(Value::as_str))
                     .collect(),
             ),
+            // Named by type only: the server logs error messages, and the value is request data.
             Some(other) => {
+                let kind = match other {
+                    Value::Bool(_) => "a boolean",
+                    Value::Number(_) => "a number",
+                    _ => "an object",
+                };
                 return Err(ApiError::invalid(format!(
-                    "unsupported message content {other}"
-                )))
+                    "message content must be a string or an array of parts, not {kind}"
+                )));
             }
         };
         out.insert("content".into(), content);
@@ -367,16 +474,44 @@ struct Job {
     images: Vec<ImagePatches>,
     sampler: Sampler,
     max_tokens: usize,
-    reply: mpsc::Sender<Result<Done, ApiError>>,
+    /// Send the output tokens as each round commits them (`Reply::Tokens`), not only at the end.
+    stream: bool,
+    reply: mpsc::Sender<Reply>,
+    queued: Instant,
+    /// A scoring request: nothing is generated (see [`Scoring`]).
+    score: Option<Scoring>,
+}
+
+/// What a scoring request scores once its prompt is in the lane (see `Core::finish_prefill`).
+struct Scoring {
+    /// Ids whose log-probabilities are read after the prompt's last token, or after each window.
+    candidates: Vec<u32>,
+    /// Token windows scored from the prompt's state, each as if it alone followed the prompt
+    /// (none: the candidates are read off the prompt's own last row).
+    windows: Vec<Vec<u32>>,
+    /// Where the prompts of the request's later questions part from this one: the lane keeps a
+    /// checkpoint there, so they resume after the shared state and images.
+    fork: Option<usize>,
+}
+
+/// What the worker sends a request's HTTP thread: committed tokens while it runs (streaming
+/// jobs), then the result.
+enum Reply {
+    Tokens(Vec<u32>),
+    Done(Result<Done, ApiError>),
 }
 
 /// What the worker hands back for a finished request.
 struct Done {
     out: Vec<u32>,
+    /// A scoring request's candidate log-probabilities, window-major.
+    scores: Vec<f32>,
     finish: &'static str,
     start: usize,
+    queue_ms: f64,
     prompt_ms: f64,
     predicted_ms: f64,
+    first_token: Instant,
 }
 
 /// A request's prompt still being fed to its lane.
@@ -421,11 +556,16 @@ struct Active<B: Backend> {
     job: Job,
     lane: usize,
     out: Vec<u32>,
+    /// Output tokens already sent to a streaming job.
+    sent: usize,
     /// The sampled token to feed next.
     c: u32,
     finish: Option<&'static str>,
     start: usize,
+    /// From hand-off to admission onto the lane.
+    queue_ms: f64,
     prompt_ms: f64,
+    /// When the first token was sampled.
     t1: Instant,
     /// MTP: cache row of the previous verify and its kept drafts (see `MtpDrafter::draft`).
     mtp_row0: usize,
@@ -434,6 +574,21 @@ struct Active<B: Backend> {
     cands: Vec<(u32, f32)>,
     /// While the prompt is still being fed.
     pre: Option<Prefill<B>>,
+    /// A scoring request's result (see `Done::scores`).
+    scores: Vec<f32>,
+}
+
+impl<B: Backend> Active<B> {
+    /// Sends a streaming job the output it has not seen yet (`complete` sends the rest).
+    fn send_new(&mut self) {
+        if self.job.stream && self.out.len() > self.sent {
+            let _ = self
+                .job
+                .reply
+                .send(Reply::Tokens(self.out[self.sent..].to_vec()));
+            self.sent = self.out.len();
+        }
+    }
 }
 
 /// Requests handed from the HTTP threads to the worker.
@@ -497,6 +652,7 @@ where
                 zero,
                 drafter,
                 last_used: 0,
+                scored: false,
             });
         }
         let dw = match &dflash {
@@ -511,9 +667,17 @@ where
             None => None,
         };
         let bw = match &dflash {
-            Some(_) if n_lanes > 1 => Some(model.batch_workspace(&b, n_lanes)?),
+            // Windows are the pending token plus the drafts (see `DFlashDrafter::workspace`).
+            Some(_) if n_lanes > 1 => Some(model.batch_workspace(
+                &b,
+                n_lanes,
+                DFlashDrafter::<B>::max_drafts(cfg.dflash_drafts) + 1,
+            )?),
             _ => None,
         };
+        // Before warm-up and the memory budget, so the attention pool is sized without them.
+        let sw =
+            model.score_workspace(&b, cfg.score_rows.clamp(1, ws.max_tokens()), SCORE_WINDOW)?;
         let special = SpecialTokens {
             im_start: single_token(&fe, "<|im_start|>"),
             vision_start: single_token(&fe, "<|vision_start|>"),
@@ -527,7 +691,28 @@ where
         } else {
             None
         };
-        let mut store = ContextStore::new(cfg.host_context_bytes, cfg.lrfu_lambda, disk);
+        let mut store = ContextStore::new(
+            cfg.host_context_bytes,
+            cfg.lrfu_lambda,
+            disk,
+            cfg.host_state_format,
+        );
+        // Pin the store's memory before serving: until the store fills, every capture would
+        // otherwise pin fresh memory on the request path (+90 ms on a 3K-token incremental
+        // prefill, +140-600 ms on a 20K one, RTX 5090 under WSL). A sixteenth more covers the
+        // free storage the store keeps beside its entries.
+        if store.enabled() {
+            let t = Instant::now();
+            let want = cfg.host_context_bytes + cfg.host_context_bytes / 16;
+            let got = b.reserve_host(want);
+            if got > 0 {
+                eprintln!(
+                    "context store: pinned {} MiB in {:.1} s",
+                    got >> 20,
+                    t.elapsed().as_secs_f64()
+                );
+            }
+        }
         // Opt-in (VELOX_PINNER=1): under WSL/WDDM, pinning on another thread stalled the device
         // (6-agent replays 74-79 s against 37-44 s) more than pinning on the engine thread costs.
         if store.enabled() && std::env::var("VELOX_PINNER").is_ok_and(|v| v == "1") {
@@ -544,9 +729,11 @@ where
             store,
             dw,
             bw,
+            sw,
             clock: 0,
             spare: Vec::new(),
             share: KvShare::default(),
+            pool: None,
         };
         let core = Arc::new(Core {
             b,
@@ -558,26 +745,19 @@ where
             special,
         });
         let mut state = state;
+        if let Some(used) = core.b.device_in_use() {
+            eprintln!(
+                "memory: {:.2} GiB in use with {} lanes' states and the workspaces",
+                used as f64 / (1u64 << 30) as f64,
+                state.lanes.len()
+            );
+        }
         core.warm_up(&mut state)?;
         // Warm-up wrote near the end of the caches; paged lanes start empty.
         for lane in &mut state.lanes {
             lane.session.trim_kv(&core.b, 0)?;
         }
-        eprintln!(
-            "attention caches: {} lanes, {:.2} GB backed ({})",
-            state.lanes.len(),
-            state
-                .lanes
-                .iter()
-                .map(|l| l.session.kv_bytes(&core.b))
-                .sum::<usize>() as f64
-                / 1e9,
-            if state.lanes.iter().any(|l| l.session.kv_paged()) {
-                "paged"
-            } else {
-                "whole"
-            }
-        );
+        core.budget_memory(&mut state)?;
         let queue = Arc::new(JobQueue {
             jobs: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -594,6 +774,7 @@ where
             core,
             queue,
             worker: Some(worker),
+            results: ScoreCache::default(),
         })
     }
 }
@@ -615,13 +796,185 @@ impl<B: Backend> Core<B> {
     /// under load: growing scratch keeps every smaller buffer (recorded graphs may hold them), and
     /// past the card's memory WDDM spills to system RAM and everything crawls. The lanes are reset
     /// afterwards.
+    /// Fixes device memory at startup, as ninfer does: recorded graphs get `graph_budget`, and the
+    /// paged caches' chunks are created now, as many as `kv_capacity` asks or the device has
+    /// left after everything else and `vram_headroom`. Requests then allocate no device memory
+    /// for caches, so VRAM stays flat instead of creeping into WDDM's system-memory spill.
+    fn budget_memory(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
+        let cfg = &self.cfg;
+        // The device checkpoints there will ever be, before the measurement below counts them.
+        // One lane needs its head and one more for the next prefill's deepest snapshot.
+        let lanes = st.lanes.len();
+        let states = DEVICE_HEADS.min(lanes) + DEVICE_SPARE.min(lanes);
+        let device = st.spare.iter().filter(|c| !c.on_host()).count();
+        for _ in device..states {
+            st.spare
+                .push(st.lanes[0].session.blank_checkpoint(&self.b, 0)?);
+        }
+        self.b.set_graph_budget(cfg.graph_budget);
+        let Some((per_set, rows_per_set)) = st.lanes[0].session.kv_set_shape() else {
+            eprintln!("attention caches: {} lanes, whole", st.lanes.len());
+            return Ok(());
+        };
+        let set_bytes = per_set * self.b.vm_chunk_len() * 4;
+        let full = st.lanes.len() * st.lanes[0].session.kv_sets_for(cfg.capacity);
+        let (graphs, graph_bytes, _) = self.b.graph_stats();
+        let gib = |x: usize| x as f64 / (1u64 << 30) as f64;
+        let used = self.b.device_in_use();
+        if let Some(used) = used {
+            eprintln!(
+                "memory: {:.2} GiB in use after warm-up, before the attention pool",
+                gib(used)
+            );
+        }
+        let graphs_to_come = cfg.graph_budget.saturating_sub(graph_bytes);
+        // The budget is in nvidia-smi's terms (device_in_use); the headroom is kept from what
+        // CUDA says it can still allocate (mem_info), the stricter figure under WDDM.
+        let sets = match (cfg.kv_capacity, cfg.vram_budget, used, self.b.mem_info()) {
+            (Some(tokens), ..) => tokens.div_ceil(rows_per_set.max(1)),
+            (None, Some(budget), Some(used), _) => {
+                let room = budget.saturating_sub(used + graphs_to_come + SCRATCH_RESERVE)
+                    / set_bytes.max(1);
+                // One full-length request must always fit.
+                let floor = st.lanes[0].session.kv_sets_for(cfg.capacity);
+                if room < floor {
+                    eprintln!(
+                        "memory budget: {:.2} GiB in use and {:.2} GiB of graph budget leave \
+                         {room} attention sets under --vram-budget-mib; taking {floor} (one full \
+                         context) over it",
+                        gib(used),
+                        gib(graphs_to_come)
+                    );
+                }
+                room.max(floor)
+            }
+            (None, _, _, Some((free, _))) => {
+                free.saturating_sub(cfg.vram_headroom + graphs_to_come) / set_bytes.max(1)
+            }
+            // No way to measure: every lane's full capacity.
+            _ => full,
+        }
+        .min(full);
+        let pool = KvPool::new(&self.b, sets, per_set)?;
+        for lane in &mut st.lanes {
+            lane.session.set_kv_pool(Arc::clone(&pool));
+        }
+        st.pool = Some(pool);
+        eprintln!(
+            "memory budget: attention pool {sets} sets of {rows_per_set} rows ({} tokens, {:.2} GiB; \
+             all lanes full: {full}), graphs up to {:.2} GiB ({graphs} recorded, {:.2} GiB); \
+             in use now {}",
+            sets * rows_per_set,
+            gib(sets * set_bytes),
+            gib(cfg.graph_budget),
+            gib(graph_bytes),
+            self.b
+                .device_in_use()
+                .map_or("unknown".into(), |u| format!("{:.2} GiB", gib(u)))
+        );
+        Ok(())
+    }
+
+    /// Room in the attention pool for a prompt of `len` tokens on lane `li` (with output room):
+    /// idle lanes, least recently used first, give their chunks back (their conversations resume
+    /// from the context store). False when that is not enough while other requests run: the
+    /// request waits for them. Alone, it runs anyway (the pool lends past its size).
+    fn kv_room(&self, st: &mut Lanes<B>, li: usize, len: usize, busy: &[usize]) -> bool {
+        let Some(pool) = st.pool.clone() else {
+            return true;
+        };
+        let need = st.lanes[li].session.kv_need(len + KV_TRIM_SLACK);
+        while pool.free_sets() < need {
+            let Some(j) = (0..st.lanes.len())
+                .filter(|&j| j != li && !busy.contains(&j))
+                .filter(|&j| st.lanes[j].session.kv_private_sets() > 1)
+                .min_by_key(|&j| st.lanes[j].last_used)
+            else {
+                return busy.is_empty();
+            };
+            if let Err(e) = self.release_lane(st, j) {
+                eprintln!("attention pool: releasing lane {j} failed: {e}");
+                return busy.is_empty();
+            }
+        }
+        true
+    }
+
+    fn log_memory(&self, st: &Lanes<B>) {
+        let gb = |x: usize| x as f64 / 1e9;
+        let (graphs, graph_bytes, released) = self.b.graph_stats();
+        let pool = st.pool.as_ref().map_or(String::new(), |p| {
+            format!(
+                ", attention pool {}/{} sets free ({} lent past it)",
+                p.free_sets(),
+                p.sets(),
+                p.overflow()
+            )
+        });
+        let snaps = format!(
+            ", snapshots {} device / {} host ({} pinned on demand)",
+            SNAPS_DEVICE.load(Ordering::Relaxed),
+            SNAPS_HOST.load(Ordering::Relaxed),
+            SNAPS_PINNED.load(Ordering::Relaxed)
+        );
+        let allocs = self
+            .b
+            .device_allocs()
+            .map_or(String::new(), |(live, peak, chunks)| {
+                format!(
+                    ", buffers {:.2} GiB (peak {:.2}), chunks {:.2} GiB",
+                    live as f64 / (1u64 << 30) as f64,
+                    peak as f64 / (1u64 << 30) as f64,
+                    chunks as f64 / (1u64 << 30) as f64
+                )
+            });
+        eprintln!(
+            "[mem] device in use {}{pool}{allocs}{snaps}, graphs {graphs} ({:.2} GB, {released} \
+             released)",
+            self.b.device_in_use().map_or("unknown".into(), |u| format!(
+                "{:.2} GiB",
+                u as f64 / (1u64 << 30) as f64
+            )),
+            gb(graph_bytes)
+        );
+    }
+
+    /// Returns idle lane `j`'s attention chunks to the pool; its chain head goes to the context
+    /// store first, so its conversation resumes from there.
+    fn release_lane(&self, st: &mut Lanes<B>, j: usize) -> Result<(), CoreError> {
+        let Lanes {
+            lanes,
+            store,
+            spare,
+            ..
+        } = st;
+        let lane = &mut lanes[j];
+        if store.enabled() {
+            self.capture_head(lane, store, 0)?;
+        }
+        let n = lane.session.trim_kv(&self.b, 0)?;
+        lane.keys.clear();
+        lane.chain = None;
+        spare.append(&mut lane.checkpoints);
+        trim_spare(spare, DEVICE_SPARE);
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+            eprintln!("[kv] lane {j} released {n} chunks to the pool");
+        }
+        Ok(())
+    }
+
     fn warm_up(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
         use velox_models::qwen3_5::VERIFY_MAX;
         let (b, model) = (&self.b, &self.model);
         let limit = self.fe.public_vocab;
         let chunk = self.cfg.chunk;
         let Lanes {
-            ws, lanes, dw, bw, ..
+            ws,
+            lanes,
+            dw,
+            bw,
+            sw,
+            ..
         } = st;
         {
             let lane = &mut lanes[0];
@@ -644,6 +997,18 @@ impl<B: Backend> Core<B> {
                 _ => model.advance(b, &mut lane.session, ws, &ids, None, &[])?,
             }
             model.candidates(b, ws, CANDIDATES, limit)?;
+            // The widest scoring pass (System One rank questions).
+            let window = [0u32; SCORE_WINDOW];
+            let n = sw.max_seqs().min(ws.max_tokens() / SCORE_WINDOW).max(1);
+            model.score_windows(
+                b,
+                &mut lane.session,
+                ws,
+                sw,
+                &vec![&window[..]; n],
+                &[0],
+                limit,
+            )?;
             if lane.drafter.is_some() {
                 let window = vec![0u32; VERIFY_MAX.min(lane.session.capacity - lane.session.pos)];
                 model.verify(b, &mut lane.session, ws, &window, CANDIDATES, limit)?;
@@ -653,11 +1018,23 @@ impl<B: Backend> Core<B> {
                 (lane.drafter.as_mut(), self.dflash.as_ref(), dw.as_mut())
             {
                 d.drafts = d.long_block();
-                d.draft(b, dm, dw, model, ws, 0, 0, lane.session.pos, 0, limit, 0.0)?;
+                d.draft(
+                    b,
+                    dm,
+                    dw,
+                    model,
+                    ws,
+                    0,
+                    0,
+                    lane.session.pos,
+                    0,
+                    limit,
+                    &Sampler::greedy(),
+                )?;
             }
         }
         if let Some(bw) = bw.as_mut() {
-            let m = 8usize;
+            let m = bw.window();
             let mut sessions: Vec<&mut Session<B>> =
                 lanes.iter_mut().map(|l| &mut l.session).collect();
             for s in sessions.iter_mut() {
@@ -712,13 +1089,21 @@ impl<B: Backend> Core<B> {
         }
         let mut waiting: VecDeque<Job> = VecDeque::new();
         let mut active: Vec<Active<B>> = Vec::new();
+        let mut mem_logged = Instant::now();
+        // Drafter context pages kept ready: a new conversation's captures save two windows, so
+        // a burst of them (see the store's RESERVE_STATES) needs several.
+        const DRAFT_RESERVE_WINDOWS: usize = 6;
         let draft = self.dflash.as_ref().map(|dm| {
             (
-                dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
+                DRAFT_RESERVE_WINDOWS * dm.context_window().div_ceil(DRAFT_PAGE_ROWS),
                 dm.context_page_len(),
             )
         });
         loop {
+            if mem_logged.elapsed() >= MEM_LOG_EVERY {
+                mem_logged = Instant::now();
+                self.log_memory(&st);
+            }
             st.store.feed(&self.b, &st.lanes[0].session, draft);
             // New requests; while idle, pin context-store storage between them.
             loop {
@@ -754,7 +1139,7 @@ impl<B: Backend> Core<B> {
                     message: "engine stopped".into(),
                 };
                 for j in waiting.drain(..).chain(active.drain(..).map(|a| a.job)) {
-                    let _ = j.reply.send(Err(gone()));
+                    let _ = j.reply.send(Reply::Done(Err(gone())));
                 }
                 return;
             }
@@ -767,6 +1152,9 @@ impl<B: Backend> Core<B> {
                 let Some(li) = Self::pick_lane(&st.lanes, &busy, &waiting[0].p.keys) else {
                     break;
                 };
+                if !self.kv_room(&mut st, li, waiting[0].p.keys.len(), &busy) {
+                    break;
+                }
                 let job = waiting.pop_front().expect("checked");
                 match self.begin(&mut st, li, job) {
                     Ok(a) => {
@@ -776,7 +1164,7 @@ impl<B: Backend> Core<B> {
                         }
                     }
                     Err((job, e)) => {
-                        let _ = job.reply.send(Err(e));
+                        let _ = job.reply.send(Reply::Done(Err(e)));
                     }
                 }
             }
@@ -789,9 +1177,13 @@ impl<B: Backend> Core<B> {
                     let lane = &mut st.lanes[a.lane];
                     lane.keys.clear();
                     lane.checkpoints.clear();
-                    let _ = a.job.reply.send(Err(e.clone()));
+                    let _ = a.job.reply.send(Reply::Done(Err(e.clone())));
                 }
                 continue;
+            }
+            // Streaming jobs get the tokens this round committed.
+            for a in active.iter_mut() {
+                a.send_new();
             }
             let (done, rest): (Vec<Active<B>>, Vec<Active<B>>) =
                 active.drain(..).partition(|a| a.finish.is_some());
@@ -829,6 +1221,7 @@ impl<B: Backend> Core<B> {
             let lane = &mut lanes[j];
             for cp in std::mem::take(&mut lane.checkpoints) {
                 if store.enabled()
+                    && !lane.scored
                     && cp.pos >= MIN_CAPTURE
                     && cp.pos <= lane.keys.len()
                     && !store.holds(&lane.keys[..cp.pos])
@@ -847,13 +1240,14 @@ impl<B: Backend> Core<B> {
                 spare.push(cp);
             }
         }
-        spare.truncate(DEVICE_SPARE);
+        trim_spare(spare, DEVICE_SPARE);
         Ok(())
     }
 
-    /// A free lane for a prompt of `keys`: the one that can reuse the most, else the least
-    /// recently used (its conversation is the least likely to come back soon; its chain head goes
-    /// to the context store when the new request takes it).
+    /// A free lane for a prompt of `keys`: the one that can reuse the most, else one whose latest
+    /// request was a scoring one (nothing there is kept for later), else the least recently used
+    /// (its conversation is the least likely to come back soon; its chain head goes to the
+    /// context store when the new request takes it).
     fn pick_lane(lanes: &[Lane<B>], busy: &[usize], keys: &[u32]) -> Option<usize> {
         let free: Vec<usize> = (0..lanes.len()).filter(|i| !busy.contains(i)).collect();
         let (best, shared) = free
@@ -863,7 +1257,8 @@ impl<B: Backend> Core<B> {
         if shared >= MIN_REUSE {
             return Some(best);
         }
-        free.into_iter().min_by_key(|&i| lanes[i].last_used)
+        free.into_iter()
+            .min_by_key(|&i| (!lanes[i].scored, lanes[i].last_used))
     }
 
     /// Takes `job` onto lane `li`: restores the best reusable state and prepares the prefill of the
@@ -911,8 +1306,21 @@ impl<B: Backend> Core<B> {
             if store.enabled() {
                 self.capture_head(lane, store, shared.min(p.keys.len() - 1))?;
             }
-            let (start, adopted) = self.reuse(lane, store, share, &p.keys)?;
+            let scoring = job.score.is_some();
+            lane.scored = scoring;
+            // Windows follow a prompt that is complete as a state: it may come whole from one.
+            let whole = job.score.as_ref().is_some_and(|s| !s.windows.is_empty());
+            let (start, adopted) = self.reuse(lane, store, share, &p.keys, whole)?;
             lane.chain = store.resumed(&p.keys, start, adopted);
+            if scoring {
+                // A scoring prompt is fed without the drafter (nothing is drafted after it), so
+                // the drafter's context ends where the prompt resumes.
+                if let (Some(Drafter::DFlash(d)), Some(dm)) =
+                    (lane.drafter.as_mut(), self.dflash.as_ref())
+                {
+                    d.forget(dm, start);
+                }
+            }
             if adopted.is_some() && debug {
                 eprintln!(
                     "[store] lane {li} resumed at {start} ({} entries, {:.2} GB; {} on disk)",
@@ -929,29 +1337,72 @@ impl<B: Backend> Core<B> {
             lane.checkpoints = keep;
             lane.spare.extend(stale);
             lane.keys = p.keys[..start].to_vec();
+            // No checkpoint left reaches past `start`, so rows past this prompt hold nothing.
+            let trimmed = lane
+                .session
+                .trim_kv(&self.b, p.keys.len() + KV_TRIM_SLACK)?;
+            // The prompt's rows are backed now rather than as its chunks run, so the next
+            // admission's room check (`kv_room`) sees this request's share of the pool taken.
+            lane.session.reserve_kv(&self.b, p.keys.len())?;
+            if trimmed > 0 && debug {
+                eprintln!(
+                    "[kv] lane {li} returned {trimmed} chunks, {:.2} GB backed",
+                    lane.session.kv_bytes(&self.b) as f64 / 1e9
+                );
+            }
+            // Scoring prompts place no roots in the context store: each would take reserved
+            // storage, pinned again on the engine thread before the next request is admitted.
             let anchors: Vec<usize> = self
                 .checkpoint_positions(&p.ids, 0)
                 .into_iter()
-                .take(2)
+                .take(if scoring { 0 } else { 2 })
                 .collect();
-            self.begin_prefill(lane, store, p, &job.images, start, anchors, t0)
+            let fork = job.score.as_ref().and_then(|s| s.fork);
+            self.begin_prefill(
+                lane,
+                store,
+                p,
+                &job.images,
+                start,
+                anchors,
+                fork,
+                scoring,
+                t0,
+            )
         })();
-        lane.spare.truncate(DEVICE_SPARE);
+        trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
+        if debug {
+            // Admission runs on the engine thread between rounds; with VELOX_DEBUG_BATCH its GPU
+            // work (state restore, vision encode) is waited for so the time is the whole cost.
+            if std::env::var_os("VELOX_DEBUG_BATCH").is_some() {
+                let _ = self.b.synchronize();
+            }
+            eprintln!(
+                "[admit] lane {li} from {} in {:.1} ms, queued {:.1} ms",
+                r.as_ref().map_or(0, |pre| pre.start),
+                t0.elapsed().as_secs_f64() * 1e3,
+                t0.duration_since(job.queued).as_secs_f64() * 1e3
+            );
+        }
+        let queue_ms = t0.duration_since(job.queued).as_secs_f64() * 1e3;
         match r {
             Ok(pre) => Ok(Active {
                 job,
                 lane: li,
                 out: Vec::new(),
+                sent: 0,
                 c: 0,
                 finish: None,
                 start: pre.start,
+                queue_ms,
                 prompt_ms: 0.0,
                 t1: Instant::now(),
                 mtp_row0: 0,
                 mtp_kept: Vec::new(),
                 cands: Vec::new(),
                 pre: Some(pre),
+                scores: Vec::new(),
             }),
             Err(e) => {
                 lane.keys.clear();
@@ -962,7 +1413,8 @@ impl<B: Backend> Core<B> {
     }
 
     /// The prompt is in the lane's state: checkpoints placed, the first token sampled from
-    /// `cands`; the request decodes from the next round on.
+    /// `cands`; the request decodes from the next round on. A scoring request is scored here
+    /// instead and finishes.
     fn finish_prefill(
         &self,
         st: &mut Lanes<B>,
@@ -972,10 +1424,12 @@ impl<B: Backend> Core<B> {
         let debug = std::env::var_os("VELOX_DEBUG_PREFIX").is_some();
         let pre = a.pre.take().expect("a prefilling request");
         let Lanes {
+            ws,
             lanes,
             store,
             spare: pool,
             share,
+            sw,
             ..
         } = st;
         let lane = &mut lanes[a.lane];
@@ -996,7 +1450,7 @@ impl<B: Backend> Core<B> {
             );
             Ok(())
         };
-        lane.spare.truncate(DEVICE_SPARE);
+        trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
         placed?;
         a.prompt_ms = pre.t0.elapsed().as_secs_f64() * 1e3;
@@ -1011,6 +1465,37 @@ impl<B: Backend> Core<B> {
                 &cands[..cands.len().min(3)]
             );
         }
+        if let Some(s) = &a.job.score {
+            // Nothing is sampled. Without windows the scores were read off the prompt's last row
+            // (`prefill_rest`, `batch_round`); otherwise every window is scored from the prompt's
+            // state, which the lane keeps for the next request.
+            if !s.windows.is_empty() {
+                let t0 = Instant::now();
+                let refs: Vec<&[u32]> = s.windows.iter().map(|w| &w[..]).collect();
+                a.scores = self.model.score_windows(
+                    &self.b,
+                    &mut lane.session,
+                    ws,
+                    sw,
+                    &refs,
+                    &s.candidates,
+                    self.fe.public_vocab,
+                )?;
+                if debug {
+                    eprintln!(
+                        "[score] lane {} {} windows (up to {} tokens) x {} candidates in {:.1} ms",
+                        a.lane,
+                        refs.len(),
+                        refs.iter().map(|w| w.len()).max().unwrap_or(0),
+                        s.candidates.len(),
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
+            a.finish = Some("score");
+            a.t1 = Instant::now();
+            return Ok(());
+        }
         lane.spec_stats = (0, 0, 0);
         a.c = a.job.sampler.sample(&cands);
         a.cands = cands;
@@ -1018,7 +1503,9 @@ impl<B: Backend> Core<B> {
         Ok(())
     }
 
-    /// Feeds what is left of a prefilling request's prompt in one go (no other request decodes).
+    /// Feeds the next workspace chunk of a prefilling request's prompt (no other request decodes).
+    /// One chunk per round: a scoring request that arrives meanwhile is admitted and fed before
+    /// the rest of a long prompt (see `round`).
     fn prefill_rest(&self, st: &mut Lanes<B>, a: &mut Active<B>) -> Result<(), CoreError> {
         let cands = {
             let Lanes { ws, lanes, dw, .. } = &mut *st;
@@ -1026,13 +1513,15 @@ impl<B: Backend> Core<B> {
             let pre = a.pre.as_mut().expect("a prefilling request");
             let p = &a.job.p;
             let from = pre.start + pre.done;
+            let n = (p.ids.len() - from).min(ws.max_tokens());
             let inserts = shift_inserts(&prefill_inserts(&pre.embeds, pre.start, p), pre.done);
-            let ids = &p.ids[from..];
-            let positions = p.positions.as_ref().map(|v| &v[from..]);
+            let ids = &p.ids[from..from + n];
+            let positions = p.positions.as_ref().map(|v| &v[from..from + n]);
             let Lane {
                 session, drafter, ..
             } = &mut *lane;
-            match drafter.as_mut() {
+            // Nothing is drafted after a scoring prompt (see `begin`).
+            match drafter.as_mut().filter(|_| a.job.score.is_none()) {
                 Some(dr) => {
                     let (row0, delta) = (session.pos, session.rope_delta);
                     let model = &self.model;
@@ -1075,10 +1564,25 @@ impl<B: Backend> Core<B> {
                     &mut pre.snaps,
                 )?,
             }
-            pre.done = p.ids.len() - pre.start;
+            pre.done += n;
             pre.chunks += 1;
-            self.model
-                .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)?
+            if from + n < p.ids.len() {
+                return Ok(());
+            }
+            match a.job.score.as_ref().filter(|s| s.windows.is_empty()) {
+                Some(s) => {
+                    a.scores = self.model.last_logprobs(
+                        &self.b,
+                        ws,
+                        &s.candidates,
+                        self.fe.public_vocab,
+                    )?;
+                    Vec::new()
+                }
+                None => self
+                    .model
+                    .candidates(&self.b, ws, CANDIDATES, self.fe.public_vocab)?,
+            }
         };
         self.finish_prefill(st, a, cands)
     }
@@ -1095,14 +1599,24 @@ impl<B: Backend> Core<B> {
                 a.out.len(),
                 a.out.len() as f64 / rounds.max(1) as f64
             );
+            // Cumulative since load: diff consecutive lines for a request's own hit rate.
+            if let Some(r) = self.model.expert_report() {
+                eprintln!(
+                    "[experts] hits {} misses {} moves {}",
+                    r.hits, r.misses, r.moves
+                );
+            }
         }
-        let _ = a.job.reply.send(Ok(Done {
+        let _ = a.job.reply.send(Reply::Done(Ok(Done {
             out: a.out,
+            scores: a.scores,
             finish: a.finish.unwrap_or("length"),
             start: a.start,
+            queue_ms: a.queue_ms,
             prompt_ms: a.prompt_ms,
             predicted_ms,
-        }));
+            first_token: a.t1,
+        })));
     }
 
     /// One step for every active request: decoding requests take their pending token, then draft,
@@ -1120,6 +1634,19 @@ impl<B: Backend> Core<B> {
             if a.out.len() >= a.job.max_tokens {
                 a.finish = Some("length");
             }
+            // The token sampled last round (the first one: at the end of the prefill) goes out
+            // now, not after this round's forward pass.
+            a.send_new();
+        }
+        // A scoring prompt already in the lane's state (an exact repeat) is scored right away.
+        for a in active.iter_mut() {
+            if a.job.score.is_some()
+                && a.pre
+                    .as_ref()
+                    .is_some_and(|p| p.start + p.done == a.job.p.ids.len())
+            {
+                self.finish_prefill(st, a, Vec::new()).map_err(core)?;
+            }
         }
         let live: Vec<usize> = (0..active.len())
             .filter(|&i| active[i].pre.is_none() && active[i].finish.is_none())
@@ -1129,7 +1656,14 @@ impl<B: Backend> Core<B> {
             .copied()
             .filter(|&i| matches!(st.lanes[active[i].lane].drafter, Some(Drafter::DFlash(_))))
             .collect();
-        if let Some(pi) = (0..active.len()).find(|&i| active[i].pre.is_some()) {
+        // Scoring prompts go first: their answer follows right after them, while a chat prompt
+        // is followed by its whole decode.
+        let prefilling = |i: &usize| active[*i].pre.is_some();
+        let next = (0..active.len())
+            .filter(prefilling)
+            .find(|&i| active[i].job.score.is_some())
+            .or_else(|| (0..active.len()).find(prefilling));
+        if let Some(pi) = next {
             if !dflash.is_empty() && st.bw.is_some() {
                 // The next prompt chunk rides with every decoding request's window.
                 return self.batch_round(st, active, &dflash, Some(pi));
@@ -1225,7 +1759,7 @@ impl<B: Backend> Core<B> {
                 lane.session.pos,
                 a.c,
                 self.fe.public_vocab,
-                a.job.sampler.temperature(),
+                &a.job.sampler,
             )
             .map_err(core)?;
         // `whole`: keep drafts past the request's budget (acceptance stops at the budget anyway),
@@ -1382,7 +1916,7 @@ impl<B: Backend> Core<B> {
                     let Some(Drafter::DFlash(d)) = lanes[a.lane].drafter.as_mut() else {
                         unreachable!("caller checked");
                     };
-                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, a.job.sampler.temperature());
+                    let (picked, qs) = d.pick(dm, &proposals[j], a.c, &a.job.sampler);
                     let budget = if room {
                         picked.len()
                     } else {
@@ -1440,18 +1974,36 @@ impl<B: Backend> Core<B> {
                             CANDIDATES,
                             self.fe.public_vocab,
                         )?;
-                        // The prefilling drafter's context for the chunk (features rows 0 .. tp).
-                        if let (Some(Drafter::DFlash(d)), Some(dm)) =
-                            (pl.drafter.as_mut(), self.dflash.as_ref())
-                        {
+                        // The prefilling drafter's context for the chunk (features rows 0 .. tp);
+                        // nothing is drafted after a scoring prompt.
+                        if let (Some(Drafter::DFlash(d)), Some(dm), None) = (
+                            pl.drafter.as_mut(),
+                            self.dflash.as_ref(),
+                            &active[pi].job.score,
+                        ) {
                             d.prefill_chunk(&self.b, dm, dw, ws, row0, tp)?;
                         }
-                        Ok((cands, rows))
+                        // A scoring prompt without windows is answered off its last row.
+                        let scores = match (&cands, &active[pi].job.score) {
+                            (Some(_), Some(s)) if s.windows.is_empty() => {
+                                Some(self.model.last_logprobs(
+                                    &self.b,
+                                    ws,
+                                    &s.candidates,
+                                    self.fe.public_vocab,
+                                )?)
+                            }
+                            _ => None,
+                        };
+                        Ok((cands, rows, scores))
                     })();
                     pstate.done += tp;
                     pstate.chunks += 1;
                     active[pi].pre = Some(pstate);
-                    let (cands, rows) = r.map_err(core)?;
+                    let (cands, rows, scores) = r.map_err(core)?;
+                    if let Some(scores) = scores {
+                        active[pi].scores = scores;
+                    }
                     done_prefill = cands.map(|c| (pi, c));
                     rows
                 }
@@ -1610,7 +2162,7 @@ impl<B: Backend> Core<B> {
                 .unwrap_or(0);
             spare.push(checkpoints.remove(drop));
         }
-        spare.truncate(MAX_SPARE);
+        trim_spare(spare, MAX_SPARE);
     }
 
     /// Host checkpoint mode, after a prefill: checkpoints at `anchors` (system prompt and task:
@@ -1638,17 +2190,17 @@ impl<B: Backend> Core<B> {
             if cp.pos == tail && store.enabled() {
                 // The prompt's end goes straight to system RAM: only an exact retry resumes there.
                 let drafter = self.drafter_context(lane);
-                let id = store.insert(
+                let (id, back) = store.insert_owned(
                     &self.b,
                     &lane.session,
                     &lane.keys,
-                    &cp,
+                    cp,
                     false,
                     None,
                     drafter,
                 )?;
                 store.mark_tail(id, head.unwrap_or(0));
-                lane.spare.push(cp);
+                lane.spare.extend(back);
                 continue;
             }
             if store.enabled()
@@ -1657,7 +2209,22 @@ impl<B: Backend> Core<B> {
                 && !store.holds(&lane.keys[..cp.pos])
             {
                 let drafter = self.drafter_context(lane);
-                store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
+                if Some(cp.pos) == head {
+                    store.insert(&self.b, &lane.session, &lane.keys, &cp, true, None, drafter)?;
+                } else {
+                    // Not the head and an anchor (never kept behind): the store owns it now.
+                    let (_, back) = store.insert_owned(
+                        &self.b,
+                        &lane.session,
+                        &lane.keys,
+                        cp,
+                        true,
+                        None,
+                        drafter,
+                    )?;
+                    lane.spare.extend(back);
+                    continue;
+                }
             }
             if Some(cp.pos) == head {
                 lane.checkpoints.push(cp);
@@ -1719,6 +2286,11 @@ impl<B: Backend> Core<B> {
         store: &mut ContextStore<B>,
         shared: usize,
     ) -> Result<(), CoreError> {
+        // A scoring prompt's state is not kept for later (an exact repeat is answered from the
+        // engine's results).
+        if lane.scored {
+            return Ok(());
+        }
         let head = lane
             .checkpoints
             .iter()
@@ -1748,9 +2320,12 @@ impl<B: Backend> Core<B> {
         store: &mut ContextStore<B>,
         share: &KvShare<B>,
         keys: &[u32],
+        whole: bool,
     ) -> Result<(usize, Option<u64>), CoreError> {
-        // At least the last prompt token must be fed to produce logits.
-        let limit = keys.len() - 1;
+        // At least the last prompt token must be fed to produce logits, unless `whole`: scoring
+        // windows follow the prompt (the first starts with its held-back last token), so all of
+        // it can come from a state.
+        let limit = keys.len() - usize::from(!whole);
         let shared = common_prefix(&lane.keys, keys);
         let target = shared.min(limit);
         let live = lane.session.pos == lane.keys.len() && lane.keys.len() <= target;
@@ -1841,11 +2416,13 @@ impl<B: Backend> Core<B> {
     fn begin_prefill(
         &self,
         lane: &mut Lane<B>,
-        store: &ContextStore<B>,
+        store: &mut ContextStore<B>,
         p: &Prompt,
         images: &[ImagePatches],
         start: usize,
         anchors: Vec<usize>,
+        fork: Option<usize>,
+        scoring: bool,
         t0: Instant,
     ) -> Result<Prefill<B>, CoreError> {
         let mut embeds: Vec<(usize, B::Buffer)> = Vec::new();
@@ -1866,11 +2443,21 @@ impl<B: Backend> Core<B> {
         // Checkpoints are filled inside the forward pass, so the prompt is not cut into short
         // segments there (each segment would stream every weight once more).
         let mut positions = self.checkpoint_positions(&p.ids, start);
+        // The point the request's later questions resume from is the lane's head (kept on the
+        // device), even past the media tail.
+        if let Some(f) = fork.filter(|&f| f > start && f < p.ids.len()) {
+            positions.push(f);
+            positions.sort_unstable();
+            positions.dedup();
+        }
         let deepest = positions.last().copied();
         // The end of the prompt (less the token fed for logits): an exact retry or replay of this
-        // request resumes there (see `place_checkpoints`).
+        // request resumes there (see `place_checkpoints`). Not for scoring: exact repeats are
+        // answered from the engine's results, and a prompt end per question would crowd chat
+        // out of the context store.
         let tail = p.ids.len() - 1;
         if self.cfg.host_checkpoints
+            && !scoring
             && store.enabled()
             && tail > start
             && Some(tail) > deepest
@@ -1884,16 +2471,41 @@ impl<B: Backend> Core<B> {
             if Some(pos) != deepest && pos != tail && !(anchor || !self.cfg.host_checkpoints) {
                 continue;
             }
-            // Storage: spare, else the lane's oldest checkpoint (its restore, if any, is queued
-            // before the snapshot), else new.
-            let mut cp = match lane.spare.pop() {
-                Some(cp) => cp,
-                None if !lane.checkpoints.is_empty() && self.cfg.host_checkpoints => {
-                    lane.checkpoints.sort_by_key(|c| c.pos);
-                    lane.checkpoints.remove(0)
-                }
-                None => lane.session.blank_checkpoint(&self.b, pos)?,
+            // Storage. Only the deepest snapshot can become the lane's head (kept on the device);
+            // the others go to the context store, so they are written straight to pinned storage
+            // the store takes over (one copy over PCIe instead of a device copy then a download).
+            // Then: spare, else the lane's oldest checkpoint (its restore, if any, is queued before
+            // the snapshot), else pinned storage the store has ready or new.
+            let to_store = Some(pos) != deepest && store.enabled() && self.cfg.host_checkpoints;
+            let ready = if to_store {
+                store.take_spare_state()
+            } else {
+                None
             };
+            let device = lane.spare.iter().position(|c| !c.on_host());
+            let mut cp = match (ready, device) {
+                (Some(cp), _) => cp,
+                (None, Some(i)) => lane.spare.swap_remove(i),
+                (None, None) => match lane.spare.pop() {
+                    Some(cp) => cp,
+                    None if !lane.checkpoints.is_empty() && self.cfg.host_checkpoints => {
+                        lane.checkpoints.sort_by_key(|c| c.pos);
+                        lane.checkpoints.remove(0)
+                    }
+                    None => match store.take_spare_state() {
+                        Some(cp) => cp,
+                        None => {
+                            SNAPS_PINNED.fetch_add(1, Ordering::Relaxed);
+                            lane.session.blank_checkpoint_in(&self.b, pos, true)?
+                        }
+                    },
+                },
+            };
+            if cp.on_host() {
+                SNAPS_HOST.fetch_add(1, Ordering::Relaxed);
+            } else {
+                SNAPS_DEVICE.fetch_add(1, Ordering::Relaxed);
+            }
             cp.pos = pos;
             cp.rope_delta = p.rope_delta;
             snaps.push(cp);
@@ -1911,25 +2523,49 @@ impl<B: Backend> Core<B> {
 
     /// Request-side preparation: the rendered, tokenized prompt with its images, the sampler and
     /// the completion budget.
+    /// Whether the request's answer opens with reasoning (`chat_template_kwargs.enable_thinking`).
+    fn thinking(&self, req: &Value) -> bool {
+        req.pointer("/chat_template_kwargs/enable_thinking")
+            .and_then(Value::as_bool)
+            .unwrap_or(self.cfg.enable_thinking)
+    }
+
     fn prepare(
         &self,
         req: &Value,
-    ) -> Result<(Prompt, Vec<ImagePatches>, Sampler, usize, Option<Value>), ApiError> {
+    ) -> Result<
+        (
+            Prompt,
+            Vec<ImagePatches>,
+            Sampler,
+            usize,
+            Option<Value>,
+            bool,
+        ),
+        ApiError,
+    > {
         let t_req = Instant::now();
         let Normalized {
             messages,
             tools,
             images: urls,
         } = normalize_request(req)?;
-        let thinking = req
-            .pointer("/chat_template_kwargs/enable_thinking")
-            .and_then(Value::as_bool)
-            .unwrap_or(self.cfg.enable_thinking);
-        let text = self
+        let thinking = self.thinking(req);
+        let mut text = self
             .fe
             .template
             .render(&messages, tools.as_ref(), thinking, true)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
+        // Forced tool call: the prompt ends in the opening tag, so the model continues inside
+        // the call (`generate` puts the tag back before parsing the output).
+        let forced = self.cfg.force_tool_call
+            && tools
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|t| !t.is_empty());
+        if forced {
+            text.push_str(TOOL_CALL_OPEN);
+        }
         let t_tpl = t_req.elapsed();
         let ids = self.fe.encode(&text).map_err(core)?;
         let t_tok = t_req.elapsed();
@@ -1944,13 +2580,7 @@ impl<B: Backend> Core<B> {
                 images.len()
             );
         }
-        let p = match self.special.image_pad {
-            Some(pad) => build_prompt(&ids, pad, &images).map_err(ApiError::invalid)?,
-            None if images.is_empty() => {
-                build_prompt(&ids, u32::MAX, &[]).map_err(ApiError::invalid)?
-            }
-            None => return Err(ApiError::invalid("tokenizer has no <|image_pad|> token")),
-        };
+        let p = self.expand(&ids, &images)?;
         let max_tokens = req
             .get("max_completion_tokens")
             .or_else(|| req.get("max_tokens"))
@@ -1971,7 +2601,370 @@ impl<B: Backend> Core<B> {
             });
         }
         let sampler = Sampler::from_request(req, thinking);
-        Ok((p, images, sampler, max_tokens, tools))
+        Ok((p, images, sampler, max_tokens, tools, forced))
+    }
+
+    /// Rendered ids plus images as model input (image placeholders expanded, MRoPE positions).
+    fn expand(&self, ids: &[u32], images: &[ImagePatches]) -> Result<Prompt, ApiError> {
+        match self.special.image_pad {
+            Some(pad) => build_prompt(ids, pad, images).map_err(ApiError::invalid),
+            None if images.is_empty() => {
+                build_prompt(ids, u32::MAX, &[]).map_err(ApiError::invalid)
+            }
+            None => Err(ApiError::invalid("tokenizer has no <|image_pad|> token")),
+        }
+    }
+
+    /// A scoring query (see `ChatEngine::score`), rendered and tokenized: the prompt renders as a
+    /// continuation of its final assistant message with thinking off, as ninfer's System One
+    /// requests do. Candidates must be one token each and branches 1 to 5 (ninfer's limits and
+    /// error codes). Its images are decoded later, by [`Self::expand_score`].
+    fn prepare_score(
+        &self,
+        req: &Value,
+        candidates: &[String],
+        branches: &[String],
+    ) -> Result<Draft, ApiError> {
+        use velox_serve::systemone::{MAX_BRANCH_TOKENS, MAX_RANK_CANDIDATES};
+        let invalid = |code: &'static str, message: String| ApiError {
+            code,
+            ..ApiError::invalid(message)
+        };
+        if candidates.is_empty() || candidates.len() > velox_core::check::GATHER_MAX {
+            return Err(invalid(
+                "invalid_request",
+                format!("1 to {} score candidates", velox_core::check::GATHER_MAX),
+            ));
+        }
+        if branches.len() > MAX_RANK_CANDIDATES {
+            return Err(invalid(
+                "too_many_candidates",
+                format!("at most {MAX_RANK_CANDIDATES} score branches"),
+            ));
+        }
+        if !branches.is_empty() && self.cfg.score_rows == 0 {
+            return Err(invalid(
+                "branch_scoring_disabled",
+                "branch scoring is disabled on this server (--score-branch-rows 0)".into(),
+            ));
+        }
+        let Normalized {
+            messages,
+            images: urls,
+            ..
+        } = normalize_request(req)?;
+        let text = self
+            .fe
+            .template
+            .render_continuation(&messages, false)
+            .map_err(|e| ApiError::invalid(e.to_string()))?;
+        let ids = self.fe.encode(&text).map_err(core)?;
+        let candidates = candidates
+            .iter()
+            .map(|c| {
+                let ids = self.fe.encode(c).map_err(core)?;
+                match ids[..] {
+                    [id] => Ok(id),
+                    _ => Err(invalid(
+                        "candidate_not_single_token",
+                        format!(
+                            "score candidate {c:?} encodes to {} tokens; exactly one is required",
+                            ids.len()
+                        ),
+                    )),
+                }
+            })
+            .collect::<Result<Vec<u32>, ApiError>>()?;
+        let branches = branches
+            .iter()
+            .map(|br| {
+                let ids = self.fe.encode(br).map_err(core)?;
+                if ids.is_empty() || ids.len() > MAX_BRANCH_TOKENS {
+                    return Err(invalid(
+                        "branch_too_long",
+                        format!(
+                            "score branch {br:?} encodes to {} tokens; 1 to {MAX_BRANCH_TOKENS} are \
+                             allowed",
+                            ids.len()
+                        ),
+                    ));
+                }
+                Ok(ids)
+            })
+            .collect::<Result<Vec<Vec<u32>>, ApiError>>()?;
+        Ok(Draft {
+            ids,
+            urls,
+            candidates,
+            branches,
+        })
+    }
+
+    /// A drafted scoring query with its images decoded (`decoded` holds those of the request's
+    /// other questions, by URL) and expanded into the prompt.
+    fn expand_score(
+        &self,
+        d: Draft,
+        decoded: &mut Vec<(String, ImagePatches)>,
+    ) -> Result<Question, ApiError> {
+        let mut images = Vec::with_capacity(d.urls.len());
+        for u in d.urls {
+            match decoded.iter().find(|(x, _)| *x == u) {
+                Some((_, img)) => images.push(img.clone()),
+                None => {
+                    let img = self
+                        .load_images(std::slice::from_ref(&u))?
+                        .pop()
+                        .expect("one image per URL");
+                    images.push(img.clone());
+                    decoded.push((u, img));
+                }
+            }
+        }
+        let p = self.expand(&d.ids, &images)?;
+        let (candidates, branches) = (d.candidates, d.branches);
+        let window = 1 + branches.iter().map(Vec::len).max().unwrap_or(0);
+        if p.ids.len() < 2 || p.ids.len() - 1 + window > self.cfg.capacity {
+            return Err(ApiError {
+                status: 400,
+                kind: "invalid_request_error",
+                code: "context_length_exceeded",
+                message: format!(
+                    "{} prompt + {} scored tokens exceed the context of {}",
+                    p.ids.len(),
+                    window - 1,
+                    self.cfg.capacity
+                ),
+            });
+        }
+        Ok(Question {
+            p,
+            images,
+            candidates,
+            branches,
+        })
+    }
+
+    /// The jobs that answer `qs` (one request's questions), in the order they run, each with the
+    /// question it answers per window (or the one question it answers off its prompt) and the
+    /// columns of that question's candidates in the job's. Questions without branches that share
+    /// the start of their prompts are one job: the shared prefix, then each question's rest as a
+    /// window (when the rests are text and fit a scoring pass). Branch questions run after them:
+    /// the prompt but its last token, which starts every branch window. When several jobs follow
+    /// one another, the first keeps a checkpoint where their prompts part.
+    fn score_plan(&self, qs: &[Question]) -> Vec<(Job, Vec<Answer>)> {
+        let mut plan = Vec::new();
+        let plain: Vec<usize> = (0..qs.len())
+            .filter(|&i| qs[i].branches.is_empty())
+            .collect();
+        let mut batched = false;
+        if plain.len() > 1 {
+            let first = &qs[plain[0]].p;
+            let fork = plain
+                .iter()
+                .map(|&i| common_prefix(&first.keys, &qs[i].p.keys).min(qs[i].p.ids.len() - 1))
+                .min()
+                .unwrap_or(0);
+            let longest = plain
+                .iter()
+                .map(|&i| qs[i].p.ids.len() - fork)
+                .max()
+                .unwrap_or(0);
+            // The rests are text (no image after the fork), so the windows take the rotary
+            // positions after the prefix.
+            let text = plain
+                .iter()
+                .all(|&i| qs[i].p.runs.iter().all(|r| r.start + r.len <= fork));
+            if fork > 0
+                && text
+                && plain.len() * longest <= self.cfg.score_rows.max(1) * SCORE_WINDOW
+            {
+                let mut candidates: Vec<u32> = Vec::new();
+                let mut answers = Vec::new();
+                for &i in &plain {
+                    let cols = qs[i]
+                        .candidates
+                        .iter()
+                        .map(|c| match candidates.iter().position(|x| x == c) {
+                            Some(j) => j,
+                            None => {
+                                candidates.push(*c);
+                                candidates.len() - 1
+                            }
+                        })
+                        .collect();
+                    answers.push((i, cols));
+                }
+                let windows = plain
+                    .iter()
+                    .map(|&i| qs[i].p.ids[fork..].to_vec())
+                    .collect();
+                let q = &qs[plain[0]];
+                let p = Prompt {
+                    ids: q.p.ids[..fork].to_vec(),
+                    keys: q.p.keys[..fork].to_vec(),
+                    positions: q.p.positions.as_ref().map(|v| v[..fork].to_vec()),
+                    rope_delta: q.p.rope_delta,
+                    runs: q.p.runs.clone(),
+                };
+                plan.push((score_job(p, q.images.clone(), candidates, windows), answers));
+                batched = true;
+            }
+        }
+        for (i, q) in qs.iter().enumerate() {
+            let all = (0..q.candidates.len()).collect::<Vec<_>>();
+            if q.branches.is_empty() {
+                if !batched {
+                    // The candidates are read off the prompt's last row.
+                    let job =
+                        score_job(q.p.clone(), q.images.clone(), q.candidates.clone(), vec![]);
+                    plan.push((job, vec![(i, all)]));
+                }
+                continue;
+            }
+            // The last token is text (the assistant prefill): fed at cache row n - 1 it takes
+            // rotary position n - 1 + rope_delta, as any token after the prompt does, so the
+            // windows are positioned exactly as the full prompt would have them.
+            let mut p = q.p.clone();
+            let tail = p.ids.pop().expect("checked in prepare_score");
+            p.keys.pop();
+            if let Some(positions) = p.positions.as_mut() {
+                positions.pop();
+            }
+            let windows = q
+                .branches
+                .iter()
+                .map(|br| std::iter::once(tail).chain(br.iter().copied()).collect())
+                .collect();
+            let job = score_job(p, q.images.clone(), q.candidates.clone(), windows);
+            plan.push((job, vec![(i, all)]));
+        }
+        if let [(first, _), rest @ ..] = &plan[..] {
+            let fork = rest
+                .iter()
+                .map(|(j, _)| common_prefix(&first.p.keys, &j.p.keys))
+                .min()
+                .filter(|&f| f >= MIN_REUSE);
+            if let Some(s) = plan[0].0.score.as_mut() {
+                s.fork = fork;
+            }
+        }
+        plan
+    }
+}
+
+/// The answers of recent scoring queries, so an exact repeat (the same prompt, images, candidates
+/// and branches) is answered without the GPU or decoding its images: the scores are
+/// deterministic, and ninfer answers repeats from the prompt ends it keeps. Least recently used
+/// out first.
+#[derive(Default)]
+struct ScoreCache {
+    entries: Mutex<VecDeque<Cached>>,
+}
+
+/// A cached answer: its key (see [`ScoreCache::key`]), the scores and the prompt's length.
+struct Cached {
+    hash: u64,
+    key: Vec<u32>,
+    scores: Vec<f32>,
+    prompt_tokens: u64,
+}
+
+impl ScoreCache {
+    const CAPACITY: usize = 256;
+
+    /// Everything a query's scores depend on, as one key (with its hash, compared first): its
+    /// rendered prompt, a 64-bit hash and the length of each image URL (the encoded bytes), its
+    /// candidates and branches.
+    fn key(d: &Draft) -> (u64, Vec<u32>) {
+        use std::hash::{Hash, Hasher};
+        let mut k = Vec::with_capacity(d.ids.len() + d.candidates.len() + 8);
+        k.push(d.ids.len() as u32);
+        k.extend_from_slice(&d.ids);
+        for u in &d.urls {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            u.hash(&mut h);
+            let h = h.finish();
+            k.extend([h as u32, (h >> 32) as u32, u.len() as u32]);
+        }
+        k.push(d.candidates.len() as u32);
+        k.extend_from_slice(&d.candidates);
+        for br in &d.branches {
+            k.push(br.len() as u32);
+            k.extend_from_slice(br);
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        (h.finish(), k)
+    }
+
+    /// The scores and prompt length of a cached answer.
+    fn get(&self, key: &(u64, Vec<u32>)) -> Option<(Vec<f32>, u64)> {
+        let mut e = self.entries.lock().ok()?;
+        let i = e.iter().position(|c| c.hash == key.0 && c.key == key.1)?;
+        let hit = e.remove(i)?;
+        let out = (hit.scores.clone(), hit.prompt_tokens);
+        e.push_back(hit);
+        Some(out)
+    }
+
+    fn put(&self, key: (u64, Vec<u32>), scores: Vec<f32>, prompt_tokens: u64) {
+        let Ok(mut e) = self.entries.lock() else {
+            return;
+        };
+        e.retain(|c| !(c.hash == key.0 && c.key == key.1));
+        if e.len() >= Self::CAPACITY {
+            e.pop_front();
+        }
+        e.push_back(Cached {
+            hash: key.0,
+            key: key.1,
+            scores,
+            prompt_tokens,
+        });
+    }
+}
+
+/// A question a scoring job answers, and the columns of its candidates among the job's.
+type Answer = (usize, Vec<usize>);
+
+/// A scoring query, rendered and tokenized but its images not decoded yet.
+struct Draft {
+    ids: Vec<u32>,
+    urls: Vec<String>,
+    candidates: Vec<u32>,
+    branches: Vec<Vec<u32>>,
+}
+
+/// A prepared scoring query: its whole prompt (the candidates are read after its last token, or
+/// after each branch appended to it).
+struct Question {
+    p: Prompt,
+    images: Vec<ImagePatches>,
+    candidates: Vec<u32>,
+    branches: Vec<Vec<u32>>,
+}
+
+/// A scoring job for the queue (its reply channel is set when it is sent).
+fn score_job(
+    p: Prompt,
+    images: Vec<ImagePatches>,
+    candidates: Vec<u32>,
+    windows: Vec<Vec<u32>>,
+) -> Job {
+    Job {
+        p,
+        images,
+        sampler: Sampler::greedy(),
+        max_tokens: 1,
+        stream: false,
+        reply: mpsc::channel().0,
+        queued: Instant::now(),
+        score: Some(Scoring {
+            candidates,
+            windows,
+            fork: None,
+        }),
     }
 }
 
@@ -1987,8 +2980,14 @@ where
 
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
         let core_ = &self.core;
-        let (p, images, sampler, max_tokens, tools) = core_.prepare(req)?;
+        let (p, images, sampler, max_tokens, tools, forced) = core_.prepare(req)?;
         let prompt_tokens = p.ids.len() as u64;
+        // A forced call has no text before it, reasoning arrives whole, and non-streaming answers
+        // are assembled whole anyway.
+        let stream = core_.cfg.stream_content
+            && !forced
+            && !core_.thinking(req)
+            && req.get("stream").and_then(Value::as_bool) == Some(true);
         let (tx, rx) = mpsc::channel();
         {
             let mut q = self
@@ -2001,17 +3000,43 @@ where
                 images,
                 sampler,
                 max_tokens,
+                stream,
                 reply: tx,
+                queued: Instant::now(),
+                score: None,
             });
         }
         self.queue.cv.notify_one();
-        let done = rx
-            .recv()
-            .map_err(|_| core(CoreError::Backend("engine worker stopped".into())))??;
-        let text = core_.fe.decode(&done.out).map_err(core)?;
+        let stopped = || core(CoreError::Backend("engine worker stopped".into()));
+        let mut tokens = Vec::new();
+        // Content already emitted: always a prefix of what `parse_output` returns at the end.
+        let mut streamed = String::new();
+        let done = loop {
+            match rx.recv().map_err(|_| stopped())? {
+                Reply::Tokens(t) => {
+                    tokens.extend(t);
+                    let text = core_.fe.decode(&tokens).map_err(core)?;
+                    if let Some(s) = streamable_content(&text) {
+                        if s.len() > streamed.len() && s.starts_with(streamed.as_str()) {
+                            emit(Delta::Content(s[streamed.len()..].to_string()));
+                            streamed = s.to_string();
+                        }
+                    }
+                }
+                Reply::Done(r) => break r?,
+            }
+        };
+        let mut text = core_.fe.decode(&done.out).map_err(core)?;
+        if forced {
+            text.insert_str(0, TOOL_CALL_OPEN);
+        }
         let parsed = parse_output(&text, tools.as_ref());
-        if !parsed.content.is_empty() {
-            emit(Delta::Content(parsed.content));
+        match parsed.content.strip_prefix(streamed.as_str()) {
+            Some(rest) if !rest.is_empty() => emit(Delta::Content(rest.to_string())),
+            Some(_) => {}
+            // Cannot happen while `streamable_content` follows `parse_output`; the client then
+            // already holds a prefix of the answer, and repeating it would be worse.
+            None => eprintln!("stream: emitted content is not a prefix of the parsed answer"),
         }
         let has_calls = !parsed.tool_calls.is_empty();
         for call in parsed.tool_calls {
@@ -2026,9 +3051,103 @@ where
             prompt_tokens,
             cached_tokens: done.start as u64,
             completion_tokens: done.out.len() as u64,
+            queue_ms: done.queue_ms,
             prompt_ms: done.prompt_ms,
             predicted_ms: done.predicted_ms,
+            first_token: Some(done.first_token),
         })
+    }
+
+    fn scores(&self) -> bool {
+        true
+    }
+
+    fn score(&self, queries: &[ScoreQuery<'_>]) -> Result<Vec<ScoreOutcome>, ApiError> {
+        let t0 = Instant::now();
+        let drafts = queries
+            .iter()
+            .map(|q| self.core.prepare_score(q.request, q.candidates, q.branches))
+            .collect::<Result<Vec<_>, _>>()?;
+        let keys: Vec<_> = drafts.iter().map(ScoreCache::key).collect();
+        let mut out: Vec<Option<ScoreOutcome>> = keys
+            .iter()
+            .map(|k| {
+                self.results
+                    .get(k)
+                    .map(|(logprobs, prompt_tokens)| ScoreOutcome {
+                        logprobs,
+                        prompt_tokens,
+                        cached_tokens: prompt_tokens,
+                        queue_ms: 0.0,
+                    })
+            })
+            .collect();
+        if out.iter().any(Option::is_none) {
+            // The questions of one request share their prefill, so all of them run again.
+            let mut decoded = Vec::new();
+            let qs = drafts
+                .into_iter()
+                .map(|d| self.core.expand_score(d, &mut decoded))
+                .collect::<Result<Vec<_>, _>>()?;
+            if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+                eprintln!(
+                    "[systemone] {} questions prepared in {:.1} ms ({} images)",
+                    qs.len(),
+                    t0.elapsed().as_secs_f64() * 1e3,
+                    decoded.len()
+                );
+            }
+            for (mut job, answers) in self.core.score_plan(&qs) {
+                let width = job.score.as_ref().map_or(0, |s| s.candidates.len());
+                let (tx, rx) = mpsc::channel();
+                job.reply = tx;
+                job.queued = Instant::now();
+                self.queue
+                    .jobs
+                    .lock()
+                    .map_err(|_| core(CoreError::Backend("engine queue poisoned".into())))?
+                    .push_back(job);
+                self.queue.cv.notify_one();
+                let done = loop {
+                    match rx
+                        .recv()
+                        .map_err(|_| core(CoreError::Backend("engine worker stopped".into())))?
+                    {
+                        Reply::Tokens(_) => {}
+                        Reply::Done(r) => break r?,
+                    }
+                };
+                let single = answers.len() == 1;
+                for (k, (qi, cols)) in answers.into_iter().enumerate() {
+                    // One question: all of the job's scores (per branch, if any); several: window
+                    // k's row, in the question's candidate order.
+                    let logprobs = if single {
+                        done.scores.clone()
+                    } else {
+                        let row = &done.scores[k * width..(k + 1) * width];
+                        cols.iter().map(|&c| row[c]).collect()
+                    };
+                    let prompt_tokens = qs[qi].p.ids.len() as u64;
+                    self.results
+                        .put(keys[qi].clone(), logprobs.clone(), prompt_tokens);
+                    out[qi] = Some(ScoreOutcome {
+                        logprobs,
+                        prompt_tokens,
+                        cached_tokens: (done.start as u64).min(prompt_tokens),
+                        queue_ms: done.queue_ms,
+                    });
+                }
+            }
+        }
+        if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+            eprintln!(
+                "[systemone] answered in {:.1} ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        out.into_iter()
+            .map(|o| o.ok_or_else(|| core(CoreError::Backend("question left unanswered".into()))))
+            .collect()
     }
 }
 
@@ -2084,5 +3203,62 @@ mod tests {
     fn prefix_length() {
         assert_eq!(common_prefix(&[1, 2, 3], &[1, 2, 4, 5]), 2);
         assert_eq!(common_prefix(&[], &[1]), 0);
+    }
+
+    #[test]
+    fn score_cache_answers_exact_repeats_only() {
+        let draft = |ids: Vec<u32>, url: &str, branches: Vec<Vec<u32>>| Draft {
+            ids,
+            urls: vec![url.to_string()],
+            candidates: vec![7, 8],
+            branches,
+        };
+        let c = ScoreCache::default();
+        let a = draft(vec![1, 2, 3], "data:a", vec![]);
+        c.put(ScoreCache::key(&a), vec![-0.5, -1.0], 40);
+        assert_eq!(c.get(&ScoreCache::key(&a)), Some((vec![-0.5, -1.0], 40)));
+        // Another image, prompt or branch set is another query.
+        for other in [
+            draft(vec![1, 2, 3], "data:b", vec![]),
+            draft(vec![1, 2, 4], "data:a", vec![]),
+            draft(vec![1, 2, 3], "data:a", vec![vec![5]]),
+        ] {
+            assert_eq!(c.get(&ScoreCache::key(&other)), None);
+        }
+        // Least recently used out first: `a`, just read, outlives the next oldest.
+        for i in 0..ScoreCache::CAPACITY as u32 - 1 {
+            c.put(
+                ScoreCache::key(&draft(vec![i + 100], "", vec![])),
+                vec![0.0],
+                1,
+            );
+        }
+        c.get(&ScoreCache::key(&a));
+        c.put(
+            ScoreCache::key(&draft(vec![9999], "", vec![])),
+            vec![0.0],
+            1,
+        );
+        assert!(c.get(&ScoreCache::key(&a)).is_some());
+        assert_eq!(c.get(&ScoreCache::key(&draft(vec![100], "", vec![]))), None);
+    }
+
+    #[test]
+    fn streamed_content_is_a_prefix_of_the_parsed_answer() {
+        let answer = "\n I'll open the menü < settings.\n\n<tool_call>\n<function=click>\n\
+                      <parameter=x>\n4\n</parameter>\n</function>\n</tool_call>";
+        let content = parse_output(answer, None).content;
+        let mut last = "";
+        for end in (0..=answer.len()).filter(|&i| answer.is_char_boundary(i)) {
+            let s = streamable_content(&answer[..end]).unwrap();
+            assert!(content.starts_with(s), "{s:?} at {end}");
+            assert!(s.starts_with(last), "streamed text shrank at {end}");
+            last = s;
+        }
+        assert_eq!(last, content);
+        // An incomplete character and a partial tag are held back.
+        assert_eq!(streamable_content("ok \u{FFFD}"), Some("ok"));
+        assert_eq!(streamable_content("ok <tool_"), Some("ok"));
+        assert_eq!(streamable_content("<think>\nplan"), None);
     }
 }

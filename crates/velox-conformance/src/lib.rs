@@ -7,18 +7,23 @@
 
 use velox_core::backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
-    CopySpec, DynConvShape, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, KvStoreShape,
-    NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    CopySpec, DilatedConvShape, DynConvShape, ExpertBank, ExpertMatrix, FullAttnShape,
+    GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape, LinearDst, LinearPart,
+    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
+    RowGateShape, WeightView,
 };
-use velox_core::format::{align256, f32_to_bf16, RowSplit, WeightFormat};
+use velox_core::format::{align256, decode_rows, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::kv::{decode_cache, encode_cache, KvFormat};
 use velox_core::model::{HostLayer, Stack};
 use velox_core::quant::{
     quantize_activations, round_attention_inputs, round_full_attention_inputs,
 };
 use velox_core::rng::Rng;
-use velox_core::{ModelSpec, Op, Result};
+use velox_core::state::STATE_ROW;
+use velox_core::{ModelSpec, Op, Result, StateFormat};
 use velox_cpu::CpuBackend;
+
+mod qwen4;
 
 #[derive(Clone, Debug)]
 pub struct CaseResult {
@@ -52,11 +57,54 @@ pub fn max_err(got: &[f32], want: &[f32]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Whether a weight's activation policy permits the input rounding a kernel reports.
+fn permitted(act: ActQuant, policy: ActPolicy) -> bool {
+    match (act, policy) {
+        (ActQuant::Exact | ActQuant::Bf16, _) => true,
+        (
+            ActQuant::Fp8Row | ActQuant::Int8G256 | ActQuant::Int8G32,
+            ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. },
+        ) => true,
+        (ActQuant::Nvfp4 { divisor: a }, ActPolicy::AllowA4 { divisor: b }) => a == b,
+        _ => false,
+    }
+}
+
 fn fetch<B: Backend>(b: &B, buf: &B::Buffer, len: usize) -> Result<Vec<f32>> {
     let mut out = vec![0.0; len];
     b.synchronize()?;
     b.download(buf, &mut out)?;
     Ok(out)
+}
+
+/// Tolerance of the chunked Gated DeltaNet recurrence (16 tokens and up): backends may form its
+/// products from bf16-rounded operands on an f32 state (ninfer's precision), so the outputs and
+/// the state carry bf16-level rounding.
+const GDN_CHUNK_TOL: f64 = 1e-2;
+
+/// Tolerance of a SwiGLU output and of a GEMM on it: silu(gate) * up scales the gate's f32
+/// accumulation error by |up|, which `max_err` only normalizes by 1 + |out| (the twin cases at
+/// K = 5120 reach 2.6e-4, bit-identical to the f32-input path on the same data).
+const SWIGLU_TOL: f64 = 5e-4;
+
+/// Elements of the bf16 twin `twin` (u16 values packed in f32 slots) that differ from the
+/// round-to-nearest-even of `full`'s first `n` values.
+fn twin_mismatches<B: Backend>(
+    b: &B,
+    full: &B::Buffer,
+    twin: &B::Buffer,
+    n: usize,
+) -> Result<usize> {
+    let f = fetch(b, full, n)?;
+    let t = fetch(b, twin, n.div_ceil(2))?;
+    let bits = t.iter().flat_map(|v| {
+        let u = v.to_bits();
+        [(u & 0xffff) as u16, (u >> 16) as u16]
+    });
+    Ok(f.iter()
+        .zip(bits)
+        .filter(|&(&v, h)| velox_core::format::f32_to_bf16(v) != h)
+        .count())
 }
 
 /// A random valid encoding of a `[n, k]` matrix in `fmt` (finite codes, positive scales).
@@ -97,6 +145,46 @@ pub fn random_weight(rng: &mut Rng, fmt: WeightFormat, n: usize, k: usize) -> Ve
             // Positive E4M3FN scales with exponent 4..11 (0.125 .. 30).
             p.extend((0..n * k / 16).map(|_| (((byte(rng) % 8) + 4) << 3) | (byte(rng) & 7)));
             p.extend_from_slice(&96.0f32.to_le_bytes());
+            p
+        }
+        WeightFormat::Iq3Xxs => {
+            // Every code byte is legal (grid index, sign index, 4-bit scale). Block scales are
+            // exact binary16 2^-9 .. 2^-6 with random mantissas: weights of order 1e-2 .. 1.
+            let blocks = n * k / 256;
+            let mut p: Vec<u8> = (0..blocks * 96).map(|_| byte(rng)).collect();
+            p.resize(align256(blocks * 96), 0);
+            for _ in 0..blocks {
+                let d = (6 + rng.next_u64() % 4) << 10 | (rng.next_u64() % 1024);
+                p.extend_from_slice(&(d as u16).to_le_bytes());
+            }
+            p
+        }
+        WeightFormat::Ggml(t) => {
+            // Random code bytes are legal for every type; binary16 scales 2^-9 .. 2^-6 with random
+            // mantissas keep weights of order 1e-2 .. 1.
+            let size = t.block_bytes();
+            let mut p = vec![0u8; n * t.row_bytes(k)];
+            for block in p.chunks_exact_mut(size) {
+                let (bytes, scales): (Vec<u8>, Vec<u16>) = (
+                    (0..size).map(|_| byte(rng)).collect(),
+                    (0..3)
+                        .map(|_| ((6 + rng.next_u64() % 4) << 10 | (rng.next_u64() % 1024)) as u16)
+                        .collect(),
+                );
+                let (mut bi, mut si) = (0, 0);
+                velox_core::ggml::random_block(
+                    t,
+                    block,
+                    || {
+                        bi += 1;
+                        bytes[bi - 1]
+                    },
+                    || {
+                        si += 1;
+                        scales[si - 1]
+                    },
+                );
+            }
             p
         }
         q => {
@@ -234,12 +322,7 @@ impl<B: Backend> Suite<'_, B> {
             .rows(begin, rows)
             .with_act(policy);
         let act = self.b.linear_act(&view, m);
-        let permitted = match (act, policy) {
-            (ActQuant::Exact | ActQuant::Bf16, _) => true,
-            (ActQuant::Fp8Row, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. }) => true,
-            (ActQuant::Nvfp4 { divisor: a }, ActPolicy::AllowA4 { divisor: b }) => a == b,
-            _ => false,
-        };
+        let permitted = permitted(act, policy);
         let mut xq = x.clone();
         quantize_activations(&mut xq, k, act);
         let wc = CpuBackend.upload_bytes(&bytes)?;
@@ -259,6 +342,8 @@ impl<B: Backend> Suite<'_, B> {
             ActQuant::Fp8Row => " a8",
             ActQuant::Nvfp4 { .. } => " a4",
             ActQuant::Bf16 => " bf16",
+            ActQuant::Int8G256 => " i8",
+            ActQuant::Int8G32 => " i8g32",
         };
         let name = format!(
             "linear {} [{n},{k}] rows {begin}+{rows} m={m}{tag}",
@@ -270,6 +355,516 @@ impl<B: Backend> Suite<'_, B> {
             // Rounding the policy forbids fails whatever the numbers say.
             let name = name + " (rounding not permitted)";
             self.record(name, Some(Op::Linear), &[f32::NAN], &[0.0], 0.0);
+        }
+        Ok(())
+    }
+
+    /// `linears` against the oracle: one input, destinations of `ld = parts' rows + 2` columns
+    /// (the last two must stay zero), each part a view `(format, parent rows, begin, rows)` of
+    /// its own random parent under `policy`, rounded as `linear_act` reports for it.
+    fn linears(
+        &mut self,
+        dsts: &[&[(WeightFormat, usize, usize, usize)]],
+        k: usize,
+        m: usize,
+        policy: ActPolicy,
+    ) -> Result<()> {
+        let x = self.rng.vec(m * k, 1.0);
+        let xd = self.b.upload(&x)?;
+        let mut parents = Vec::new();
+        for d in dsts {
+            for &(fmt, n, _, _) in *d {
+                let bytes = random_weight(&mut self.rng, fmt, n, k);
+                parents.push((
+                    self.b.upload_bytes(&bytes)?,
+                    CpuBackend.upload_bytes(&bytes)?,
+                ));
+            }
+        }
+        let lds: Vec<usize> = dsts
+            .iter()
+            .map(|d| d.iter().map(|p| p.3).sum::<usize>() + 2)
+            .collect();
+        let mut ys = Vec::new();
+        for &ld in &lds {
+            ys.push(self.b.upload(&vec![0.0; m * ld])?);
+        }
+        let widest = dsts
+            .iter()
+            .flat_map(|d| d.iter().map(|p| p.3))
+            .max()
+            .unwrap_or(1);
+        let mut scratch = self.b.alloc(m * widest)?;
+        let (mut parts, mut wants, mut tags, mut permitted_all) =
+            (Vec::new(), Vec::new(), Vec::new(), true);
+        let mut pi = 0;
+        for (d, &ld) in dsts.iter().zip(&lds) {
+            let (mut col, mut dp, mut want) = (0, Vec::new(), vec![0.0; m * ld]);
+            for &(fmt, n, begin, rows) in *d {
+                let view = WeightView::full(&parents[pi].0, fmt, n, k)
+                    .rows(begin, rows)
+                    .with_act(policy);
+                let act = self.b.linear_act(&view, m);
+                permitted_all &= permitted(act, policy);
+                let mut xq = x.clone();
+                quantize_activations(&mut xq, k, act);
+                let mut part = vec![0.0; m * rows];
+                CpuBackend.linear(
+                    &xq,
+                    &WeightView::full(&parents[pi].1, fmt, n, k).rows(begin, rows),
+                    &mut part,
+                    m,
+                )?;
+                for t in 0..m {
+                    want[t * ld + col..t * ld + col + rows]
+                        .copy_from_slice(&part[t * rows..(t + 1) * rows]);
+                }
+                tags.push(format!("{}:{rows}", fmt.name()));
+                dp.push(LinearPart { w: view, col });
+                col += rows;
+                pi += 1;
+            }
+            parts.push(dp);
+            wants.push(want);
+        }
+        let mut dl: Vec<LinearDst<'_, '_, '_, B::Buffer>> = ys
+            .iter_mut()
+            .zip(&parts)
+            .zip(&lds)
+            .map(|((y, p), &ld)| LinearDst { y, ld, parts: p })
+            .collect();
+        self.b.linears(&xd, None, None, &mut dl, &mut scratch, m)?;
+        drop(dl);
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for ((y, w), &ld) in ys.iter().zip(&wants).zip(&lds) {
+            got.extend(fetch(self.b, y, m * ld)?);
+            want.extend_from_slice(w);
+        }
+        let name = format!("linears [{}] k={k} m={m}", tags.join(" "));
+        if permitted_all {
+            self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+        } else {
+            let name = name + " (rounding not permitted)";
+            self.record(name, Some(Op::Linear), &[f32::NAN], &[0.0], 0.0);
+        }
+        Ok(())
+    }
+
+    /// Int8 twins ([`Backend::int8_twin_layout`]) at `m` rows of width `k`: `add_rms_norm_q8` in
+    /// the layout of `views[0]` (`(format, rows)` of `[rows, k]` parents under `AllowA8`) against
+    /// the oracle, then its twin through `linear_q8` and `linears` on every view of that layout,
+    /// and through `linear_swiglu_q8` for `swiglu` (`(format, width)`): each against the oracle
+    /// on the producer's own output rounded as `ActQuant::Int8G256`, so the twin must quantize
+    /// exactly as the backend's int8 linears do.
+    fn twins_q8(
+        &mut self,
+        m: usize,
+        k: usize,
+        views: &[(WeightFormat, usize)],
+        swiglu: Option<(WeightFormat, usize)>,
+    ) -> Result<()> {
+        let n = m * k;
+        let mut parents = Vec::new();
+        for &(fmt, rows) in views {
+            let bytes = random_weight(&mut self.rng, fmt, rows, k);
+            let (d, c) = (
+                self.b.upload_bytes(&bytes)?,
+                CpuBackend.upload_bytes(&bytes)?,
+            );
+            parents.push((d, c, fmt, rows));
+        }
+        let Some((d0, _, fmt0, rows0)) = parents.first() else {
+            return Ok(());
+        };
+        let view0 = WeightView::full(d0, *fmt0, *rows0, k).with_act(ActPolicy::AllowA8);
+        let Some(layout) = self.b.int8_twin_layout(&view0, m) else {
+            return Ok(());
+        };
+        let slots = self.b.int8_twin_slots(m, k, layout);
+        if slots == 0 {
+            return Ok(());
+        }
+        let (acc, x, w) = (
+            self.rng.vec(n, 1.0),
+            self.rng.vec(n, 1.0),
+            self.rng.vec(k, 0.5),
+        );
+        let (mut accd, xd, wd) = (self.b.upload(&acc)?, self.b.upload(&x)?, self.b.upload(&w)?);
+        let (mut yd, mut yq) = (self.b.alloc(n)?, self.b.alloc(slots)?);
+        self.b.add_rms_norm_q8(
+            &mut accd,
+            &xd,
+            &wd,
+            &mut yd,
+            &mut yq,
+            layout,
+            m,
+            k,
+            1e-6,
+            NormKind::Offset,
+        )?;
+        let (mut acc_c, mut y_c) = (acc.clone(), vec![0.0; n]);
+        CpuBackend.add_rms_norm(&mut acc_c, &x, &w, &mut y_c, m, k, 1e-6, NormKind::Offset)?;
+        let mut got = fetch(self.b, &accd, n)?;
+        got.extend(fetch(self.b, &yd, n)?);
+        let want: Vec<f32> = [acc_c, y_c].concat();
+        let name = format!("int8 twin producer add_rms_norm [{m}x{k}] layout {layout}");
+        self.record(name, None, &got, &want, 1e-5);
+        // The twin through its consumers: the oracle rounds the backend's own output.
+        let mut xr = fetch(self.b, &yd, n)?;
+        quantize_activations(&mut xr, k, ActQuant::Int8G256);
+        for (pd, pc, fmt, rows) in &parents {
+            let (fmt, rows) = (*fmt, *rows);
+            let view = WeightView::full(pd, fmt, rows, k).with_act(ActPolicy::AllowA8);
+            if self.b.int8_twin_layout(&view, m) != Some(layout) {
+                continue;
+            }
+            let mut want = vec![0.0; m * rows];
+            CpuBackend.linear(&xr, &WeightView::full(pc, fmt, rows, k), &mut want, m)?;
+            let mut yo = self.b.alloc(m * rows)?;
+            self.b.linear_q8(&yq, layout, &view, &mut yo, m)?;
+            let got = fetch(self.b, &yo, m * rows)?;
+            let name = format!(
+                "linear_q8 {} [{rows},{k}] m={m} from add_rms_norm twin",
+                fmt.name()
+            );
+            self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+            // linears reading the twin: the part as a column range of a wider destination.
+            let ld = rows + 2;
+            let mut yl = self.b.upload(&vec![0.0; m * ld])?;
+            let parts = [LinearPart {
+                w: WeightView::full(pd, fmt, rows, k).with_act(ActPolicy::AllowA8),
+                col: 1,
+            }];
+            let mut scratch = self.b.alloc(m * rows)?;
+            self.b.linears(
+                &yd,
+                None,
+                Some((&yq, layout)),
+                &mut [LinearDst {
+                    y: &mut yl,
+                    ld,
+                    parts: &parts,
+                }],
+                &mut scratch,
+                m,
+            )?;
+            let got = fetch(self.b, &yl, m * ld)?;
+            let mut want_l = vec![0.0; m * ld];
+            for r in 0..m {
+                want_l[r * ld + 1..r * ld + 1 + rows]
+                    .copy_from_slice(&want[r * rows..(r + 1) * rows]);
+            }
+            let name = format!("linears q8 twin {} [{rows},{k}] m={m}", fmt.name());
+            self.record(name, Some(Op::Linear), &got, &want_l, 2e-4);
+        }
+        if let Some((fmt, width)) = swiglu {
+            let bytes = random_weight(&mut self.rng, fmt, 2 * width, k);
+            let wd = self.b.upload_bytes(&bytes)?;
+            let full = WeightView::full(&wd, fmt, 2 * width, k).with_act(ActPolicy::AllowA8);
+            let (gate, up) = (full.rows(0, width), full.rows(width, width));
+            if self.b.int8_twin_layout(&gate, m) == Some(layout)
+                && self.b.fuses_swiglu(&gate, &up, m)
+            {
+                let wc = CpuBackend.upload_bytes(&bytes)?;
+                let (mut g, mut u) = (vec![0.0; m * width], vec![0.0; m * width]);
+                CpuBackend.linear(
+                    &xr,
+                    &WeightView::full(&wc, fmt, 2 * width, k).rows(0, width),
+                    &mut g,
+                    m,
+                )?;
+                CpuBackend.linear(
+                    &xr,
+                    &WeightView::full(&wc, fmt, 2 * width, k).rows(width, width),
+                    &mut u,
+                    m,
+                )?;
+                CpuBackend.silu_mul(&mut g, &u, m * width)?;
+                let mut out = self.b.alloc(m * width)?;
+                self.b
+                    .linear_swiglu_q8(&yq, layout, &gate, &up, &mut out, m)?;
+                let got = fetch(self.b, &out, m * width)?;
+                let name = format!("linear_swiglu_q8 {} [{width}x2,{k}] m={m}", fmt.name());
+                self.record(name, Some(Op::Linear), &got, &g, SWIGLU_TOL);
+            }
+        }
+        Ok(())
+    }
+
+    /// bf16 twins ([`Backend::bf16_twins`]) at `m` rows of width `k`: every producer's f32 output
+    /// against the oracle, and its twin through each consumer the backend accepts: `linear_bf16`
+    /// on `views` (`(format, rows)` of a `[rows, k]` parent) and, for `swiglu` (`(format,
+    /// width)`), `linear_swiglu_twin` whose output twin then feeds `linear_bf16` on a `[64,
+    /// width]` view of the same format. Consumers are checked against the oracle on the
+    /// producer's own output rounded to bf16, so the twin must match that rounding exactly.
+    fn twins(
+        &mut self,
+        m: usize,
+        k: usize,
+        views: &[(WeightFormat, usize)],
+        swiglu: Option<(WeightFormat, usize)>,
+    ) -> Result<()> {
+        if !self.b.bf16_twins() {
+            return Ok(());
+        }
+        let n = m * k;
+        let (acc, x, w) = (
+            self.rng.vec(n, 1.0),
+            self.rng.vec(n, 1.0),
+            self.rng.vec(k, 0.5),
+        );
+        let (gate_in, o) = (self.rng.vec(n, 2.0), self.rng.vec(n, 1.0));
+        let wn = self.rng.vec(128, 0.5);
+        // Producers on the backend.
+        let (mut accd, xd, wd) = (self.b.upload(&acc)?, self.b.upload(&x)?, self.b.upload(&w)?);
+        let (mut yd, mut yb) = (self.b.alloc(n)?, self.b.alloc(n)?);
+        self.b.add_rms_norm_twin(
+            &mut accd,
+            &xd,
+            &wd,
+            &mut yd,
+            &mut yb,
+            m,
+            k,
+            1e-6,
+            NormKind::Offset,
+        )?;
+        let (od, wnd) = (self.b.upload(&o)?, self.b.upload(&wn)?);
+        let (mut zd, mut zb) = (self.b.upload(&gate_in)?, self.b.alloc(n)?);
+        self.b.rms_norm_gated_twin(
+            &od,
+            &wnd,
+            &mut zd,
+            &mut zb,
+            n / 128,
+            128,
+            1e-6,
+            NormKind::Plain,
+        )?;
+        let (mut sd, mut sb) = (self.b.upload(&o)?, self.b.alloc(n)?);
+        let gd = self.b.upload(&gate_in)?;
+        self.b.sigmoid_mul_twin(&mut sd, &gd, &mut sb, n)?;
+        // Their f32 outputs against the oracle.
+        let (mut acc_c, mut y_c) = (acc.clone(), vec![0.0; n]);
+        CpuBackend.add_rms_norm(&mut acc_c, &x, &w, &mut y_c, m, k, 1e-6, NormKind::Offset)?;
+        let mut z_c = gate_in.clone();
+        CpuBackend.rms_norm_gated(&o, &wn, &mut z_c, n / 128, 128, 1e-6, NormKind::Plain)?;
+        let mut s_c = o.clone();
+        CpuBackend.sigmoid_mul(&mut s_c, &gate_in, n)?;
+        let mut got = fetch(self.b, &accd, n)?;
+        got.extend(fetch(self.b, &yd, n)?);
+        got.extend(fetch(self.b, &zd, n)?);
+        got.extend(fetch(self.b, &sd, n)?);
+        let want: Vec<f32> = [acc_c, y_c, z_c, s_c].concat();
+        let name = format!("bf16 twin producers [{m}x{k}]");
+        self.record(name, None, &got, &want, 1e-5);
+        // Twins through their consumers: the oracle rounds the backend's own outputs.
+        let produced = [
+            ("add_rms_norm", &yd, &yb),
+            ("rms_norm_gated", &zd, &zb),
+            ("sigmoid_mul", &sd, &sb),
+        ];
+        for (what, full, twin) in produced {
+            let bad = twin_mismatches(self.b, full, twin, n)? as f32;
+            let name = format!("bf16 twin of {what} [{m}x{k}] (mismatches)");
+            self.record(name, None, &[bad], &[0.0], 0.0);
+        }
+        for &(fmt, rows) in views {
+            let bytes = random_weight(&mut self.rng, fmt, rows, k);
+            let wd = self.b.upload_bytes(&bytes)?;
+            let view = WeightView::full(&wd, fmt, rows, k);
+            if !self.b.takes_bf16(&view, m) {
+                continue;
+            }
+            let wc = CpuBackend.upload_bytes(&bytes)?;
+            for (what, full, twin) in produced {
+                let mut xr = fetch(self.b, full, n)?;
+                quantize_activations(&mut xr, k, ActQuant::Bf16);
+                let mut want = vec![0.0; m * rows];
+                CpuBackend.linear(&xr, &WeightView::full(&wc, fmt, rows, k), &mut want, m)?;
+                let mut yo = self.b.alloc(m * rows)?;
+                self.b.linear_bf16(twin, &view, &mut yo, m)?;
+                let got = fetch(self.b, &yo, m * rows)?;
+                let name = format!(
+                    "linear_bf16 {} [{rows},{k}] m={m} from {what} twin",
+                    fmt.name()
+                );
+                self.record(name, Some(Op::Linear), &got, &want, 2e-4);
+            }
+        }
+        if let Some((fmt, width)) = swiglu {
+            let bytes = random_weight(&mut self.rng, fmt, 2 * width, k);
+            let wd = self.b.upload_bytes(&bytes)?;
+            let gate = WeightView::full(&wd, fmt, 2 * width, k).rows(0, width);
+            let up = WeightView::full(&wd, fmt, 2 * width, k).rows(width, width);
+            if self.b.swiglu_twin(&gate, &up, m) {
+                let wc = CpuBackend.upload_bytes(&bytes)?;
+                let mut xr = fetch(self.b, &yd, n)?;
+                quantize_activations(&mut xr, k, ActQuant::Bf16);
+                let (mut g, mut u) = (vec![0.0; m * width], vec![0.0; m * width]);
+                CpuBackend.linear(
+                    &xr,
+                    &WeightView::full(&wc, fmt, 2 * width, k).rows(0, width),
+                    &mut g,
+                    m,
+                )?;
+                CpuBackend.linear(
+                    &xr,
+                    &WeightView::full(&wc, fmt, 2 * width, k).rows(width, width),
+                    &mut u,
+                    m,
+                )?;
+                CpuBackend.silu_mul(&mut g, &u, m * width)?;
+                let (mut out, mut outb) = (self.b.alloc(m * width)?, self.b.alloc(m * width)?);
+                self.b
+                    .linear_swiglu_twin(&yb, &gate, &up, &mut out, &mut outb, m)?;
+                let got = fetch(self.b, &out, m * width)?;
+                let name = format!("linear_swiglu_twin {} [{width}x2,{k}] m={m}", fmt.name());
+                self.record(name, Some(Op::Linear), &got, &g, SWIGLU_TOL);
+                let bad = twin_mismatches(self.b, &out, &outb, m * width)? as f32;
+                let name = format!("bf16 twin of linear_swiglu [{m}x{width}] (mismatches)");
+                self.record(name, None, &[bad], &[0.0], 0.0);
+                // The output twin feeding the down projection.
+                let dbytes = random_weight(&mut self.rng, fmt, 64, width);
+                let dd = self.b.upload_bytes(&dbytes)?;
+                let down = WeightView::full(&dd, fmt, 64, width);
+                if self.b.takes_bf16(&down, m) {
+                    let dc = CpuBackend.upload_bytes(&dbytes)?;
+                    let mut hr = got.clone();
+                    quantize_activations(&mut hr, width, ActQuant::Bf16);
+                    let mut want = vec![0.0; m * 64];
+                    CpuBackend.linear(&hr, &WeightView::full(&dc, fmt, 64, width), &mut want, m)?;
+                    let mut yo = self.b.alloc(m * 64)?;
+                    self.b.linear_bf16(&outb, &down, &mut yo, m)?;
+                    let got = fetch(self.b, &yo, m * 64)?;
+                    let name = format!(
+                        "linear_bf16 {} [64,{width}] m={m} from swiglu twin",
+                        fmt.name()
+                    );
+                    self.record(name, Some(Op::Linear), &got, &want, SWIGLU_TOL);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `linear_swiglu` against the oracle: gate rows then up rows of one `[2 * width + extra, k]`
+    /// parent from row `begin` (`swap`: up first), or (`split`) separate parents.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu(
+        &mut self,
+        fmt: WeightFormat,
+        k: usize,
+        width: usize,
+        begin: usize,
+        m: usize,
+        swap: bool,
+        split: bool,
+    ) -> Result<()> {
+        self.linear_swiglu_with(fmt, k, width, begin, m, swap, split, ActPolicy::A16Only)
+    }
+
+    /// [`Self::linear_swiglu`] with both views under an activation policy.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_with(
+        &mut self,
+        fmt: WeightFormat,
+        k: usize,
+        width: usize,
+        begin: usize,
+        m: usize,
+        swap: bool,
+        split: bool,
+        policy: ActPolicy,
+    ) -> Result<()> {
+        self.linear_swiglu_pair(fmt, fmt, k, width, begin, m, swap, split, policy)
+    }
+
+    /// [`Self::linear_swiglu_with`] with the up rows in `up_fmt` (a separate parent when it
+    /// differs from the gate's format).
+    #[allow(clippy::too_many_arguments)]
+    fn linear_swiglu_pair(
+        &mut self,
+        fmt: WeightFormat,
+        up_fmt: WeightFormat,
+        k: usize,
+        width: usize,
+        begin: usize,
+        m: usize,
+        swap: bool,
+        split: bool,
+        policy: ActPolicy,
+    ) -> Result<()> {
+        let split = split || up_fmt != fmt;
+        let n = (begin + 2 * width + 16).div_ceil(128) * 128; // nvfp4 needs whole 128-row tiles
+        let bytes = random_weight(&mut self.rng, fmt, n, k);
+        let bytes2 = random_weight(&mut self.rng, up_fmt, n, k);
+        let x = self.rng.vec(m * k, 1.0);
+        let (gb, ub) = if swap {
+            (begin + width, begin)
+        } else {
+            (begin, begin + width)
+        };
+        let (wd, wd2) = (self.b.upload_bytes(&bytes)?, self.b.upload_bytes(&bytes2)?);
+        let gate = WeightView::full(&wd, fmt, n, k)
+            .rows(gb, width)
+            .with_act(policy);
+        let up = WeightView::full(if split { &wd2 } else { &wd }, up_fmt, n, k)
+            .rows(ub, width)
+            .with_act(policy);
+        let act = self.b.linear_swiglu_act(&gate, &up, m);
+        let mut xq = x.clone();
+        quantize_activations(&mut xq, k, act);
+        let (wc, wc2) = (
+            CpuBackend.upload_bytes(&bytes)?,
+            CpuBackend.upload_bytes(&bytes2)?,
+        );
+        let (mut g, mut u) = (vec![0.0; m * width], vec![0.0; m * width]);
+        CpuBackend.linear(
+            &xq,
+            &WeightView::full(&wc, fmt, n, k).rows(gb, width),
+            &mut g,
+            m,
+        )?;
+        let up_parent = if split { &wc2 } else { &wc };
+        CpuBackend.linear(
+            &xq,
+            &WeightView::full(up_parent, up_fmt, n, k).rows(ub, width),
+            &mut u,
+            m,
+        )?;
+        CpuBackend.silu_mul(&mut g, &u, m * width)?;
+        let xd = self.b.upload(&x)?;
+        let (mut od, mut sd) = (self.b.alloc(m * width)?, self.b.alloc(2 * m * width)?);
+        self.b.linear_swiglu(&xd, &gate, &up, &mut od, m, &mut sd)?;
+        let got = fetch(self.b, &od, m * width)?;
+        let tag = match act {
+            ActQuant::Exact => "",
+            ActQuant::Fp8Row => " a8",
+            ActQuant::Nvfp4 { .. } => " a4",
+            ActQuant::Bf16 => " bf16",
+            ActQuant::Int8G256 => " i8",
+            ActQuant::Int8G32 => " i8g32",
+        };
+        let layout = if split {
+            " split"
+        } else if swap {
+            " up|gate"
+        } else {
+            ""
+        };
+        let fmts = if up_fmt == fmt {
+            fmt.name().to_string()
+        } else {
+            format!("{}+{}", fmt.name(), up_fmt.name())
+        };
+        let name = format!("linear_swiglu {fmts} [{width}x2,{k}] from {begin} m={m}{layout}{tag}");
+        if permitted(act, policy) {
+            self.record(name, Some(Op::LinearSwiglu), &got, &g, 2e-4);
+        } else {
+            let name = name + " (rounding not permitted)";
+            self.record(name, Some(Op::LinearSwiglu), &[f32::NAN], &[0.0], 0.0);
         }
         Ok(())
     }
@@ -365,9 +960,20 @@ impl<B: Backend> Suite<'_, B> {
     }
 
     /// `top_k` must agree exactly (indices and values) with the host selection, including ties
-    /// (lower index first) and NaN (ranked last).
-    fn top_k(&mut self, rows: usize, row_len: usize, limit: usize, k: usize) -> Result<()> {
+    /// (lower index first) and NaN (ranked last). `coarse` rounds every value to a multiple of 0.5,
+    /// so the top k is mostly ties.
+    fn top_k(
+        &mut self,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        k: usize,
+        coarse: bool,
+    ) -> Result<()> {
         let mut x = self.rng.vec(rows * row_len, 4.0);
+        if coarse {
+            x.iter_mut().for_each(|v| *v = (*v * 2.0).round() / 2.0);
+        }
         // Ties and NaN: copy a value forward and poison a few entries.
         for r in 0..rows {
             let base = r * row_len;
@@ -395,6 +1001,45 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `log_softmax_gather` against the f64 host reference: ids inside and past `limit`, and a NaN
+    /// at id 1 of every row; with `dead` the first row holds no finite value, so all its ids read
+    /// -inf. Every -inf must come back as -inf; the finite values go through the error metric.
+    fn log_softmax_gather(
+        &mut self,
+        rows: usize,
+        row_len: usize,
+        limit: usize,
+        ids: &[u32],
+        dead: bool,
+    ) -> Result<()> {
+        let mut x = self.rng.vec(rows * row_len, 8.0);
+        for r in 0..rows {
+            x[r * row_len + 1] = f32::NAN;
+        }
+        if dead {
+            x[..row_len].fill(f32::NEG_INFINITY);
+        }
+        let want = CpuBackend.log_softmax_gather(&x, rows, row_len, limit, ids)?;
+        let xd = self.b.upload(&x)?;
+        let got = self.b.log_softmax_gather(&xd, rows, row_len, limit, ids)?;
+        let inf = |v: &f32| *v == f32::NEG_INFINITY;
+        let same_inf =
+            got.len() == want.len() && got.iter().zip(&want).all(|(g, w)| inf(g) == inf(w));
+        let finite =
+            |v: &[f32]| -> Vec<f32> { v.iter().map(|x| if inf(x) { 0.0 } else { *x }).collect() };
+        let mut got = finite(&got);
+        if !same_inf {
+            got.push(f32::NAN);
+        }
+        let name = format!(
+            "log_softmax_gather rows={rows} len={row_len} limit={limit} ids={}{}",
+            ids.len(),
+            if dead { " dead" } else { "" }
+        );
+        self.record(name, Some(Op::LogSoftmaxGather), &got, &finite(&want), 1e-5);
+        Ok(())
+    }
+
     fn embed(&mut self, fmt: WeightFormat, n: usize, k: usize, ids: &[u32]) -> Result<()> {
         let bytes = random_weight(&mut self.rng, fmt, n, k);
         let wc = CpuBackend.upload_bytes(&bytes)?;
@@ -408,6 +1053,71 @@ impl<B: Backend> Suite<'_, B> {
         self.record(
             format!("embed {} [{n},{k}] ids {ids:?}", fmt.name()),
             Some(Op::Embed),
+            &got,
+            &want,
+            1e-6,
+        );
+        Ok(())
+    }
+
+    /// `argmax_to` must select the id `top_k` (k = 1) does, ties and NaN included, into the device
+    /// slot alone (its neighbours untouched), and `fetch_u32` must return it through the queued
+    /// read.
+    fn argmax_to(&mut self, row_len: usize, limit: usize, coarse: bool) -> Result<()> {
+        let mut x = self.rng.vec(row_len, 4.0);
+        if coarse {
+            x.iter_mut().for_each(|v| *v = (*v * 2.0).round() / 2.0);
+        }
+        x[limit / 2] = x[limit / 3];
+        x[1] = f32::NAN;
+        let want = CpuBackend.top_k(&x, 1, row_len, limit, 1)?[0][0].0;
+        let xd = self.b.upload(&x)?;
+        let mut slot = self.b.upload(&[f32::from_bits(u32::MAX); 3])?;
+        self.b.argmax_to(&xd, limit, &mut slot, 1)?;
+        self.b.fetch_u32_begin(&slot, 1, 3)?;
+        let got = self.b.fetch_u32(&slot, 1, 3)?;
+        let bits = fetch(self.b, &slot, 3)?;
+        let same = got == want
+            && bits[1].to_bits() == want
+            && bits[0].to_bits() == u32::MAX
+            && bits[2].to_bits() == u32::MAX;
+        let name = format!(
+            "argmax_to len={row_len} limit={limit}{}",
+            if coarse { " coarse" } else { "" }
+        );
+        self.record(
+            name,
+            Some(Op::ArgmaxTo),
+            &[if same { 0.0 } else { f32::NAN }],
+            &[0.0],
+            0.0,
+        );
+        Ok(())
+    }
+
+    /// `embed_from` must embed ids held in a device buffer (at an offset, as `argmax_to` leaves
+    /// them) exactly as `embed` embeds them from the host.
+    fn embed_from(&mut self, fmt: WeightFormat, n: usize, k: usize, ids: &[u32]) -> Result<()> {
+        let bytes = random_weight(&mut self.rng, fmt, n, k);
+        let wc = CpuBackend.upload_bytes(&bytes)?;
+        let mut want = vec![0.0; ids.len() * k];
+        CpuBackend.embed(ids, &WeightView::full(&wc, fmt, n, k), &mut want)?;
+        let wd = self.b.upload_bytes(&bytes)?;
+        let mut slots = vec![f32::from_bits(7)];
+        slots.extend(ids.iter().map(|&i| f32::from_bits(i)));
+        let idd = self.b.upload(&slots)?;
+        let mut od = self.b.alloc(ids.len() * k)?;
+        self.b.embed_from(
+            &idd,
+            1,
+            ids.len(),
+            &WeightView::full(&wd, fmt, n, k),
+            &mut od,
+        )?;
+        let got = fetch(self.b, &od, ids.len() * k)?;
+        self.record(
+            format!("embed_from {} [{n},{k}] ids {ids:?}", fmt.name()),
+            Some(Op::EmbedFrom),
             &got,
             &want,
             1e-6,
@@ -544,6 +1254,64 @@ impl<B: Backend> Suite<'_, B> {
         let name =
             format!("kv_store {format} t={tokens} kv_heads={kv_heads} d={head_dim} pos0={pos0}");
         self.record(name, Some(Op::KvStore), &got, &want, 0.0);
+        Ok(())
+    }
+
+    /// `state_pack` and `state_unpack` of `n` values, bit-exact against the oracle. With `host`
+    /// the packed side is system-RAM storage, as context-store checkpoints are.
+    fn state_codec(&mut self, fmt: StateFormat, n: usize, host: bool) -> Result<()> {
+        // Rows of very different magnitudes (GDN heads decay at different rates), a zero row, a
+        // row too small for a finite divisor and an outlier.
+        let mut x = self.rng.vec(n, 1.0);
+        for (r, row) in x.chunks_mut(STATE_ROW).enumerate() {
+            let mag = [1e-4f32, 1.0, 50.0, 0.0, 1e-38][r % 5];
+            row.iter_mut().for_each(|v| *v *= mag);
+        }
+        x[(STATE_ROW + 3) % n] = 300.0;
+        let slots = fmt.slots(n);
+        let mut want = vec![0.0; slots];
+        CpuBackend.state_pack(&x, &mut want, n, fmt)?;
+        let xd = self.b.upload(&x)?;
+        let mut packed = if host {
+            self.b.alloc_host(slots)?
+        } else {
+            self.b.alloc(slots)?
+        };
+        self.b.state_pack(&xd, &mut packed, n, fmt)?;
+        // Packed bytes compared as byte values (raw slots may hold NaN patterns).
+        let bytes = |s: &[f32]| -> Vec<f32> {
+            s.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .map(f32::from)
+                .collect()
+        };
+        let got = fetch(self.b, &packed, slots)?;
+        let side = if host { "host" } else { "device" };
+        self.record(
+            format!("state_pack {fmt} n={n} {side}"),
+            Some(Op::StatePack),
+            &bytes(&got),
+            &bytes(&want),
+            0.0,
+        );
+        let mut back = vec![0.0; n];
+        CpuBackend.state_unpack(&want, &mut back, n, fmt)?;
+        let raw: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let src = if host {
+            self.b.upload_bytes_host(&raw)?
+        } else {
+            self.b.upload_bytes(&raw)?
+        };
+        let mut yd = self.b.alloc(n)?;
+        self.b.state_unpack(&src, &mut yd, n, fmt)?;
+        let got = fetch(self.b, &yd, n)?;
+        self.record(
+            format!("state_unpack {fmt} n={n} {side}"),
+            Some(Op::StateUnpack),
+            &got,
+            &back,
+            0.0,
+        );
         Ok(())
     }
 
@@ -845,6 +1613,25 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn transpose_heads(&mut self, rows: usize, a: usize, b: usize, dim: usize) -> Result<()> {
+        let n = rows * a * b * dim;
+        let x = self.rng.vec(n, 1.0);
+        let mut want = vec![0.0; n];
+        CpuBackend.transpose_heads(&x, &mut want, rows, a, b, dim)?;
+        let xd = self.b.upload(&x)?;
+        let mut yd = self.b.alloc(n)?;
+        self.b.transpose_heads(&xd, &mut yd, rows, a, b, dim)?;
+        let got = fetch(self.b, &yd, n)?;
+        self.record(
+            format!("transpose_heads rows {rows} [{a}x{b}] dim {dim}"),
+            None,
+            &got,
+            &want,
+            0.0,
+        );
+        Ok(())
+    }
+
     /// Two calls (prefill chunk, then one token) so the rolling state is exercised.
     fn conv1d(&mut self, channels: usize, width: usize, chunks: [usize; 2]) -> Result<()> {
         let w = self.rng.vec(width * channels, 0.5);
@@ -921,7 +1708,15 @@ impl<B: Backend> Suite<'_, B> {
             got.extend(fetch(self.b, &sd, state_len)?);
             want.extend_from_slice(&sc);
             let name = format!("gated_delta_net heads {k_heads}/{v_heads} d {k_dim}/{v_dim} call {i} ({tokens} tokens at row {row0}) + state");
-            self.record(name, Some(Op::GatedDeltaNet), &got, &want, 1e-4);
+            // Chunked widths (16 tokens and up) may run the recurrence with bf16 tensor-core
+            // products on an f32 state (GDN_CHUNK_TOL), and later calls carry that state; per-row
+            // widths are exact f32.
+            let tol = if chunks[..=i].iter().any(|&t| t >= 16) {
+                GDN_CHUNK_TOL
+            } else {
+                1e-4
+            };
+            self.record(name, Some(Op::GatedDeltaNet), &got, &want, tol);
         }
         Ok(())
     }
@@ -976,7 +1771,21 @@ impl<B: Backend> Suite<'_, B> {
         let name = format!(
             "gated_delta_net_from heads {k_heads}/{v_heads} d {dk} ({tokens} tokens) + states"
         );
-        self.record(name, Some(Op::GatedDeltaNet), &got, &want_o, 1e-4);
+        let tol = if tokens >= 16 { GDN_CHUNK_TOL } else { 1e-4 };
+        self.record(name, Some(Op::GatedDeltaNet), &got, &want_o, tol);
+
+        // Outputs only (no state kept): same outputs, the input state untouched.
+        let mut od2 = self.b.alloc(out_len)?;
+        self.b
+            .gated_delta_net_out(&qd, &abd, &ad, &dd, &sd, &mut so, &mut od2, gs)?;
+        let mut got = fetch(self.b, &od2, out_len)?;
+        got.extend(fetch(self.b, &sd, state_len)?);
+        let mut want = want_o[..out_len].to_vec();
+        want.extend_from_slice(&s0);
+        let name = format!(
+            "gated_delta_net_out heads {k_heads}/{v_heads} d {dk} ({tokens} tokens) + state_in"
+        );
+        self.record(name, Some(Op::GatedDeltaNet), &got, &want, 1e-4);
 
         let (channels, width) = (gs.qkv_width(), 4);
         let cs = ConvShape {
@@ -1000,6 +1809,126 @@ impl<B: Backend> Suite<'_, B> {
         want_y.extend_from_slice(&c0);
         let name = format!("conv1d_silu_from c={channels} w={width} ({tokens} tokens) + states");
         self.record(name, Some(Op::Conv1dSilu), &got, &want_y, 1e-5);
+        Ok(())
+    }
+
+    /// `conv1d_silu_windows` / `gated_delta_net_windows`: `windows` scoring windows of `tokens`
+    /// rows from `row0`, every one from the same states, which must stay as they were.
+    fn gdn_windows(
+        &mut self,
+        k_heads: usize,
+        v_heads: usize,
+        dk: usize,
+        tokens: usize,
+        windows: usize,
+        row0: usize,
+    ) -> Result<()> {
+        let gs = GdnShape {
+            tokens,
+            k_heads,
+            v_heads,
+            k_dim: dk,
+            v_dim: dk,
+            row0,
+        };
+        let rows = row0 + windows * tokens;
+        let (state_len, out_len) = (v_heads * dk * dk, rows * v_heads * dk);
+        let qkv = self.rng.vec(rows * gs.qkv_width(), 1.0);
+        let ab = self.rng.vec(rows * 2 * v_heads, 2.0);
+        let (a_log, dt_bias) = (self.rng.vec(v_heads, 1.0), self.rng.vec(v_heads, 1.0));
+        let s0 = self.rng.vec(state_len, 0.1);
+        let mut want = vec![0.0; out_len];
+        CpuBackend
+            .gated_delta_net_windows(&qkv, &ab, &a_log, &dt_bias, &s0, &mut want, gs, windows)?;
+        let (qd, abd) = (self.b.upload(&qkv)?, self.b.upload(&ab)?);
+        let (ad, dd, sd) = (
+            self.b.upload(&a_log)?,
+            self.b.upload(&dt_bias)?,
+            self.b.upload(&s0)?,
+        );
+        let mut od = self.b.alloc(out_len)?;
+        self.b
+            .gated_delta_net_windows(&qd, &abd, &ad, &dd, &sd, &mut od, gs, windows)?;
+        let skip = row0 * v_heads * dk;
+        let mut got = fetch(self.b, &od, out_len)?.split_off(skip);
+        got.extend(fetch(self.b, &sd, state_len)?);
+        let mut want = want.split_off(skip);
+        want.extend_from_slice(&s0);
+        let name = format!(
+            "gated_delta_net_windows heads {k_heads}/{v_heads} d {dk} ({windows} x {tokens} tokens at row {row0}) + state_in"
+        );
+        self.record(name, Some(Op::GatedDeltaNetWindows), &got, &want, 1e-4);
+
+        let (channels, width) = (gs.qkv_width(), 4);
+        let cs = ConvShape {
+            tokens,
+            channels,
+            width,
+            row0,
+        };
+        let w = self.rng.vec(width * channels, 0.5);
+        let c0 = self.rng.vec((width - 1) * channels, 1.0);
+        let mut want = vec![0.0; rows * channels];
+        CpuBackend.conv1d_silu_windows(&qkv, &w, &c0, &mut want, cs, windows)?;
+        let (wd, cd) = (self.b.upload(&w)?, self.b.upload(&c0)?);
+        let mut yd = self.b.alloc(rows * channels)?;
+        self.b
+            .conv1d_silu_windows(&qd, &wd, &cd, &mut yd, cs, windows)?;
+        let skip = row0 * channels;
+        let mut got = fetch(self.b, &yd, rows * channels)?.split_off(skip);
+        got.extend(fetch(self.b, &cd, c0.len())?);
+        let mut want = want.split_off(skip);
+        want.extend_from_slice(&c0);
+        let name = format!(
+            "conv1d_silu_windows c={channels} w={width} ({windows} x {tokens} tokens at row {row0}) + state_in"
+        );
+        self.record(name, Some(Op::Conv1dSiluWindows), &got, &want, 1e-5);
+        Ok(())
+    }
+
+    /// `attention_windows`: `windows` windows of `window` query rows over a `prefix`-row prefix,
+    /// f32 keys and values; the reference rounds its inputs as the backend reports.
+    fn attention_windows(
+        &mut self,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        prefix: usize,
+        window: usize,
+        windows: usize,
+    ) -> Result<()> {
+        let s = AttnShape {
+            tokens: windows * window,
+            heads,
+            kv_heads,
+            head_dim,
+            pos0: prefix,
+            kv: KvFormat::F32,
+        };
+        let q_len = s.tokens * heads * head_dim;
+        let kv_len = s.kv_len() * kv_heads * head_dim;
+        let q = self.rng.vec(q_len, 2.0);
+        let k = self.rng.vec(kv_len, 2.0);
+        let v = self.rng.vec(kv_len, 1.0);
+        let precision = self.b.attention_windows_precision(s);
+        let (mut qr, mut kr, mut vr) = (q.clone(), k.clone(), v.clone());
+        round_attention_inputs(&mut qr, &mut kr, &mut vr, s, precision);
+        let mut want = vec![0.0; q_len];
+        CpuBackend.attention_windows(&qr, &kr, &vr, &mut want, s, window)?;
+        let (qd, kd, vd) = (self.b.upload(&q)?, self.b.upload(&k)?, self.b.upload(&v)?);
+        let mut od = self.b.alloc(q_len)?;
+        self.b
+            .attention_windows(&qd, &kd, &vd, &mut od, s, window)?;
+        let got = fetch(self.b, &od, q_len)?;
+        let (tag, tol) = match precision {
+            AttnPrecision::Exact => ("", 2e-4),
+            AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+            AttnPrecision::F16 => (" f16", 2e-3),
+        };
+        let name = format!(
+            "attention_windows h={heads}/{kv_heads} d={head_dim} prefix={prefix} {windows} x {window}{tag}"
+        );
+        self.record(name, Some(Op::AttentionWindows), &got, &want, tol);
         Ok(())
     }
 
@@ -1139,6 +2068,447 @@ impl<B: Backend> Suite<'_, B> {
             &want,
             1e-5,
         );
+        Ok(())
+    }
+
+    fn rms_norm_groups(&mut self, rows: usize, groups: usize, dim: usize) -> Result<()> {
+        let n = rows * groups * dim;
+        let (x, w) = (self.rng.vec(n, 2.0), self.rng.vec(groups * dim, 1.5));
+        let mut want = vec![0.0; n];
+        CpuBackend.rms_norm_groups(&x, &w, &mut want, rows, groups, dim, 1e-6)?;
+        let (xd, wd) = (self.b.upload(&x)?, self.b.upload(&w)?);
+        let mut yd = self.b.alloc(n)?;
+        self.b
+            .rms_norm_groups(&xd, &wd, &mut yd, rows, groups, dim, 1e-6)?;
+        let got = fetch(self.b, &yd, n)?;
+        let name = format!("rms_norm_groups {rows}x{groups}x{dim}");
+        self.record(name, Some(Op::RmsNormGroups), &got, &want, 1e-5);
+        Ok(())
+    }
+
+    /// The hyper-connection elementwise ops: `silu`, `hc_mix`, `hc_combine` (injection logits
+    /// read from a column range of a wider row), `ple_gate`, `sigmoid_scale_rows`.
+    fn hyper_connections(&mut self, rows: usize, streams: usize, dim: usize) -> Result<()> {
+        let wide = rows * streams * dim;
+        let tag = format!("{rows}x{streams}x{dim}");
+        // silu over a length that is not a multiple of any block size.
+        let x = self.rng.vec(wide + 3, 6.0);
+        let mut want = x.clone();
+        CpuBackend.silu(&mut want, wide + 3)?;
+        let mut xd = self.b.upload(&x)?;
+        self.b.silu(&mut xd, wide + 3)?;
+        let got = fetch(self.b, &xd, wide + 3)?;
+        self.record(
+            format!("silu {}", wide + 3),
+            Some(Op::Silu),
+            &got,
+            &want,
+            1e-6,
+        );
+
+        let (xn, gate) = (self.rng.vec(wide, 2.0), self.rng.vec(wide, 4.0));
+        let mut want = vec![0.0; rows * dim];
+        CpuBackend.hc_mix(&xn, &gate, &mut want, rows, streams, dim)?;
+        let (xnd, gd) = (self.b.upload(&xn)?, self.b.upload(&gate)?);
+        let mut od = self.b.alloc(rows * dim)?;
+        self.b.hc_mix(&xnd, &gd, &mut od, rows, streams, dim)?;
+        let got = fetch(self.b, &od, rows * dim)?;
+        self.record(format!("hc_mix {tag}"), Some(Op::HcMix), &got, &want, 1e-5);
+
+        let ld = streams + 5;
+        let s = HcCombineShape {
+            rows,
+            streams,
+            dim,
+            inject_ld: ld,
+            inject_col: 3,
+        };
+        let (res0, y, inj) = (
+            self.rng.vec(wide, 2.0),
+            self.rng.vec(rows * dim, 1.0),
+            self.rng.vec(rows * ld, 3.0),
+        );
+        let mut want = res0.clone();
+        CpuBackend.hc_combine(&mut want, &y, &inj, s)?;
+        let mut rd = self.b.upload(&res0)?;
+        let (yd, id) = (self.b.upload(&y)?, self.b.upload(&inj)?);
+        self.b.hc_combine(&mut rd, &yd, &id, s)?;
+        let got = fetch(self.b, &rd, wide)?;
+        self.record(
+            format!("hc_combine {tag}"),
+            Some(Op::HcCombine),
+            &got,
+            &want,
+            1e-5,
+        );
+
+        let (key, q, value) = (
+            self.rng.vec(wide, 1.5),
+            self.rng.vec(wide, 1.5),
+            self.rng.vec(rows * dim, 1.0),
+        );
+        let mut want = vec![0.0; wide];
+        CpuBackend.ple_gate(&key, &q, &value, &mut want, rows, streams, dim)?;
+        let (kd, qd, vd) = (
+            self.b.upload(&key)?,
+            self.b.upload(&q)?,
+            self.b.upload(&value)?,
+        );
+        let mut od = self.b.alloc(wide)?;
+        self.b
+            .ple_gate(&kd, &qd, &vd, &mut od, rows, streams, dim)?;
+        let got = fetch(self.b, &od, wide)?;
+        self.record(
+            format!("ple_gate {tag}"),
+            Some(Op::PleGate),
+            &got,
+            &want,
+            1e-5,
+        );
+
+        // One gate per row from column 2 of a [rows, 7] projection.
+        let s = RowGateShape {
+            rows,
+            dim,
+            gate_offset: 2,
+            gate_stride: 7,
+        };
+        let (x, g) = (self.rng.vec(rows * dim, 2.0), self.rng.vec(rows * 7, 4.0));
+        let mut want = x.clone();
+        CpuBackend.sigmoid_scale_rows(&mut want, &g, s)?;
+        let mut xd = self.b.upload(&x)?;
+        let gd = self.b.upload(&g)?;
+        self.b.sigmoid_scale_rows(&mut xd, &gd, s)?;
+        let got = fetch(self.b, &xd, rows * dim)?;
+        let name = format!("sigmoid_scale_rows {rows}x{dim}");
+        self.record(name, Some(Op::SigmoidScaleRows), &got, &want, 1e-6);
+        Ok(())
+    }
+
+    /// Two calls so the dilated history carries over; outputs and final state are compared.
+    fn conv1d_dilated(
+        &mut self,
+        channels: usize,
+        width: usize,
+        dilation: usize,
+        chunks: [usize; 2],
+    ) -> Result<()> {
+        let hist = (width - 1) * dilation;
+        let w = self.rng.vec(width * channels, 0.5);
+        let state0 = self.rng.vec(hist * channels, 1.0);
+        let (wd, mut sd) = (self.b.upload(&w)?, self.b.upload(&state0)?);
+        let mut sc = state0;
+        for (i, tokens) in chunks.into_iter().enumerate() {
+            let s = DilatedConvShape {
+                tokens,
+                channels,
+                width,
+                dilation,
+            };
+            let x = self.rng.vec(tokens * channels, 1.0);
+            let mut want = vec![0.0; tokens * channels];
+            CpuBackend.conv1d_dilated_silu(&x, &w, &mut sc, &mut want, s)?;
+            let xd = self.b.upload(&x)?;
+            let mut od = self.b.alloc(tokens * channels)?;
+            self.b.conv1d_dilated_silu(&xd, &wd, &mut sd, &mut od, s)?;
+            let mut got = fetch(self.b, &od, tokens * channels)?;
+            got.extend(fetch(self.b, &sd, hist * channels)?);
+            want.extend_from_slice(&sc);
+            let name = format!(
+                "conv1d_dilated_silu c={channels} w={width} dil={dilation} call {i} ({tokens} tokens) + state"
+            );
+            self.record(name, Some(Op::Conv1dDilatedSilu), &got, &want, 1e-5);
+        }
+        Ok(())
+    }
+
+    /// `moe_route` with counts: ids, weights and the counts compared (ids as numbers).
+    fn moe_route(&mut self, rows: usize, row_len: usize, experts: usize, k: usize) -> Result<()> {
+        let s = MoeRouteShape {
+            rows,
+            row_len,
+            experts,
+            k,
+        };
+        let logits = self.rng.vec(rows * row_len, 4.0);
+        let counts0 = vec![1.0f32; experts];
+        let (mut ids, mut w, mut counts) =
+            (vec![0.0; rows * k], vec![0.0; rows * k], counts0.clone());
+        CpuBackend.moe_route(&logits, &mut ids, &mut w, Some(&mut counts), s)?;
+        let ld = self.b.upload(&logits)?;
+        let (mut idd, mut wd) = (self.b.alloc(rows * k)?, self.b.alloc(rows * k)?);
+        let mut cd = self.b.upload(&counts0)?;
+        self.b.moe_route(&ld, &mut idd, &mut wd, Some(&mut cd), s)?;
+        let as_num = |v: Vec<f32>| -> Vec<f32> { v.iter().map(|x| x.to_bits() as f32).collect() };
+        let mut got = as_num(fetch(self.b, &idd, rows * k)?);
+        got.extend(fetch(self.b, &wd, rows * k)?);
+        got.extend(fetch(self.b, &cd, experts)?);
+        let mut want = as_num(ids);
+        want.extend(w);
+        want.extend(counts);
+        let name = format!("moe_route {rows}x{row_len} experts={experts} k={k} + counts");
+        self.record(name, Some(Op::MoeRoute), &got, &want, 1e-6);
+        Ok(())
+    }
+
+    /// `moe_experts` over a random bank: `gate_fmt` for gate and up, `down_fmt` for down, some
+    /// experts resident in slots (mapped in a shuffled order), the rest read from records.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &mut self,
+        gate_fmt: WeightFormat,
+        down_fmt: WeightFormat,
+        experts: usize,
+        width: usize,
+        hidden: usize,
+        rows: usize,
+        k: usize,
+        policy: ActPolicy,
+    ) -> Result<()> {
+        let gb = gate_fmt.payload_bytes(width, hidden);
+        let db = down_fmt.payload_bytes(hidden, width);
+        let record_bytes = (2 * gb + db).div_ceil(16) * 16;
+        let mut records = vec![0u8; experts * record_bytes];
+        for rec in records.chunks_exact_mut(record_bytes) {
+            rec[..gb].copy_from_slice(&random_weight(&mut self.rng, gate_fmt, width, hidden));
+            rec[gb..2 * gb].copy_from_slice(&random_weight(&mut self.rng, gate_fmt, width, hidden));
+            rec[2 * gb..2 * gb + db].copy_from_slice(&random_weight(
+                &mut self.rng,
+                down_fmt,
+                hidden,
+                width,
+            ));
+        }
+        // Every third expert gets a slot, in reverse order.
+        let resident: Vec<usize> = (0..experts).filter(|e| e % 3 == 1).rev().collect();
+        // Slots a little wider than records, as a pool shared by banks of several sizes is.
+        let slot_bytes = record_bytes + 48;
+        let mut slots = vec![0u8; resident.len().max(1) * slot_bytes];
+        let mut map = vec![f32::from_bits(-1i32 as u32); experts];
+        for (i, &e) in resident.iter().enumerate() {
+            slots[i * slot_bytes..i * slot_bytes + record_bytes]
+                .copy_from_slice(&records[e * record_bytes..(e + 1) * record_bytes]);
+            map[e] = f32::from_bits(i as u32);
+        }
+        // k distinct experts per row (5 is coprime to every bank size used).
+        let mut ids = Vec::with_capacity(rows * k);
+        let mut weights = Vec::with_capacity(rows * k);
+        for r in 0..rows {
+            let start = (r * 7 + (self.rng.next_u64() % experts as u64) as usize) % experts;
+            let w: Vec<f32> = (0..k).map(|_| self.rng.uniform().abs() + 0.1).collect();
+            let sum: f32 = w.iter().sum();
+            for (j, wj) in w.into_iter().enumerate() {
+                ids.push(f32::from_bits(((start + 5 * j) % experts) as u32));
+                weights.push(wj / sum);
+            }
+        }
+        // Small inputs keep both chained products of order one, where the metric is meaningful.
+        let x = self.rng.vec(rows * hidden, 0.1);
+        let mat = |format, offset, rows, k| ExpertMatrix {
+            format,
+            offset,
+            rows,
+            k,
+        };
+        let (gate, up, down) = (
+            mat(gate_fmt, 0, width, hidden),
+            mat(gate_fmt, gb, width, hidden),
+            mat(down_fmt, 2 * gb, hidden, width),
+        );
+        let (rd, sd, md) = (
+            self.b.upload_bytes_host(&records)?,
+            self.b.upload_bytes(&slots)?,
+            self.b.upload(&map)?,
+        );
+        let bank = ExpertBank {
+            records: &rd,
+            slots: &sd,
+            map: &md,
+            experts,
+            slot_count: resident.len(),
+            slot_bytes,
+            record_bytes,
+            gate,
+            up,
+            down,
+            act: policy,
+        };
+        let act = self.b.moe_experts_act(&bank, rows);
+        let want = moe_reference(
+            &records,
+            record_bytes,
+            (gate, up, down),
+            &ids,
+            &weights,
+            &x,
+            k,
+            act,
+        )?;
+        let (xd, idd, wd) = (
+            self.b.upload(&x)?,
+            self.b.upload(&ids)?,
+            self.b.upload(&weights)?,
+        );
+        let mut yd = self.b.alloc(rows * hidden)?;
+        let mut scratch = self.b.alloc(self.b.moe_scratch_len(&bank, rows, k))?;
+        self.b
+            .moe_experts(&xd, &idd, &wd, &bank, &mut yd, &mut scratch, rows, k)?;
+        let got = fetch(self.b, &yd, rows * hidden)?;
+        let name = format!(
+            "moe_experts {}/{} experts={experts} [{width},{hidden}] rows={rows} k={k}{}",
+            gate_fmt.name(),
+            down_fmt.name(),
+            if act == ActQuant::Exact {
+                ""
+            } else {
+                " (rounded)"
+            }
+        );
+        if permitted(act, policy) && act != ActQuant::Exact {
+            // The SwiGLU product is rounded again from values the device computes in f32: a value
+            // on an int8 rounding boundary may land one code apart from the oracle's. Relative L2
+            // error tolerates such isolated codes; a wrong expert, row or scale is O(1).
+            let (num, den) = got
+                .iter()
+                .zip(&want)
+                .fold((0f64, 0f64), |(n, d), (&g, &w)| {
+                    let e = f64::from(g) - f64::from(w);
+                    (n + e * e, d + f64::from(w) * f64::from(w))
+                });
+            let rel = if num.is_nan() {
+                f64::INFINITY
+            } else {
+                (num / den.max(1e-30)).sqrt()
+            };
+            self.record(
+                name + ", relative L2",
+                Some(Op::MoeExperts),
+                &[rel as f32],
+                &[0.0],
+                1e-3,
+            );
+        } else if permitted(act, policy) {
+            self.record(name, Some(Op::MoeExperts), &got, &want, 5e-4);
+        } else {
+            let name = name + " (rounding not permitted)";
+            self.record(name, Some(Op::MoeExperts), &[f32::NAN], &[0.0], 0.0);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_pool(
+        &mut self,
+        block0: usize,
+        blocks: usize,
+        ratio: usize,
+        dim: usize,
+        rotary_dim: usize,
+    ) -> Result<()> {
+        let s = QsaPoolShape {
+            block0,
+            blocks,
+            ratio,
+            dim,
+            rotary_dim,
+            theta: 1e7,
+            eps: 1e-6,
+        };
+        let end = block0 + blocks;
+        let raw = self.rng.vec(end * ratio * dim, 2.0);
+        let w = self.rng.vec(dim, 1.5);
+        let pooled0 = self.rng.vec(end * dim, 1.0);
+        let mut want = pooled0.clone();
+        CpuBackend.qsa_pool(&raw, &w, &mut want, s)?;
+        let (rd, wd) = (self.b.upload(&raw)?, self.b.upload(&w)?);
+        let mut pd = self.b.upload(&pooled0)?;
+        self.b.qsa_pool(&rd, &wd, &mut pd, s)?;
+        let got = fetch(self.b, &pd, end * dim)?;
+        let name =
+            format!("qsa_pool blocks {block0}+{blocks} ratio={ratio} dim={dim} rot={rotary_dim}");
+        // Normalised values of a few units rotated by f32 angles of up to ~300 rad.
+        self.record(name, Some(Op::QsaPool), &got, &want, 5e-5);
+        Ok(())
+    }
+
+    fn qsa_select(&mut self, s: QsaSelectShape) -> Result<()> {
+        let blocks = s.complete_blocks(s.tokens - 1);
+        let q = self.rng.vec(s.tokens * s.heads * s.dim, 1.0);
+        let pooled = self.rng.vec(blocks.max(1) * s.dim, 1.0);
+        let len = s.tokens * s.sel_len();
+        let mut want = vec![0.0; len];
+        let mut scratch = vec![0.0; (s.tokens * blocks).max(1)];
+        CpuBackend.qsa_select(&q, &pooled, &mut want, &mut scratch, s)?;
+        let (qd, pd) = (self.b.upload(&q)?, self.b.upload(&pooled)?);
+        let mut sd = self.b.alloc(len)?;
+        let mut scd = self.b.alloc((s.tokens * blocks).max(1))?;
+        self.b.qsa_select(&qd, &pd, &mut sd, &mut scd, s)?;
+        let as_num =
+            |v: Vec<f32>| -> Vec<f32> { v.iter().map(|x| x.to_bits() as i32 as f32).collect() };
+        let got = as_num(fetch(self.b, &sd, len)?);
+        let name = format!(
+            "qsa_select t={} h={} d={} pos0={} ratio={} budget={}",
+            s.tokens, s.heads, s.dim, s.pos0, s.ratio, s.budget
+        );
+        self.record(name, Some(Op::QsaSelect), &got, &as_num(want), 0.0);
+        Ok(())
+    }
+
+    /// `attention_sparse` over a cache in `s.kv`, each token selecting a random subset of the
+    /// positions it sees (in shuffled order, -1 entries mixed in).
+    fn attention_sparse(&mut self, s: AttnShape, sel_len: usize) -> Result<()> {
+        let d = s.head_dim;
+        let q_len = s.tokens * s.heads * d;
+        let rows = (s.kv_len() + 3) * s.kv_heads;
+        let q = self.rng.vec(q_len, 2.0);
+        let kb = encode_cache(s.kv, &self.rng.vec(rows * d, 2.0), d, false);
+        let vb = encode_cache(s.kv, &self.rng.vec(rows * d, 1.0), d, true);
+        let mut sel = Vec::with_capacity(s.tokens * sel_len);
+        for t in 0..s.tokens {
+            let visible = s.pos0 + t + 1;
+            let mut row: Vec<i32> = (0..visible as i32)
+                .filter(|_| !self.rng.next_u64().is_multiple_of(3))
+                .take(sel_len - 1)
+                .collect();
+            row.push(visible as i32 - 1);
+            row.dedup();
+            row.resize(sel_len, -1);
+            row.rotate_left(t % sel_len);
+            sel.extend(row.into_iter().map(|p| f32::from_bits(p as u32)));
+        }
+        let (mut kr, mut vr) = (
+            decode_cache(s.kv, &kb, rows, d, false),
+            decode_cache(s.kv, &vb, rows, d, true),
+        );
+        let f32_shape = AttnShape {
+            kv: KvFormat::F32,
+            ..s
+        };
+        let precision = self.b.attention_precision(s);
+        let mut qr = q.clone();
+        round_attention_inputs(&mut qr, &mut kr, &mut vr, f32_shape, precision);
+        let mut want = vec![0.0; q_len];
+        CpuBackend.attention_sparse(&qr, &kr, &vr, &sel, sel_len, &mut want, f32_shape)?;
+        let (qd, kd, vd, sd) = (
+            self.b.upload(&q)?,
+            self.b.upload_bytes(&kb)?,
+            self.b.upload_bytes(&vb)?,
+            self.b.upload(&sel)?,
+        );
+        let mut od = self.b.alloc(q_len)?;
+        self.b
+            .attention_sparse(&qd, &kd, &vd, &sd, sel_len, &mut od, s)?;
+        let got = fetch(self.b, &od, q_len)?;
+        let (tag, tol) = match precision {
+            AttnPrecision::Exact => ("", 2e-4),
+            AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
+            AttnPrecision::F16 => (" f16", 2e-3),
+        };
+        let name = format!(
+            "attention_sparse {} t={} h={}/{} d={} pos0={} sel={sel_len}{tag}",
+            s.kv, s.tokens, s.heads, s.kv_heads, s.head_dim, s.pos0
+        );
+        self.record(name, Some(Op::AttentionSparse), &got, &want, tol);
         Ok(())
     }
 
@@ -1306,6 +2676,57 @@ impl<B: Backend> Suite<'_, B> {
     }
 }
 
+/// The routed experts' sum with every projection input rounded as `act` (x for gate and up, the
+/// SwiGLU product for down), exact products otherwise: the oracle `moe_experts` is checked against.
+#[allow(clippy::too_many_arguments)]
+fn moe_reference(
+    records: &[u8],
+    record_bytes: usize,
+    (gate, up, down): (ExpertMatrix, ExpertMatrix, ExpertMatrix),
+    ids: &[f32],
+    weights: &[f32],
+    x: &[f32],
+    k: usize,
+    act: ActQuant,
+) -> Result<Vec<f32>> {
+    let (hidden, width) = (gate.k, gate.rows);
+    let rows = x.len() / hidden;
+    let dot = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&p, &q)| f64::from(p) * f64::from(q))
+            .sum()
+    };
+    let mut y = vec![0.0f32; rows * hidden];
+    for r in 0..rows {
+        let mut xq = x[r * hidden..(r + 1) * hidden].to_vec();
+        quantize_activations(&mut xq, hidden, act);
+        let mut acc = vec![0f64; hidden];
+        for j in 0..k {
+            let e = ids[r * k + j].to_bits() as usize;
+            let rec = &records[e * record_bytes..(e + 1) * record_bytes];
+            let dec =
+                |m: &ExpertMatrix| decode_rows(m.format, &rec[m.offset..], m.rows, m.k, 0, m.rows);
+            let (g, u, dn) = (dec(&gate)?, dec(&up)?, dec(&down)?);
+            let mut h: Vec<f32> = (0..width)
+                .map(|i| {
+                    let a = dot(&xq, &g[i * hidden..(i + 1) * hidden]);
+                    (a / (1.0 + (-a).exp()) * dot(&xq, &u[i * hidden..(i + 1) * hidden])) as f32
+                })
+                .collect();
+            quantize_activations(&mut h, width, act);
+            let w = f64::from(weights[r * k + j]);
+            for (c, a) in acc.iter_mut().enumerate() {
+                *a += w * dot(&h, &dn[c * width..(c + 1) * width]);
+            }
+        }
+        for (c, a) in acc.into_iter().enumerate() {
+            y[r * hidden + c] = a as f32;
+        }
+    }
+    Ok(y)
+}
+
 pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     let mut s = Suite {
         b,
@@ -1338,11 +2759,27 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 16)?;
     // Verify and draft sizes with K a multiple of 128 (GDN gate projection, a row view).
     s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 8)?;
+    // A block of tokens over many bf16 rows (the DFlash conv kernel projections).
+    s.linear(WeightFormat::Bf16, 1280, 5120, 0, 1280, 8)?;
     s.linear(WeightFormat::Bf16, 130, 1024, 3, 98, 3)?;
     s.linear(WeightFormat::Bf16, 40, 256, 0, 40, 2)?;
     s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 12)?;
     s.linear(WeightFormat::Bf16, 1280, 1024, 0, 1280, 16)?;
     s.linear(WeightFormat::Bf16, 300, 1024, 40, 200, 3)?;
+    // K a multiple of 16 but not 32 at prefill widths (Qwen3-VL's ViT fc2, K = 4304), on their
+    // own seed so the cases after them keep their data.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x4304));
+    s.linear(WeightFormat::Bf16, 300, 80, 8, 280, 70)?;
+    s.linear(WeightFormat::Bf16, 1152, 4304, 0, 1152, 130)?;
+    s.rng = rng;
+    // Prefill widths over at most 128 rows (the skinny kernel; the GDN a | b projection is
+    // [96, 5120]): split K, ragged tokens, rows and K, a row view; on their own seed.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x5c1e));
+    s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 600)?;
+    s.linear(WeightFormat::Bf16, 130, 1024, 3, 98, 1100)?;
+    s.linear(WeightFormat::Bf16, 40, 300, 0, 40, 70)?;
+    s.linear(WeightFormat::F32, 20, 520, 0, 20, 64)?;
+    s.rng = rng;
     s.linear(WeightFormat::Nvfp4, 256, 128, 0, 256, 1)?;
     s.linear(WeightFormat::Nvfp4, 384, 192, 128, 200, 5)?;
     // Activation policies: tuned kernels may round inputs to FP8 / NVFP4 where the artifact allows.
@@ -1416,6 +2853,40 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         64,
         ActPolicy::A16Only,
     )?;
+    // A DFlash2 drafter's NVFP4 MLP (Qwen3.6-35B-A3B: hidden 2048, width 6144) at every block
+    // width a draft window can have, on its own seed so the cases after it keep their data.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0xdf1a_2048));
+    for m in 1..=9 {
+        s.linear_act(
+            WeightFormat::Nvfp4,
+            6144,
+            2048,
+            0,
+            6144,
+            m,
+            ActPolicy::A16Only,
+        )?;
+        s.linear_act(
+            WeightFormat::Nvfp4,
+            2048,
+            6144,
+            0,
+            2048,
+            m,
+            ActPolicy::A16Only,
+        )?;
+        s.linear_swiglu_with(
+            WeightFormat::Nvfp4,
+            2048,
+            6144,
+            0,
+            m,
+            false,
+            false,
+            ActPolicy::A16Only,
+        )?;
+    }
+    s.rng = rng;
     // Batched drafting with A16-only NVFP4 weights (draft model, proposal head): 17..96 rows.
     for m in [21, 42, 48, 96] {
         s.linear_act(
@@ -1506,14 +2977,50 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         })?;
     }
     s.concat_cols(7, 13, 5)?;
-    s.top_k(2, 248_320, 248_077, 64)?;
-    s.top_k(3, 5000, 4097, 20)?;
-    s.top_k(1, 50, 50, 64)?;
-    s.top_k(4, 1000, 1000, 1)?;
+    s.top_k(2, 248_320, 248_077, 64, false)?;
+    s.top_k(3, 5000, 4097, 20, false)?;
+    s.top_k(1, 50, 50, 64, false)?;
+    s.top_k(4, 1000, 1000, 1, false)?;
+    // Draft proposals: a few rows over a large head, small k (selected by reductions).
+    s.top_k(7, 131_072, 131_072, 16, false)?;
+    s.top_k(7, 131_072, 130_001, 12, true)?;
+    s.top_k(2, 20_000, 20_000, 32, true)?;
+    s.top_k(2, 20_000, 20_000, 33, true)?;
+    // System One scoring: rating digits over the Qwen head, ids past the public vocabulary, NaN.
+    // On their own seed, so the cases after them keep their data.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x5157));
+    s.log_softmax_gather(
+        2,
+        248_320,
+        248_077,
+        &[0, 1, 15, 24, 248_076, 248_077, 248_319],
+        false,
+    )?;
+    s.log_softmax_gather(16, 248_320, 248_077, &[15, 16, 17, 18, 19], false)?;
+    s.log_softmax_gather(3, 5000, 4097, &[7, 4096, 4097], true)?;
+    s.log_softmax_gather(1, 50, 50, &(0..50).collect::<Vec<u32>>(), false)?;
+    s.rng = rng;
+    s.argmax_to(248_320, 248_077, false)?;
+    s.argmax_to(5000, 4097, true)?;
+    s.argmax_to(50, 50, false)?;
+    s.embed_from(WeightFormat::Q8G32, 64, 256, &[3, 0, 63, 17])?;
+    s.embed_from(WeightFormat::Q4G64, 40, 128, &[39, 39, 2])?;
+    s.top_k(3, 9000, 5, 8, false)?;
+    s.embed(WeightFormat::Q5G64, 16, 5120, &[15, 0, 7, 7, 3, 9, 1, 12])?;
     s.embed(WeightFormat::Fp8RowBf16, 50, 64, &[3, 0, 49, 3])?;
     s.embed(WeightFormat::Bf16, 10, 130, &[9, 1])?;
     s.embed(WeightFormat::Nvfp4, 128, 64, &[127, 0, 64])?;
     s.embed(WeightFormat::Q5G64, 20, 200, &[19, 0])?;
+    s.embed(WeightFormat::Q4G64, 30, 256, &[29, 0, 7, 7])?;
+    s.embed(WeightFormat::Q8G32, 10, 96, &[9, 3])?;
+    // 16-byte reads per thread (FP8 rows with K a multiple of 16, bf16 rows with K a multiple of
+    // 8), including a partial last slice, on their own seed.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0xe3bd));
+    s.embed(WeightFormat::Fp8RowBf16, 40, 5120, &[39, 0, 17, 17, 5])?;
+    s.embed(WeightFormat::Fp8RowBf16, 9, 2064, &[8, 1])?;
+    s.embed(WeightFormat::Bf16, 12, 1032, &[11, 0, 4])?;
+    s.embed_from(WeightFormat::Fp8RowBf16, 30, 5120, &[29, 2, 2])?;
+    s.rng = rng;
     s.add_rms_norm(8, 5120, NormKind::Offset)?;
     s.rms_norm_gated(8 * 48, 128, NormKind::Plain)?;
     s.rms_norm_gated(5, 96, NormKind::Offset)?;
@@ -1691,6 +3198,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.kv_load(f, 4, 256, 0, 300)?;
         s.kv_load(f, 2, 64, 17, 5)?;
     }
+    for f in StateFormat::ALL {
+        s.state_codec(f, 128, false)?;
+        // One 27B GDN layer (48 heads of 128 x 128), and a host-side store copy of a smaller one.
+        s.state_codec(f, 48 * 128 * 128, false)?;
+        s.state_codec(f, 16 * 128 * 128, true)?;
+    }
     let attn = |tokens, heads, kv_heads, head_dim, pos0, kv| AttnShape {
         tokens,
         heads,
@@ -1725,6 +3238,18 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.state_from(16, 48, 128, 8)?;
     s.state_from(2, 6, 64, 3)?;
     s.state_from(2, 4, 128, 20)?;
+    // System One scoring windows: Qwen3.8's GDN heads, short and long windows, a row offset; on
+    // their own seed.
+    let rng = std::mem::replace(&mut s.rng, Rng::new(0x5158));
+    s.gdn_windows(16, 48, 128, 6, 40, 0)?;
+    s.gdn_windows(2, 6, 64, 1, 3, 5)?;
+    s.gdn_windows(2, 4, 128, 20, 3, 0)?;
+    s.attention_windows(24, 4, 256, 300, 6, 20)?;
+    s.attention_windows(24, 4, 256, 611, 5, 40)?;
+    s.attention_windows(8, 2, 128, 37, 3, 7)?;
+    s.attention_windows(4, 4, 64, 0, 5, 2)?;
+    s.attention_windows(16, 2, 64, 1_500, 1, 3)?;
+    s.rng = rng;
     s.gdn_replay(3, 8, 5, 0)?;
     s.gdn_replay(2, 8, 1, 0)?;
     s.gdn_replay(2, 12, 12, 0)?;
@@ -1780,6 +3305,382 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         layout: RopeLayout::Blocked,
     })?;
     s.stack(&ModelSpec::preset("tiny")?)?;
+    // Cases added later go last: the suite draws from one random stream, so inserting earlier
+    // would change every following case's data.
+    // IQ3_XXS dense MLP: decode, a verify window over an odd row view, and the tiled path.
+    s.linear(WeightFormat::Iq3Xxs, 96, 512, 0, 96, 1)?;
+    s.linear(WeightFormat::Iq3Xxs, 130, 768, 3, 100, 8)?;
+    s.linear(WeightFormat::Iq3Xxs, 200, 256, 17, 150, 33)?;
+    s.embed(WeightFormat::Iq3Xxs, 12, 512, &[11, 0, 5])?;
+    // Greedy speculative verify: the argmax of each row of a verify window.
+    s.top_k(8, 248_320, 248_077, 1, false)?;
+    // Fused SwiGLU projections at decode and verify widths: the dense MLP's formats, ragged
+    // widths, both row orders and separate parents.
+    for m in [1, 2, 8, 16] {
+        s.linear_swiglu(WeightFormat::Iq3Xxs, 512, 40, 0, m, false, false)?;
+    }
+    s.linear_swiglu(WeightFormat::Iq3Xxs, 768, 24, 8, 3, false, false)?;
+    s.linear_swiglu(WeightFormat::Iq3Xxs, 256, 16, 0, 8, true, false)?;
+    s.linear_swiglu(WeightFormat::Iq3Xxs, 512, 16, 0, 8, false, true)?;
+    s.linear_swiglu(WeightFormat::Q4G64, 320, 40, 3, 8, false, false)?;
+    s.linear_swiglu(WeightFormat::Nvfp4, 512, 128, 0, 8, false, false)?;
+    s.linear_swiglu(WeightFormat::Bf16, 96, 33, 1, 5, false, false)?;
+    // Prefill widths under AllowA8 (int8 tensor-core paths): ragged token tiles, row views that
+    // start mid-tile, ragged row counts, and a fused SwiGLU over separate parents.
+    let a8 = ActPolicy::AllowA8;
+    for m in [33, 64, 100] {
+        s.linear_act(WeightFormat::Iq3Xxs, 160, 768, 16, 128, m, a8)?;
+        s.linear_act(WeightFormat::Q5G64, 200, 512, 8, 136, m, a8)?;
+    }
+    s.linear_act(WeightFormat::Iq3Xxs, 100, 512, 3, 90, 47, a8)?;
+    s.linear_act(WeightFormat::Q4G64, 128, 1024, 0, 128, 70, a8)?;
+    s.linear_act(WeightFormat::Q8G32, 96, 512, 0, 96, 70, a8)?;
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 512, 40, 0, 70, false, false, a8)?;
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 768, 24, 8, 33, false, true, a8)?;
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 256, 64, 0, 130, true, false, a8)?;
+    // Full prefill chunks (the widest token tiles).
+    s.linear_act(WeightFormat::Iq3Xxs, 160, 512, 16, 136, 1030, a8)?;
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 256, 72, 0, 1030, false, false, a8)?;
+    s.linear_act(WeightFormat::Q5G64, 128, 512, 0, 128, 1030, a8)?;
+    // A16-only NVFP4 at prefill widths (output projections of the IQ3_XXS DFlash2 artifact): a
+    // view starting mid-tile with ragged rows, and a full chunk.
+    s.linear(WeightFormat::Nvfp4, 384, 512, 40, 300, 100)?;
+    s.linear(WeightFormat::Nvfp4, 256, 448, 0, 256, 1030)?;
+    // Prefill grids of several hundred tiles (kernel sets may pick larger tiles for them): ragged
+    // tokens and rows, a view starting one scale tile into its parent.
+    let a4 = ActPolicy::AllowA4 { divisor: 600.0 };
+    s.linear_act(WeightFormat::Nvfp4, 8448, 256, 128, 8200, 1030, a4)?;
+    s.linear_act(WeightFormat::Fp8RowBf16, 8448, 256, 64, 8200, 1030, a8)?;
+    // Fused SwiGLU under A4 at prefill widths: both row orders, separate parents, a view one scale
+    // tile into its parent, and a grid of several hundred tiles.
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 512, 256, 0, 100, false, false, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 128, 128, 300, true, false, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 256, 0, 70, false, true, a4)?;
+    s.linear_swiglu_with(WeightFormat::Nvfp4, 256, 4096, 0, 1030, false, false, a4)?;
+    // ... and FP8 rows under A8 (the Qwen3.8 NVFP4 artifact's FP8 MLP layers): separate parents,
+    // ragged columns, a view not starting on a tile, and a wide grid.
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 256, 192, 0, 130, false, true, a8)?;
+    s.linear_swiglu_with(WeightFormat::Fp8RowBf16, 320, 200, 17, 300, true, false, a8)?;
+    s.linear_swiglu_with(
+        WeightFormat::Fp8RowBf16,
+        128,
+        4096,
+        0,
+        1030,
+        false,
+        true,
+        a8,
+    )?;
+    // IQ3_XXS at the dense MLP's own K (gate/up 5120, down 17408), which kernels specialize on,
+    // at decode and verify widths.
+    for m in [1, 8] {
+        s.linear_swiglu(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false)?;
+        s.linear(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m)?;
+    }
+    // IQ3_XXS under AllowA8 at decode and verify widths (kernel sets may run int8 decode kernels):
+    // ragged token tiles, a row view starting mid-tile, separate SwiGLU parents, the MLP's own K,
+    // and int8 twins of a norm's output.
+    for m in [2, 5, 8, 16] {
+        s.linear_act(WeightFormat::Iq3Xxs, 160, 768, 16, 128, m, a8)?;
+        s.linear_swiglu_with(WeightFormat::Iq3Xxs, 512, 40, 0, m, false, false, a8)?;
+    }
+    s.linear_swiglu_with(WeightFormat::Iq3Xxs, 768, 24, 8, 13, false, true, a8)?;
+    for m in [1, 8, 16] {
+        s.linear_swiglu_with(WeightFormat::Iq3Xxs, 5120, 24, 0, m, false, false, a8)?;
+        s.linear_act(WeightFormat::Iq3Xxs, 32, 17408, 0, 32, m, a8)?;
+    }
+    {
+        use WeightFormat::Iq3Xxs;
+        s.twins_q8(8, 5120, &[(Iq3Xxs, 32)], Some((Iq3Xxs, 256)))?;
+        s.twins_q8(16, 17408, &[(Iq3Xxs, 32)], None)?;
+    }
+    // A4 at batched-verify widths (several lanes' windows: 17..64 tokens), wide and narrow K
+    // stages, row views starting one scale tile in.
+    s.linear_act(WeightFormat::Nvfp4, 512, 2048, 128, 384, 24, a4)?;
+    s.linear_act(WeightFormat::Nvfp4, 384, 640, 128, 256, 48, a4)?;
+    s.linear_act(WeightFormat::Nvfp4, 256, 1024, 0, 256, 64, a4)?;
+    // bf16 weights with few rows (GDN gate projections) at prefill widths: a full chunk, a row
+    // view spanning two 128-row blocks with ragged tokens, and K off the 32-value step.
+    s.linear(WeightFormat::Bf16, 96, 5120, 0, 96, 1030)?;
+    s.linear(WeightFormat::Bf16, 300, 1024, 40, 200, 100)?;
+    s.linear(WeightFormat::Bf16, 90, 70, 0, 90, 40)?;
+    // Several projections of one input (Backend::linears): runs into column ranges, a whole
+    // destination, mixed formats, at decode, verify and prefill widths under A8 and A16.
+    {
+        use WeightFormat::{Bf16, Iq3Xxs, Q4G64, Q5G64};
+        let gdn: &[&[(WeightFormat, usize, usize, usize)]] = &[
+            &[(Q4G64, 256, 0, 128), (Q5G64, 192, 64, 96)],
+            &[(Q5G64, 160, 32, 128)],
+            &[(Bf16, 48, 0, 48), (Bf16, 40, 8, 24)],
+        ];
+        for m in [1, 8, 70, 130] {
+            s.linears(gdn, 512, m, ActPolicy::AllowA8)?;
+        }
+        s.linears(gdn, 512, 70, ActPolicy::A16Only)?;
+        let attn: &[&[(WeightFormat, usize, usize, usize)]] = &[
+            &[(Iq3Xxs, 128, 0, 128)],
+            &[(Q5G64, 128, 0, 128)],
+            &[(Q4G64, 64, 0, 64)],
+        ];
+        s.linears(attn, 768, 100, ActPolicy::AllowA8)?;
+    }
+    // Prefill widths on a grid of a few tiles with a long K (kernel sets may split K there).
+    s.linear_act(WeightFormat::Fp8RowBf16, 256, 4096, 0, 256, 100, a8)?;
+    s.linear_act(WeightFormat::Nvfp4, 256, 4096, 0, 256, 100, a4)?;
+    // bf16 twins of GEMM inputs at decode and verify widths (backends that write them).
+    {
+        use WeightFormat::{Iq3Xxs, Nvfp4, Q4G64, Q5G64};
+        let views = [(Q4G64, 96), (Q5G64, 80), (Nvfp4, 128), (Iq3Xxs, 48)];
+        for m in [2, 8, 13] {
+            s.twins(m, 1024, &views, Some((Iq3Xxs, 256)))?;
+        }
+        // The dense MLP's own K: gate/up at 5120, down at 17408.
+        s.twins(8, 5120, &[(Iq3Xxs, 32)], Some((Iq3Xxs, 256)))?;
+        s.twins(8, 17408, &[(Iq3Xxs, 32)], None)?;
+        // A prefill width: the NVFP4 output projections read the z / attn twins there too.
+        s.twins(300, 1024, &[(Nvfp4, 128)], None)?;
+        // int8 twins of a norm's output at prefill widths: the IQ3_XXS layout and the q4/q5 one.
+        s.twins_q8(100, 1024, &[(Iq3Xxs, 48)], Some((Iq3Xxs, 256)))?;
+        s.twins_q8(100, 1024, &[(Q4G64, 96), (Q5G64, 80)], None)?;
+        s.twins_q8(1030, 512, &[(Q5G64, 64), (Iq3Xxs, 32)], None)?;
+    }
+    // GGML blocks (GGUF imports): decode, a verify window over an odd row view, the tiled path,
+    // embedding rows and a fused SwiGLU over separate parents, for every type.
+    for t in velox_core::ggml::GgmlType::ALL {
+        let f = WeightFormat::Ggml(t);
+        s.linear(f, 96, 512, 0, 96, 1)?;
+        s.linear(f, 130, 768, 3, 100, 8)?;
+        s.linear(f, 72, 512, 0, 72, 16)?;
+        s.linear(f, 200, 256, 17, 150, 33)?;
+        s.embed(f, 12, 512, &[11, 0, 5])?;
+        s.linear_swiglu(f, 512, 24, 0, 2, false, true)?;
+    }
+    // Dense GGML under AllowA8 with K a multiple of 1024, where hardware variants run their wide
+    // kernels (int8 activations: dp4a up to 16 tokens, tensor cores above): odd row views at
+    // decode, verify and prefill widths (600: long-prompt token tiles of up to 128 and a ragged
+    // last one), and fused SwiGLUs. The 1- and 2-bit types only: at this
+    // K the portable kernels already miss the 2e-4 tolerance (2.0e-4 .. 5.6e-4) from 16 tokens on
+    // for Q4_K, Q6_K, IQ3_XXS, IQ3_S and IQ4_XS, which is a separate question.
+    {
+        use velox_core::ggml::GgmlType::{Iq1M, Iq1S, Iq2S, Iq2Xs, Iq2Xxs, Q2K};
+        for t in [Q2K, Iq1M, Iq1S, Iq2Xxs, Iq2Xs, Iq2S] {
+            let f = WeightFormat::Ggml(t);
+            let a8 = ActPolicy::AllowA8;
+            for m in [1, 3, 8, 16, 17, 70, 200, 600] {
+                s.linear_act(f, 140, 2048, 5, 100, m, a8)?;
+            }
+            s.linear_swiglu_with(f, 2048, 40, 0, 8, false, false, a8)?;
+            s.linear_swiglu_with(f, 2048, 40, 0, 70, false, true, a8)?;
+        }
+    }
+    // Blocks of 64 / 32 values: K a multiple of the block but not of 256, odd row views, decode,
+    // verify and tiled widths.
+    {
+        use velox_core::ggml::GgmlType::{Iq4Nl, Q2_0, Q8_0};
+        for (t, k) in [
+            (Q2_0, 640),
+            (Q2_0, 64),
+            (Iq4Nl, 160),
+            (Iq4Nl, 32),
+            (Q8_0, 96),
+        ] {
+            let f = WeightFormat::Ggml(t);
+            s.linear(f, 37, k, 5, 29, 1)?;
+            s.linear(f, 41, k, 3, 33, 8)?;
+            s.linear(f, 45, k, 7, 31, 20)?;
+            s.embed(f, 9, k, &[8, 0, 3])?;
+            s.linear_swiglu(f, k, 7, 0, 3, false, true)?;
+        }
+    }
+    // The dense MLP's own K (gate/up 5120, down 17408) at decode and verify widths.
+    s.linear(
+        WeightFormat::Ggml(velox_core::ggml::GgmlType::Iq3S),
+        64,
+        5120,
+        0,
+        64,
+        8,
+    )?;
+    s.linear(
+        WeightFormat::Ggml(velox_core::ggml::GgmlType::Iq4Xs),
+        64,
+        17408,
+        0,
+        64,
+        1,
+    )?;
+    // Gated DeltaNet outputs into llama.cpp's tiled value-head order (16 key heads x 3).
+    s.transpose_heads(1, 16, 3, 128)?;
+    s.transpose_heads(37, 16, 3, 128)?;
+    s.transpose_heads(5, 2, 3, 7)?;
+    // Qwen4-Exp (docs/qwen4_exp.md): hyper-connection streams (decode, prefill, odd widths),
+    // PLE's dilated convolution across two calls, MoE routing and experts, the QSA indexer.
+    s.rms_norm_groups(1, 4, 2560)?;
+    s.rms_norm_groups(37, 4, 2560)?;
+    s.rms_norm_groups(5, 3, 70)?;
+    s.hyper_connections(1, 4, 2560)?;
+    s.hyper_connections(33, 4, 512)?;
+    s.hyper_connections(3, 3, 70)?;
+    s.conv1d_dilated(10240, 4, 3, [1, 1])?;
+    s.conv1d_dilated(96, 4, 3, [17, 2])?;
+    s.conv1d_dilated(33, 3, 2, [1, 5])?;
+    s.moe_route(1, 513, 512, 10)?;
+    s.moe_route(70, 513, 512, 10)?;
+    s.moe_route(9, 40, 37, 32)?;
+    s.moe_route(3, 16, 16, 1)?;
+    {
+        use velox_core::ggml::GgmlType::{Iq2S, Iq2Xxs, Q4K};
+        use WeightFormat::{Bf16, Ggml, Nvfp4};
+        let a8 = ActPolicy::AllowA8;
+        // Decode, a verify window and a prefill chunk where experts take several 64-row tiles.
+        s.moe_experts(Ggml(Iq2S), Ggml(Q4K), 24, 512, 256, 1, 10, a8)?;
+        s.moe_experts(Ggml(Iq2Xxs), Ggml(Q4K), 24, 512, 256, 8, 6, a8)?;
+        s.moe_experts(Ggml(Iq2S), Ggml(Q4K), 12, 256, 512, 130, 4, a8)?;
+        // Odd widths (partial tiles everywhere) and bf16 records.
+        s.moe_experts(Bf16, Bf16, 7, 40, 70, 5, 3, ActPolicy::A16Only)?;
+        // Qwen3.8-Flash-Next IQ2_XS geometry: IQ2_S / IQ2_XXS / IQ1_M gate and up, Q2_0 down,
+        // at decode, verify and prefill widths.
+        use velox_core::ggml::GgmlType::{Iq1M, Q2_0};
+        s.moe_experts(Ggml(Iq2S), Ggml(Q2_0), 24, 640, 2560, 1, 10, a8)?;
+        s.moe_experts(Ggml(Iq2Xxs), Ggml(Q2_0), 24, 640, 2560, 8, 10, a8)?;
+        s.moe_experts(Ggml(Iq1M), Ggml(Q2_0), 24, 640, 2560, 3, 10, a8)?;
+        s.moe_experts(Ggml(Iq2S), Ggml(Q2_0), 24, 640, 2560, 40, 10, a8)?;
+        // Qwen3.6-35B-A3B: NVFP4 experts (width 512, hidden 2048, top-8) and its MTP head's
+        // bf16 experts, at decode, verify and prefill widths.
+        for rows in [1, 3, 40] {
+            s.moe_experts(Nvfp4, Nvfp4, 16, 512, 2048, rows, 8, ActPolicy::A16Only)?;
+        }
+        s.moe_experts(Bf16, Bf16, 16, 512, 2048, 2, 8, ActPolicy::A16Only)?;
+        // TEMP (local only): NVFP4 experts under AllowA8, as ExpertCache::bank hands them.
+        for rows in [1, 2, 3, 4, 16, 17, 40, 130] {
+            s.moe_experts(Nvfp4, Nvfp4, 16, 512, 2048, rows, 8, a8)?;
+        }
+        s.moe_experts(Nvfp4, Nvfp4, 300, 256, 512, 70, 10, a8)?;
+        // The MTP head's IQ4_NL experts at decode, verify and prefill widths.
+        use velox_core::ggml::GgmlType::Iq4Nl;
+        for rows in [1, 2, 4, 16, 40] {
+            s.moe_experts(Ggml(Iq4Nl), Ggml(Iq4Nl), 24, 640, 2560, rows, 10, a8)?;
+        }
+    }
+    for (block0, blocks, ratio, dim, rot) in
+        [(0, 1, 4, 128, 64), (5, 70, 4, 128, 64), (2, 9, 3, 40, 40)]
+    {
+        s.qsa_pool(block0, blocks, ratio, dim, rot)?;
+    }
+    for (tokens, pos0, budget) in [
+        // Dense (every block fits the budget), a decode past the budget, a prefill crossing it.
+        (5, 0, 64),
+        (1, 900, 256),
+        (40, 230, 128),
+        (3, 2100, 2048),
+    ] {
+        let sh = QsaSelectShape {
+            tokens,
+            heads: 4,
+            dim: 128,
+            pos0,
+            ratio: 4,
+            budget,
+        };
+        s.qsa_select(sh)?;
+    }
+    s.qsa_select(QsaSelectShape {
+        tokens: 7,
+        heads: 3,
+        dim: 40,
+        pos0: 61,
+        ratio: 3,
+        budget: 30,
+    })?;
+    for kv in [
+        KvFormat::F32,
+        KvFormat::Bf16,
+        KvFormat::Fp8,
+        KvFormat::Nvfp4,
+    ] {
+        for (tokens, pos0, sel_len) in [(1, 300, 67), (9, 40, 23)] {
+            let sh = AttnShape {
+                tokens,
+                heads: 24,
+                kv_heads: 2,
+                head_dim: 256,
+                pos0,
+                kv,
+            };
+            s.attention_sparse(sh, sel_len)?;
+        }
+    }
+    s.attention_sparse(
+        AttnShape {
+            tokens: 4,
+            heads: 6,
+            kv_heads: 3,
+            head_dim: 40,
+            pos0: 17,
+            kv: KvFormat::F32,
+        },
+        9,
+    )?;
+    // Qwen3.8-Flash-Next's bf16 projections at their real shapes (hyper-connection low rank,
+    // injection, router + shared gate, GDN gates, PLE) at decode, verify and prefill widths.
+    for (n, k) in [
+        (320, 10240),
+        (10240, 320),
+        (4, 10240),
+        (513, 2560),
+        (96, 2560),
+        (10240, 2560),
+    ] {
+        for m in [1, 8, 70] {
+            s.linear(WeightFormat::Bf16, n, k, 0, n, m)?;
+        }
+    }
+    // GGML projections with K = 2560 (not a multiple of 1024) at decode and prefill widths, A8.
+    {
+        use velox_core::ggml::GgmlType::{Iq3S, Iq4Xs, Q4K};
+        for t in [Iq4Xs, Q4K, Iq3S] {
+            // IQ4_XS's large weights take the portable f32 GEMM past 2e-4 at prefill widths.
+            let ms: &[usize] = if t == Iq4Xs {
+                &[1, 3, 8]
+            } else {
+                &[1, 3, 8, 70, 300, 600]
+            };
+            for &m in ms {
+                s.linear_act(
+                    WeightFormat::Ggml(t),
+                    96,
+                    2560,
+                    0,
+                    96,
+                    m,
+                    ActPolicy::AllowA8,
+                )?;
+            }
+        }
+    }
+    // SwiGLU with gate and up in different formats, as GGUF imports produce them (IQ3_XXS planar
+    // next to GGML blocks), at prefill widths.
+    {
+        use velox_core::ggml::GgmlType::{Iq2S, Q2K};
+        let (iq3, a8) = (WeightFormat::Iq3Xxs, ActPolicy::AllowA8);
+        let (iq2s, q2k) = (WeightFormat::Ggml(Iq2S), WeightFormat::Ggml(Q2K));
+        for m in [70, 600] {
+            s.linear_swiglu_pair(iq3, iq2s, 512, 40, 0, m, false, true, a8)?;
+            s.linear_swiglu_pair(q2k, iq3, 512, 40, 0, m, false, true, a8)?;
+        }
+    }
+    // GGML prefill at a width and row count where hardware variants pick their wide token tiles
+    // (enough 128-row tiles to fill a wave of blocks), with a ragged last token tile.
+    {
+        use velox_core::ggml::GgmlType::{Iq1M, Iq1S, Iq2S, Iq2Xs, Iq2Xxs, Iq3S, Q2K};
+        for t in [Q2K, Iq1M, Iq1S, Iq2Xxs, Iq2Xs, Iq2S, Iq3S] {
+            let f = WeightFormat::Ggml(t);
+            s.linear_act(f, 4616, 1024, 8, 4600, 250, ActPolicy::AllowA8)?;
+        }
+    }
+    // Its own seed: the synthetic model must not change when cases are added before it.
+    let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
+    s.results.extend(stack);
     Ok(s.results)
 }
 
@@ -1828,6 +3729,7 @@ mod tests {
             (WeightFormat::Fp8RowBf16, 96, 300),
             (WeightFormat::Nvfp4, 256, 128),
             (WeightFormat::Bf16, 3, 5),
+            (WeightFormat::Iq3Xxs, 5, 768),
         ] {
             assert_eq!(
                 random_weight(&mut rng, f, n, k).len(),

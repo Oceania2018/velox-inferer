@@ -2,11 +2,14 @@
 //!
 //! Endpoints: `GET /health`, `GET /v1/models`, `GET /metrics` (Prometheus text, including the
 //! `velox_max_concurrency` gauge llm-inference-daemon probes), `POST /v1/chat/completions`
-//! (JSON or SSE stream). Responses carry llama.cpp-style `timings` like ninfer's, so the replay
-//! gate and the daemon read both engines the same way.
+//! (JSON or SSE stream), and `POST /v1/systemone` (ninfer's System One decisions, see
+//! [`systemone`]) when the engine scores. Responses carry llama.cpp-style `timings` like
+//! ninfer's, so the replay gate and the daemon read both engines the same way.
 //!
 //! The API layer is engine-agnostic: it validates and frames requests and hands them to a
 //! [`ChatEngine`]. Model execution lives behind that trait.
+
+pub mod systemone;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -14,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// An OpenAI-style error: HTTP status, `type` and `code`.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,10 +67,40 @@ pub struct Outcome {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub completion_tokens: u64,
+    /// Engine-side wait from hand-off until the request's prefill began.
+    pub queue_ms: f64,
     /// Server-side prefill time of the uncached prompt tokens.
     pub prompt_ms: f64,
     /// Server-side time from the first to the last generated token.
     pub predicted_ms: f64,
+    /// When the first token was sampled. Engines that emit their output only once it is complete
+    /// must set it; without it the first emitted delta stands in.
+    pub first_token: Option<Instant>,
+}
+
+/// Result of a scoring request ([`ChatEngine::score`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreOutcome {
+    /// Log-probability of each candidate, in request order; with branches, branch-major
+    /// (`[branch][candidate]`).
+    pub logprobs: Vec<f32>,
+    pub prompt_tokens: u64,
+    /// Prompt tokens served from the prefix cache.
+    pub cached_tokens: u64,
+    /// Engine-side wait from hand-off until the request's prefill began.
+    pub queue_ms: f64,
+}
+
+/// One scoring prompt of [`ChatEngine::score`]: a chat request whose prompt ends inside its final
+/// assistant message (`request.messages`, rendered as a continuation; nothing is generated), the
+/// `candidates` texts (one token each) whose log-probabilities are read after it, and optional
+/// `branches` (a few tokens each), each appended to the prompt on its own with the candidates
+/// scored after every branch.
+#[derive(Clone, Copy, Debug)]
+pub struct ScoreQuery<'a> {
+    pub request: &'a Value,
+    pub candidates: &'a [String],
+    pub branches: &'a [String],
 }
 
 pub trait ChatEngine: Send + Sync {
@@ -79,6 +112,17 @@ pub trait ChatEngine: Send + Sync {
     /// Housekeeping after a response has been delivered, while no request may be waiting (e.g.
     /// preparing memory the next one would otherwise allocate). Returns promptly once one is.
     fn idle(&self) {}
+    /// Whether [`Self::score`] is implemented. Without it `POST /v1/systemone` answers 404,
+    /// which llm-inference-daemon's probe reads as "unsupported".
+    fn scores(&self) -> bool {
+        false
+    }
+    /// Scores each query (see [`ScoreQuery`]), in order; the first error fails the call. The
+    /// queries of one System One request share the start of their prompts (system, state,
+    /// images), which an engine can feed once.
+    fn score(&self, _queries: &[ScoreQuery<'_>]) -> Result<Vec<ScoreOutcome>, ApiError> {
+        Err(ApiError::not_implemented("this engine does not score"))
+    }
 }
 
 /// Engine for a model whose execution path velox does not implement yet. Loading, health,
@@ -124,6 +168,50 @@ impl Lanes {
     }
 }
 
+/// Histogram bucket bounds (seconds), ninfer's, so one query reads both engines.
+const BUCKETS: [f64; 20] = [
+    0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0,
+    160.0, 320.0, 640.0, 1280.0,
+];
+
+#[derive(Default)]
+struct Histogram {
+    /// Per-bucket counts (inclusive upper bounds), the last for `+Inf`.
+    bins: [u64; BUCKETS.len() + 1],
+    sum: f64,
+}
+
+impl Histogram {
+    fn observe(&mut self, seconds: f64) {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return;
+        }
+        self.bins[BUCKETS.partition_point(|&b| b < seconds)] += 1;
+        self.sum += seconds;
+    }
+
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} histogram");
+        let mut count = 0;
+        for (i, n) in self.bins.iter().enumerate() {
+            count += n;
+            let le = BUCKETS.get(i).map_or("+Inf".to_string(), f64::to_string);
+            let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {count}");
+        }
+        let _ = writeln!(out, "{name}_sum {}\n{name}_count {count}", self.sum);
+    }
+}
+
+/// Latency of settled generations (completed, or abandoned by the client); engine failures are
+/// counted in `velox_request_errors_total` only.
+#[derive(Default)]
+struct Latency {
+    ttft: Histogram,
+    queue: Histogram,
+    duration: Histogram,
+}
+
 struct LaneGuard<'a>(&'a Lanes);
 
 impl Drop for LaneGuard<'_> {
@@ -139,6 +227,9 @@ pub struct Server {
     lanes: Lanes,
     requests: AtomicU64,
     errors: AtomicU64,
+    prompt_tokens: AtomicU64,
+    cached_tokens: AtomicU64,
+    latency: Mutex<Latency>,
     started: u64,
 }
 
@@ -248,6 +339,9 @@ impl Server {
             lanes,
             requests: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            prompt_tokens: AtomicU64::new(0),
+            cached_tokens: AtomicU64::new(0),
+            latency: Mutex::default(),
             started: unix_now(),
         })
     }
@@ -292,8 +386,18 @@ impl Server {
                 self.engine.idle();
                 r
             }
+            ("POST", "/v1/systemone") if self.engine.scores() => {
+                let r = self.systemone(&mut w, &req.body);
+                let _ = w.flush();
+                let _ = w.shutdown(std::net::Shutdown::Write);
+                self.engine.idle();
+                r
+            }
             (_, "/health" | "/v1/models" | "/metrics" | "/v1/chat/completions") => {
                 respond_json(&mut w, 405, &ApiError::invalid("method not allowed").body())
+            }
+            (_, "/v1/systemone") if self.engine.scores() => {
+                respond_json(&mut w, 405, &json!({"error": "method not allowed"}))
             }
             _ => respond_json(
                 &mut w,
@@ -312,7 +416,7 @@ impl Server {
             .chain(self.cfg.info.iter().cloned())
             .map(|(k, v)| format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect();
-        format!(
+        let mut out = format!(
             "# HELP velox_max_concurrency Concurrent generation lanes fixed at startup\n\
              # TYPE velox_max_concurrency gauge\n\
              velox_max_concurrency {}\n\
@@ -320,13 +424,38 @@ impl Server {
              velox_requests_total {}\n\
              # TYPE velox_request_errors_total counter\n\
              velox_request_errors_total {}\n\
+             # HELP velox_prompt_tokens_total Prompt tokens of completed generations\n\
+             # TYPE velox_prompt_tokens_total counter\n\
+             velox_prompt_tokens_total {}\n\
+             # HELP velox_prompt_tokens_cached_total Prompt tokens served from the prefix cache\n\
+             # TYPE velox_prompt_tokens_cached_total counter\n\
+             velox_prompt_tokens_cached_total {}\n\
              # TYPE velox_info gauge\n\
              velox_info{{{}}} 1\n",
             self.cfg.max_concurrency.max(1),
             self.requests.load(Ordering::Relaxed),
             self.errors.load(Ordering::Relaxed),
+            self.prompt_tokens.load(Ordering::Relaxed),
+            self.cached_tokens.load(Ordering::Relaxed),
             labels.join(",")
-        )
+        );
+        let l = self.latency.lock().unwrap();
+        l.ttft.render(
+            &mut out,
+            "velox_time_to_first_token_seconds",
+            "Request receipt through the first sampled token, including preparation and queueing",
+        );
+        l.queue.render(
+            &mut out,
+            "velox_request_queue_seconds",
+            "Wait for a lane and for the engine to admit the request",
+        );
+        l.duration.render(
+            &mut out,
+            "velox_request_duration_seconds",
+            "Request receipt through generation settlement, including client cancellation",
+        );
+        out
     }
 
     fn validate(&self, body: &[u8]) -> Result<Value, ApiError> {
@@ -351,12 +480,107 @@ impl Server {
         Ok(req)
     }
 
+    /// Counts a rejected or failed generation and logs it: the reply goes only to the client.
+    /// Messages carry counts and limits, never prompt text.
+    fn count_error(&self, e: &ApiError, t_req: Instant) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[error] {} {} after {:.1} ms: {}",
+            e.status,
+            e.code,
+            t_req.elapsed().as_secs_f64() * 1e3,
+            e.message
+        );
+    }
+
+    /// `POST /v1/systemone`: the questions are scored one after another on one lane, as
+    /// independent engine requests (a shared state and system prompt hit the prefix cache after
+    /// the first). Any failure fails the request; errors are `{"error": "<message>"}` as the spec
+    /// has them.
+    fn systemone(&self, w: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+        let t_req = Instant::now();
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let fail = |w: &mut TcpStream, e: ApiError| {
+            self.count_error(&e, t_req);
+            respond_json(w, e.status, &json!({"error": e.message}))
+        };
+        let parsed = serde_json::from_slice::<Value>(body)
+            .map_err(|e| ApiError::invalid(format!("body is not JSON: {e}")))
+            .and_then(|v| systemone::parse(&v));
+        let req = match parsed {
+            Ok(r) => r,
+            Err(e) => return fail(w, e),
+        };
+        if req.model != self.cfg.model_id {
+            return fail(
+                w,
+                ApiError {
+                    status: 404,
+                    kind: "invalid_request_error",
+                    code: "model_not_found",
+                    message: format!("model '{}' not found", req.model),
+                },
+            );
+        }
+        let t_lane = Instant::now();
+        let _lane = self.lanes.acquire();
+        let t0 = Instant::now();
+        let mut answers = Map::new();
+        let (mut input, mut cached, mut output, mut queue_ms) = (0u64, 0u64, 0u64, 0.0);
+        let queries: Vec<ScoreQuery<'_>> = req
+            .questions
+            .iter()
+            .map(|q| ScoreQuery {
+                request: &q.request,
+                candidates: &q.candidates,
+                branches: &q.branches,
+            })
+            .collect();
+        let outcomes = match self.engine.score(&queries) {
+            Ok(o) => o,
+            Err(e) => return fail(w, e),
+        };
+        for (q, o) in req.questions.iter().zip(&outcomes) {
+            match systemone::answer(q, &o.logprobs) {
+                Ok(a) => answers.insert(q.name.clone(), a),
+                Err(e) => return fail(w, e),
+            };
+            input += o.prompt_tokens;
+            cached += o.cached_tokens.min(o.prompt_tokens);
+            output += systemone::output_tokens(q);
+            queue_ms += o.queue_ms;
+        }
+        self.prompt_tokens.fetch_add(input, Ordering::Relaxed);
+        self.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+        {
+            let mut l = self.latency.lock().unwrap();
+            l.queue
+                .observe((t0 - t_lane).as_secs_f64() + queue_ms / 1e3);
+            l.duration.observe(t_req.elapsed().as_secs_f64());
+        }
+        respond_json(
+            w,
+            200,
+            &json!({
+                "model": req.model,
+                "answers": answers,
+                // cached_input_tokens is the part of input_tokens served from the prefix cache.
+                "usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": cached,
+                    "output_tokens": output,
+                },
+            }),
+        )
+    }
+
     fn chat(&self, w: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+        let t_req = Instant::now();
         self.requests.fetch_add(1, Ordering::Relaxed);
         let req = match self.validate(body) {
             Ok(r) => r,
             Err(e) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.count_error(&e, t_req);
                 return respond_json(w, e.status, &e.body());
             }
         };
@@ -370,13 +594,16 @@ impl Server {
         let model = self.cfg.model_id.clone();
         let chunk = |delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
 
+        let t_lane = Instant::now();
         let _lane = self.lanes.acquire();
         let t0 = Instant::now();
         let mut content = String::new();
         let mut tool_calls = Vec::new();
         let mut headers_sent = false;
         let mut io_err = None;
+        let mut first_delta = None;
         let result = self.engine.generate(&req, &mut |d| {
+            first_delta.get_or_insert_with(Instant::now);
             if !stream {
                 match d {
                     Delta::Content(t) => content.push_str(&t),
@@ -402,13 +629,27 @@ impl Server {
                 io_err = Some(e);
             }
         });
+        // Counted before the stream-error check: a client that hung up still cost the prefill.
+        if let Ok(o) = &result {
+            self.prompt_tokens
+                .fetch_add(o.prompt_tokens, Ordering::Relaxed);
+            self.cached_tokens
+                .fetch_add(o.cached_tokens, Ordering::Relaxed);
+            let mut l = self.latency.lock().unwrap();
+            if let Some(t) = o.first_token.or(first_delta) {
+                l.ttft.observe(t.duration_since(t_req).as_secs_f64());
+            }
+            l.queue
+                .observe((t0 - t_lane).as_secs_f64() + o.queue_ms / 1e3);
+            l.duration.observe(t_req.elapsed().as_secs_f64());
+        }
         if let Some(e) = io_err {
             return Err(e);
         }
         let outcome = match result {
             Ok(o) => o,
             Err(e) => {
-                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.count_error(&e, t_req);
                 if headers_sent {
                     sse(w, &e.body())?;
                     return w.write_all(b"0\r\n\r\n");

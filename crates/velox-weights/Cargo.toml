@@ -7,3 +7,6 @@ license.workspace = true
 
 [dependencies]
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

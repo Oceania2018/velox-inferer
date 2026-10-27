@@ -18,8 +18,10 @@ impl ChatEngine for Scripted {
             prompt_tokens: 100,
             cached_tokens: 60,
             completion_tokens: 11,
+            queue_ms: 300.0,
             prompt_ms: 20.0,
             predicted_ms: 50.0,
+            first_token: None,
         })
     }
 }
@@ -69,8 +71,136 @@ fn models_health_metrics() {
         "{metrics}"
     );
     assert!(metrics.contains("variant=\"generic\""));
-    // The daemon's System One probe must read "unsupported".
+    assert!(metrics.lines().any(|l| l == "velox_prompt_tokens_total 0"));
+    let chat = r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#;
+    for _ in 0..2 {
+        assert_eq!(http(port, "POST", "/v1/chat/completions", chat).0, 200);
+    }
+    let (_, metrics) = http(port, "GET", "/metrics", "");
+    assert!(
+        metrics
+            .lines()
+            .any(|l| l == "velox_prompt_tokens_total 200"),
+        "{metrics}"
+    );
+    assert!(
+        metrics
+            .lines()
+            .any(|l| l == "velox_prompt_tokens_cached_total 120"),
+        "{metrics}"
+    );
+    // The engine's 300 ms queue wait lands between the 0.25 and 0.5 bounds.
+    for line in [
+        "velox_request_queue_seconds_bucket{le=\"0.25\"} 0",
+        "velox_request_queue_seconds_bucket{le=\"0.5\"} 2",
+        "velox_request_queue_seconds_count 2",
+        "velox_time_to_first_token_seconds_bucket{le=\"+Inf\"} 2",
+        "velox_request_duration_seconds_count 2",
+    ] {
+        assert!(metrics.lines().any(|l| l == line), "{line}\n{metrics}");
+    }
+    // Without scoring, the daemon's System One probe must read "unsupported".
     assert_eq!(http(port, "POST", "/v1/systemone", "{}").0, 404);
+}
+
+/// Scores the first candidate at -0.1 and the others at -3, after the prompt or after each
+/// branch.
+struct Scoring;
+
+impl ChatEngine for Scoring {
+    fn architecture(&self) -> &str {
+        "Scoring"
+    }
+
+    fn generate(&self, _: &Value, _: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
+        Err(ApiError::not_implemented("scoring only"))
+    }
+
+    fn scores(&self) -> bool {
+        true
+    }
+
+    fn score(&self, queries: &[ScoreQuery<'_>]) -> Result<Vec<ScoreOutcome>, ApiError> {
+        Ok(queries
+            .iter()
+            .map(|q| {
+                let row = (0..q.candidates.len()).map(|i| if i == 0 { -0.1 } else { -3.0 });
+                ScoreOutcome {
+                    logprobs: (0..q.branches.len().max(1))
+                        .flat_map(|_| row.clone())
+                        .collect(),
+                    prompt_tokens: 50,
+                    cached_tokens: 40,
+                    queue_ms: 0.0,
+                }
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn systemone_answers_every_question() {
+    let port = start(Box::new(Scoring));
+    // The daemon's probe: an empty body is a 400 from a server that has the endpoint.
+    let (s, body) = http(port, "POST", "/v1/systemone", "{}");
+    assert_eq!(s, 400);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"],
+        "missing required field: model"
+    );
+    let req = json!({
+        "model": "m",
+        "state": "s",
+        "questions": {
+            "pick": {"type": "choice", "instructions": "?", "criteria": {"a": null, "b": null}},
+            "similar": {"type": "rank", "instructions": "?", "criteria": {"x": "1", "y": "2"}},
+        },
+    });
+    let (s, body) = http(port, "POST", "/v1/systemone", &req.to_string());
+    assert_eq!(s, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["model"], "m");
+    assert_eq!(v["answers"]["pick"]["choice"], "a");
+    assert_eq!(v["answers"]["similar"]["type"], "rank");
+    assert_eq!(
+        v["usage"],
+        json!({"input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 3})
+    );
+    let mut wrong = req.clone();
+    wrong["model"] = "other".into();
+    assert_eq!(
+        http(port, "POST", "/v1/systemone", &wrong.to_string()).0,
+        404
+    );
+    assert_eq!(http(port, "GET", "/v1/systemone", "").0, 405);
+    let (_, metrics) = http(port, "GET", "/metrics", "");
+    assert!(
+        metrics
+            .lines()
+            .any(|l| l == "velox_prompt_tokens_total 100"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn histogram_buckets_are_inclusive() {
+    let mut h = Histogram::default();
+    for s in [0.25, 0.2501, 2000.0, f64::NAN, -1.0] {
+        h.observe(s);
+    }
+    let mut out = String::new();
+    h.render(&mut out, "x", "help");
+    for line in [
+        "x_bucket{le=\"0.1\"} 0",
+        "x_bucket{le=\"0.25\"} 1",
+        "x_bucket{le=\"0.5\"} 2",
+        "x_bucket{le=\"1\"} 2",
+        "x_bucket{le=\"1280\"} 2",
+        "x_bucket{le=\"+Inf\"} 3",
+        "x_count 3",
+    ] {
+        assert!(out.lines().any(|l| l == line), "{line}\n{out}");
+    }
 }
 
 #[test]

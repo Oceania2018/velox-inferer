@@ -6,6 +6,7 @@ mod bench_verify;
 mod generate;
 mod profile;
 mod prompt_debug;
+mod qwen4;
 mod replay;
 mod select;
 mod serve;
@@ -43,37 +44,69 @@ COMMANDS:
       --prefill <n>         prefill chunk to time (default 128)
       --iters <n>           timed iterations (default 20)
   bench-linear            Time one linear at a model shape with random stored weights
-      --format <name>       nvfp4 | fp8 | bf16 | q4 | q8 ... (default nvfp4)
+      --format <name>       nvfp4 | fp8 | bf16 | q4 | q8 | iq3 | ggml_<type> ... (default nvfp4)
       --n <rows> --k <cols> default 17408 x 5120 (Qwen3.8 MLP gate)
       --m <list>            token counts, comma separated (default 1,4,16,128,512)
       --act <a16|a8|a4>     activation policy (default a16); --divisor <f> for a4 (default 500)
       --iters <n>           timed iterations (default 20)
+  bench-moe               Time moe_experts over a bank of random experts in system RAM, a share
+                          of each row's experts in device slots (Qwen3.8-Flash-Next geometry)
+      --gate <ggml_type> (ggml_iq2_s) --down <ggml_type> (ggml_q2_0) --experts 512 --width 640
+      --hidden 2560 --k 10 --rows <list> (1,4,16,128) --resident <list> (0,0.5,1) --iters 64
   bench-gdn               Time one gated_delta_net at a model head geometry with random inputs
       --k-heads <n> --v-heads <n> --k-dim <n> --v-dim <n>  default 16/48 heads, 128/128 (Qwen3.8)
       --tokens <list>       token counts, comma separated (default 1,8,64,512)
       --iters <n>           timed iterations (default 50)
   bench-attn              Time causal attention over a KV cache in each storage format
-  bench-verify            Time batched speculative verify rounds against one sequence at a time
       --heads <n> --kv-heads <n> --head-dim <n>  default 24/4, 256 (Qwen3.8)
       --pos0 <n> (16384) --tokens <list> (1,8,16) --kv-format <list> (f32,bf16,fp8,nvfp4) --iters <n> (50)
+      --window <n>          time attention_windows (System One scoring windows, f32 K/V) instead
+  bench-verify            Time batched speculative verify rounds against one sequence at a time
+      --artifact <path> --batch <n> (3) --window <n> (12) --context <n> (13000) --rounds <n> (40)
+      [--keep <n>] [--kv-format nvfp4] [--prefill <n>] (mixed rounds) [--only batched]
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
+  import-gguf             Qwen3.5/3.8 GGUF text weights + a donor artifact's config, tokenizer,
+                          vision tower and DFlash2 drafter -> .vi (GGML blocks kept as stored)
+      --gguf <path> --donor <.ninfer|.vi> --output <.vi>
+  import-hf               Qwen3.5/3.6 Hugging Face checkpoint (safetensors; BF16, compressed-tensors
+                          FP8 / NVFP4) text stack, MTP head, tokenizer and chat template -> .vi
+      --hf-dir <dir> --output <.vi>
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
       [--max-tokens 64] [--chunk 256] [--capacity 4096] [--mtp N | --dflash N] (speculative)
       [--kv-format f32|bf16|fp8|nvfp4] (attention KV cache storage, default f32)
-  serve                   OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
+      [--host-weights <list>|none] (matrices kept in system RAM, default text/token_embedding)
+      --gguf <first shard> --hf-dir <dir> (prompt | --prompts-file) instead of --artifact:
+                            Qwen4-Exp (Qwen3.8-Flash-Next) GGUFs; routed experts stay in system
+                            RAM with a device cache; tokenizer and chat template from <dir>
+      [--vram-margin-mib 768] (device memory left free after the expert slots)
+      [--expert-slots <n>] [--cache-interval 8] [--cache-moves 512] [--cache-decay 0.7]
+                            (decode cache updates: tokens between, experts moved, score kept)
+      [--expert-stats <file>] (JSON selections per layer and expert, after the run)
+      [--expert-trace <file>] (JSON selections per cache update, for replaying cache policies)
+      [--mtp <sidecar GGUF>] [--mtp-drafts 2] (MTP speculative greedy, drafts per verify)
+      [--show-top N] (logprobs of the N best first tokens) [--assistant-prefix <text>]
+      [--ple-threads 32] (parallel reads of the PLE n-gram table)
+      [--state-quant bf16,nvfp4 [--split-tail 256]] (resume from a recurrent state stored in
+      each format vs exact: storage error, greedy divergence, logit deltas)
+  serve                  OpenAI-compatible API (/v1/chat/completions, /v1/models, /metrics, /health)
+                         and ninfer's System One decisions (/v1/systemone)
       --artifact <path>     .vi or .ninfer weights
       --port <n>            default 8010   --host <addr> default 0.0.0.0
       --model-id <id>       default: artifact metadata name
       --chat-template <file> --max-context <n> (32768) --prefill-chunk <n> (512)
       --ctx-checkpoints <n> (8) --enable-thinking true|false (false)
+      --force-tool-call on|off (off)  requests offering tools answer with a tool call only
+      --stream-content on|off (on)    streaming requests get their text as it is generated
       --kv-format <fmt>     attention KV cache storage: f32 | bf16 | fp8 | nvfp4 (f32)
+      --host-state-dtype <fmt>  context-store recurrent states: f32 | bf16 | nvfp4 (bf16)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
       --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
-  replay                  Replay a recorded agent session against an OpenAI-compatible server
+      --score-branch-rows <n>  System One rank candidates per forward pass (100; 0 rejects rank)
+  replay                 Replay a recorded agent session against an OpenAI-compatible server
       --session <dir>       directory with session.json and screenshots/
       --endpoint <url>      e.g. http://127.0.0.1:8010 (default)
       --out <file>          JSON report (default target/replay/<label>.json)
@@ -115,10 +148,13 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench") => bench_cmd(a),
         Some("bench-linear") => bench_linear(a),
         Some("bench-gdn") => bench_gdn(a),
+        Some("bench-moe") => bench_moe(a),
         Some("bench-attn") => bench_attn(a),
         Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
+        Some("import-gguf") => weights::import_gguf(a),
+        Some("import-hf") => weights::import_hf(a),
         Some("generate") => generate::run(a),
         Some("serve") => serve::run(a),
         Some("prompt-debug") => prompt_debug::run(a),
@@ -317,7 +353,11 @@ fn bench_linear(a: &Args) -> Result<ExitCode> {
         "q5" => WeightFormat::Q5G64,
         "q6" => WeightFormat::Q6G64,
         "q8" => WeightFormat::Q8G32,
-        other => return Err(Error::Config(format!("unknown --format {other}"))),
+        "iq3" => WeightFormat::Iq3Xxs,
+        other => match velox_core::ggml::GgmlType::from_name(other) {
+            Some(t) => WeightFormat::Ggml(t),
+            None => return Err(Error::Config(format!("unknown --format {other}"))),
+        },
     };
     let act = match a.get("act").unwrap_or("a16") {
         "a16" => ActPolicy::A16Only,
@@ -347,6 +387,49 @@ fn bench_linear(a: &Args) -> Result<ExitCode> {
         Selected::Cpu(b) => bench::run_linear(b, &cfg)?,
         #[cfg(feature = "cuda")]
         Selected::Cuda(b) => bench::run_linear(b, &cfg)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn bench_moe(a: &Args) -> Result<ExitCode> {
+    use velox_core::{Error, WeightFormat};
+    let fmt = |key: &str, default: &str| -> Result<WeightFormat> {
+        let name = a.get(key).unwrap_or(default);
+        if name == "nvfp4" {
+            return Ok(WeightFormat::Nvfp4);
+        }
+        velox_core::ggml::GgmlType::from_name(name)
+            .map(WeightFormat::Ggml)
+            .ok_or_else(|| Error::Config(format!("unknown --{key} {name} (ggml_<type>)")))
+    };
+    let list = |key: &str, default: &str| -> Result<Vec<f64>> {
+        a.get(key)
+            .unwrap_or(default)
+            .split(',')
+            .map(|s| s.trim().parse::<f64>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::Config(format!("--{key} takes comma-separated numbers")))
+    };
+    let cfg = bench::MoeConfig {
+        gate: fmt("gate", "ggml_iq2_s")?,
+        down: fmt("down", "ggml_q2_0")?,
+        experts: a.parse("experts", 512)?,
+        width: a.parse("width", 640)?,
+        hidden: a.parse("hidden", 2560)?,
+        k: a.parse("k", 10)?,
+        rows: list("rows", "1,4,16,128")?
+            .into_iter()
+            .map(|v| v as usize)
+            .collect(),
+        resident: list("resident", "0,0.5,1")?,
+        iters: a.parse("iters", 64)?,
+        pool: a.parse("pool", 0)?,
+    };
+    let sel = select::backend(a)?;
+    match &sel {
+        Selected::Cpu(b) => bench::run_moe(b, &cfg)?,
+        #[cfg(feature = "cuda")]
+        Selected::Cuda(b) => bench::run_moe(b, &cfg)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -401,6 +484,7 @@ fn bench_attn(a: &Args) -> Result<ExitCode> {
         tokens,
         formats,
         iters: a.parse("iters", 50)?,
+        window: a.parse("window", 0)?,
     };
     let sel = select::backend(a)?;
     match &sel {

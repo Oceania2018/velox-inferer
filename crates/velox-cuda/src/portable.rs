@@ -2,12 +2,14 @@
 //! tuned kernels do not cover. Each wrapper re-validates, so it is safe to call directly.
 
 use velox_core::backend::{
-    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DynConvShape, FullAttnShape, GdnReplayLayer,
-    GdnShape, GeluKind, KvStoreShape, NormKind, RopeLayout, RopePosShape, RopeShape, WeightView,
+    AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank,
+    ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape,
+    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
+    RowGateShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
 use velox_core::kv::{hadamard_norm, KvFormat};
-use velox_core::{Result, WeightFormat, GRAPH_KV_BUCKET};
+use velox_core::{Error, Result, StateFormat, WeightFormat, GRAPH_KV_BUCKET};
 
 use crate::{dtod, graph_mode, stage, status, CudaBuffer, GraphMode};
 
@@ -96,6 +98,33 @@ extern "C" {
         out: *mut f32,
     ) -> i32;
     fn velox_portable_sigmoid_mul(x: *mut f32, gate: *const f32, len: i64) -> i32;
+    fn velox_portable_sigmoid_mul_twin(
+        x: *mut f32,
+        gate: *const f32,
+        xb: *mut u16,
+        len: i64,
+    ) -> i32;
+    fn velox_portable_add_rms_norm_twin(
+        acc: *mut f32,
+        x: *const f32,
+        weight: *const f32,
+        y: *mut f32,
+        yb: *mut u16,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
+    fn velox_portable_rms_norm_gated_twin(
+        x: *const f32,
+        weight: *const f32,
+        gate: *mut f32,
+        gb: *mut u16,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        offset: i32,
+    ) -> i32;
     fn velox_portable_conv1d_silu(
         x: *const f32,
         w: *const f32,
@@ -122,6 +151,45 @@ extern "C" {
         v_dim: i32,
         pp: *const i64,
     ) -> i32;
+    fn velox_portable_conv1d_silu_windows(
+        x: *const f32,
+        w: *const f32,
+        state_in: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        windows: i32,
+        channels: i32,
+        width: i32,
+        pp: *const i64,
+    ) -> i32;
+    fn velox_portable_gated_delta_net_windows(
+        qkv: *const f32,
+        ab: *const f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state_in: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        windows: i32,
+        k_heads: i32,
+        v_heads: i32,
+        k_dim: i32,
+        v_dim: i32,
+        pp: *const i64,
+    ) -> i32;
+    fn velox_portable_attention_windows(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        window: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
+    ) -> i32;
 }
 
 /// Format codes shared with the kernels (`VELOX_FMT_*` in portable_model.cu).
@@ -135,6 +203,14 @@ pub fn format_code(f: WeightFormat) -> i32 {
         WeightFormat::Q5G64 => 5,
         WeightFormat::Q6G64 => 6,
         WeightFormat::Q8G32 => 7,
+        WeightFormat::Iq3Xxs => 8,
+        // VELOX_FMT_GGML_BASE + the type's position in GgmlType::ALL.
+        WeightFormat::Ggml(t) => {
+            16 + velox_core::ggml::GgmlType::ALL
+                .iter()
+                .position(|&u| u == t)
+                .expect("listed type") as i32
+        }
     }
 }
 
@@ -207,6 +283,99 @@ pub fn embed(ids: &[u32], table: &WeightView<'_, CudaBuffer>, out: &mut CudaBuff
         },
         "portable embed",
     )
+}
+
+/// [`embed`] reading `count` ids at `ids[offset..]` on the device (no staging: the address is
+/// part of a recording).
+pub fn embed_from(
+    ids: &CudaBuffer,
+    offset: usize,
+    count: usize,
+    table: &WeightView<'_, CudaBuffer>,
+    out: &mut CudaBuffer,
+) -> Result<()> {
+    check::embed_from(ids.len(), offset, count, table, table.buf.len(), out.len())?;
+    if count == 0 {
+        return Ok(());
+    }
+    // SAFETY: ids holds offset + count slots and out holds count rows (checked); the kernels
+    // write zeros for an id past the table.
+    status(
+        unsafe {
+            velox_portable_embed(
+                ids.as_ptr().add(offset).cast(),
+                to_i32("ids", count)?,
+                table.buf.as_ptr().cast(),
+                format_code(table.format),
+                table.parent_rows as i64,
+                table.k as i64,
+                table.row_begin as i64,
+                out.as_mut_ptr(),
+            )
+        },
+        "portable embed_from",
+    )
+}
+
+/// See [`velox_core::backend::Backend::argmax_to`].
+pub fn argmax_to(
+    x: &CudaBuffer,
+    limit: usize,
+    dst: &mut CudaBuffer,
+    dst_offset: usize,
+) -> Result<()> {
+    if limit == 0 || limit > x.len() {
+        return Err(velox_core::Error::Shape(format!(
+            "argmax_to: limit {limit} outside the {} values",
+            x.len()
+        )));
+    }
+    if dst_offset >= dst.len() {
+        return Err(velox_core::Error::Shape(format!(
+            "argmax_to: slot {dst_offset} past the {} slots",
+            dst.len()
+        )));
+    }
+    // SAFETY: extents checked above.
+    status(
+        unsafe {
+            velox_portable_argmax_to(
+                x.as_ptr(),
+                x.len() as i64,
+                to_i32("limit", limit)?,
+                dst.as_mut_ptr().add(dst_offset).cast(),
+            )
+        },
+        "portable argmax_to",
+    )
+}
+
+/// See [`velox_core::backend::Backend::fetch_u32_begin`].
+pub fn fetch_u32_begin(src: &CudaBuffer, offset: usize, slot: usize) -> Result<()> {
+    if offset >= src.len() {
+        return Err(velox_core::Error::Shape(format!(
+            "fetch_u32: slot {offset} past the {} slots",
+            src.len()
+        )));
+    }
+    // SAFETY: offset is in bounds (checked); the shim copies 4 bytes into its pinned ring.
+    status(
+        unsafe {
+            velox_portable_fetch_u32_begin(src.as_ptr().add(offset).cast(), to_i32("slot", slot)?)
+        },
+        "portable fetch_u32",
+    )
+}
+
+/// See [`velox_core::backend::Backend::fetch_u32`].
+pub fn fetch_u32(slot: usize) -> Result<u32> {
+    let mut v = 0u32;
+    // SAFETY: out-pointer to a live local.
+    status(
+        unsafe { velox_portable_fetch_u32_wait(to_i32("slot", slot)?, &mut v) },
+        "portable fetch_u32",
+    )?;
+    Ok(v)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -338,6 +507,103 @@ pub fn sigmoid_mul(x: &mut CudaBuffer, gate: &CudaBuffer, len: usize) -> Result<
     )
 }
 
+/// A bf16 twin of `n` values packs two per f32 slot.
+fn check_twin(what: &str, twin: &CudaBuffer, n: usize) -> Result<()> {
+    check::elementwise(what, &[twin.len() * 2], n)
+}
+
+/// [`add_rms_norm`] that also writes `y` rounded to bf16 into `yb` (see `Backend::add_rms_norm_twin`).
+#[allow(clippy::too_many_arguments)]
+pub fn add_rms_norm_twin(
+    acc: &mut CudaBuffer,
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    y: &mut CudaBuffer,
+    yb: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    kind: NormKind,
+) -> Result<()> {
+    check::rms_norm(acc.len(), weight.len(), y.len(), rows, dim)?;
+    check::elementwise("add_rms_norm", &[x.len()], rows * dim)?;
+    check_twin("add_rms_norm twin", yb, rows * dim)?;
+    let (rows, dim) = (to_i32("rows", rows)?, to_i32("dim", dim)?);
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_add_rms_norm_twin(
+                acc.as_mut_ptr(),
+                x.as_ptr(),
+                weight.as_ptr(),
+                y.as_mut_ptr(),
+                yb.as_mut_ptr().cast(),
+                rows,
+                dim,
+                eps,
+                i32::from(kind == NormKind::Offset),
+            )
+        },
+        "portable add_rms_norm twin",
+    )
+}
+
+/// [`rms_norm_gated`] that also writes the result rounded to bf16 into `gb`.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gated_twin(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    gate: &mut CudaBuffer,
+    gb: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    kind: NormKind,
+) -> Result<()> {
+    check::rms_norm(x.len(), weight.len(), gate.len(), rows, dim)?;
+    check_twin("rms_norm_gated twin", gb, rows * dim)?;
+    let (rows, dim) = (to_i32("rows", rows)?, to_i32("dim", dim)?);
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_rms_norm_gated_twin(
+                x.as_ptr(),
+                weight.as_ptr(),
+                gate.as_mut_ptr(),
+                gb.as_mut_ptr().cast(),
+                rows,
+                dim,
+                eps,
+                i32::from(kind == NormKind::Offset),
+            )
+        },
+        "portable rms_norm_gated twin",
+    )
+}
+
+/// [`sigmoid_mul`] that also writes the result rounded to bf16 into `xb`.
+pub fn sigmoid_mul_twin(
+    x: &mut CudaBuffer,
+    gate: &CudaBuffer,
+    xb: &mut CudaBuffer,
+    len: usize,
+) -> Result<()> {
+    check::elementwise("sigmoid_mul", &[x.len(), gate.len()], len)?;
+    check_twin("sigmoid_mul twin", xb, len)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_sigmoid_mul_twin(
+                x.as_mut_ptr(),
+                gate.as_ptr(),
+                xb.as_mut_ptr().cast(),
+                len as i64,
+            )
+        },
+        "portable sigmoid_mul twin",
+    )
+}
+
 pub fn add(acc: &mut CudaBuffer, x: &CudaBuffer, len: usize) -> Result<()> {
     check::elementwise("add", &[acc.len(), x.len()], len)?;
     // SAFETY: buffer extents validated above.
@@ -460,6 +726,8 @@ extern "C" {
         params: *const i64,
         kv_grid: i32,
     ) -> i32;
+    fn velox_portable_state_pack(src: *const f32, dst: *mut u8, n: i64, format: i32) -> i32;
+    fn velox_portable_state_unpack(src: *const u8, dst: *mut f32, n: i64, format: i32) -> i32;
     fn velox_portable_kv_load(
         k_cache: *const u8,
         v_cache: *const u8,
@@ -627,6 +895,170 @@ pub fn gated_delta_net(
             )
         },
         "portable gated_delta_net",
+    )
+}
+
+/// [`gated_delta_net`] from `state_in` writing only `out` (no state): the per-row kernel with a null
+/// state target, also through graph staging.
+pub fn gated_delta_net_out(
+    qkv: &CudaBuffer,
+    ab: &CudaBuffer,
+    a_log: &CudaBuffer,
+    dt_bias: &CudaBuffer,
+    state_in: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: GdnShape,
+) -> Result<()> {
+    check::gdn(
+        qkv.len(),
+        ab.len(),
+        a_log.len(),
+        dt_bias.len(),
+        state_in.len(),
+        out.len(),
+        &s,
+    )?;
+    let Some(pp) = graph_params(&[state_in.as_ptr() as i64, 0])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above; a null state is never written.
+    status(
+        unsafe {
+            velox_portable_gated_delta_net(
+                qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                ab.as_ptr().add(s.row0 * 2 * s.v_heads),
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                state_in.as_ptr(),
+                std::ptr::null_mut(),
+                out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
+                to_i32("tokens", s.tokens)?,
+                to_i32("k_heads", s.k_heads)?,
+                to_i32("v_heads", s.v_heads)?,
+                to_i32("k_dim", s.k_dim)?,
+                to_i32("v_dim", s.v_dim)?,
+                pp,
+            )
+        },
+        "portable gated_delta_net_out",
+    )
+}
+
+/// [`velox_core::Backend::conv1d_silu_windows`].
+pub fn conv1d_silu_windows(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    state_in: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: ConvShape,
+    windows: usize,
+) -> Result<()> {
+    check::conv1d_windows(
+        x.len(),
+        weight.len(),
+        state_in.len(),
+        out.len(),
+        &s,
+        windows,
+    )?;
+    let Some(pp) = graph_params(&[state_in.as_ptr() as i64, 0])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above; no state is written.
+    status(
+        unsafe {
+            velox_portable_conv1d_silu_windows(
+                x.as_ptr().add(s.row0 * s.channels),
+                weight.as_ptr(),
+                state_in.as_ptr(),
+                out.as_mut_ptr().add(s.row0 * s.channels),
+                to_i32("tokens", s.tokens)?,
+                to_i32("windows", windows)?,
+                to_i32("channels", s.channels)?,
+                to_i32("width", s.width)?,
+                pp,
+            )
+        },
+        "portable conv1d_silu_windows",
+    )
+}
+
+/// [`velox_core::Backend::gated_delta_net_windows`].
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_net_windows(
+    qkv: &CudaBuffer,
+    ab: &CudaBuffer,
+    a_log: &CudaBuffer,
+    dt_bias: &CudaBuffer,
+    state_in: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: GdnShape,
+    windows: usize,
+) -> Result<()> {
+    check::gdn_windows(
+        qkv.len(),
+        ab.len(),
+        a_log.len(),
+        dt_bias.len(),
+        state_in.len(),
+        out.len(),
+        &s,
+        windows,
+    )?;
+    let Some(pp) = graph_params(&[state_in.as_ptr() as i64, 0])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above; no state is written.
+    status(
+        unsafe {
+            velox_portable_gated_delta_net_windows(
+                qkv.as_ptr().add(s.row0 * s.qkv_width()),
+                ab.as_ptr().add(s.row0 * 2 * s.v_heads),
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                state_in.as_ptr(),
+                out.as_mut_ptr().add(s.row0 * s.v_heads * s.v_dim),
+                to_i32("tokens", s.tokens)?,
+                to_i32("windows", windows)?,
+                to_i32("k_heads", s.k_heads)?,
+                to_i32("v_heads", s.v_heads)?,
+                to_i32("k_dim", s.k_dim)?,
+                to_i32("v_dim", s.v_dim)?,
+                pp,
+            )
+        },
+        "portable gated_delta_net_windows",
+    )
+}
+
+/// [`velox_core::Backend::attention_windows`].
+pub fn attention_windows(
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: AttnShape,
+    window: usize,
+) -> Result<()> {
+    check::attention_windows(q.len(), k.len(), v.len(), out.len(), &s, window)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_attention_windows(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                out.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("window", window)?,
+                to_i32("heads", s.heads)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                to_i32("pos0", s.pos0)?,
+                s.scale(),
+            )
+        },
+        "portable attention_windows",
     )
 }
 
@@ -909,6 +1341,48 @@ pub fn top_k(
 }
 
 extern "C" {
+    fn velox_portable_log_softmax_gather(
+        x: *const f32,
+        rows: i32,
+        row_len: i64,
+        limit: i32,
+        ids: *const u32,
+        n: i32,
+        out: *mut f32,
+    ) -> i32;
+}
+
+pub fn log_softmax_gather(
+    x: &CudaBuffer,
+    rows: usize,
+    row_len: usize,
+    limit: usize,
+    ids: &[u32],
+) -> Result<Vec<f32>> {
+    check::log_softmax_gather(x.len(), rows, row_len, limit, ids.len())?;
+    let mut out = vec![0f32; rows * ids.len()];
+    if rows == 0 {
+        return Ok(out);
+    }
+    // SAFETY: x holds rows * row_len values (checked); out holds rows * ids.len() entries.
+    status(
+        unsafe {
+            velox_portable_log_softmax_gather(
+                x.as_ptr(),
+                to_i32("rows", rows)?,
+                row_len as i64,
+                to_i32("limit", limit)?,
+                ids.as_ptr(),
+                to_i32("ids", ids.len())?,
+                out.as_mut_ptr(),
+            )
+        },
+        "portable log_softmax_gather",
+    )?;
+    Ok(out)
+}
+
+extern "C" {
     fn velox_portable_concat_cols(
         a: *const f32,
         b: *const f32,
@@ -1054,6 +1528,14 @@ extern "C" {
         accumulate: i32,
         block: i32,
     ) -> i32;
+    fn velox_portable_transpose_heads(
+        x: *const f32,
+        y: *mut f32,
+        rows: i64,
+        a: i32,
+        b: i32,
+        dim: i32,
+    ) -> i32;
     fn velox_portable_copy2d(
         src: *const f32,
         src_stride: i64,
@@ -1071,6 +1553,9 @@ extern "C" {
         cols: i64,
         params: *const i64,
     ) -> i32;
+    fn velox_portable_argmax_to(x: *const f32, row_len: i64, limit: i32, dst: *mut u32) -> i32;
+    fn velox_portable_fetch_u32_begin(src: *const u32, slot: i32) -> i32;
+    fn velox_portable_fetch_u32_wait(slot: i32, out: *mut u32) -> i32;
     fn velox_portable_copy_param(
         src: *const f32,
         dst: *mut f32,
@@ -1098,7 +1583,14 @@ pub fn attention_block(
         out.len(),
         &s,
     )?;
-    let Some(params) = graph_params(&[s.pos0 as i64, s.ctx_lo as i64])? else {
+    // Graph steps stage the positions and the context rings: a recording serves any sequence.
+    let Some(params) = graph_params(&[
+        s.pos0 as i64,
+        s.ctx_lo as i64,
+        k_ctx.as_ptr() as i64,
+        v_ctx.as_ptr() as i64,
+    ])?
+    else {
         return Ok(());
     };
     // SAFETY: extents validated above.
@@ -1151,6 +1643,31 @@ pub fn dyn_conv(
             )
         },
         "portable dyn_conv",
+    )
+}
+
+pub fn transpose_heads(
+    x: &CudaBuffer,
+    y: &mut CudaBuffer,
+    rows: usize,
+    a: usize,
+    b: usize,
+    dim: usize,
+) -> Result<()> {
+    check::transpose_heads(x.len(), y.len(), rows, a, b, dim)?;
+    // SAFETY: both buffers hold rows * a * b * dim values (checked).
+    status(
+        unsafe {
+            velox_portable_transpose_heads(
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                rows as i64,
+                to_i32("a", a)?,
+                to_i32("b", b)?,
+                to_i32("dim", dim)?,
+            )
+        },
+        "portable transpose_heads",
     )
 }
 
@@ -1223,6 +1740,58 @@ pub fn kv_grid(kv_len: usize) -> usize {
     kv_bucket(kv_len).max(crate::static_kv_bucket().unwrap_or(0))
 }
 
+fn state_format_code(f: StateFormat) -> i32 {
+    match f {
+        StateFormat::F32 => 0,
+        StateFormat::Bf16 => 1,
+        StateFormat::Nvfp4 => 2,
+    }
+}
+
+/// Packs an f32 recurrent state; see `Backend::state_pack`. `dst` may be mapped host memory.
+pub fn state_pack(
+    src: &CudaBuffer,
+    dst: &mut CudaBuffer,
+    n: usize,
+    fmt: StateFormat,
+) -> Result<()> {
+    check::state_pack(src.len(), dst.len(), n, fmt)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_state_pack(
+                src.as_ptr(),
+                dst.as_mut_ptr().cast(),
+                n as i64,
+                state_format_code(fmt),
+            )
+        },
+        "portable state_pack",
+    )
+}
+
+/// Unpacks a recurrent state to f32; see `Backend::state_unpack`. `src` may be mapped host memory.
+pub fn state_unpack(
+    src: &CudaBuffer,
+    dst: &mut CudaBuffer,
+    n: usize,
+    fmt: StateFormat,
+) -> Result<()> {
+    check::state_unpack(src.len(), dst.len(), n, fmt)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_state_unpack(
+                src.as_ptr().cast(),
+                dst.as_mut_ptr(),
+                n as i64,
+                state_format_code(fmt),
+            )
+        },
+        "portable state_unpack",
+    )
+}
+
 /// Decodes cache rows to the f32 rows they represent; see `Backend::kv_load`.
 pub fn kv_load(
     k_cache: &CudaBuffer,
@@ -1249,5 +1818,539 @@ pub fn kv_load(
             )
         },
         "portable kv_load",
+    )
+}
+
+extern "C" {
+    fn velox_portable_rms_norm_groups(
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        rows: i32,
+        groups: i32,
+        dim: i32,
+        eps: f32,
+    ) -> i32;
+    fn velox_portable_silu(x: *mut f32, len: i64) -> i32;
+    fn velox_portable_hc_mix(
+        xn: *const f32,
+        gate: *const f32,
+        out: *mut f32,
+        rows: i64,
+        streams: i32,
+        dim: i32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_hc_combine(
+        res: *mut f32,
+        y: *const f32,
+        inj: *const f32,
+        rows: i64,
+        streams: i32,
+        dim: i32,
+        ld: i32,
+        col: i32,
+    ) -> i32;
+    fn velox_portable_ple_gate(
+        key: *const f32,
+        q: *const f32,
+        value: *const f32,
+        out: *mut f32,
+        rows: i32,
+        streams: i32,
+        dim: i32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_conv1d_dilated(
+        x: *const f32,
+        w: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        tokens: i32,
+        channels: i32,
+        width: i32,
+        dil: i32,
+        params: *const i64,
+    ) -> i32;
+    fn velox_portable_sigmoid_scale_rows(
+        x: *mut f32,
+        gate: *const f32,
+        rows: i64,
+        dim: i32,
+        goff: i64,
+        gstride: i64,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_moe_route(
+        logits: *const f32,
+        ids: *mut f32,
+        wts: *mut f32,
+        counts: *mut f32,
+        rows: i32,
+        row_len: i32,
+        experts: i32,
+        k: i32,
+    ) -> i32;
+    fn velox_portable_moe_scratch(experts: i32, pairs: i32, width: i32, hidden: i32) -> i64;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_moe_experts(
+        x: *const f32,
+        ids: *const f32,
+        w: *const f32,
+        records: *const u8,
+        slots: *const u8,
+        map: *const f32,
+        record_bytes: i64,
+        slot_bytes: i64,
+        experts: i32,
+        gate_fmt: i32,
+        gate_off: i64,
+        up_fmt: i32,
+        up_off: i64,
+        down_fmt: i32,
+        down_off: i64,
+        width: i32,
+        hidden: i32,
+        rows: i32,
+        k: i32,
+        y: *mut f32,
+        scratch: *mut f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_qsa_pool(
+        raw: *const f32,
+        w: *const f32,
+        pooled: *mut f32,
+        block0: i32,
+        blocks: i32,
+        ratio: i32,
+        dim: i32,
+        rotary: i32,
+        theta: f32,
+        eps: f32,
+        params: *const i64,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_qsa_select(
+        q: *const f32,
+        pooled: *const f32,
+        sel: *mut f32,
+        scratch: *mut f32,
+        tokens: i32,
+        heads: i32,
+        dim: i32,
+        pos0: i32,
+        ratio: i32,
+        budget: i32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_portable_attention_sparse(
+        q: *const f32,
+        k: *const u8,
+        v: *const u8,
+        sel: *const f32,
+        sel_len: i32,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        format: i32,
+        norm: f32,
+    ) -> i32;
+}
+
+/// Ops whose per-call host values (positions, block ranges) are not staged for graph replay.
+fn outside_graphs(what: &str) -> Result<()> {
+    if graph_mode() != GraphMode::None {
+        return Err(Error::Unsupported(format!(
+            "{what} inside a recorded graph step"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_groups(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    y: &mut CudaBuffer,
+    rows: usize,
+    groups: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<()> {
+    check::rms_norm_groups(x.len(), weight.len(), y.len(), rows, groups, dim)?;
+    to_i32("rows * groups", rows * groups)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_rms_norm_groups(
+                x.as_ptr(),
+                weight.as_ptr(),
+                y.as_mut_ptr(),
+                to_i32("rows", rows)?,
+                to_i32("groups", groups)?,
+                to_i32("dim", dim)?,
+                eps,
+            )
+        },
+        "portable rms_norm_groups",
+    )
+}
+
+pub fn silu(x: &mut CudaBuffer, len: usize) -> Result<()> {
+    check::elementwise("silu", &[x.len()], len)?;
+    // SAFETY: buffer extent validated above.
+    status(
+        unsafe { velox_portable_silu(x.as_mut_ptr(), len as i64) },
+        "portable silu",
+    )
+}
+
+pub fn hc_mix(
+    xn: &CudaBuffer,
+    gate: &CudaBuffer,
+    out: &mut CudaBuffer,
+    rows: usize,
+    streams: usize,
+    dim: usize,
+) -> Result<()> {
+    check::hc_mix(xn.len(), gate.len(), out.len(), rows, streams, dim)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_hc_mix(
+                xn.as_ptr(),
+                gate.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                to_i32("streams", streams)?,
+                to_i32("dim", dim)?,
+            )
+        },
+        "portable hc_mix",
+    )
+}
+
+pub fn hc_combine(
+    res: &mut CudaBuffer,
+    y: &CudaBuffer,
+    inject: &CudaBuffer,
+    s: HcCombineShape,
+) -> Result<()> {
+    check::hc_combine(res.len(), y.len(), inject.len(), &s)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_hc_combine(
+                res.as_mut_ptr(),
+                y.as_ptr(),
+                inject.as_ptr(),
+                s.rows as i64,
+                to_i32("streams", s.streams)?,
+                to_i32("dim", s.dim)?,
+                to_i32("inject_ld", s.inject_ld)?,
+                to_i32("inject_col", s.inject_col)?,
+            )
+        },
+        "portable hc_combine",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ple_gate(
+    key_n: &CudaBuffer,
+    q_n: &CudaBuffer,
+    value: &CudaBuffer,
+    out: &mut CudaBuffer,
+    rows: usize,
+    streams: usize,
+    dim: usize,
+) -> Result<()> {
+    check::ple_gate(
+        key_n.len(),
+        q_n.len(),
+        value.len(),
+        out.len(),
+        rows,
+        streams,
+        dim,
+    )?;
+    to_i32("rows * streams", rows * streams)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_ple_gate(
+                key_n.as_ptr(),
+                q_n.as_ptr(),
+                value.as_ptr(),
+                out.as_mut_ptr(),
+                to_i32("rows", rows)?,
+                to_i32("streams", streams)?,
+                to_i32("dim", dim)?,
+            )
+        },
+        "portable ple_gate",
+    )
+}
+
+pub fn conv1d_dilated_silu(
+    x: &CudaBuffer,
+    weight: &CudaBuffer,
+    state: &mut CudaBuffer,
+    out: &mut CudaBuffer,
+    s: DilatedConvShape,
+) -> Result<()> {
+    check::conv1d_dilated(x.len(), weight.len(), state.len(), out.len(), &s)?;
+    // Graph steps stage the state: a recording serves any session.
+    let Some(params) = graph_params(&[state.as_ptr() as i64])? else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_conv1d_dilated(
+                x.as_ptr(),
+                weight.as_ptr(),
+                state.as_mut_ptr(),
+                out.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("channels", s.channels)?,
+                to_i32("width", s.width)?,
+                to_i32("dilation", s.dilation)?,
+                params,
+            )
+        },
+        "portable conv1d_dilated_silu",
+    )
+}
+
+pub fn sigmoid_scale_rows(x: &mut CudaBuffer, gate: &CudaBuffer, s: RowGateShape) -> Result<()> {
+    check::row_gate(x.len(), gate.len(), &s)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_sigmoid_scale_rows(
+                x.as_mut_ptr(),
+                gate.as_ptr(),
+                s.rows as i64,
+                to_i32("dim", s.dim)?,
+                s.gate_offset as i64,
+                s.gate_stride as i64,
+            )
+        },
+        "portable sigmoid_scale_rows",
+    )
+}
+
+pub fn moe_route(
+    logits: &CudaBuffer,
+    ids: &mut CudaBuffer,
+    weights: &mut CudaBuffer,
+    counts: Option<&mut CudaBuffer>,
+    s: MoeRouteShape,
+) -> Result<()> {
+    check::moe_route(
+        logits.len(),
+        ids.len(),
+        weights.len(),
+        counts.as_ref().map(|c| c.len()),
+        &s,
+    )?;
+    let counts = counts.map_or(std::ptr::null_mut(), |c| c.as_mut_ptr());
+    // SAFETY: buffer extents validated above; counts is null or holds `experts` slots.
+    status(
+        unsafe {
+            velox_portable_moe_route(
+                logits.as_ptr(),
+                ids.as_mut_ptr(),
+                weights.as_mut_ptr(),
+                counts,
+                to_i32("rows", s.rows)?,
+                to_i32("row_len", s.row_len)?,
+                to_i32("experts", s.experts)?,
+                to_i32("k", s.k)?,
+            )
+        },
+        "portable moe_route",
+    )
+}
+
+/// f32 slots of scratch [`moe_experts`] needs.
+pub fn moe_scratch_len(bank: &ExpertBank<'_, CudaBuffer>, rows: usize, k: usize) -> usize {
+    // SAFETY: a pure size computation.
+    let n = unsafe {
+        velox_portable_moe_scratch(
+            bank.experts as i32,
+            (rows * k) as i32,
+            bank.width() as i32,
+            bank.hidden() as i32,
+        )
+    };
+    n.max(1) as usize
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn moe_experts(
+    x: &CudaBuffer,
+    ids: &CudaBuffer,
+    weights: &CudaBuffer,
+    bank: &ExpertBank<'_, CudaBuffer>,
+    y: &mut CudaBuffer,
+    scratch: &mut CudaBuffer,
+    rows: usize,
+    k: usize,
+) -> Result<()> {
+    let bufs = (bank.records.len(), bank.slots.len(), bank.map.len());
+    check::moe_experts(
+        x.len(),
+        ids.len(),
+        weights.len(),
+        bank,
+        bufs,
+        y.len(),
+        rows,
+        k,
+    )?;
+    to_i32("rows * k", rows * k)?;
+    let need = moe_scratch_len(bank, rows, k);
+    if scratch.len() < need {
+        return Err(Error::Shape(format!(
+            "moe_experts scratch: buffer has {} elements, needs {need}",
+            scratch.len()
+        )));
+    }
+    let off = |m: &ExpertMatrix| m.offset as i64;
+    // SAFETY: extents validated above; expert ids past the bank are skipped by the kernels.
+    status(
+        unsafe {
+            velox_portable_moe_experts(
+                x.as_ptr(),
+                ids.as_ptr(),
+                weights.as_ptr(),
+                bank.records.as_ptr().cast(),
+                bank.slots.as_ptr().cast(),
+                bank.map.as_ptr(),
+                bank.record_bytes as i64,
+                bank.slot_bytes as i64,
+                to_i32("experts", bank.experts)?,
+                format_code(bank.gate.format),
+                off(&bank.gate),
+                format_code(bank.up.format),
+                off(&bank.up),
+                format_code(bank.down.format),
+                off(&bank.down),
+                to_i32("width", bank.width())?,
+                to_i32("hidden", bank.hidden())?,
+                rows as i32,
+                k as i32,
+                y.as_mut_ptr(),
+                scratch.as_mut_ptr(),
+            )
+        },
+        "portable moe_experts",
+    )
+}
+
+pub fn qsa_pool(
+    raw: &CudaBuffer,
+    weight: &CudaBuffer,
+    pooled: &mut CudaBuffer,
+    s: QsaPoolShape,
+) -> Result<()> {
+    check::qsa_pool(raw.len(), weight.len(), pooled.len(), &s)?;
+    to_i32("pooled positions", (s.block0 + s.blocks) * s.ratio)?;
+    // Graph steps stage the first block and the caches (the block count is the step's shape).
+    let Some(params) =
+        graph_params(&[s.block0 as i64, raw.as_ptr() as i64, pooled.as_ptr() as i64])?
+    else {
+        return Ok(());
+    };
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_qsa_pool(
+                raw.as_ptr(),
+                weight.as_ptr(),
+                pooled.as_mut_ptr(),
+                s.block0 as i32,
+                to_i32("blocks", s.blocks)?,
+                to_i32("ratio", s.ratio)?,
+                to_i32("dim", s.dim)?,
+                to_i32("rotary_dim", s.rotary_dim)?,
+                s.theta,
+                s.eps,
+                params,
+            )
+        },
+        "portable qsa_pool",
+    )
+}
+
+pub fn qsa_select(
+    q: &CudaBuffer,
+    pooled: &CudaBuffer,
+    sel: &mut CudaBuffer,
+    scratch: &mut CudaBuffer,
+    s: QsaSelectShape,
+) -> Result<()> {
+    check::qsa_select(q.len(), pooled.len(), sel.len(), scratch.len(), &s)?;
+    outside_graphs("qsa_select")?;
+    to_i32("positions", s.pos0 + s.tokens)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_qsa_select(
+                q.as_ptr(),
+                pooled.as_ptr(),
+                sel.as_mut_ptr(),
+                scratch.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("heads", s.heads)?,
+                to_i32("dim", s.dim)?,
+                s.pos0 as i32,
+                to_i32("ratio", s.ratio)?,
+                to_i32("budget", s.budget)?,
+            )
+        },
+        "portable qsa_select",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_sparse(
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    sel: &CudaBuffer,
+    sel_len: usize,
+    out: &mut CudaBuffer,
+    s: AttnShape,
+) -> Result<()> {
+    check::attention_sparse(q.len(), k.len(), v.len(), sel.len(), sel_len, out.len(), &s)?;
+    outside_graphs("attention_sparse")?;
+    to_i32("kv_len", s.kv_len())?;
+    // SAFETY: buffer extents validated above; selected positions index rows below kv_len.
+    status(
+        unsafe {
+            velox_portable_attention_sparse(
+                q.as_ptr(),
+                k.as_ptr().cast(),
+                v.as_ptr().cast(),
+                sel.as_ptr(),
+                to_i32("sel_len", sel_len)?,
+                out.as_mut_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("heads", s.heads)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                s.scale(),
+                kv_format_code(s.kv),
+                hadamard_norm(s.head_dim),
+            )
+        },
+        "portable attention_sparse",
     )
 }

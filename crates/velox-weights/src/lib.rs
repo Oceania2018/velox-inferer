@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+pub mod gguf;
+
 pub const NINFER_ENTRY_MAGIC: [u8; 8] = *b"NINFER\0\x03";
 pub const NINFER_PART_MAGIC: [u8; 8] = *b"NINPRT\0\x03";
 pub const VI_ENTRY_MAGIC: [u8; 8] = *b"VELOXVI\x01";
@@ -611,7 +613,33 @@ pub fn convert(
             dir.remove("velox");
         }
     }
-    let payload = src.payload_bytes();
+    write_container(
+        out,
+        dir,
+        target,
+        part_limit,
+        artifact_id,
+        src.payload_bytes(),
+        &mut |at, buf| src.read_range(at, buf),
+    )
+}
+
+/// Writes an artifact whose directory is `dir` (its `files` table is rebuilt) and whose
+/// logical payload is `payload` bytes produced by `fill(offset, buf)` in increasing offsets.
+/// Files are written under temporary names and renamed parts first, entry last, so a visible
+/// entry always has its parts; an existing `out` is never overwritten.
+pub fn write_container(
+    out: &Path,
+    mut dir: Map<String, Value>,
+    target: Container,
+    part_limit: u64,
+    artifact_id: [u8; 16],
+    payload: u64,
+    fill: &mut dyn FnMut(u64, &mut [u8]) -> Result<()>,
+) -> Result<()> {
+    if out.exists() {
+        return bad(format!("{} already exists", out.display()));
+    }
     let name = out
         .file_name()
         .and_then(|n| n.to_str())
@@ -689,7 +717,7 @@ pub fn convert(
             let mut done = 0;
             while done < bytes {
                 let n = (bytes - done).min(chunk.len() as u64) as usize;
-                src.read_range(logical + done, &mut chunk[..n])?;
+                fill(logical + done, &mut chunk[..n])?;
                 f.write_all(&chunk[..n]).map_err(io)?;
                 done += n as u64;
             }

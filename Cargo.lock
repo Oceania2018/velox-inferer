@@ -866,6 +866,7 @@ dependencies = [
  "velox-core",
  "velox-cpu",
  "velox-cuda",
+ "velox-models",
  "velox-variant",
 ]
 
@@ -943,6 +944,7 @@ dependencies = [
 name = "velox-weights"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
 ]
 

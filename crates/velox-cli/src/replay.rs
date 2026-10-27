@@ -28,6 +28,76 @@ struct Step {
     request: Value,
     screenshot: Option<PathBuf>,
     recorded: Value,
+    /// The recorded run's tool call (name, arguments), from its `rawResponse`.
+    recorded_call: Option<Call>,
+}
+
+/// One tool call: function name and parsed arguments (an object when they parse).
+#[derive(Clone)]
+struct Call {
+    name: String,
+    args: Value,
+}
+
+/// The single tool call of an OpenAI chat-completion response (`choices[0].message`).
+fn response_call(raw: &str) -> Option<Call> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let tc = v["choices"][0]["message"]["tool_calls"].as_array()?;
+    let f = &tc.first()?["function"];
+    Some(Call {
+        name: f["name"].as_str()?.to_string(),
+        args: f["arguments"]
+            .as_str()
+            .and_then(|a| serde_json::from_str(a).ok())
+            .unwrap_or(Value::Null),
+    })
+}
+
+/// Arguments compared as free text and therefore left out of the exact-agreement check: the
+/// model's explanation and its descriptions of the target (the point itself is `at`).
+const FREE_TEXT_ARGS: [&str; 3] = ["why", "query", "visible"];
+
+/// A point `[x, y]` (0..1000 normalised screen coordinates).
+fn point(v: &Value) -> Option<(f64, f64)> {
+    let a = v.as_array()?;
+    Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?))
+}
+
+/// Agreement of a step's call with the recorded one: metrics only, never text.
+fn call_quality(got: &[Call], want: Option<&Call>) -> Value {
+    let valid = got.len() == 1 && got[0].args.is_object();
+    let Some(want) = want else {
+        return json!({ "valid": valid });
+    };
+    let Some(g) = got.first().filter(|_| valid) else {
+        return json!({ "valid": false, "name_match": false });
+    };
+    let name_match = g.name == want.name;
+    let structured = |c: &Call| -> serde_json::Map<String, Value> {
+        c.args
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .filter(|(k, _)| !FREE_TEXT_ARGS.contains(&k.as_str()) && k.as_str() != "at")
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let args_match = name_match && structured(g) == structured(want);
+    let at = match (point(&g.args["at"]), point(&want.args["at"])) {
+        (Some(a), Some(b)) if name_match => {
+            Some(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt())
+        }
+        _ => None,
+    };
+    json!({
+        "valid": true,
+        "name_match": name_match,
+        "args_match": args_match,
+        "has_point": point(&want.args["at"]).is_some(),
+        "at_distance": at,
+    })
 }
 
 /// The full request of a step record: an inline `requestPrompt` string, or the session's
@@ -87,11 +157,16 @@ fn collect_steps(v: &Value, dir: &Path, env: Option<&Value>, out: &mut Vec<Step>
                         recorded[k] = x.clone();
                     }
                 }
+                let recorded_call = m
+                    .get("rawResponse")
+                    .and_then(Value::as_str)
+                    .and_then(response_call);
                 out.push(Step {
                     index: out.len() + 1,
                     request,
                     screenshot,
                     recorded,
+                    recorded_call,
                 });
                 return Ok(());
             }
@@ -184,6 +259,8 @@ struct Measured {
     timings: Value,
     output_hash: String,
     finish: Option<String>,
+    /// The streamed tool calls, assembled by index.
+    calls: Vec<Call>,
 }
 
 /// Streams one chat completion and timestamps the first generated delta.
@@ -234,6 +311,8 @@ fn stream_chat(ep: &Endpoint, body: &[u8]) -> Result<Measured> {
     let mut timings = Value::Null;
     let mut finish = None;
     let mut output = Vec::new();
+    // (name, arguments text) per tool-call index; streamed arguments arrive in pieces.
+    let mut parts: Vec<(String, String)> = Vec::new();
     let mut pending = String::new();
     let mut on_data = |text: &str, now: f64| {
         pending.push_str(text);
@@ -272,6 +351,18 @@ fn stream_chat(ep: &Endpoint, body: &[u8]) -> Result<Measured> {
                 if let Some(tc) = d.get("tool_calls").filter(|t| !t.is_null()) {
                     output.extend_from_slice(tc.to_string().as_bytes());
                     produced = true;
+                    for (j, c) in tc.as_array().into_iter().flatten().enumerate() {
+                        let i = c["index"].as_u64().map_or(j, |i| i as usize);
+                        if parts.len() <= i {
+                            parts.resize(i + 1, (String::new(), String::new()));
+                        }
+                        if let Some(n) = c["function"]["name"].as_str() {
+                            parts[i].0.push_str(n);
+                        }
+                        if let Some(a) = c["function"]["arguments"].as_str() {
+                            parts[i].1.push_str(a);
+                        }
+                    }
                 }
                 if produced && ttft.is_none() {
                     ttft = Some(now);
@@ -307,6 +398,18 @@ fn stream_chat(ep: &Endpoint, body: &[u8]) -> Result<Measured> {
         }
     }
     let total = ms(t0);
+    // Local inspection of what the model produced (confidential: never leaves the machine).
+    if std::env::var_os("VELOX_REPLAY_DUMP").is_some() {
+        eprintln!("[output] {}", String::from_utf8_lossy(&output));
+    }
+    let calls = parts
+        .into_iter()
+        .filter(|(n, _)| !n.is_empty())
+        .map(|(name, args)| Call {
+            name,
+            args: serde_json::from_str(&args).unwrap_or(Value::Null),
+        })
+        .collect();
     Ok(Measured {
         ttft,
         total,
@@ -314,6 +417,7 @@ fn stream_chat(ep: &Endpoint, body: &[u8]) -> Result<Measured> {
         timings,
         output_hash: fnv(&output),
         finish,
+        calls,
     })
 }
 
@@ -395,6 +499,10 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     let mut rows = Vec::new();
     let (mut ttfts, mut totals, mut rec_lat) = (vec![], vec![], vec![]);
     let (mut srv_prefill, mut srv_decode) = (vec![], vec![]);
+    // Tool-call agreement with the recorded run: counts, and click distances (0..1000 units).
+    let (mut n_valid, mut n_name, mut n_args, mut n_compared) = (0usize, 0usize, 0usize, 0usize);
+    let (mut dists, mut n_points) = (Vec::new(), 0usize);
+    let mut retries = 0usize;
     let wall = Instant::now();
     for st in steps {
         let mut req = st.request;
@@ -412,7 +520,16 @@ pub fn run(a: &Args) -> Result<ExitCode> {
         req["stream"] = true.into();
         req["stream_options"] = json!({"include_usage": true});
         let body = serde_json::to_vec(&req).expect("serialisable");
-        let m = stream_chat(&ep, &body)?;
+        // A transport error (the connection dropped, os error 11) is retried once; the step's
+        // timings are then the retry's.
+        let m = match stream_chat(&ep, &body) {
+            Err(Error::Backend(e)) if e.starts_with("http: ") => {
+                eprintln!("step {:3}: retrying after {e}", st.index);
+                retries += 1;
+                stream_chat(&ep, &body)?
+            }
+            r => r?,
+        };
 
         // Decode speed comes only from the server's timings: tool-call answers arrive in one
         // burst at the end, so a client-side TTFT-to-end rate is meaningless.
@@ -449,7 +566,19 @@ pub fn run(a: &Args) -> Result<ExitCode> {
             m.timings.get("predicted_per_second").and_then(Value::as_f64).unwrap_or(f64::NAN),
             st.recorded.get("latencyMs").map_or("-".into(), |v| v.to_string())
         );
+        let quality = call_quality(&m.calls, st.recorded_call.as_ref());
+        n_valid += usize::from(quality["valid"] == true);
+        if st.recorded_call.is_some() {
+            n_compared += 1;
+            n_name += usize::from(quality["name_match"] == true);
+            n_args += usize::from(quality["args_match"] == true);
+            n_points += usize::from(quality["has_point"] == true);
+            if let Some(d) = quality["at_distance"].as_f64() {
+                dists.push(d);
+            }
+        }
         rows.push(json!({
+            "quality": quality,
             "step": st.index,
             "images": images,
             "ttft_ms": m.ttft,
@@ -466,7 +595,19 @@ pub fn run(a: &Args) -> Result<ExitCode> {
         "endpoint": endpoint_url,
         "session": dir.file_name().map(|n| n.to_string_lossy().to_string()),
         "wall_s": wall.elapsed().as_secs_f64(),
-        "summary": {"ttft_ms": stats(&mut ttfts), "total_ms": stats(&mut totals),"server_prefill_ms": stats(&mut srv_prefill), "server_decode_tps": stats(&mut srv_decode), "recorded_latency_ms": stats(&mut rec_lat)},
+        "retries": retries,
+        "summary": {"ttft_ms": stats(&mut ttfts), "total_ms": stats(&mut totals),"server_prefill_ms": stats(&mut srv_prefill), "server_decode_tps": stats(&mut srv_decode), "recorded_latency_ms": stats(&mut rec_lat),
+            "tool_calls": {
+                "steps": rows.len(),
+                "valid": n_valid,
+                "compared_with_recording": n_compared,
+                "same_tool": n_name,
+                "same_arguments": n_args,
+                "recorded_points": n_points,
+                "points_hit_20": dists.iter().filter(|&&d| d <= 20.0).count(),
+                "points_hit_50": dists.iter().filter(|&&d| d <= 50.0).count(),
+                "point_distance": stats(&mut dists),
+            }},
         "steps": rows,
     });
     if let Some(parent) = out.parent() {

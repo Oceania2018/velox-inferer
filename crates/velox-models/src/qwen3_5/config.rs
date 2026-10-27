@@ -52,6 +52,11 @@ pub struct TextConfig {
     pub ffn: FfnConfig,
     pub eps: f32,
     pub max_positions: usize,
+    /// The GDN gate (`z`) rows and output-projection columns hold value heads in llama.cpp's
+    /// tiled order (`j * k_heads + g` for value head `j` of key head `g`), as GGUF imports store
+    /// them; the recurrence still runs in the grouped order (`g * (v_heads / k_heads) + j`).
+    /// Set by `"velox_gdn_value_heads": "tiled"`.
+    pub gdn_v_tiled: bool,
 }
 
 fn usize_field(v: &Value, key: &str) -> Result<usize> {
@@ -122,6 +127,15 @@ impl TextConfig {
             ffn,
             eps: f64_field(v, "rms_norm_eps")? as f32,
             max_positions: usize_field(v, "max_position_embeddings")?,
+            gdn_v_tiled: match v.get("velox_gdn_value_heads").and_then(Value::as_str) {
+                None | Some("grouped") => false,
+                Some("tiled") => true,
+                Some(other) => {
+                    return Err(Error::Config(format!(
+                        "text config: unknown velox_gdn_value_heads '{other}'"
+                    )))
+                }
+            },
         };
         if v.get("tie_word_embeddings").and_then(Value::as_bool) == Some(true) {
             return Err(Error::Unsupported(

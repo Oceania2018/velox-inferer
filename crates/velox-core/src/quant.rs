@@ -94,6 +94,33 @@ pub fn quantize_activations(x: &mut [f32], k: usize, q: ActQuant) {
                 }
             }
         }
+        ActQuant::Int8G32 => {
+            for row in x.chunks_mut(k) {
+                for group in row.chunks_mut(32) {
+                    let amax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                    let scale = amax / 127.0;
+                    for v in group {
+                        *v = (*v * inv).round_ties_even() * scale;
+                    }
+                }
+            }
+        }
+        ActQuant::Int8G256 => {
+            for row in x.chunks_mut(k) {
+                for group in row.chunks_mut(256) {
+                    for v in group.iter_mut() {
+                        *v = crate::format::bf16_to_f32(crate::format::f32_to_bf16(*v));
+                    }
+                    let amax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                    let scale = amax / 127.0;
+                    for v in group {
+                        *v = (*v * inv).round_ties_even() * scale;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -255,5 +282,41 @@ mod tests {
                 assert!((a - b).abs() <= amax / 6.0 * 1.07 + 1e-6, "{a} vs {b}");
             }
         }
+    }
+
+    #[test]
+    fn int8_activations_are_codes_times_the_group_scale() {
+        // Two rows of two 256-value groups, one of them all zero.
+        let mut x: Vec<f32> = (0..1024)
+            .map(|i| {
+                if (256..512).contains(&i) {
+                    0.0
+                } else {
+                    ((i * 53 % 101) as f32 - 50.0) * 0.013
+                }
+            })
+            .collect();
+        let orig = x.clone();
+        quantize_activations(&mut x, 512, ActQuant::Int8G256);
+        for (g, o) in x.chunks(256).zip(orig.chunks(256)) {
+            // The scale comes from the bf16-rounded group.
+            let amax = o.iter().fold(0f32, |m, v| {
+                m.max(crate::format::bf16_to_f32(crate::format::f32_to_bf16(*v)).abs())
+            });
+            let scale = amax / 127.0;
+            for (a, b) in g.iter().zip(o) {
+                let code = if scale > 0.0 { a / scale } else { 0.0 };
+                assert!(
+                    (code - code.round()).abs() < 1e-3 && code.abs() <= 127.0,
+                    "{a}"
+                );
+                // Half a step, plus the bf16 rounding of the input.
+                assert!(
+                    (a - b).abs() <= scale * 0.5 + b.abs() / 256.0 + 1e-7,
+                    "{a} vs {b}"
+                );
+            }
+        }
+        assert!(x[256..512].iter().all(|&v| v == 0.0));
     }
 }

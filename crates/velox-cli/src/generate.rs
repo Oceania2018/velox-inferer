@@ -6,9 +6,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use serde_json::json;
-use velox_core::{Backend, Error, KvFormat, Result};
+use velox_core::{Backend, Error, KvFormat, Result, StateFormat};
 use velox_frontend::Frontend;
-use velox_models::qwen3_5::{argmax, Qwen35Text, TextConfig, TextWeights};
+use velox_models::qwen3_5::{ExpertPolicy, Qwen35Text, TextConfig, TextWeights};
 use velox_weights::Artifact;
 
 use crate::args::Args;
@@ -38,6 +38,9 @@ enum Input {
 }
 
 fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Result<ExitCode> {
+    if a.get("gguf").is_some() {
+        return crate::qwen4::generate(b, a, on_phase);
+    }
     let path = a
         .get("artifact")
         .ok_or_else(|| Error::Config("--artifact is required".into()))?;
@@ -92,16 +95,59 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
     let cfg = TextConfig::from_json(&art.components()["text"]["config"])?;
     eprintln!("backend {}", b.describe());
     let t0 = Instant::now();
-    let w = TextWeights::load(b, &art, &cfg, |line| eprint!("\rloading {line}   "))?;
+    // As `velox serve`: matrices in --host-weights stay in system RAM (default the token
+    // embedding; `none` keeps everything on the device), and DFlash2 runs skip the MTP weights.
+    let host: Vec<String> = match a.get("host-weights").unwrap_or("text/token_embedding") {
+        "none" | "" => Vec::new(),
+        list => list.split(',').map(|s| s.trim().to_string()).collect(),
+    };
+    let mtp = a.get("dflash").is_none();
+    let w = TextWeights::load_opts(b, &art, &cfg, mtp, &host, |line| {
+        eprint!("\rloading {line}   ")
+    })?;
     eprintln!(
-        "\nloaded {:.2} GB in {:.1}s",
+        "\nloaded {:.2} GB to the device and {:.2} GB to system RAM in {:.1}s",
         w.bytes as f64 / 1e9,
+        w.host_bytes as f64 / 1e9,
         t0.elapsed().as_secs_f64()
     );
-    let model = Qwen35Text::new(cfg, w);
+    let mut model = Qwen35Text::new(cfg, w);
     let mut ws = model.workspace(b, chunk)?;
+    // A DFlash2 drafter is loaded per prompt after this: keep its weights' room free too.
+    let drafter_mib = if a.get("dflash").is_some() {
+        component_bytes(&art, "dflash2/") >> 20
+    } else {
+        0
+    };
+    enable_experts(b, &mut model, a, 1536 + drafter_mib as usize)?;
 
-    for input in inputs {
+    let report_experts = |model: &Qwen35Text<B>| {
+        if let Some(r) = model.expert_report() {
+            eprintln!(
+                "experts   {:.1}% of selections from device slots so far, {} moves",
+                100.0 * r.hit_rate(),
+                r.moves
+            );
+        }
+    };
+    // --state-quant f32,bf16,...: formats compared by `state_quant` (f32 first: the noise floor).
+    let state_formats = match a.get("state-quant") {
+        Some(list) => {
+            let mut v = vec![StateFormat::F32];
+            for f in list.split(',') {
+                let f = StateFormat::parse(f.trim())?;
+                if !v.contains(&f) {
+                    v.push(f);
+                }
+            }
+            Some(v)
+        }
+        None => None,
+    };
+    let mut state_rows: Vec<StateQuantRow> = Vec::new();
+
+    for (n, input) in inputs.into_iter().enumerate() {
+        report_experts(&model);
         let (prompt, ids) = match input {
             Input::Prompt(p) => {
                 let text = fe.template.render(
@@ -130,6 +176,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
                 draft_len,
                 chunk,
                 &fe,
+                on_phase,
             )?;
             continue;
         }
@@ -148,7 +195,25 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
                 drafts,
                 chunk,
                 &fe,
+                on_phase,
             )?;
+            continue;
+        }
+        if let Some(formats) = &state_formats {
+            let tail: usize = a.parse("split-tail", 256)?;
+            state_rows.extend(state_quant(
+                b,
+                &model,
+                &mut session,
+                &mut ws,
+                &ids,
+                max_tokens,
+                formats,
+                tail,
+                fe.public_vocab,
+                &|t| fe.is_eos(t),
+                n,
+            )?);
             continue;
         }
         if a.get("spec-check").is_some() {
@@ -163,14 +228,26 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             )?;
             continue;
         }
+        // Greedy on the device: each step selects its id into the workspace's slot and the next
+        // step embeds from there, so one step is always queued behind the running one and the
+        // device never waits for the host; the host fetches a step's id while the next runs.
+        // Step k yields id k; steps past max_tokens - 1 are not queued (a step queued before an
+        // EOS is wasted; the session is dropped anyway).
+        let limit = fe.public_vocab;
         let t1 = Instant::now();
-        let mut logits = model.forward(b, &mut session, &mut ws, &ids)?;
+        model.advance(b, &mut session, &mut ws, &ids, None, &[])?;
+        model.argmax_into(b, &mut ws, limit, 0)?;
+        if max_tokens >= 2 {
+            model.advance_from(b, &mut session, &mut ws)?;
+            model.argmax_into(b, &mut ws, limit, 1)?;
+        }
+        let mut next = model.next_id(b, &ws, 0)?;
         let prefill = t1.elapsed().as_secs_f64();
         on_phase("prefill");
         let mut out = Vec::new();
         let t2 = Instant::now();
+        let mut step = 0usize;
         loop {
-            let next = argmax(&logits, fe.public_vocab);
             if fe.is_eos(next) {
                 break;
             }
@@ -178,7 +255,12 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             if out.len() >= max_tokens {
                 break;
             }
-            logits = model.forward(b, &mut session, &mut ws, &[next])?;
+            step += 1; // its step is queued; queue the one after before fetching its id
+            if step + 1 < max_tokens {
+                model.advance_from(b, &mut session, &mut ws)?;
+                model.argmax_into(b, &mut ws, limit, (step + 1) % 8)?;
+            }
+            next = model.next_id(b, &ws, step % 8)?;
         }
         let decode = t2.elapsed().as_secs_f64();
         on_phase("decode");
@@ -204,7 +286,186 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
             println!("text      {text:?}");
         }
     }
+    report_experts(&model);
+    if let Some(formats) = &state_formats {
+        state_quant_summary(formats, &state_rows);
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One prompt's result for one format of `--state-quant`.
+struct StateQuantRow {
+    format: StateFormat,
+    /// Relative L2 error of the stored recurrent state.
+    state_err: f64,
+    steps: usize,
+    /// First step whose greedy token differs from the exact run's (a greedy run diverges there).
+    first_mismatch: Option<usize>,
+    mismatches: usize,
+    /// Largest and summed |logit difference| of the exact run's token over the steps.
+    max_dlogit: f32,
+    sum_dlogit: f64,
+    bytes: usize,
+}
+
+/// `--state-quant f1,f2,..`: the cost of keeping a checkpoint's recurrent state in a lossy format
+/// (see `StateFormat`). Prefills all but the last `tail` prompt tokens, snapshots the state to
+/// system RAM, then for each format stores it packed (as the context store does), restores it, feeds the rest of the
+/// prompt and decodes `steps` tokens teacher-forced on the exact run's greedy tokens. `f32` runs
+/// the exact state again: its differences are the run-to-run noise floor. Prints one JSON line
+/// per format.
+#[allow(clippy::too_many_arguments)]
+fn state_quant<B: Backend>(
+    b: &B,
+    model: &Qwen35Text<B>,
+    s: &mut velox_models::qwen3_5::Session<B>,
+    ws: &mut velox_models::qwen3_5::Workspace<B>,
+    ids: &[u32],
+    steps: usize,
+    formats: &[StateFormat],
+    tail: usize,
+    limit: usize,
+    is_eos: &dyn Fn(u32) -> bool,
+    prompt: usize,
+) -> Result<Vec<StateQuantRow>> {
+    const TOP: usize = 8;
+    if ids.len() < 2 || steps == 0 {
+        return Err(Error::Config(
+            "--state-quant needs prompts of 2+ tokens and --max-tokens 1+".into(),
+        ));
+    }
+    let split = ids.len().saturating_sub(tail).clamp(1, ids.len() - 1);
+    model.advance(b, s, ws, &ids[..split], None, &[])?;
+    let exact = s.checkpoint_in(b, true)?;
+    // Candidates after the prompt and after each fed token: free-running when `force` is None,
+    // else fed `force` (which then also bounds the steps).
+    let run = |s: &mut velox_models::qwen3_5::Session<B>,
+               ws: &mut velox_models::qwen3_5::Workspace<B>,
+               cp: &velox_models::qwen3_5::Checkpoint<B>,
+               force: Option<&[u32]>|
+     -> Result<Vec<Vec<(u32, f32)>>> {
+        s.restore(b, cp)?;
+        model.advance(b, s, ws, &ids[split..], None, &[])?;
+        let mut rows = vec![model.candidates(b, ws, TOP, limit)?];
+        let n = force.map_or(steps, <[u32]>::len);
+        for i in 1..n {
+            let t = match force {
+                Some(f) => f[i - 1],
+                None => rows[i - 1][0].0,
+            };
+            if force.is_none() && is_eos(t) {
+                break;
+            }
+            model.advance(b, s, ws, &[t], None, &[])?;
+            rows.push(model.candidates(b, ws, TOP, limit)?);
+        }
+        Ok(rows)
+    };
+    let reference = run(s, ws, &exact, None)?;
+    let tokens: Vec<u32> = reference.iter().map(|r| r[0].0).collect();
+    let mut out = Vec::new();
+    for &format in formats {
+        // Stored as the context store would (packed in system RAM), restored by unpacking.
+        let mut cp = s.blank_checkpoint_as(b, exact.pos, true, format)?;
+        exact.copy_into(b, &mut cp)?;
+        let mut decoded = s.blank_checkpoint_in(b, exact.pos, true)?;
+        cp.copy_into(b, &mut decoded)?;
+        let state_err = rel_err(b, &exact, &decoded)?;
+        let rows = run(s, ws, &cp, Some(&tokens))?;
+        let mut r = StateQuantRow {
+            format,
+            state_err,
+            steps: rows.len(),
+            first_mismatch: None,
+            mismatches: 0,
+            max_dlogit: 0.0,
+            sum_dlogit: 0.0,
+            bytes: cp.bytes(b),
+        };
+        for (i, (got, want)) in rows.iter().zip(&reference).enumerate() {
+            if got[0].0 != want[0].0 {
+                r.mismatches += 1;
+                r.first_mismatch.get_or_insert(i);
+            }
+            // The exact token's logit; past the top candidates, bounded by the last one shown.
+            let logit = got
+                .iter()
+                .find(|c| c.0 == want[0].0)
+                .unwrap_or(&got[got.len() - 1])
+                .1;
+            let d = (logit - want[0].1).abs();
+            r.max_dlogit = r.max_dlogit.max(d);
+            r.sum_dlogit += f64::from(d);
+        }
+        // The exact run's margin at the divergence: near-ties diverge from any perturbation.
+        let margin = r
+            .first_mismatch
+            .map(|i| reference[i][0].1 - reference[i][1].1);
+        println!(
+            "{}",
+            json!({"prompt": prompt, "prompt_tokens": ids.len(), "split": split,
+                   "format": format.name(), "state_rel_err": r.state_err,
+                   "state_mb": r.bytes as f64 / 1e6, "steps": r.steps,
+                   "first_mismatch": r.first_mismatch, "mismatches": r.mismatches,
+                   "margin_at_mismatch": margin, "max_dlogit": r.max_dlogit,
+                   "mean_dlogit": r.sum_dlogit / r.steps as f64})
+        );
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// Relative L2 difference of two checkpoints' states (`got` against `want`).
+fn rel_err<B: Backend>(
+    b: &B,
+    want: &velox_models::qwen3_5::Checkpoint<B>,
+    got: &velox_models::qwen3_5::Checkpoint<B>,
+) -> Result<f64> {
+    b.synchronize()?;
+    let (mut err, mut norm) = (0f64, 0f64);
+    for (w, g) in want.buffers().zip(got.buffers()) {
+        let (mut x, mut y) = (vec![0f32; b.len(w)], vec![0f32; b.len(g)]);
+        b.download(w, &mut x)?;
+        b.download(g, &mut y)?;
+        for (p, q) in x.iter().zip(&y) {
+            err += f64::from(p - q).powi(2);
+            norm += f64::from(*p).powi(2);
+        }
+    }
+    Ok(if norm > 0.0 { (err / norm).sqrt() } else { 0.0 })
+}
+
+/// Per-format totals of `--state-quant` over every prompt (stderr, after the JSON lines).
+fn state_quant_summary(formats: &[StateFormat], rows: &[StateQuantRow]) {
+    eprintln!(
+        "\nformat   state MB  rel err   diverged  first mismatch  mismatched steps  max |dlogit|  mean |dlogit|"
+    );
+    for &f in formats {
+        let rs: Vec<&StateQuantRow> = rows.iter().filter(|r| r.format == f).collect();
+        if rs.is_empty() {
+            continue;
+        }
+        let mut firsts: Vec<usize> = rs.iter().filter_map(|r| r.first_mismatch).collect();
+        firsts.sort_unstable();
+        let steps: usize = rs.iter().map(|r| r.steps).sum();
+        let first = match firsts.get(firsts.len() / 2) {
+            Some(m) => format!("median {m}"),
+            None => "-".to_string(),
+        };
+        eprintln!(
+            "{:<8} {:>8.1}  {:>8.2e}  {:>3}/{:<4}  {:>14}  {:>7}/{:<8}  {:>12.3}  {:>13.4}",
+            f.name(),
+            rs[0].bytes as f64 / 1e6,
+            rs.iter().map(|r| r.state_err).sum::<f64>() / rs.len() as f64,
+            firsts.len(),
+            rs.len(),
+            first,
+            rs.iter().map(|r| r.mismatches).sum::<usize>(),
+            steps,
+            rs.iter().map(|r| r.max_dlogit).fold(0f32, f32::max),
+            rs.iter().map(|r| r.sum_dlogit).sum::<f64>() / steps.max(1) as f64
+        );
+    }
 }
 
 /// `--spec-check`: speculative verify/commit must reproduce sequential decoding. Decodes greedily
@@ -282,6 +543,7 @@ fn mtp_generate<B: Backend>(
     draft_len: usize,
     chunk: usize,
     fe: &Frontend,
+    on_phase: &mut dyn FnMut(&str),
 ) -> Result<()> {
     use velox_engine::spec::MtpDrafter;
     let limit = fe.public_vocab;
@@ -293,6 +555,7 @@ fn mtp_generate<B: Backend>(
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;
     let prefill = t0.elapsed().as_secs_f64();
+    on_phase("prefill");
     let t1 = Instant::now();
     let mut out = vec![c];
     let mut drafts = dr.draft(b, model, s, ws, 0, &[], c, limit)?;
@@ -327,6 +590,7 @@ fn mtp_generate<B: Backend>(
         drafts = dr.draft(b, model, s, ws, p, &window[1..keep], c, limit)?;
     }
     let decode = t1.elapsed().as_secs_f64();
+    on_phase("decode");
     if out.last().is_some_and(|&t| fe.is_eos(t)) {
         out.pop();
     }
@@ -357,6 +621,7 @@ fn dflash_generate<B: Backend>(
     drafts_per_block: usize,
     chunk: usize,
     fe: &Frontend,
+    on_phase: &mut dyn FnMut(&str),
 ) -> Result<()> {
     use velox_engine::spec::DFlashDrafter;
     use velox_models::qwen3_5::DFlashModel;
@@ -373,6 +638,7 @@ fn dflash_generate<B: Backend>(
     })?;
     let mut c = model.candidates(b, ws, 1, limit)?[0].0;
     let prefill = t0.elapsed().as_secs_f64();
+    on_phase("prefill");
     let t1 = Instant::now();
     let mut out = vec![c];
     let (mut rounds, mut accepted, mut proposed) = (0usize, 0usize, 0usize);
@@ -392,7 +658,19 @@ fn dflash_generate<B: Backend>(
             }
         }
         let td = Instant::now();
-        let (drafts, _) = dr.draft(b, &dm, &mut dw, model, ws, row, kept, s.pos, c, limit, 0.0)?;
+        let (drafts, _) = dr.draft(
+            b,
+            &dm,
+            &mut dw,
+            model,
+            ws,
+            row,
+            kept,
+            s.pos,
+            c,
+            limit,
+            &velox_engine::Sampler::greedy(),
+        )?;
         draft_s += td.elapsed().as_secs_f64();
         let mut window = vec![c];
         window.extend(drafts.iter().copied().take(max_tokens - out.len()));
@@ -405,9 +683,10 @@ fn dflash_generate<B: Backend>(
             keep += 1;
         }
         let next = rows[keep - 1][0].0;
+        // Commit is timed as submitted, not waited for (like the server): the next draft's
+        // submission overlaps it, and its GPU time lands in the next round's drafting.
         let tc = Instant::now();
         model.commit(b, s, ws, keep)?;
-        b.synchronize()?;
         commit_s += tc.elapsed().as_secs_f64();
         rounds += 1;
         proposed += window.len() - 1;
@@ -428,6 +707,7 @@ fn dflash_generate<B: Backend>(
         (row, kept) = (p, keep);
     }
     let decode = t1.elapsed().as_secs_f64();
+    on_phase("decode");
     if out.last().is_some_and(|&t| fe.is_eos(t)) {
         out.pop();
     }
@@ -445,4 +725,61 @@ fn dflash_generate<B: Backend>(
     println!("ids       {out:?}");
     println!("text      {:?}", fe.decode(&out)?);
     Ok(())
+}
+
+/// Readies a MoE model's routed experts: device slots for the most selected ones in the memory
+/// left after `margin_mib` (`--vram-margin-mib`; room for what is still to be allocated), or
+/// `--expert-slots`. A dense model is left as is.
+pub(crate) fn enable_experts<B: Backend>(
+    b: &B,
+    model: &mut Qwen35Text<B>,
+    a: &Args,
+    margin_mib: usize,
+) -> Result<()> {
+    let slot = model.expert_slot_bytes();
+    if slot == 0 {
+        return Ok(());
+    }
+    b.synchronize()?;
+    let free = b.mem_info().map_or(0, |(free, _)| free);
+    let margin: usize = a.parse("vram-margin-mib", margin_mib)?;
+    let slots =
+        (free.saturating_sub(margin << 20) / slot).min(a.parse("expert-slots", usize::MAX)?);
+    let policy = ExpertPolicy {
+        interval: a.parse("cache-interval", ExpertPolicy::default().interval)?,
+        moves: a.parse("cache-moves", ExpertPolicy::default().moves)?,
+        reads: a.parse("cache-score-reads", u8::from(ExpertPolicy::default().reads))? != 0,
+        ..ExpertPolicy::default()
+    };
+    model.enable_experts(b, slots, policy)?;
+    let total = model.cfg.layers.len() * model.cfg_experts();
+    eprintln!(
+        "expert cache: {slots} slots of {:.2} MiB ({:.2} GB, {:.1}% of {total} experts)",
+        slot as f64 / (1 << 20) as f64,
+        (slots * slot) as f64 / 1e9,
+        100.0 * slots as f64 / total.max(1) as f64,
+    );
+    Ok(())
+}
+
+/// Bytes of the objects bound under `prefix` (each object once).
+fn component_bytes(art: &Artifact, prefix: &str) -> u64 {
+    let mut ids = std::collections::BTreeSet::new();
+    for (name, b) in art.directory["bindings"].as_object().into_iter().flatten() {
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if let Some(id) = b["object"].as_str() {
+            ids.insert(id.to_string());
+        }
+        for p in b["parts"].as_array().into_iter().flatten() {
+            if let Some(id) = p["object"].as_str() {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids.iter()
+        .filter_map(|id| art.object(id))
+        .map(|o| o.bytes)
+        .sum()
 }

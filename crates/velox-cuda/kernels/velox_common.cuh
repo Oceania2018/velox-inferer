@@ -70,3 +70,13 @@ struct VeloxScratch {
         return ptr;
     }
 };
+
+// f32 -> bf16 bits, round to nearest even (NaN stays NaN): the bf16 twins producers write for
+// linears that round their activations to bf16 (Backend::linear_bf16). Integer ops only, so it is
+// the same on every toolchain.
+__device__ __forceinline__ unsigned short velox_bf16_bits(float f) {
+    unsigned int u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return static_cast<unsigned short>((u >> 16) | 0x40u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return static_cast<unsigned short>(u >> 16);
+}

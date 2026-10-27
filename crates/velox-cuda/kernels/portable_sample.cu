@@ -2,10 +2,12 @@
 // `limit` values of each row, so the host only receives a few candidates instead of the vocabulary.
 //
 // Two passes. Pass 1: blocks of 256 threads take 4096-value slices of a row and keep the top k of
-// each by a bitonic sort in shared memory. Pass 2: one 1024-thread block per row sorts all slice
-// candidates the same way and keeps the final top k.
+// each. Pass 2: one 1024-thread block per row keeps the final top k of all slice candidates. Each
+// pass selects by k block reductions for k <= kSelectMax (each picks the best value ranked after
+// the previous pick), else by a bitonic sort in shared memory; both give the same top k.
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <mutex>
 
@@ -16,6 +18,7 @@ namespace {
 constexpr int kSlicePer = 16, kMergePer = 4;
 constexpr int kSlice = 256 * kSlicePer;     // values per pass-1 block (61 slices for a 248k vocabulary)
 constexpr int kMergeCap = 1024 * kMergePer;  // candidates one pass-2 block can hold
+constexpr int kSelectMax = 32;                // largest k selected by reductions
 
 __device__ __forceinline__ float rank_key(float v) { return isnan(v) ? -INFINITY : v; }
 
@@ -52,6 +55,74 @@ __device__ void block_top_k(float* sv, int* si, int n, int k, float* out_v, int*
     for (int r = threadIdx.x; r < k; r += THREADS) out_v[r] = sv[r], out_i[r] = si[r];
 }
 
+__device__ __forceinline__ void keep_best(float& v, int& i, float ov, int oi) {
+    if (before(ov, oi, v, i)) v = ov, i = oi;
+}
+
+// The block-wide best of every thread's (v, i), returned to all threads.
+template <int THREADS>
+__device__ void block_best(float& v, int& i) {
+    __shared__ float wv[THREADS / 32];
+    __shared__ int wi[THREADS / 32];
+    for (int o = 16; o > 0; o >>= 1) keep_best(v, i, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, i, o));
+    if ((threadIdx.x & 31) == 0) wv[threadIdx.x / 32] = v, wi[threadIdx.x / 32] = i;
+    __syncthreads();
+    v = wv[0], i = wi[0];
+    for (int w = 1; w < THREADS / 32; ++w) keep_best(v, i, wv[w], wi[w]);
+    __syncthreads();
+}
+
+// The top k (k <= kSelectMax) of the pairs each thread holds in registers (index -1: padding)
+// into out_v/out_i, best first: round r takes the best pair ranked after round r - 1's pick.
+template <int THREADS, int PER>
+__device__ void block_select(const float (&v)[PER], const int (&ix)[PER], int k, float* out_v, int* out_i) {
+    float pv = INFINITY;
+    int pi = -1;
+    for (int r = 0; r < k; ++r) {
+        float bv = -INFINITY;
+        int bi = -1;
+#pragma unroll
+        for (int p = 0; p < PER; ++p)
+            if (ix[p] >= 0 && (r == 0 || before(pv, pi, v[p], ix[p]))) keep_best(bv, bi, v[p], ix[p]);
+        block_best<THREADS>(bv, bi);
+        if (threadIdx.x == 0) out_v[r] = bv, out_i[r] = bi;
+        pv = bv, pi = bi;
+    }
+}
+
+__global__ void __launch_bounds__(256) top_k_select_slices(const float* __restrict__ x, long long row_len, int limit,
+                                                           int k, float* __restrict__ cand_v, int* __restrict__ cand_i) {
+    const int row = blockIdx.y, slice = blockIdx.x, slices = gridDim.x;
+    const int lo = slice * kSlice;
+    const int n = min(kSlice, limit - lo);
+    const float* xr = x + row * row_len + lo;
+    float v[kSlicePer];
+    int ix[kSlicePer];
+#pragma unroll
+    for (int p = 0; p < kSlicePer; ++p) {
+        const int j = p * 256 + threadIdx.x;
+        v[p] = j < n ? rank_key(xr[j]) : -INFINITY;
+        ix[p] = j < n ? lo + j : -1;
+    }
+    const long long out = (static_cast<long long>(row) * slices + slice) * k;
+    block_select<256, kSlicePer>(v, ix, k, cand_v + out, cand_i + out);
+}
+
+__global__ void __launch_bounds__(1024) top_k_select_merge(const float* __restrict__ cand_v,
+                                                           const int* __restrict__ cand_i, int n, int k,
+                                                           float* __restrict__ out_v, int* __restrict__ out_i) {
+    const int row = blockIdx.x;
+    float v[kMergePer];
+    int ix[kMergePer];
+#pragma unroll
+    for (int p = 0; p < kMergePer; ++p) {
+        const int j = p * 1024 + threadIdx.x;
+        v[p] = j < n ? cand_v[static_cast<long long>(row) * n + j] : -INFINITY;
+        ix[p] = j < n ? cand_i[static_cast<long long>(row) * n + j] : -1;
+    }
+    block_select<1024, kMergePer>(v, ix, k, out_v + static_cast<long long>(row) * k, out_i + static_cast<long long>(row) * k);
+}
+
 __global__ void __launch_bounds__(256) top_k_slices(const float* __restrict__ x, long long row_len, int limit, int k,
                                                     float* __restrict__ cand_v, int* __restrict__ cand_i) {
     __shared__ float sv[kSlice];
@@ -82,6 +153,46 @@ __global__ void __launch_bounds__(1024) top_k_merge(const float* __restrict__ ca
     block_top_k<1024, kMergePer>(sv, si, n, k, out_v + static_cast<long long>(row) * k, out_i + static_cast<long long>(row) * k);
 }
 
+// k = 1 (greedy argmax, e.g. speculative verify): a reduction instead of sorting each slice.
+// Same order as `before`: value desc, then index asc; NaN ranks lowest; index -1 is padding.
+
+template <int THREADS>
+__device__ void block_argmax(float v, int i, float* out_v, int* out_i) {
+    __shared__ float wv[THREADS / 32];
+    __shared__ int wi[THREADS / 32];
+    for (int o = 16; o > 0; o >>= 1) keep_best(v, i, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, i, o));
+    if ((threadIdx.x & 31) == 0) wv[threadIdx.x / 32] = v, wi[threadIdx.x / 32] = i;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        v = threadIdx.x < THREADS / 32 ? wv[threadIdx.x] : -INFINITY;
+        i = threadIdx.x < THREADS / 32 ? wi[threadIdx.x] : -1;
+        for (int o = 16; o > 0; o >>= 1) keep_best(v, i, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, i, o));
+        if (threadIdx.x == 0) *out_v = v, *out_i = i;
+    }
+}
+
+__global__ void __launch_bounds__(256) argmax_slices(const float* __restrict__ x, long long row_len, int limit,
+                                                     float* __restrict__ cand_v, int* __restrict__ cand_i) {
+    const int row = blockIdx.y, slice = blockIdx.x;
+    const int lo = slice * kSlice, n = min(kSlice, limit - lo);
+    const float* xr = x + row * row_len + lo;
+    float v = -INFINITY;
+    int i = -1;
+    for (int j = threadIdx.x; j < n; j += 256) keep_best(v, i, rank_key(xr[j]), lo + j);
+    const long long out = static_cast<long long>(row) * gridDim.x + slice;
+    block_argmax<256>(v, i, cand_v + out, cand_i + out);
+}
+
+__global__ void __launch_bounds__(256) argmax_merge(const float* __restrict__ cand_v, const int* __restrict__ cand_i,
+                                                    int n, float* __restrict__ out_v, int* __restrict__ out_i) {
+    const int row = blockIdx.x;
+    float v = -INFINITY;
+    int i = -1;
+    for (int j = threadIdx.x; j < n; j += 256)
+        keep_best(v, i, cand_v[static_cast<long long>(row) * n + j], cand_i[static_cast<long long>(row) * n + j]);
+    block_argmax<256>(v, i, out_v + row, out_i + row);
+}
+
 struct Scratch {
     std::mutex mu;
     uint8_t* ptr = nullptr;
@@ -99,6 +210,24 @@ struct Scratch {
 };
 Scratch g_topk;
 
+// Pinned staging for the results: one async copy and one stream synchronization per call (a
+// pageable cudaMemcpy pays a full host round trip per array).
+struct HostStage {
+    uint8_t* ptr = nullptr;
+    size_t bytes = 0;
+    uint8_t* get(size_t need) {
+        if (need > bytes) {
+            if (ptr) cudaFreeHost(ptr);
+            ptr = nullptr;
+            bytes = 0;
+            if (cudaMallocHost(&ptr, need) != cudaSuccess) return nullptr;
+            bytes = need;
+        }
+        return ptr;
+    }
+};
+HostStage g_topk_host;
+
 }  // namespace
 
 // Writes rows * k (index, value) pairs to host arrays; index -1 marks a missing value. Returns
@@ -115,9 +244,158 @@ VELOX_API int velox_portable_top_k(const float* x, int rows, long long row_len, 
     int* cand_i = reinterpret_cast<int*>(base + cand * 4);
     float* out_v = reinterpret_cast<float*>(base + cand * 8);
     int* out_i = reinterpret_cast<int*>(base + cand * 8 + outn * 4);
-    top_k_slices<<<dim3(slices, rows), 256>>>(x, row_len, limit, k, cand_v, cand_i);
-    top_k_merge<<<rows, 1024>>>(cand_v, cand_i, slices * k, k, out_v, out_i);
+    if (k == 1) {
+        argmax_slices<<<dim3(slices, rows), 256>>>(x, row_len, limit, cand_v, cand_i);
+        argmax_merge<<<rows, 256>>>(cand_v, cand_i, slices, out_v, out_i);
+    } else if (k <= kSelectMax) {
+        top_k_select_slices<<<dim3(slices, rows), 256>>>(x, row_len, limit, k, cand_v, cand_i);
+        top_k_select_merge<<<rows, 1024>>>(cand_v, cand_i, slices * k, k, out_v, out_i);
+    } else {
+        top_k_slices<<<dim3(slices, rows), 256>>>(x, row_len, limit, k, cand_v, cand_i);
+        top_k_merge<<<rows, 1024>>>(cand_v, cand_i, slices * k, k, out_v, out_i);
+    }
     if (const int e = velox_launch_status()) return e;
-    if (cudaError_t e = cudaMemcpy(host_idx, out_i, outn * 4, cudaMemcpyDeviceToHost)) return static_cast<int>(e);
-    return static_cast<int>(cudaMemcpy(host_val, out_v, outn * 4, cudaMemcpyDeviceToHost));
+    // out_v and out_i are adjacent: one copy brings both.
+    uint8_t* stage = g_topk_host.get(outn * 8);
+    if (!stage) return static_cast<int>(cudaErrorMemoryAllocation);
+    if (cudaError_t e = cudaMemcpyAsync(stage, out_v, outn * 8, cudaMemcpyDeviceToHost, 0)) return static_cast<int>(e);
+    if (cudaError_t e = cudaStreamSynchronize(0)) return static_cast<int>(e);
+    memcpy(host_val, stage, outn * 4);
+    memcpy(host_idx, stage + outn * 4, outn * 4);
+    return 0;
+}
+
+namespace {
+
+// argmax_merge writing the best index as a u32 (the row's best is always found: limit >= 1).
+__global__ void __launch_bounds__(256) argmax_merge_to(const float* __restrict__ cand_v, const int* __restrict__ cand_i,
+                                                       int n, unsigned int* __restrict__ dst) {
+    float v = -INFINITY;
+    int i = -1;
+    for (int j = threadIdx.x; j < n; j += 256) keep_best(v, i, cand_v[j], cand_i[j]);
+    block_best<256>(v, i);
+    if (threadIdx.x == 0) *dst = static_cast<unsigned int>(i < 0 ? 0 : i);
+}
+
+Scratch g_argmax;  // its own scratch: a captured step must keep its addresses
+
+// Pinned slots the device writes u32 values into, each with an event the host waits on.
+constexpr int kFetchSlots = 8;
+struct FetchRing {
+    std::mutex mu;
+    unsigned int* host = nullptr;
+    cudaEvent_t ev[kFetchSlots] = {};
+    int init() {
+        if (host) return 0;
+        if (cudaError_t e = cudaHostAlloc(reinterpret_cast<void**>(&host), kFetchSlots * sizeof(unsigned int),
+                                          cudaHostAllocDefault))
+            return static_cast<int>(e);
+        for (int s = 0; s < kFetchSlots; ++s)
+            if (cudaError_t e = cudaEventCreateWithFlags(&ev[s], cudaEventDisableTiming)) return static_cast<int>(e);
+        return 0;
+    }
+} g_fetch;
+
+}  // namespace
+
+// The index of the best of the first `limit` values of one row (ranked as top_k: value desc,
+// index asc, NaN last), written to dst as a u32 on the device, so the next step can read it there.
+VELOX_API int velox_portable_argmax_to(const float* x, long long row_len, int limit, unsigned int* dst) {
+    const int slices = (limit + kSlice - 1) / kSlice;
+    if (limit <= 0 || row_len < limit) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_argmax.mu);
+    uint8_t* base = g_argmax.get(static_cast<size_t>(slices) * 8);
+    if (!base) return static_cast<int>(cudaErrorMemoryAllocation);
+    float* cand_v = reinterpret_cast<float*>(base);
+    int* cand_i = reinterpret_cast<int*>(base + static_cast<size_t>(slices) * 4);
+    argmax_slices<<<dim3(slices, 1), 256>>>(x, row_len, limit, cand_v, cand_i);
+    argmax_merge_to<<<1, 256>>>(cand_v, cand_i, slices, dst);
+    return velox_launch_status();
+}
+
+// Queues a copy of the u32 at src into pinned slot `slot` (0 <= slot < 8) behind the work queued
+// so far, with an event; `velox_portable_fetch_u32_wait` waits for that event and reads the slot.
+VELOX_API int velox_portable_fetch_u32_begin(const unsigned int* src, int slot) {
+    if (slot < 0 || slot >= kFetchSlots) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_fetch.mu);
+    if (const int e = g_fetch.init()) return e;
+    if (cudaError_t e = cudaMemcpyAsync(g_fetch.host + slot, src, sizeof(unsigned int), cudaMemcpyDeviceToHost, 0))
+        return static_cast<int>(e);
+    return static_cast<int>(cudaEventRecord(g_fetch.ev[slot], 0));
+}
+
+VELOX_API int velox_portable_fetch_u32_wait(int slot, unsigned int* out) {
+    if (slot < 0 || slot >= kFetchSlots) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_fetch.mu);
+    if (const int e = g_fetch.init()) return e;
+    if (cudaError_t e = cudaEventSynchronize(g_fetch.ev[slot])) return static_cast<int>(e);
+    *out = g_fetch.host[slot];
+    return 0;
+}
+
+namespace {
+
+// Block-wide maximum for blockDim.x a multiple of VELOX_WARP and at most 1024 (see
+// velox_block_sum). Every thread gets the result.
+__device__ __forceinline__ float block_max(float v, float* scratch) {
+    const int lane = threadIdx.x % VELOX_WARP;
+    const int warp = threadIdx.x / VELOX_WARP;
+    v = velox_warp_max(v);
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    v = lane < static_cast<int>(blockDim.x) / VELOX_WARP ? scratch[lane] : -INFINITY;
+    v = velox_warp_max(v);
+    __syncthreads();
+    return v;
+}
+
+// One block per row: the maximum of the first `limit` values, then the sum of exp(x - max) (NaN
+// counts as -inf), then x[id] - max - log(sum) for each of the n ids.
+__global__ void __launch_bounds__(1024) log_softmax_gather_rows(const float* __restrict__ x, long long row_len,
+                                                                int limit, const unsigned int* __restrict__ ids,
+                                                                int n, float* __restrict__ out) {
+    __shared__ float scratch[VELOX_WARP];
+    const float* xr = x + static_cast<long long>(blockIdx.x) * row_len;
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < limit; j += blockDim.x) m = fmaxf(m, rank_key(xr[j]));
+    m = block_max(m, scratch);
+    const bool finite = isfinite(m);
+    float s = 0.0f;
+    if (finite)
+        for (int j = threadIdx.x; j < limit; j += blockDim.x) s += expf(rank_key(xr[j]) - m);
+    s = velox_block_sum(s, scratch);
+    const float log_z = m + logf(s);
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const unsigned int id = ids[j];
+        out[static_cast<long long>(blockIdx.x) * n + j] =
+            finite && id < static_cast<unsigned int>(limit) ? rank_key(xr[id]) - log_z : -INFINITY;
+    }
+}
+
+Scratch g_gather;
+HostStage g_gather_host;
+
+}  // namespace
+
+// Log-softmax over the first `limit` values of each of `rows` rows, read at the n host ids and
+// written to host_out as [rows, n]. One upload of the ids and one download of the results.
+VELOX_API int velox_portable_log_softmax_gather(const float* x, int rows, long long row_len, int limit,
+                                                const unsigned int* host_ids, int n, float* host_out) {
+    if (rows <= 0 || rows > 65535 || n <= 0 || limit <= 0 || row_len < limit) return VELOX_ERR_UNSUPPORTED;
+    std::lock_guard<std::mutex> lock(g_gather.mu);
+    const size_t id_bytes = static_cast<size_t>(n) * 4, out_bytes = static_cast<size_t>(rows) * n * 4;
+    uint8_t* base = g_gather.get(id_bytes + out_bytes);
+    uint8_t* stage = g_gather_host.get(id_bytes + out_bytes);
+    if (!base || !stage) return static_cast<int>(cudaErrorMemoryAllocation);
+    unsigned int* ids = reinterpret_cast<unsigned int*>(base);
+    float* out = reinterpret_cast<float*>(base + id_bytes);
+    memcpy(stage, host_ids, id_bytes);
+    if (cudaError_t e = cudaMemcpyAsync(ids, stage, id_bytes, cudaMemcpyHostToDevice, 0)) return static_cast<int>(e);
+    log_softmax_gather_rows<<<rows, 1024>>>(x, row_len, limit, ids, n, out);
+    if (const int e = velox_launch_status()) return e;
+    if (cudaError_t e = cudaMemcpyAsync(stage + id_bytes, out, out_bytes, cudaMemcpyDeviceToHost, 0))
+        return static_cast<int>(e);
+    if (cudaError_t e = cudaStreamSynchronize(0)) return static_cast<int>(e);
+    memcpy(host_out, stage + id_bytes, out_bytes);
+    return 0;
 }
