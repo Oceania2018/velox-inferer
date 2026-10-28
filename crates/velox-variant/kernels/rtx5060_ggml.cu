@@ -1115,9 +1115,12 @@ int launch_mma_rd(const uint8_t* w, long long row_bytes, long long rb, int rows,
     const int row_tiles = (rows + 15) / 16, steps = subs / (RD ? 8 : 16), tok_tiles = L.tiles;
     const int nt = m <= 8 ? 1 : m <= 16 ? 2 : 8;
     const int chunks = (tok_tiles + nt - 1) / nt;
-    // K splits: enough warps to fill the GPU (about 1024), at most one step per split.
+    // K splits: enough warps to fill the GPU (about 1024), at most one step per split. RD runs three
+    // blocks per SM, so a gate / up projection (1088 row tiles) splits K in two there: 272 blocks
+    // made 2.5 waves of 108 (ggml_iq2_s [17408,5120] m = 8: 111 -> 103 us).
+    constexpr int target = RD ? 2048 : 1024;
     int ks = 1;
-    while (ks < kMmaWarps && row_tiles * chunks * ks < 1024 && ks * 2 <= steps) ks *= 2;
+    while (ks < kMmaWarps && row_tiles * chunks * ks < target && ks * 2 <= steps) ks *= 2;
     const int per_block = kMmaWarps / ks;
     const dim3 grid(chunks, (row_tiles + per_block - 1) / per_block);
     if (grid.y > 65535) return VELOX_ERR_UNSUPPORTED;
