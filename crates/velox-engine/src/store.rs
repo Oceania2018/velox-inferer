@@ -21,8 +21,9 @@
 //!   that step); each chain keeps its newest `superseded` such points (ninfer `--ctx-checkpoints`)
 //!   and a second adoption makes one a branch, kept under the general rules.
 //!
-//! An optional NVMe tier ([`DiskTier`]) keeps copies of evicted entries that can still be
-//! resumed.
+//! An optional NVMe tier ([`DiskTier`]) keeps copies of the hot entries (see [`Entry::hot`]):
+//! written while they are still resident ([`ContextStore::persist`]) or when they are evicted,
+//! for a cold start and for hot prefixes system RAM cannot keep.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -64,6 +65,11 @@ pub(crate) struct Entry<B: Backend> {
     superseded_at: u64,
     last: u64,
     crf: f64,
+    /// Disk record being written from this entry's memory (which must stay put until then).
+    writing: Option<u64>,
+    /// [`ContextStore::persist`] tried it (not again if the disk drops it: a tier too small for
+    /// every hot entry would rewrite them all the time).
+    written: bool,
 }
 
 impl<B: Backend> Entry<B> {
@@ -74,6 +80,13 @@ impl<B: Backend> Entry<B> {
     fn prefix_of(&self, keys: &[u32]) -> bool {
         keys.len() >= self.keys.len() && keys[..self.keys.len()] == self.keys[..]
     }
+
+    /// Worth a disk copy: a root (system prompt, task) a request resumed from, or a branch point
+    /// more than one request resumed from. A root no request reused yet (a one-off task) and
+    /// one-off history points are not: NVMe writes go to prefixes that come back.
+    fn hot(&self) -> bool {
+        !self.superseded && self.adopted >= if self.root { 1 } else { 2 }
+    }
 }
 
 pub(crate) struct ContextStore<B: Backend> {
@@ -81,7 +94,11 @@ pub(crate) struct ContextStore<B: Backend> {
     pinner: Option<Pinner<B>>,
     /// Declared before `inflight`: dropping it joins the writer that reads those entries.
     disk: Option<DiskTier>,
-    /// Evicted entries being copied to disk, by record id (their memory must stay put).
+    /// Shortest prefix worth a disk copy: a request reads a record back only when it covers this
+    /// many tokens more than every resident source.
+    disk_min: usize,
+    /// Entries no longer resident whose disk copy is still being written, by record id (their
+    /// memory must stay put).
     inflight: Vec<(u64, Entry<B>)>,
     entries: Vec<Entry<B>>,
     /// Storage of evicted states and KV pages, reused for new ones: pinning memory costs about
@@ -158,11 +175,19 @@ where
 
 impl<B: Backend> ContextStore<B> {
     /// A store of at most `budget` bytes ranking entries by LRFU with decay `lambda` per request,
-    /// keeping recurrent states in `format`.
-    pub fn new(budget: usize, lambda: f64, disk: Option<DiskTier>, format: StateFormat) -> Self {
+    /// keeping recurrent states in `format`, and hot prefixes of at least `disk_min` tokens on
+    /// `disk`.
+    pub fn new(
+        budget: usize,
+        lambda: f64,
+        disk: Option<DiskTier>,
+        disk_min: usize,
+        format: StateFormat,
+    ) -> Self {
         ContextStore {
             pinner: None,
             disk,
+            disk_min,
             inflight: Vec::new(),
             entries: Vec::new(),
             spare: Vec::new(),
@@ -185,6 +210,11 @@ impl<B: Backend> ContextStore<B> {
     /// Advances the LRFU clock (once per request) and releases entries whose disk copy is done.
     pub fn tick(&mut self) {
         self.now += 1;
+        self.reap();
+    }
+
+    /// Takes finished disk copies: frees the entries that waited only for theirs.
+    fn reap(&mut self) {
         let Some(disk) = self.disk.as_mut() else {
             return;
         };
@@ -192,7 +222,59 @@ impl<B: Backend> ContextStore<B> {
             if let Some(i) = self.inflight.iter().position(|(r, _)| *r == id) {
                 let (_, e) = self.inflight.swap_remove(i);
                 self.release(e);
+            } else if let Some(e) = self.entries.iter_mut().find(|e| e.writing == Some(id)) {
+                e.writing = None;
             }
+        }
+    }
+
+    /// Write-through of a persistent disk tier: queues a background copy of every resident hot
+    /// entry the disk does not hold yet, so a restarted server finds it. Cheap when there is
+    /// nothing new (a scan of the entries); call once per request and when idle.
+    pub fn persist(&mut self, b: &B) -> Result<(), CoreError> {
+        self.reap();
+        let Some(disk) = self.disk.as_ref().filter(|d| d.persistent()) else {
+            return Ok(());
+        };
+        let new: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| {
+                let e = &self.entries[i];
+                e.hot()
+                    && e.pos() >= self.disk_min
+                    && !e.written
+                    && e.writing.is_none()
+                    && !disk.holds(&e.keys)
+            })
+            .collect();
+        if new.is_empty() {
+            return Ok(());
+        }
+        // The copies that filled these entries may still be in flight.
+        b.synchronize()?;
+        let (disk, now) = (self.disk.as_mut().expect("checked above"), self.now);
+        for i in new {
+            let e = &mut self.entries[i];
+            // Once, written or not (no room, device storage): no device sync for it every request.
+            e.written = true;
+            if let Some(id) = write(b, disk, e, now) {
+                e.writing = Some(id);
+                if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+                    eprintln!(
+                        "[disk] writing {}{}",
+                        if e.root { "*" } else { "" },
+                        e.pos()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Frees an entry no longer resident, or parks it until its disk copy is written.
+    fn retire(&mut self, e: Entry<B>) {
+        match e.writing {
+            Some(id) => self.inflight.push((id, e)),
+            None => self.release(e),
         }
     }
 
@@ -304,6 +386,8 @@ impl<B: Backend> ContextStore<B> {
             superseded_at: 0,
             last: self.now,
             crf: 1.0,
+            writing: None,
+            written: true,
         });
         self.evict(b, id)?;
         Ok(true)
@@ -500,7 +584,7 @@ impl<B: Backend> ContextStore<B> {
             for i in dead.into_iter().rev() {
                 let e = self.entries.swap_remove(i);
                 self.held.set(None);
-                self.release(e);
+                self.retire(e);
             }
         }
         let (lambda, now) = (self.lambda, self.now);
@@ -564,7 +648,7 @@ impl<B: Backend> ContextStore<B> {
         for i in old.into_iter().rev() {
             let e = self.entries.swap_remove(i);
             self.held.set(None);
-            self.release(e);
+            self.retire(e);
         }
     }
 
@@ -734,6 +818,8 @@ impl<B: Backend> ContextStore<B> {
             superseded_at: 0,
             last: now,
             crf: 1.0,
+            writing: None,
+            written: false,
         };
         if !root {
             if let Some(p) = chain.and_then(|c| self.entries.iter_mut().find(|e| e.id == c)) {
@@ -819,7 +905,7 @@ impl<B: Backend> ContextStore<B> {
             let e = self.entries.swap_remove(i);
             self.held.set(None);
             if let Some(e) = self.spill(b, e) {
-                self.release(e);
+                self.retire(e);
             }
         }
         self.shared.retain(|_, w| w.strong_count() > 0);
@@ -841,37 +927,18 @@ impl<B: Backend> ContextStore<B> {
         }
     }
 
-    /// Queues an evicted entry that can still be resumed for the disk tier; returns it back when
-    /// it is not written (no tier, superseded, already on disk, no room, device storage).
-    fn spill(&mut self, b: &B, e: Entry<B>) -> Option<Entry<B>> {
+    /// Queues an evicted hot entry for the disk tier; returns it back when it is not written (no
+    /// tier, not hot, too short, already on disk or being written, no room, device storage).
+    fn spill(&mut self, b: &B, mut e: Entry<B>) -> Option<Entry<B>> {
         let Some(disk) = self.disk.as_mut() else {
             return Some(e);
         };
-        if e.superseded || disk.holds(&e.keys) {
+        if !e.hot() || e.pos() < self.disk_min || e.writing.is_some() || disk.holds(&e.keys) {
             return Some(e);
         }
-        let parts: Option<Vec<(*const u8, usize)>> = e
-            .state
-            .buffers()
-            .chain(e.kv.iter().flat_map(|s| s.buffers()))
-            .chain(e.draft.iter().flat_map(|d| d.buffers()))
-            .map(|buf| b.host_bytes(buf).map(|x| (x.as_ptr(), x.len())))
-            .collect();
-        let Some(parts) = parts else {
-            return Some(e);
-        };
-        let segs = e.kv.iter().map(|s| (s.lo, s.hi)).collect();
-        let draft = e.draft.as_ref().map(|d| (d.lo, d.hi));
-        match disk.write(
-            &e.keys,
-            e.state.rope_delta,
-            segs,
-            draft,
-            e.root,
-            parts,
-            self.now,
-        ) {
+        match write(b, disk, &e, self.now) {
             Some(id) => {
+                e.writing = Some(id);
                 self.inflight.push((id, e));
                 None
             }
@@ -901,6 +968,29 @@ impl<B: Backend> ContextStore<B> {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// Queues a disk copy of entry `e` (state, KV pages, drafter context, in that order); its
+/// storage must be in system RAM and stay unchanged until the copy completes.
+fn write<B: Backend>(b: &B, disk: &mut DiskTier, e: &Entry<B>, now: u64) -> Option<u64> {
+    let parts: Option<Vec<(*const u8, usize)>> = e
+        .state
+        .buffers()
+        .chain(e.kv.iter().flat_map(|s| s.buffers()))
+        .chain(e.draft.iter().flat_map(|d| d.buffers()))
+        .map(|buf| b.host_bytes(buf).map(|x| (x.as_ptr(), x.len())))
+        .collect();
+    let segs = e.kv.iter().map(|s| (s.lo, s.hi)).collect();
+    let draft = e.draft.as_ref().map(|d| (d.lo, d.hi));
+    disk.write(
+        &e.keys,
+        e.state.rope_delta,
+        segs,
+        draft,
+        e.root,
+        parts?,
+        now,
+    )
 }
 
 /// Hash of the keys of every full KV page's whole prefix: entry `i` covers keys
