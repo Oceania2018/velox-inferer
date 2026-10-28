@@ -852,14 +852,17 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p);
 // l / 2, sub-block l % 2 (a row's consecutive words share their index, sign and high bytes, and
 // IQ2_S's two halves of a grid entry), stores the codes to a per-warp 16 x 32-byte tile and reads
 // the A fragments back with ldmatrix; K stays in the natural order for every type.
+// RD steps are one block (SB = 1), copied from the 4-byte boundary at or below its start (a lead of
+// 0..3 bytes), which halves the stage so three blocks fit per SM.
 template <int T, int NT, bool RD>
-__global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
+__global__ void __launch_bounds__(kMmaWarps * VELOX_WARP, RD ? 3 : 1)
     ggml_mma_kernel(const uint8_t* __restrict__ w, long long row_bytes, long long row_begin, int rows, int subs,
                     const int2* __restrict__ frag, const float2* __restrict__ fd, const float4* __restrict__ fs,
                     int m, int tiles, float* __restrict__ y, long long ldy, int ks, int mode) {
     // frag points at the order this type's k-slots use (natural or paired; RD: natural).
     constexpr int BB = block_bytes(T);
-    constexpr int W32 = 2 * BB / 4;                                // words of one row's step
+    constexpr int SB = RD ? 1 : 2;                                 // blocks per step
+    constexpr int W32 = RD ? (BB + 6) / 4 : 2 * BB / 4;            // words of one row's step
     // Staged stride (odd), at least 4 NT words so the stage can hold the K splits' partial sums
     // (IQ1's 50- / 56-byte blocks are shorter).
     constexpr int SW = (W32 > 4 * NT ? W32 : 4 * NT) | 1;
@@ -899,7 +902,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
     const int n0 = blockIdx.x * NT;
     const int r0 = (blockIdx.y * (kMmaWarps / ks) + warp / ks) * 16;
     const bool live = r0 < rows;
-    const int steps = subs / 16;
+    const int steps = subs / (8 * SB);
     float acc[NT][4];
 #pragma unroll
     for (int n = 0; n < NT; ++n)
@@ -913,12 +916,14 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
     const uint8_t* tile = w + (row_begin + r0) * row_bytes;
     const int last = rows - 1 - r0;
     auto issue = [&](int st, int buf) {
-        const uint8_t* base = tile + static_cast<long long>(st) * 2 * BB;
+        const long long b0 = (static_cast<long long>(st) * SB * BB) & ~3ll;
+        const uint8_t* base = tile + b0;
 #pragma unroll
         for (int i = 0; i < PER; ++i) {
             const int e = lane + i * VELOX_WARP, r = e / W32, c = e % W32;
             const uint32_t off = static_cast<uint32_t>(min(r, last)) * static_cast<uint32_t>(row_bytes) + 4u * c;
-            if (e < 16 * W32) cp_async4(&stage[warp][buf][r][c], base + off);
+            // RD: the window's words past the row end are never decoded (and may be past the tensor).
+            if (e < 16 * W32 && (!RD || b0 + 4 * c < row_bytes)) cp_async4(&stage[warp][buf][r][c], base + off);
         }
         cp_async_commit();
     };
@@ -994,12 +999,16 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
             }
         };
         if constexpr (RD) {
-            const int lr = lane >> 1, ls = lane & 1, sw = (lr >> 2) & 1;
-            const uint8_t* xr = reinterpret_cast<const uint8_t*>(stage[warp][buf][lr]);
+            // Lane l takes row l % 16 of sub-block l / 16: a quarter warp's STS.128 then covers 128
+            // contiguous bytes of one tile (lanes 2r, 2r + 1 on one row hit the same banks).
+            const int lr = lane & 15, ls = lane >> 4, sw = (lr >> 2) & 1;
+            // The step's block starts `lead` bytes into the staged window (block sizes are even: 0 or 2).
+            const int lead = static_cast<int>((static_cast<long long>(st) * SB * BB) & 3);
+            const uint8_t* xr = reinterpret_cast<const uint8_t*>(stage[warp][buf][lr]) + lead;
             // ldmatrix x4 lane addressing: rows 0-7 / 8-15 at chunk 0, then the same at chunk 1.
             const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ac = (lane >> 4) ^ ((ar >> 2) & 1);
 #pragma unroll 2
-            for (int p = 0; p < 8; ++p) {
+            for (int p = 0; p < 4 * SB; ++p) {
                 const int jj = 2 * p + ls, ib = jj % 8, off = (jj / 8) * BB;
                 int wv[8];
 #pragma unroll
@@ -1017,7 +1026,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
                     const float4 ta = ascl[warp][h][g], tb = ascl[warp][h][g + 8];
                     const float sa[2] = {ta.x, ta.y}, oa[2] = {ta.z, ta.w};
                     const float sb[2] = {tb.x, tb.y}, ob[2] = {tb.z, tb.w};
-                    mul(st * 16 + 2 * p + h, static_cast<int>(a[0]), static_cast<int>(a[1]), static_cast<int>(a[2]),
+                    mul(st * 8 * SB + 2 * p + h, static_cast<int>(a[0]), static_cast<int>(a[1]), static_cast<int>(a[2]),
                         static_cast<int>(a[3]), sa, oa, sb, ob);
                 }
                 __syncwarp();  // the tiles are read before the next pair overwrites them
@@ -1089,11 +1098,12 @@ int mma_min_m() {
 }
 
 // The types that take the row-decode variant of the tensor-core kernel. RTX 5060 Ti, bench-linear a8,
-// m = 8 (us): ggml_iq1_m [17408,5120] 128 -> 111, [6144,5120] 60 -> 47; ggml_iq1_s [17408,5120]
-// 108 -> 102. Neutral for IQ2_S / IQ2_XS; 7-14% slower for the paired decodes (IQ2_XXS, IQ3_S, Q4_K)
-// and Q2_K, whose fragment-order decode already shares the work RD shares.
+// m = 8 (us), fragment-order decode -> RD: ggml_iq1_m [17408,5120] 128 -> 111, [6144,5120] 60 -> 47;
+// ggml_iq2_s [17408,5120] 117 -> 110, [5120,17408] 121 -> 106; ggml_iq2_xs [5120,17408] 115 -> 103;
+// ggml_iq1_s [5120,17408] 101 -> 95. The paired decodes (IQ2_XXS, IQ3_S, Q4_K) and Q2_K / IQ4_XS
+// measured 3-13% slower on [17408,5120] (their fragment-order decode already shares RD's work).
 template <int T>
-constexpr bool kRowDecode = T == kIq1M || T == kIq1S;
+constexpr bool kRowDecode = T == kIq1M || T == kIq1S || T == kIq2S || T == kIq2Xs;
 
 template <int T, bool RD>
 int launch_mma_rd(const uint8_t* w, long long row_bytes, long long rb, int rows, int subs, const uint8_t* blob,
@@ -1102,7 +1112,7 @@ int launch_mma_rd(const uint8_t* w, long long row_bytes, long long rb, int rows,
     const auto* frag = reinterpret_cast<const int2*>(blob + (kPaired<T> && !RD ? L.fragp : L.frag));
     const auto* fd = reinterpret_cast<const float2*>(blob + L.fd);
     const auto* fs = reinterpret_cast<const float4*>(blob + L.fs);
-    const int row_tiles = (rows + 15) / 16, steps = subs / 16, tok_tiles = L.tiles;
+    const int row_tiles = (rows + 15) / 16, steps = subs / (RD ? 8 : 16), tok_tiles = L.tiles;
     const int nt = m <= 8 ? 1 : m <= 16 ? 2 : 8;
     const int chunks = (tok_tiles + nt - 1) / nt;
     // K splits: enough warps to fill the GPU (about 1024), at most one step per split.
