@@ -136,8 +136,11 @@ where
         // --host-state-dtype f32|bf16|nvfp4 (ninfer's name and default: bf16): storage of the
         // recurrent states the context store keeps; lanes always run on f32 state.
         host_state_format: StateFormat::parse(a.get("host-state-dtype").unwrap_or("bf16"))?,
-        // --disk-context-mib N (default 0: off) and --disk-context-dir DIR: NVMe tier below RAM.
-        disk_context_bytes: a.parse::<u64>("disk-context-mib", 0)? << 20,
+        // --disk-context-mib N (default 16384; 0: off) and --disk-context-dir DIR: NVMe tier below
+        // RAM for reused roots (system prompt, task) and branch points, kept across restarts so a
+        // cold start resumes them instead of prefilling (CUA: 15.5 s -> 1.4 s on the RTX 5060 Ti).
+        // Writes once per new prefix; mount DIR on a volume to keep it across container rebuilds.
+        disk_context_bytes: a.parse::<u64>("disk-context-mib", 16384)? << 20,
         disk_context_dir: match a.get("disk-context-dir") {
             Some(d) => d.into(),
             None => std::env::var_os("XDG_CACHE_HOME")
@@ -148,6 +151,16 @@ where
                 .unwrap_or_else(std::env::temp_dir)
                 .join("velox/disk-context"),
         },
+        // Records outlive the process, kept per model artifact and kernel variant (a restart
+        // resumes system prompts and tasks from disk instead of prefilling them).
+        disk_context_tag: Some(format!(
+            "{}-{}",
+            art.artifact_id
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect::<String>(),
+            velox_variant::INFO.id
+        )),
         // --max-concurrency N: lanes decoding at once (default 6, as ninfer on this machine).
         lanes: a.parse("max-concurrency", 6)?,
         mtp_drafts: a.parse("mtp-drafts", 7)?,

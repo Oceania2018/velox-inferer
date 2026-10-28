@@ -37,7 +37,7 @@ use velox_frontend::{parse_output, Frontend};
 use velox_models::qwen3_5::{
     shift_inserts, BatchWorkspace, Checkpoint, DFlashModel, DFlashState, DFlashWorkspace,
     EmbedInsert, KvPool, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
-    DRAFT_PAGE_ROWS,
+    DRAFT_PAGE_ROWS, KV_PAGE_ROWS,
 };
 use velox_serve::{ApiError, ChatEngine, Delta, Outcome, ScoreOutcome, ScoreQuery};
 
@@ -80,10 +80,15 @@ pub struct EngineConfig {
     /// `--host-state-dtype`): bf16 holds twice as many prefixes as f32 in the same RAM, nvfp4
     /// about 5.5 times; lanes always run on f32 state.
     pub host_state_format: StateFormat,
-    /// NVMe tier below the context store (see `disk`); 0 disables it.
+    /// NVMe tier below the context store (see `disk`): roots and branch points several requests
+    /// resumed from; 0 disables it.
     pub disk_context_bytes: u64,
-    /// Directory of the NVMe tier's files (a private subdirectory is created and removed).
+    /// Directory of the NVMe tier's files.
     pub disk_context_dir: std::path::PathBuf,
+    /// Identity of the loaded model (weights and kernels): records are kept across restarts in a
+    /// subdirectory named after it and the storage layout. `None`: a private subdirectory removed
+    /// on shutdown.
+    pub disk_context_tag: Option<String>,
     /// Lanes: requests decoding at once (ninfer `--max-concurrency`), each with `capacity`
     /// tokens of KV cache.
     pub lanes: usize,
@@ -684,9 +689,25 @@ where
             image_pad: single_token(&fe, "<|image_pad|>"),
         };
         let disk = if cfg.disk_context_bytes > 0 && cfg.host_context_bytes > 0 {
+            // Records hold raw storage: they only fit sessions of the same shapes and formats.
+            let session = &lanes[0].session;
+            let layout = format!(
+                "{:?} {} {} {} {} {:?}",
+                session.state_lens(&b, cfg.host_state_format),
+                session.kv_page_len(),
+                KV_PAGE_ROWS,
+                cfg.kv_format,
+                cfg.host_state_format,
+                dflash.as_ref().map(|dm| dm.context_page_len()),
+            );
             Some(
-                DiskTier::new(cfg.disk_context_dir.clone(), cfg.disk_context_bytes)
-                    .map_err(|e| CoreError::Config(format!("disk context tier: {e}")))?,
+                DiskTier::new(
+                    cfg.disk_context_dir.clone(),
+                    cfg.disk_context_bytes,
+                    cfg.disk_context_tag.as_deref(),
+                    disk::fnv64(disk::FNV_OFFSET, layout.as_bytes()),
+                )
+                .map_err(|e| CoreError::Config(format!("disk context tier: {e}")))?,
             )
         } else {
             None
@@ -695,6 +716,7 @@ where
             cfg.host_context_bytes,
             cfg.lrfu_lambda,
             disk,
+            DISK_GAIN,
             cfg.host_state_format,
         );
         // Pin the store's memory before serving: until the store fills, every capture would
@@ -1114,6 +1136,9 @@ impl<B: Backend> Core<B> {
                     break;
                 }
                 drop(q);
+                if let Err(e) = st.store.persist(&self.b) {
+                    eprintln!("disk context: {e}");
+                }
                 // One drafter window of context pages: a capture that saves the drafter context
                 // does not allocate pinned memory on the request path.
                 let more = match st.store.top_up(&self.b, &st.lanes[0].session, draft) {
@@ -1301,6 +1326,10 @@ impl<B: Backend> Core<B> {
             None => {}
         }
         store.tick();
+        // Hot entries the previous requests stored go to disk in the background.
+        if let Err(e) = store.persist(&self.b) {
+            eprintln!("disk context: {e}");
+        }
         let shared = common_prefix(&lane.keys, &p.keys);
         let r = (|| -> Result<Prefill<B>, CoreError> {
             if store.enabled() {
