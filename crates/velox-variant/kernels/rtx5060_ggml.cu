@@ -668,7 +668,7 @@ __device__ __forceinline__ int word(const uint8_t* __restrict__ x, int ib, int w
         const uint32_t g = sg[2 * (q & 511) + half];
         const uint32_t sb = sks[q >> 9];
         return signed4(g, (sb >> (4 * half)) & 0xf);
-    } else if constexpr (T == kIq1S) {
+    } else if constexpr (T == kIq1S || T == kIq1M) {  // codes 8 g +- 1 (|code| <= 9)
         return static_cast<int>(iq1_word<T>(x, ib, wi, sg));
     } else {  // IQ2_S
         const uint32_t idx = x[2 + 4 * ib + l] | ((static_cast<uint32_t>(x[66 + ib]) << (8 - 2 * l)) & 0x300);
@@ -777,6 +777,15 @@ __device__ __forceinline__ void half_scales(const uint8_t* __restrict__ x, int i
         }
     } else if constexpr (T == kIq2Xxs) {
         s[0] = s[1] = f16_at(x) * (0.5f + static_cast<float>(u16_at(x + 8 + 8 * ib) >> 12)) * 0.25f;
+    } else if constexpr (T == kIq1S) {  // codes 8 g +- 1 carry the delta: scale d (2 s + 1) / 8
+        s[0] = s[1] = f16_at(x) * static_cast<float>(2 * ((u16_at(x + 34 + 2 * ib) >> 12) & 7) + 1) * 0.125f;
+    } else if constexpr (T == kIq1M) {  // the same per 16 values; d's bits are spread over the scales
+        const uint32_t s0 = u16_at(x + 48), s1 = u16_at(x + 50), s2 = u16_at(x + 52), s3 = u16_at(x + 54);
+        const uint32_t dbits = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
+        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dbits))) * 0.125f;
+        const uint32_t w = u16_at(x + 48 + 2 * (ib / 2));
+        s[0] = d * static_cast<float>(2 * ((w >> (6 * (ib % 2))) & 7) + 1);
+        s[1] = d * static_cast<float>(2 * ((w >> (6 * (ib % 2) + 3)) & 7) + 1);
     } else {  // IQ2_XS (scales at 66), IQ2_S (scales at 74)
         const uint32_t v = x[(T == kIq2Xs ? 66 : 74) + ib];
         const float d = f16_at(x);
@@ -845,9 +854,14 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
     // frag points at the order this type's k-slots use (natural or paired).
     constexpr int BB = block_bytes(T);
     constexpr int W32 = 2 * BB / 4;                                // words of one row's step
-    constexpr int SW = W32 | 1;                                    // staged stride (odd)
+    // Staged stride (odd), at least 4 NT words so the stage can hold the K splits' partial sums
+    // (IQ1's 50- / 56-byte blocks are shorter).
+    constexpr int SW = (W32 > 4 * NT ? W32 : 4 * NT) | 1;
     constexpr int PER = (16 * W32 + VELOX_WARP - 1) / VELOX_WARP;  // copy words per lane
-    constexpr bool kHalves = Traits<T>::G == 2;
+    // IQ1_M's scales cover 16 values like the 2-group types; IQ1 codes carry their delta, so no
+    // offset term (the dp4a kernels' kOff) here.
+    constexpr bool kHalves = Traits<T>::G == 2 || T == kIq1M;
+    constexpr bool kOff = Traits<T>::kOff && T != kIq1S && T != kIq1M;
     __shared__ uint32_t stage[kMmaWarps][2][16][SW];
     __shared__ uint32_t sg[Grid<T>::kWords];
     __shared__ uint8_t sks[128];
@@ -857,7 +871,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
     // offsets keep the scale only; 16-value-scale types or offsets keep (s0, s1, o0, o1) or (s, o).
     // Only the types whose scales take real unpacking use it (K-quants' 6-bit scale/min pairs, the
     // 16-value-scale IQ2s); a 4-bit scale is cheaper to decode in place than to stage.
-    constexpr bool kUseTab = kHalves || Traits<T>::kOff;
+    constexpr bool kUseTab = kHalves || kOff;
     constexpr int kTab = kHalves ? 4 : 2;
     __shared__ float sct[kUseTab ? kMmaWarps : 1][16][17][kTab];
     if constexpr (Grid<T>::kWords > 1) {
@@ -965,7 +979,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
                     mma_k32(c0, a0, a1, a2, a3, b.x, b.y);
                 }
                 float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                if constexpr (Traits<T>::kOff) z = __ldg(fs + e * 4 + t);
+                if constexpr (kOff) z = __ldg(fs + e * 4 + t);
 #pragma unroll
                 for (int q = 0; q < 2; ++q) {  // token columns 2t, 2t + 1 (zero scale past m)
                     const float dx = q ? d2.y : d2.x;
@@ -977,7 +991,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
                         va = sa[0] * static_cast<float>(c0[q]);
                         vb = sb[0] * static_cast<float>(c0[2 + q]);
                     }
-                    if constexpr (Traits<T>::kOff) {
+                    if constexpr (kOff) {
                         const float z0 = q ? z.z : z.x, z1 = q ? z.w : z.y;
                         va += oa[0] * z0 + oa[1] * z1;
                         vb += ob[0] * z0 + ob[1] * z1;
@@ -1018,7 +1032,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
         }
 }
 
-// From this many tokens the tensor-core kernel serves GGML weights (except IQ1_M);
+// From this many tokens the tensor-core kernel serves GGML weights (except IQ4_NL);
 // VELOX_GGML_MMA_MIN overrides it for tuning.
 int mma_min_m() {
     static const int v = [] {
@@ -1059,7 +1073,7 @@ int launch_mma(const uint8_t* w, long long row_bytes, long long rb, int rows, in
 template <int T>
 int launch_any(const uint8_t* w, long long row_bytes, long long rb, int rows, int subs, const int8_t* xq,
                const float* xd, int m, float* y, long long ldy, int mode) {
-    if constexpr (T != kIq1M && T != kIq4Nl && T != kIq1S) {
+    if constexpr (T != kIq4Nl) {
         if (m >= mma_min_m())
             return launch_mma<T>(w, row_bytes, rb, rows, subs, reinterpret_cast<const uint8_t*>(xq), m, y, ldy,
                                  mode);
