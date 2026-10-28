@@ -44,7 +44,7 @@ use velox_models::qwen3_5::{
     Checkpoint, DFlashModel, DFlashState, DraftContext, KvSegment, Session, KV_PAGE_ROWS,
 };
 
-use crate::disk::DiskTier;
+use crate::disk::{DiskStats, DiskTier};
 
 pub(crate) struct Entry<B: Backend> {
     pub id: u64,
@@ -533,6 +533,15 @@ impl<B: Backend> ContextStore<B> {
     /// Disk records ready to be read back.
     pub fn disk_len(&self) -> usize {
         self.disk.as_ref().map_or(0, |d| d.len())
+    }
+
+    /// The disk tier's occupancy and traffic, when there is one.
+    pub fn disk_stats(&self) -> Option<DiskStats> {
+        self.disk.as_ref().map(DiskTier::stats)
+    }
+
+    pub fn budget(&self) -> usize {
+        self.budget
     }
 
     /// The deepest entry on the prefix of `keys` at or below `limit` tokens.

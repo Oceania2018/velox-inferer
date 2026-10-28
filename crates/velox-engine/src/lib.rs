@@ -23,7 +23,7 @@ use store::{ContextStore, Pinner};
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -280,7 +280,33 @@ struct Core<B: Backend> {
     fe: Frontend,
     cfg: EngineConfig,
     special: SpecialTokens,
+    /// What `GET /metrics` reports of memory and the cache tiers, published by the worker.
+    gauges: Gauges,
 }
+
+/// Device memory and context-cache figures the worker publishes (it owns the store) for the
+/// HTTP threads to render. Each is a plain snapshot; the counters only grow.
+#[derive(Default)]
+struct Gauges {
+    device_used: AtomicU64,
+    device_total: AtomicU64,
+    host_used: AtomicU64,
+    host_budget: AtomicU64,
+    host_entries: AtomicU64,
+    /// Whether there is a disk tier (the disk figures stay unrendered without one).
+    disk: AtomicBool,
+    disk_used: AtomicU64,
+    disk_budget: AtomicU64,
+    disk_records: AtomicU64,
+    disk_reads: AtomicU64,
+    disk_read_bytes: AtomicU64,
+    disk_read_tokens: AtomicU64,
+    disk_writes: AtomicU64,
+    disk_written_bytes: AtomicU64,
+}
+
+/// How often a busy worker refreshes [`Gauges`]; an idle one does before it waits.
+const GAUGES_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 struct SpecialTokens {
     im_start: Option<u32>,
@@ -765,6 +791,7 @@ where
             fe,
             cfg,
             special,
+            gauges: Gauges::default(),
         });
         let mut state = state;
         if let Some(used) = core.b.device_in_use() {
@@ -961,6 +988,32 @@ impl<B: Backend> Core<B> {
         );
     }
 
+    /// Refreshes [`Gauges`] from the device and the store.
+    fn publish(&self, st: &Lanes<B>) {
+        let g = &self.gauges;
+        let set = |a: &AtomicU64, v: u64| a.store(v, Ordering::Relaxed);
+        if let Some(used) = self.b.device_in_use() {
+            set(&g.device_used, used as u64);
+        }
+        if let Some((_, total)) = self.b.mem_info() {
+            set(&g.device_total, total as u64);
+        }
+        set(&g.host_used, st.store.bytes(&self.b) as u64);
+        set(&g.host_budget, st.store.budget() as u64);
+        set(&g.host_entries, st.store.len() as u64);
+        if let Some(d) = st.store.disk_stats() {
+            set(&g.disk_used, d.used);
+            set(&g.disk_budget, d.budget);
+            set(&g.disk_records, d.records);
+            set(&g.disk_reads, d.reads);
+            set(&g.disk_read_bytes, d.read_bytes);
+            set(&g.disk_read_tokens, d.read_tokens);
+            set(&g.disk_writes, d.writes);
+            set(&g.disk_written_bytes, d.written_bytes);
+            g.disk.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Returns idle lane `j`'s attention chunks to the pool; its chain head goes to the context
     /// store first, so its conversation resumes from there.
     fn release_lane(&self, st: &mut Lanes<B>, j: usize) -> Result<(), CoreError> {
@@ -1112,6 +1165,7 @@ impl<B: Backend> Core<B> {
         let mut waiting: VecDeque<Job> = VecDeque::new();
         let mut active: Vec<Active<B>> = Vec::new();
         let mut mem_logged = Instant::now();
+        let mut published: Option<Instant> = None;
         // Drafter context pages kept ready: a new conversation's captures save two windows, so
         // a burst of them (see the store's RESERVE_STATES) needs several.
         const DRAFT_RESERVE_WINDOWS: usize = 6;
@@ -1125,6 +1179,10 @@ impl<B: Backend> Core<B> {
             if mem_logged.elapsed() >= MEM_LOG_EVERY {
                 mem_logged = Instant::now();
                 self.log_memory(&st);
+            }
+            if published.is_none_or(|t| t.elapsed() >= GAUGES_EVERY) {
+                published = Some(Instant::now());
+                self.publish(&st);
             }
             st.store.feed(&self.b, &st.lanes[0].session, draft);
             // New requests; while idle, pin context-store storage between them.
@@ -1149,6 +1207,8 @@ impl<B: Backend> Core<B> {
                     }
                 };
                 if !more {
+                    // The state the last request left, which holds until the next one.
+                    self.publish(&st);
                     let q = queue.jobs.lock().expect("queue lock");
                     let _q = queue
                         .cv
@@ -3005,6 +3065,101 @@ where
 {
     fn architecture(&self) -> &str {
         "Qwen3_5ForCausalLM"
+    }
+
+    fn gauges(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        let g = &self.core.gauges;
+        let mut put = |name: &str, kind: &str, help: &str, v: &AtomicU64| {
+            let _ = writeln!(
+                out,
+                "# HELP {name} {help}
+# TYPE {name} {kind}
+{name} {}",
+                v.load(Ordering::Relaxed)
+            );
+        };
+        put(
+            "velox_device_memory_used_bytes",
+            "gauge",
+            "Device memory in use by every process (nvidia-smi's figure where NVML is available)",
+            &g.device_used,
+        );
+        put(
+            "velox_device_memory_total_bytes",
+            "gauge",
+            "Device memory",
+            &g.device_total,
+        );
+        put(
+            "velox_host_context_used_bytes",
+            "gauge",
+            "Context store (pinned system RAM) bytes held",
+            &g.host_used,
+        );
+        put(
+            "velox_host_context_budget_bytes",
+            "gauge",
+            "Context store budget",
+            &g.host_budget,
+        );
+        put(
+            "velox_host_context_entries",
+            "gauge",
+            "Context store entries",
+            &g.host_entries,
+        );
+        if !g.disk.load(Ordering::Relaxed) {
+            return;
+        }
+        put(
+            "velox_disk_context_used_bytes",
+            "gauge",
+            "NVMe context tier bytes of complete records",
+            &g.disk_used,
+        );
+        put(
+            "velox_disk_context_budget_bytes",
+            "gauge",
+            "NVMe context tier budget (--disk-context-mib)",
+            &g.disk_budget,
+        );
+        put(
+            "velox_disk_context_records",
+            "gauge",
+            "NVMe context tier complete records",
+            &g.disk_records,
+        );
+        put(
+            "velox_disk_context_reads_total",
+            "counter",
+            "Records read back from the NVMe tier",
+            &g.disk_reads,
+        );
+        put(
+            "velox_disk_context_read_bytes_total",
+            "counter",
+            "Bytes read back from the NVMe tier",
+            &g.disk_read_bytes,
+        );
+        put(
+            "velox_disk_context_read_tokens_total",
+            "counter",
+            "Prompt tokens covered by records read back from the NVMe tier",
+            &g.disk_read_tokens,
+        );
+        put(
+            "velox_disk_context_writes_total",
+            "counter",
+            "Records written to the NVMe tier",
+            &g.disk_writes,
+        );
+        put(
+            "velox_disk_context_written_bytes_total",
+            "counter",
+            "Bytes written to the NVMe tier",
+            &g.disk_written_bytes,
+        );
     }
 
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
