@@ -852,17 +852,22 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p);
 // l / 2, sub-block l % 2 (a row's consecutive words share their index, sign and high bytes, and
 // IQ2_S's two halves of a grid entry), stores the codes to a per-warp 16 x 32-byte tile and reads
 // the A fragments back with ldmatrix; K stays in the natural order for every type.
-// RD steps are one block (SB = 1), copied from the 4-byte boundary at or below its start (a lead of
-// 0..3 bytes), which halves the stage so three blocks fit per SM.
+// One-block steps (SB = 1) are copied from the 4-byte boundary at or below the block (a lead of 0..3
+// bytes), which halves the stage so three blocks fit per SM: the row-decode types, and of the
+// fragment-order ones IQ3_S and Q2_K. In-model per DFlash round (nsys, Qwen3.8-27B GSQ IQ2_S, m = 8):
+// ggml_iq3_s 4.35 -> 3.97 ms, ggml_q2_k 3.12 -> 2.78 ms; IQ2_XXS and IQ4_XS +2%, Q4_K the same.
+template <int T>
+constexpr bool kOneBlock = T == kIq1M || T == kIq1S || T == kIq2S || T == kIq2Xs || T == kIq3S || T == kQ2K;
+
 template <int T, int NT, bool RD>
-__global__ void __launch_bounds__(kMmaWarps * VELOX_WARP, RD ? 3 : 1)
+__global__ void __launch_bounds__(kMmaWarps * VELOX_WARP, kOneBlock<T> ? 3 : 1)
     ggml_mma_kernel(const uint8_t* __restrict__ w, long long row_bytes, long long row_begin, int rows, int subs,
                     const int2* __restrict__ frag, const float2* __restrict__ fd, const float4* __restrict__ fs,
                     int m, int tiles, float* __restrict__ y, long long ldy, int ks, int mode) {
     // frag points at the order this type's k-slots use (natural or paired; RD: natural).
     constexpr int BB = block_bytes(T);
-    constexpr int SB = RD ? 1 : 2;                                 // blocks per step
-    constexpr int W32 = RD ? (BB + 6) / 4 : 2 * BB / 4;            // words of one row's step
+    constexpr int SB = kOneBlock<T> ? 1 : 2;                               // blocks per step
+    constexpr int W32 = SB == 1 ? (BB + 6) / 4 : 2 * BB / 4;          // words of one row's step
     // Staged stride (odd), at least 4 NT words so the stage can hold the K splits' partial sums
     // (IQ1's 50- / 56-byte blocks are shorter).
     constexpr int SW = (W32 > 4 * NT ? W32 : 4 * NT) | 1;
@@ -923,7 +928,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP, RD ? 3 : 1)
             const int e = lane + i * VELOX_WARP, r = e / W32, c = e % W32;
             const uint32_t off = static_cast<uint32_t>(min(r, last)) * static_cast<uint32_t>(row_bytes) + 4u * c;
             // RD: the window's words past the row end are never decoded (and may be past the tensor).
-            if (e < 16 * W32 && (!RD || b0 + 4 * c < row_bytes)) cp_async4(&stage[warp][buf][r][c], base + off);
+            if (e < 16 * W32 && (SB == 2 || b0 + 4 * c < row_bytes)) cp_async4(&stage[warp][buf][r][c], base + off);
         }
         cp_async_commit();
     };
@@ -935,11 +940,14 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP, RD ? 3 : 1)
         else cp_async_commit();  // an empty group keeps wait_group 1 meaning "this step's copy"
         cp_async_wait1();
         __syncwarp();
-        const uint8_t* xa = reinterpret_cast<const uint8_t*>(stage[warp][buf][g]);
-        const uint8_t* xb = reinterpret_cast<const uint8_t*>(stage[warp][buf][g + 8]);
+        // The step's first block starts `lead` bytes into the staged window (one-block steps; block
+        // sizes are even, so 0 or 2).
+        const int lead = static_cast<int>((static_cast<long long>(st) * SB * BB) & 3);
+        const uint8_t* xa = reinterpret_cast<const uint8_t*>(stage[warp][buf][g]) + lead;
+        const uint8_t* xb = reinterpret_cast<const uint8_t*>(stage[warp][buf][g + 8]) + lead;
 #pragma unroll
-        for (int i = 0; i < (kUseTab ? 8 : 0); ++i) {  // 256 (row, sub-block) entries, 8 per lane
-            const int e = lane + i * VELOX_WARP, r = e / 16, jj = e % 16;
+        for (int i = 0; i < (kUseTab ? 4 * SB : 0); ++i) {  // 256 (row, sub-block) entries, 8 per lane
+            const int e = lane + i * VELOX_WARP, r = e / (8 * SB), jj = e % (8 * SB);
             float s2[2], o2[2];
             half_scales<T>(reinterpret_cast<const uint8_t*>(stage[warp][buf][r]) + (jj / 8) * BB, jj % 8, s2, o2);
             float* d = sct[warp][r][jj];
@@ -1002,8 +1010,6 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP, RD ? 3 : 1)
             // Lane l takes row l % 16 of sub-block l / 16: a quarter warp's STS.128 then covers 128
             // contiguous bytes of one tile (lanes 2r, 2r + 1 on one row hit the same banks).
             const int lr = lane & 15, ls = lane >> 4, sw = (lr >> 2) & 1;
-            // The step's block starts `lead` bytes into the staged window (block sizes are even: 0 or 2).
-            const int lead = static_cast<int>((static_cast<long long>(st) * SB * BB) & 3);
             const uint8_t* xr = reinterpret_cast<const uint8_t*>(stage[warp][buf][lr]) + lead;
             // ldmatrix x4 lane addressing: rows 0-7 / 8-15 at chunk 0, then the same at chunk 1.
             const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ac = (lane >> 4) ^ ((ar >> 2) & 1);
@@ -1033,7 +1039,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP, RD ? 3 : 1)
             }
         } else {
 #pragma unroll kSubUnroll
-            for (int j = 0; j < 16; ++j) {
+            for (int j = 0; j < 8 * SB; ++j) {
                 const int ib = j % 8, off = (j / 8) * BB;
                 const int2 pa = pair<T>(xa + off, ib, t, sg, sks), pb = pair<T>(xb + off, ib, t, sg, sks);
                 float sa[2], oa[2], sb[2], ob[2];
@@ -1053,7 +1059,7 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP, RD ? 3 : 1)
                         ob[0] = ob[1] = kTab == 2 ? tb[1] : 0.0f;
                     }
                 }
-                mul(st * 16 + j, pa.x, pb.x, pa.y, pb.y, sa, oa, sb, ob);
+                mul(st * 8 * SB + j, pa.x, pb.x, pa.y, pb.y, sa, oa, sb, ob);
             }
         }
         __syncwarp();  // every lane is done with this buffer before the step after next refills it
@@ -1112,13 +1118,13 @@ int launch_mma_rd(const uint8_t* w, long long row_bytes, long long rb, int rows,
     const auto* frag = reinterpret_cast<const int2*>(blob + (kPaired<T> && !RD ? L.fragp : L.frag));
     const auto* fd = reinterpret_cast<const float2*>(blob + L.fd);
     const auto* fs = reinterpret_cast<const float4*>(blob + L.fs);
-    const int row_tiles = (rows + 15) / 16, steps = subs / (RD ? 8 : 16), tok_tiles = L.tiles;
+    const int row_tiles = (rows + 15) / 16, steps = subs / (kOneBlock<T> ? 8 : 16), tok_tiles = L.tiles;
     const int nt = m <= 8 ? 1 : m <= 16 ? 2 : 8;
     const int chunks = (tok_tiles + nt - 1) / nt;
     // K splits: enough warps to fill the GPU (about 1024), at most one step per split. RD runs three
     // blocks per SM, so a gate / up projection (1088 row tiles) splits K in two there: 272 blocks
     // made 2.5 waves of 108 (ggml_iq2_s [17408,5120] m = 8: 111 -> 103 us).
-    constexpr int target = RD ? 2048 : 1024;
+    constexpr int target = kOneBlock<T> ? 2048 : 1024;
     int ks = 1;
     while (ks < kMmaWarps && row_tiles * chunks * ks < target && ks * 2 <= steps) ks *= 2;
     const int per_block = kMmaWarps / ks;
