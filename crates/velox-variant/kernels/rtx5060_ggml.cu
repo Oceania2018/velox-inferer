@@ -836,6 +836,8 @@ __device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 __device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
 
+__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p);
+
 // Warp per (16 weight rows, K split): the mma's M and NT tiles of 8 tokens (its N); a block's 8 warps
 // cover 8 / KS row tiles with KS splits of K each (KS chosen per shape so a projection of a few
 // thousand rows still fills the GPU), and the splits meet in shared memory. Each step a warp copies
@@ -846,12 +848,16 @@ __device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_g
 // mma (two k16 for 16-value scales), whose int32 result each lane scales for its rows and tokens
 // 2t, 2t + 1. Lane (g, t) decodes only the words its A fragment holds: rows g and g + 8, words t and
 // t + 4.
-template <int T, int NT>
+// RD (row decode): instead, per pair of sub-blocks lane l decodes all 8 words and the scales of row
+// l / 2, sub-block l % 2 (a row's consecutive words share their index, sign and high bytes, and
+// IQ2_S's two halves of a grid entry), stores the codes to a per-warp 16 x 32-byte tile and reads
+// the A fragments back with ldmatrix; K stays in the natural order for every type.
+template <int T, int NT, bool RD>
 __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
     ggml_mma_kernel(const uint8_t* __restrict__ w, long long row_bytes, long long row_begin, int rows, int subs,
                     const int2* __restrict__ frag, const float2* __restrict__ fd, const float4* __restrict__ fs,
                     int m, int tiles, float* __restrict__ y, long long ldy, int ks, int mode) {
-    // frag points at the order this type's k-slots use (natural or paired).
+    // frag points at the order this type's k-slots use (natural or paired; RD: natural).
     constexpr int BB = block_bytes(T);
     constexpr int W32 = 2 * BB / 4;                                // words of one row's step
     // Staged stride (odd), at least 4 NT words so the stage can hold the K splits' partial sums
@@ -871,9 +877,13 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
     // offsets keep the scale only; 16-value-scale types or offsets keep (s0, s1, o0, o1) or (s, o).
     // Only the types whose scales take real unpacking use it (K-quants' 6-bit scale/min pairs, the
     // 16-value-scale IQ2s); a 4-bit scale is cheaper to decode in place than to stage.
-    constexpr bool kUseTab = kHalves || kOff;
+    constexpr bool kUseTab = !RD && (kHalves || kOff);
     constexpr int kTab = kHalves ? 4 : 2;
     __shared__ float sct[kUseTab ? kMmaWarps : 1][16][17][kTab];
+    // RD: the decoded codes of a sub-block pair (16-byte chunk c of row r at c ^ ((r >> 2) & 1), so an
+    // ldmatrix phase's 8 rows hit distinct banks) and their (s0, s1, o0, o1).
+    __shared__ uint4 atile[RD ? kMmaWarps : 1][2][16][2];
+    __shared__ float4 ascl[RD ? kMmaWarps : 1][2][16];
     if constexpr (Grid<T>::kWords > 1) {
         const uint32_t* src = Grid<T>::source();
         for (int i = threadIdx.x; i < Grid<T>::kWords; i += blockDim.x) sg[i] = __ldg(src + i);
@@ -938,28 +948,10 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
             }
         }
         __syncwarp();
-#pragma unroll kSubUnroll
-        for (int j = 0; j < 16; ++j) {
-            const int u = st * 16 + j, ib = j % 8, off = (j / 8) * BB;
-            const int2 pa = pair<T>(xa + off, ib, t, sg, sks), pb = pair<T>(xb + off, ib, t, sg, sks);
-            const int a0 = pa.x, a1 = pb.x, a2 = pa.y, a3 = pb.y;
-            float sa[2], oa[2], sb[2], ob[2];
-            if constexpr (!kUseTab) {
-                half_scales<T>(xa + off, ib, sa, oa);
-                half_scales<T>(xb + off, ib, sb, ob);
-            } else {
-                const float* ta = sct[warp][g][j];
-                const float* tb = sct[warp][g + 8][j];
-                if constexpr (kTab == 4) {
-                    sa[0] = ta[0], sa[1] = ta[1], oa[0] = ta[2], oa[1] = ta[3];
-                    sb[0] = tb[0], sb[1] = tb[1], ob[0] = tb[2], ob[1] = tb[3];
-                } else {
-                    sa[0] = sa[1] = ta[0];
-                    sb[0] = sb[1] = tb[0];
-                    oa[0] = oa[1] = kTab == 2 ? ta[1] : 0.0f;
-                    ob[0] = ob[1] = kTab == 2 ? tb[1] : 0.0f;
-                }
-            }
+        // Sub-block u's products for this warp's rows: A fragments a0..a3, scales / offsets of rows g
+        // (sa, oa) and g + 8 (sb, ob).
+        auto mul = [&](int u, int a0, int a1, int a2, int a3, const float (&sa)[2], const float (&oa)[2],
+                       const float (&sb)[2], const float (&ob)[2]) {
 #pragma unroll
             for (int n = 0; n < NT; ++n) {
                 // Only the 8-tile instance can run past the last token tile (a partial chunk); a
@@ -999,6 +991,60 @@ __global__ void __launch_bounds__(kMmaWarps * VELOX_WARP)
                     acc[n][q] += dx * va;
                     acc[n][2 + q] += dx * vb;
                 }
+            }
+        };
+        if constexpr (RD) {
+            const int lr = lane >> 1, ls = lane & 1, sw = (lr >> 2) & 1;
+            const uint8_t* xr = reinterpret_cast<const uint8_t*>(stage[warp][buf][lr]);
+            // ldmatrix x4 lane addressing: rows 0-7 / 8-15 at chunk 0, then the same at chunk 1.
+            const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ac = (lane >> 4) ^ ((ar >> 2) & 1);
+#pragma unroll 2
+            for (int p = 0; p < 8; ++p) {
+                const int jj = 2 * p + ls, ib = jj % 8, off = (jj / 8) * BB;
+                int wv[8];
+#pragma unroll
+                for (int wi = 0; wi < 8; ++wi) wv[wi] = word<T>(xr + off, ib, wi, sg, sks);
+                float s2[2], o2[2];
+                half_scales<T>(xr + off, ib, s2, o2);
+                atile[warp][ls][lr][sw] = make_uint4(wv[0], wv[1], wv[2], wv[3]);
+                atile[warp][ls][lr][sw ^ 1] = make_uint4(wv[4], wv[5], wv[6], wv[7]);
+                ascl[warp][ls][lr] = make_float4(s2[0], s2[1], o2[0], o2[1]);
+                __syncwarp();
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    uint32_t a[4];
+                    ldsm_x4(a, &atile[warp][h][ar][ac]);
+                    const float4 ta = ascl[warp][h][g], tb = ascl[warp][h][g + 8];
+                    const float sa[2] = {ta.x, ta.y}, oa[2] = {ta.z, ta.w};
+                    const float sb[2] = {tb.x, tb.y}, ob[2] = {tb.z, tb.w};
+                    mul(st * 16 + 2 * p + h, static_cast<int>(a[0]), static_cast<int>(a[1]), static_cast<int>(a[2]),
+                        static_cast<int>(a[3]), sa, oa, sb, ob);
+                }
+                __syncwarp();  // the tiles are read before the next pair overwrites them
+            }
+        } else {
+#pragma unroll kSubUnroll
+            for (int j = 0; j < 16; ++j) {
+                const int ib = j % 8, off = (j / 8) * BB;
+                const int2 pa = pair<T>(xa + off, ib, t, sg, sks), pb = pair<T>(xb + off, ib, t, sg, sks);
+                float sa[2], oa[2], sb[2], ob[2];
+                if constexpr (!kUseTab) {
+                    half_scales<T>(xa + off, ib, sa, oa);
+                    half_scales<T>(xb + off, ib, sb, ob);
+                } else {
+                    const float* ta = sct[warp][g][j];
+                    const float* tb = sct[warp][g + 8][j];
+                    if constexpr (kTab == 4) {
+                        sa[0] = ta[0], sa[1] = ta[1], oa[0] = ta[2], oa[1] = ta[3];
+                        sb[0] = tb[0], sb[1] = tb[1], ob[0] = tb[2], ob[1] = tb[3];
+                    } else {
+                        sa[0] = sa[1] = ta[0];
+                        sb[0] = sb[1] = tb[0];
+                        oa[0] = oa[1] = kTab == 2 ? ta[1] : 0.0f;
+                        ob[0] = ob[1] = kTab == 2 ? tb[1] : 0.0f;
+                    }
+                }
+                mul(st * 16 + j, pa.x, pb.x, pa.y, pb.y, sa, oa, sb, ob);
             }
         }
         __syncwarp();  // every lane is done with this buffer before the step after next refills it
@@ -1042,11 +1088,18 @@ int mma_min_m() {
     return v;
 }
 
+// The types that take the row-decode variant of the tensor-core kernel. RTX 5060 Ti, bench-linear a8,
+// m = 8 (us): ggml_iq1_m [17408,5120] 128 -> 111, [6144,5120] 60 -> 47; ggml_iq1_s [17408,5120]
+// 108 -> 102. Neutral for IQ2_S / IQ2_XS; 7-14% slower for the paired decodes (IQ2_XXS, IQ3_S, Q4_K)
+// and Q2_K, whose fragment-order decode already shares the work RD shares.
 template <int T>
-int launch_mma(const uint8_t* w, long long row_bytes, long long rb, int rows, int subs, const uint8_t* blob,
-               int m, float* y, long long ldy, int mode) {
+constexpr bool kRowDecode = T == kIq1M || T == kIq1S;
+
+template <int T, bool RD>
+int launch_mma_rd(const uint8_t* w, long long row_bytes, long long rb, int rows, int subs, const uint8_t* blob,
+                  int m, float* y, long long ldy, int mode) {
     const ActLayout L(m, static_cast<long long>(subs) * 32);
-    const auto* frag = reinterpret_cast<const int2*>(blob + (kPaired<T> ? L.fragp : L.frag));
+    const auto* frag = reinterpret_cast<const int2*>(blob + (kPaired<T> && !RD ? L.fragp : L.frag));
     const auto* fd = reinterpret_cast<const float2*>(blob + L.fd);
     const auto* fs = reinterpret_cast<const float4*>(blob + L.fs);
     const int row_tiles = (rows + 15) / 16, steps = subs / 16, tok_tiles = L.tiles;
@@ -1059,15 +1112,21 @@ int launch_mma(const uint8_t* w, long long row_bytes, long long rb, int rows, in
     const dim3 grid(chunks, (row_tiles + per_block - 1) / per_block);
     if (grid.y > 65535) return VELOX_ERR_UNSUPPORTED;
     if (nt == 1)
-        ggml_mma_kernel<T, 1><<<grid, kMmaWarps * VELOX_WARP>>>(w, row_bytes, rb, rows, subs, frag, fd, fs, m,
+        ggml_mma_kernel<T, 1, RD><<<grid, kMmaWarps * VELOX_WARP>>>(w, row_bytes, rb, rows, subs, frag, fd, fs, m,
                                                                 tok_tiles, y, ldy, ks, mode);
     else if (nt == 2)
-        ggml_mma_kernel<T, 2><<<grid, kMmaWarps * VELOX_WARP>>>(w, row_bytes, rb, rows, subs, frag, fd, fs, m,
+        ggml_mma_kernel<T, 2, RD><<<grid, kMmaWarps * VELOX_WARP>>>(w, row_bytes, rb, rows, subs, frag, fd, fs, m,
                                                                 tok_tiles, y, ldy, ks, mode);
     else
-        ggml_mma_kernel<T, 8><<<grid, kMmaWarps * VELOX_WARP>>>(w, row_bytes, rb, rows, subs, frag, fd, fs, m,
+        ggml_mma_kernel<T, 8, RD><<<grid, kMmaWarps * VELOX_WARP>>>(w, row_bytes, rb, rows, subs, frag, fd, fs, m,
                                                                 tok_tiles, y, ldy, ks, mode);
     return velox_launch_status();
+}
+
+template <int T>
+int launch_mma(const uint8_t* w, long long row_bytes, long long rb, int rows, int subs, const uint8_t* blob,
+               int m, float* y, long long ldy, int mode) {
+    return launch_mma_rd<T, kRowDecode<T>>(w, row_bytes, rb, rows, subs, blob, m, y, ldy, mode);
 }
 
 template <int T>
