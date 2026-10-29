@@ -469,6 +469,9 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> Result<()> {
         self.time("kv_load", || self.inner.kv_load(kc, vc, k, v, s))
     }
+    fn attends_quantized(&self, s: AttnShape) -> bool {
+        self.inner.attends_quantized(s)
+    }
     fn state_pack(
         &self,
         src: &B::Buffer,
@@ -671,6 +674,50 @@ impl<B: Backend> Backend for Profiled<B> {
     }
     fn rope_positions(&self, x: &mut B::Buffer, p: &[u32], s: RopePosShape) -> Result<()> {
         self.time("rope_positions", || self.inner.rope_positions(x, p, s))
+    }
+    fn rope_table(&self, p: &[u32], s: RopePosShape) -> Result<B::Buffer> {
+        self.time("rope_table", || self.inner.rope_table(p, s))
+    }
+    fn add_bias_rope(
+        &self,
+        x: &mut B::Buffer,
+        bias: Option<&B::Buffer>,
+        p: &[u32],
+        table: &B::Buffer,
+        s: RopePosShape,
+    ) -> Result<()> {
+        self.time("add_bias_rope", || {
+            self.inner.add_bias_rope(x, bias, p, table, s)
+        })
+    }
+    fn add_bias_gelu(
+        &self,
+        x: &mut B::Buffer,
+        bias: &B::Buffer,
+        rows: usize,
+        dim: usize,
+        kind: GeluKind,
+    ) -> Result<()> {
+        self.time("add_bias_gelu", || {
+            self.inner.add_bias_gelu(x, bias, rows, dim, kind)
+        })
+    }
+    fn add_bias_add_layer_norm(
+        &self,
+        acc: &mut B::Buffer,
+        x: &mut B::Buffer,
+        bias: &B::Buffer,
+        weight: &B::Buffer,
+        norm_bias: &B::Buffer,
+        y: &mut B::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        self.time("add_bias_add_layer_norm", || {
+            self.inner
+                .add_bias_add_layer_norm(acc, x, bias, weight, norm_bias, y, rows, dim, eps)
+        })
     }
     fn copy2d(&self, src: &B::Buffer, dst: &mut B::Buffer, s: Copy2dShape) -> Result<()> {
         self.time("copy2d", || self.inner.copy2d(src, dst, s))

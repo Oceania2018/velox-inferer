@@ -136,6 +136,9 @@ where
         // --host-state-dtype f32|bf16|nvfp4 (ninfer's name and default: bf16): storage of the
         // recurrent states the context store keeps; lanes always run on f32 state.
         host_state_format: StateFormat::parse(a.get("host-state-dtype").unwrap_or("bf16"))?,
+        // --device-state-dtype f32|bf16|nvfp4 (default f32): storage of the device checkpoints
+        // (lane heads and spares); bf16 halves them at the context store's rounding.
+        device_state_format: StateFormat::parse(a.get("device-state-dtype").unwrap_or("f32"))?,
         // --disk-context-mib N (default 16384; 0: off) and --disk-context-dir DIR: NVMe tier below
         // RAM for reused roots (system prompt, task) and branch points, kept across restarts so a
         // cold start resumes them instead of prefilling (CUA: 15.5 s -> 1.4 s on the RTX 5060 Ti).

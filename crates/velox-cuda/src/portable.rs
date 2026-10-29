@@ -1165,6 +1165,42 @@ extern "C" {
         axes: i32,
         layout: i32,
     ) -> i32;
+    fn velox_portable_rope_table(
+        pos: *const u32,
+        tokens: i32,
+        rotary_dim: i32,
+        theta: f32,
+        axes: i32,
+        layout: i32,
+        table: *mut f32,
+    ) -> i32;
+    fn velox_portable_add_bias_rope(
+        x: *mut f32,
+        bias: *const f32,
+        table: *const f32,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+    ) -> i32;
+    fn velox_portable_add_bias_gelu(
+        x: *mut f32,
+        bias: *const f32,
+        len: i64,
+        dim: i32,
+        erf_kind: i32,
+    ) -> i32;
+    fn velox_portable_add_bias_add_layer_norm(
+        acc: *mut f32,
+        x: *mut f32,
+        bias: *const f32,
+        w: *const f32,
+        b: *const f32,
+        y: *mut f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+    ) -> i32;
 }
 
 pub fn attention_full(
@@ -1270,6 +1306,111 @@ pub fn rope_positions(x: &mut CudaBuffer, positions: &[u32], s: RopePosShape) ->
             )
         },
         "portable rope_positions",
+    )
+}
+
+/// The rotary table of [`rope_positions`] at these positions: `[tokens, rotary_dim]`, each row its
+/// `rotary_dim / 2` cosines then sines.
+pub fn rope_table(positions: &[u32], s: RopePosShape) -> Result<CudaBuffer> {
+    check::rope_positions(s.tokens * s.heads * s.head_dim, positions, &s)?;
+    let mut table = CudaBuffer::new(s.tokens * s.rotary_dim)?;
+    let bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let pos = stage(&bytes)?;
+    // SAFETY: pos holds axes * tokens u32 values; table holds tokens * rotary_dim floats.
+    status(
+        unsafe {
+            velox_portable_rope_table(
+                pos.cast(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("rotary_dim", s.rotary_dim)?,
+                s.theta,
+                to_i32("axes", s.axes)?,
+                i32::from(s.layout == RopeLayout::Blocked),
+                table.as_mut_ptr(),
+            )
+        },
+        "portable rope_table",
+    )?;
+    Ok(table)
+}
+
+pub fn add_bias_rope(
+    x: &mut CudaBuffer,
+    bias: Option<&CudaBuffer>,
+    table: &CudaBuffer,
+    s: RopePosShape,
+) -> Result<()> {
+    check::add_bias_rope(x.len(), bias.map(CudaBuffer::len), table.len(), &s)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_add_bias_rope(
+                x.as_mut_ptr(),
+                bias.map_or(std::ptr::null(), CudaBuffer::as_ptr),
+                table.as_ptr(),
+                to_i32("tokens", s.tokens)?,
+                to_i32("heads", s.heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                to_i32("rotary_dim", s.rotary_dim)?,
+            )
+        },
+        "portable add_bias_rope",
+    )
+}
+
+pub fn add_bias_gelu(
+    x: &mut CudaBuffer,
+    bias: &CudaBuffer,
+    rows: usize,
+    dim: usize,
+    kind: GeluKind,
+) -> Result<()> {
+    check::add_bias(x.len(), bias.len(), rows, dim)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_add_bias_gelu(
+                x.as_mut_ptr(),
+                bias.as_ptr(),
+                (rows * dim) as i64,
+                to_i32("dim", dim)?,
+                i32::from(kind == GeluKind::Erf),
+            )
+        },
+        "portable add_bias_gelu",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_bias_add_layer_norm(
+    acc: &mut CudaBuffer,
+    x: &mut CudaBuffer,
+    bias: &CudaBuffer,
+    weight: &CudaBuffer,
+    norm_bias: &CudaBuffer,
+    y: &mut CudaBuffer,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<()> {
+    check::add_bias(x.len(), bias.len(), rows, dim)?;
+    check::layer_norm(acc.len(), weight.len(), norm_bias.len(), y.len(), rows, dim)?;
+    // SAFETY: buffer extents validated above.
+    status(
+        unsafe {
+            velox_portable_add_bias_add_layer_norm(
+                acc.as_mut_ptr(),
+                x.as_mut_ptr(),
+                bias.as_ptr(),
+                weight.as_ptr(),
+                norm_bias.as_ptr(),
+                y.as_mut_ptr(),
+                to_i32("rows", rows)?,
+                to_i32("dim", dim)?,
+                eps,
+            )
+        },
+        "portable add_bias_add_layer_norm",
     )
 }
 

@@ -1302,6 +1302,12 @@ pub trait Backend {
         v: &mut Self::Buffer,
         shape: KvStoreShape,
     ) -> Result<()>;
+    /// Whether `attention` reads this quantized cache at prefill speed for a chunk of
+    /// `shape.tokens`. Otherwise callers decode the visible rows once with [`Self::kv_load`] and
+    /// attend over f32 rows, which takes an f32 copy of the whole visible cache.
+    fn attends_quantized(&self, _shape: AttnShape) -> bool {
+        false
+    }
     /// Encodes `n` values of the f32 recurrent state `src` into `dst` in `fmt`'s packed layout
     /// (see [`crate::StateFormat`]; bit-exact with `velox_core::state::pack`). `dst` may be
     /// storage from [`Self::alloc_host`]: a checkpoint is written straight to system RAM.
@@ -1432,6 +1438,63 @@ pub trait Backend {
         positions: &[u32],
         shape: RopePosShape,
     ) -> Result<()>;
+    /// What [`Self::add_bias_rope`] reuses across calls with the same positions and shape (a vision
+    /// encode's layers): a backend's precomputed rotary table. Backends without one return an
+    /// empty buffer and recompute from the positions.
+    fn rope_table(&self, positions: &[u32], shape: RopePosShape) -> Result<Self::Buffer> {
+        let _ = (positions, shape);
+        self.alloc(0)
+    }
+    /// `x[r, c] += bias[c]` when `bias` is given (`x` is `[tokens, heads * head_dim]`), then
+    /// [`Self::rope_positions`]; `table` comes from [`Self::rope_table`] for the same positions and
+    /// shape. One pass where a backend fuses it.
+    fn add_bias_rope(
+        &self,
+        x: &mut Self::Buffer,
+        bias: Option<&Self::Buffer>,
+        positions: &[u32],
+        table: &Self::Buffer,
+        shape: RopePosShape,
+    ) -> Result<()> {
+        let _ = table;
+        if let Some(b) = bias {
+            self.add_bias(x, b, shape.tokens, shape.heads * shape.head_dim)?;
+        }
+        self.rope_positions(x, positions, shape)
+    }
+    /// `x[r, c] = gelu(x[r, c] + bias[c])` for `rows` rows of width `dim`. One pass where a backend
+    /// fuses it.
+    fn add_bias_gelu(
+        &self,
+        x: &mut Self::Buffer,
+        bias: &Self::Buffer,
+        rows: usize,
+        dim: usize,
+        kind: GeluKind,
+    ) -> Result<()> {
+        self.add_bias(x, bias, rows, dim)?;
+        self.gelu(x, rows * dim, kind)
+    }
+    /// A projection's bias, the residual add and the next layer norm: `x[r, c] += bias[c]`,
+    /// `acc += x`, then `y = layer_norm(acc)` (see [`Self::layer_norm`]). One pass where a backend
+    /// fuses it.
+    #[allow(clippy::too_many_arguments)]
+    fn add_bias_add_layer_norm(
+        &self,
+        acc: &mut Self::Buffer,
+        x: &mut Self::Buffer,
+        bias: &Self::Buffer,
+        weight: &Self::Buffer,
+        norm_bias: &Self::Buffer,
+        y: &mut Self::Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        self.add_bias(x, bias, rows, dim)?;
+        self.add(acc, x, rows * dim)?;
+        self.layer_norm(acc, weight, norm_bias, y, rows, dim, eps)
+    }
     /// Runs `f`, which must only queue device work: no host readback and no synchronization. A
     /// backend may record the work once per `key` and replay it as one submission (CUDA graphs);
     /// work under one key must keep the same structure (the same ops in the same order) for

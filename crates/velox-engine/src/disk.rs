@@ -63,6 +63,24 @@ pub(crate) struct DiskTier {
     done: Receiver<(u64, std::io::Result<()>)>,
     writer: Option<JoinHandle<()>>,
     next_id: u64,
+    /// Reads and writes since start (the other [`DiskStats`] fields are left at zero here).
+    io: DiskStats,
+}
+
+/// What the tier holds and what it has moved since start, for `GET /metrics`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DiskStats {
+    /// Bytes of ready records.
+    pub used: u64,
+    pub budget: u64,
+    pub records: u64,
+    /// Records read back, their payload bytes and the prompt tokens they covered.
+    pub reads: u64,
+    pub read_bytes: u64,
+    pub read_tokens: u64,
+    /// Records written completely and their bytes.
+    pub writes: u64,
+    pub written_bytes: u64,
 }
 
 const MAGIC: &[u8; 8] = b"VXCTX\0\0\x01";
@@ -149,6 +167,7 @@ impl DiskTier {
             done,
             writer: Some(writer),
             next_id: 1,
+            io: DiskStats::default(),
         };
         if tier.persistent {
             tier.scan();
@@ -406,6 +425,8 @@ impl DiskTier {
                 Ok(()) => {
                     if let Some(rec) = self.records.iter_mut().find(|r| r.id == id) {
                         rec.ready = true;
+                        self.io.writes += 1;
+                        self.io.written_bytes += rec.bytes;
                     }
                 }
                 Err(e) => {
@@ -456,7 +477,12 @@ impl DiskTier {
             })
         };
         match &r {
-            Ok(()) => self.records[i].last = now,
+            Ok(()) => {
+                self.records[i].last = now;
+                self.io.reads += 1;
+                self.io.read_bytes += payload;
+                self.io.read_tokens += self.records[i].keys.len() as u64;
+            }
             Err(_) => {
                 self.records.swap_remove(i);
                 let _ = fs::remove_file(path);
@@ -467,6 +493,16 @@ impl DiskTier {
 
     pub fn len(&self) -> usize {
         self.records.iter().filter(|r| r.ready).count()
+    }
+
+    pub fn stats(&self) -> DiskStats {
+        let ready = self.records.iter().filter(|r| r.ready);
+        DiskStats {
+            used: ready.clone().map(|r| r.bytes).sum(),
+            budget: self.budget,
+            records: ready.count() as u64,
+            ..self.io
+        }
     }
 }
 
@@ -530,6 +566,42 @@ mod tests {
         let other = DiskTier::new(dir.clone(), 1 << 20, Some("test"), 43).unwrap();
         assert_eq!(other.len(), 0);
         drop(other);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_count_complete_writes_and_successful_reads() {
+        let dir = std::env::temp_dir().join(format!("velox-disk-stats-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let keys: Vec<u32> = (0..40).collect();
+        let data = [5u8; 100];
+        let mut t = tier(&dir, 1 << 20);
+        let id = t
+            .write(
+                &keys,
+                0,
+                vec![(0, 40)],
+                None,
+                true,
+                vec![(data.as_ptr(), data.len())],
+                1,
+            )
+            .unwrap();
+        wait(&mut t);
+        let s = t.stats();
+        assert_eq!((s.records, s.writes, s.reads), (1, 1, 0));
+        assert_eq!((s.used, s.budget), (s.written_bytes, 1 << 20));
+        assert!(s.used > 100, "header and payload");
+        let mut back = [0u8; 100];
+        t.read(id, &mut [&mut back[..]], 2).unwrap();
+        let s = t.stats();
+        assert_eq!((s.reads, s.read_bytes, s.read_tokens), (1, 100, 40));
+        // A failed read counts nothing (and drops the record).
+        let mut short = [0u8; 1];
+        assert!(t.read(id, &mut [&mut short[..]], 3).is_err());
+        let s = t.stats();
+        assert_eq!((s.reads, s.records, s.used), (1, 0, 0));
+        drop(t);
         let _ = fs::remove_dir_all(&dir);
     }
 

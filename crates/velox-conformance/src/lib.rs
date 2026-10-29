@@ -2647,6 +2647,97 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `add_bias_gelu` and `add_bias_add_layer_norm` against their unfused CPU parts (the trait
+    /// defaults).
+    fn vision_fused(&mut self, rows: usize, dim: usize) -> Result<()> {
+        let len = rows * dim;
+        let (x, o, bias, w, nb) = (
+            self.rng.vec(len, 3.0),
+            self.rng.vec(len, 2.0),
+            self.rng.vec(dim, 0.5),
+            self.rng.vec(dim, 1.0),
+            self.rng.vec(dim, 0.5),
+        );
+        let (bd, wd, nbd) = (
+            self.b.upload(&bias)?,
+            self.b.upload(&w)?,
+            self.b.upload(&nb)?,
+        );
+        for kind in [GeluKind::Tanh, GeluKind::Erf] {
+            let mut want = o.clone();
+            CpuBackend.add_bias_gelu(&mut want, &bias, rows, dim, kind)?;
+            let mut d = self.b.upload(&o)?;
+            self.b.add_bias_gelu(&mut d, &bd, rows, dim, kind)?;
+            let got = fetch(self.b, &d, len)?;
+            self.record(
+                format!("add_bias_gelu {kind:?} rows={rows} dim={dim}"),
+                Some(Op::Gelu),
+                &got,
+                &want,
+                1e-5,
+            );
+        }
+        let (mut acc, mut xb, mut want) = (x.clone(), o.clone(), vec![0.0; len]);
+        CpuBackend.add_bias_add_layer_norm(
+            &mut acc, &mut xb, &bias, &w, &nb, &mut want, rows, dim, 1e-6,
+        )?;
+        let (mut accd, mut od, mut yd) =
+            (self.b.upload(&x)?, self.b.upload(&o)?, self.b.alloc(len)?);
+        self.b.add_bias_add_layer_norm(
+            &mut accd, &mut od, &bd, &wd, &nbd, &mut yd, rows, dim, 1e-6,
+        )?;
+        let got = fetch(self.b, &yd, len)?;
+        self.record(
+            format!("add_bias_add_layer_norm rows={rows} dim={dim}"),
+            Some(Op::LayerNorm),
+            &got,
+            &want,
+            1e-5,
+        );
+        let got = fetch(self.b, &accd, len)?;
+        self.record(
+            format!("add_bias_add_layer_norm residual rows={rows} dim={dim}"),
+            Some(Op::LayerNorm),
+            &got,
+            &acc,
+            1e-6,
+        );
+        Ok(())
+    }
+
+    /// `add_bias_rope` with the backend's rotary table, applied twice from one table (a vision
+    /// encode reuses it across layers), against the CPU's bias then `rope_positions`.
+    fn add_bias_rope(&mut self, s: RopePosShape, with_bias: bool) -> Result<()> {
+        let len = s.tokens * s.heads * s.head_dim;
+        let positions: Vec<u32> = (0..s.axes * s.tokens)
+            .map(|_| (self.rng.next_u64() % 5000) as u32)
+            .collect();
+        let bias = self.rng.vec(s.heads * s.head_dim, 0.5);
+        let bd = self.b.upload(&bias)?;
+        let table = self.b.rope_table(&positions, s)?;
+        let cpu_table = CpuBackend.rope_table(&positions, s)?;
+        for round in 0..2 {
+            let mut want = self.rng.vec(len, 1.0);
+            let mut xd = self.b.upload(&want)?;
+            CpuBackend.add_bias_rope(
+                &mut want,
+                with_bias.then_some(&bias),
+                &positions,
+                &cpu_table,
+                s,
+            )?;
+            self.b
+                .add_bias_rope(&mut xd, with_bias.then_some(&bd), &positions, &table, s)?;
+            let got = fetch(self.b, &xd, len)?;
+            let name = format!(
+                "add_bias_rope {:?} axes={} t={} d={} r={} bias={with_bias} round={round}",
+                s.layout, s.axes, s.tokens, s.head_dim, s.rotary_dim
+            );
+            self.record(name, Some(Op::RopePositions), &got, &want, 1e-5);
+        }
+        Ok(())
+    }
+
     /// Prefill then two decode steps through a two-layer stack, compared step by step.
     fn stack(&mut self, spec: &ModelSpec) -> Result<()> {
         let layers: Vec<HostLayer> = (0..spec.layers)
@@ -3222,6 +3313,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.attention(attn(20, 6, 1, 256, 16_500, f))?;
         s.attention(attn(100, 24, 4, 256, 200, f))?;
         s.attention(attn(70, 6, 1, 256, 0, f))?;
+        // A chunk over several thousand cached rows (backends may decode packed rows in tiles).
+        s.attention(attn(48, 6, 1, 256, 4_500, f))?;
     }
     // Other head dims: non-power-of-two (bf16 only), narrower rotations, no GQA.
     s.attention(attn(3, 6, 2, 96, 1_000, KvFormat::Bf16))?;
@@ -3678,6 +3771,34 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             s.linear_act(f, 4616, 1024, 8, 4600, 250, ActPolicy::AllowA8)?;
         }
     }
+    // The vision tower's fused elementwise ops (hidden 1152, MLP 4304; 2D RoPE over all 72 dims)
+    // against their unfused parts, and a text-like rotary slice with unrotated dims and no bias.
+    s.vision_fused(5, 1152)?;
+    s.vision_fused(3, 4304)?;
+    s.add_bias_rope(
+        RopePosShape {
+            tokens: 9,
+            heads: 3,
+            head_dim: 72,
+            rotary_dim: 72,
+            theta: 10_000.0,
+            axes: 2,
+            layout: RopeLayout::Blocked,
+        },
+        true,
+    )?;
+    s.add_bias_rope(
+        RopePosShape {
+            tokens: 5,
+            heads: 3,
+            head_dim: 256,
+            rotary_dim: 64,
+            theta: 10_000_000.0,
+            axes: 3,
+            layout: RopeLayout::Interleaved,
+        },
+        false,
+    )?;
     // Its own seed: the synthetic model must not change when cases are added before it.
     let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);
