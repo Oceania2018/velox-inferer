@@ -141,7 +141,9 @@ nvfp4_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restri
     for (int s = 0; s < kStages; ++s)
         if (s < tiles) stage(s, s);
     const int b_row = lane & 7, b_k = ((lane >> 3) & 1) << 3, wk0 = warp * kTileK;
-#pragma unroll
+    // Two tiles per iteration: the whole K loop unrolled at the model's widths overflows the
+    // instruction cache (as rtx4090_rs_sliced.cu measured).
+#pragma unroll 2
     for (int tile = 0; tile < tiles; ++tile) {
         const int slot = tile % kStages;
         if (tile + kStages - 1 < tiles) cp_wait<kStages - 1>();
