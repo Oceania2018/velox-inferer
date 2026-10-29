@@ -1302,6 +1302,12 @@ pub trait Backend {
         v: &mut Self::Buffer,
         shape: KvStoreShape,
     ) -> Result<()>;
+    /// Whether `attention` reads this quantized cache at prefill speed for a chunk of
+    /// `shape.tokens`. Otherwise callers decode the visible rows once with [`Self::kv_load`] and
+    /// attend over f32 rows, which takes an f32 copy of the whole visible cache.
+    fn attends_quantized(&self, _shape: AttnShape) -> bool {
+        false
+    }
     /// Encodes `n` values of the f32 recurrent state `src` into `dst` in `fmt`'s packed layout
     /// (see [`crate::StateFormat`]; bit-exact with `velox_core::state::pack`). `dst` may be
     /// storage from [`Self::alloc_host`]: a checkpoint is written straight to system RAM.

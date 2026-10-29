@@ -1940,7 +1940,7 @@ impl<B: Backend> Qwen35Text<B> {
             pos0,
             kv: kv_format,
         };
-        if kv_format != KvFormat::F32 && t > FUSE_MAX_TOKENS {
+        if kv_format != KvFormat::F32 && t > FUSE_MAX_TOKENS && !b.attends_quantized(shape) {
             // Long chunk over a quantized cache: decode the visible rows once per layer (a few
             // ms at 16k positions) and run the f32 prefill kernels on them.
             let rows = (pos0 + t) * c.kv_dim();

@@ -805,6 +805,11 @@ pub trait CudaKernels: Send + Sync {
         portable::kv_load(k_cache, v_cache, k, v, s)
     }
 
+    /// See [`Backend::attends_quantized`]. The portable kernels read packed caches row by row.
+    fn attends_quantized(&self, _s: AttnShape) -> bool {
+        false
+    }
+
     /// Packs a recurrent state; see [`Backend::state_pack`]. Must be bit-exact with
     /// `velox_core::state::pack`.
     fn state_pack(
@@ -2786,6 +2791,10 @@ impl Backend for CudaBackend {
         self.timed("kv_load", || {
             self.kernels.kv_load(k_cache, v_cache, k, v, s)
         })
+    }
+
+    fn attends_quantized(&self, s: AttnShape) -> bool {
+        s.kv != KvFormat::F32 && self.kernels.attends_quantized(s)
     }
 
     fn state_pack(
