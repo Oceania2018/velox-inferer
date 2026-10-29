@@ -469,9 +469,6 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> Result<()> {
         self.time("kv_load", || self.inner.kv_load(kc, vc, k, v, s))
     }
-    fn attends_quantized(&self, s: AttnShape) -> bool {
-        self.inner.attends_quantized(s)
-    }
     fn state_pack(
         &self,
         src: &B::Buffer,
