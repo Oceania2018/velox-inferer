@@ -750,14 +750,20 @@ impl Ids<'_> {
 
 /// Puts the GDN outputs of `t` tokens (`ws.o`, value heads grouped by key head) into the tiled
 /// order of the gate rows and output-projection columns, when the artifact stores those tiled
-/// ([`TextConfig::gdn_v_tiled`]). `ws.conv_out` is free once the recurrence has run.
-fn tile_v_heads<B: Backend>(b: &B, c: &TextConfig, ws: &mut Workspace<B>, t: usize) -> Result<()> {
+/// ([`TextConfig::gdn_v_tiled`]): into `ws.conv_out`, which is free once the recurrence has run,
+/// and which the gated norm then reads instead of `ws.o` (no copy back). Returns whether it did.
+fn tile_v_heads<B: Backend>(
+    b: &B,
+    c: &TextConfig,
+    ws: &mut Workspace<B>,
+    t: usize,
+) -> Result<bool> {
     if !c.gdn_v_tiled {
-        return Ok(());
+        return Ok(false);
     }
     let per = c.gdn_v_heads / c.gdn_k_heads;
     b.transpose_heads(&ws.o, &mut ws.conv_out, t, c.gdn_k_heads, per, c.gdn_v_dim)?;
-    b.copy(&ws.conv_out, 0, &mut ws.o, 0, t * c.gdn_v())
+    Ok(true)
 }
 
 /// A MoE FFN's buffers: router logits (`[t, experts + 1]` with the shared gate fused), the
@@ -1635,13 +1641,14 @@ impl<B: Backend> Qwen35Text<B> {
                         }
                         row0 = end;
                     }
-                    tile_v_heads(b, c, ws, t)?;
+                    let tiled = tile_v_heads(b, c, ws, t)?;
+                    let o = if tiled { &ws.conv_out } else { &ws.o };
                     // z = silu(z) * plain_rmsnorm(o)
                     let rows = t * c.gdn_v_heads;
                     match ws.twins.as_mut().filter(|_| b.takes_bf16(&w.view(out), t)) {
                         Some(tw) => {
                             b.rms_norm_gated_twin(
-                                &ws.o,
+                                o,
                                 w.param(*norm),
                                 &mut ws.z,
                                 &mut tw.z,
@@ -1654,7 +1661,7 @@ impl<B: Backend> Qwen35Text<B> {
                         }
                         None => {
                             b.rms_norm_gated(
-                                &ws.o,
+                                o,
                                 w.param(*norm),
                                 &mut ws.z,
                                 rows,
@@ -3107,9 +3114,10 @@ impl<B: Backend> Qwen35Text<B> {
                         let ow = c.gdn_v();
                         b.copy(&bw.o, 0, &mut ws.o, tp * ow, v * ow)?;
                     }
-                    tile_v_heads(b, c, ws, t)?;
+                    let tiled = tile_v_heads(b, c, ws, t)?;
+                    let o = if tiled { &ws.conv_out } else { &ws.o };
                     b.rms_norm_gated(
-                        &ws.o,
+                        o,
                         w.param(*norm),
                         &mut ws.z,
                         t * c.gdn_v_heads,
