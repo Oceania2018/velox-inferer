@@ -14,7 +14,8 @@
 
 namespace {
 
-constexpr int kW = 8;         // warps per block, splitting K
+constexpr int kW = 8;         // warps per block, splitting K (prefill)
+constexpr int kWSmall = 32;   // the same up to one token tile, where a dozen blocks cover all rows
 constexpr int kTokens = 16;   // tokens per block (one MMA tile)
 
 __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -32,8 +33,8 @@ __device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
 
 // NT: n-tiles of 8 rows this block computes (rows of the last block may be fewer; they are
 // skipped warp-uniformly).
-template <int NT>
-__global__ void __launch_bounds__(kW * 32) bf16_skinny_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+template <int NT, int W>
+__global__ void __launch_bounds__(W * 32) bf16_skinny_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                                               int m, int k, int rows, float* __restrict__ y,
                                                               long long ldy) {
     constexpr int kRows = 8 * NT;  // weight rows per block
@@ -58,7 +59,7 @@ __global__ void __launch_bounds__(kW * 32) bf16_skinny_kernel(const float* __res
 
     const int steps = k / 32;
 #pragma unroll 2
-    for (int s = warp; s < steps; s += kW) {
+    for (int s = warp; s < steps; s += W) {
         const int k0 = s * 32;
         float4 a[2][2];
         const float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -82,8 +83,23 @@ __global__ void __launch_bounds__(kW * 32) bf16_skinny_kernel(const float* __res
         }
     }
 
+    const int n_here = min(kRows, rows - n0);
+    if constexpr (NT == 1) {
+        // One tile: every warp parks its partial, then one thread per output sums them in warp order.
+        __shared__ float part[W][kTokens][8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) part[warp][g + 8 * (j >> 1)][2 * t + (j & 1)] = acc[0][j];
+        __syncthreads();
+        if (threadIdx.x < kTokens * 8) {
+            const int tt = threadIdx.x / 8, r = threadIdx.x % 8;
+            float d = part[0][tt][r];
+            for (int wi = 1; wi < W; ++wi) d += part[wi][tt][r];
+            if (t0 + tt < m && r < n_here) y[static_cast<long long>(t0 + tt) * ldy + n0 + r] = d;
+        }
+        return;
+    }
     // Fixed-order cross-warp sum: c0, c1 = token g, rows 2t, 2t + 1 of the tile; c2, c3 = token g + 8.
-    for (int wi = 0; wi < kW; ++wi) {
+    for (int wi = 0; wi < W; ++wi) {
         if (warp == wi) {
 #pragma unroll
             for (int nt = 0; nt < NT; ++nt) {
@@ -98,8 +114,7 @@ __global__ void __launch_bounds__(kW * 32) bf16_skinny_kernel(const float* __res
         }
         __syncthreads();
     }
-    const int n_here = min(kRows, rows - n0);
-    for (int i = threadIdx.x; i < kTokens * n_here; i += kW * 32) {
+    for (int i = threadIdx.x; i < kTokens * n_here; i += W * 32) {
         const int tt = i / n_here, r = i % n_here;
         if (t0 + tt < m) y[static_cast<long long>(t0 + tt) * ldy + n0 + r] = sum[tt][r];
     }
@@ -116,12 +131,15 @@ VELOX_API int velox_5060_linear_bf16_skinny(const float* x, int m, const uint8_t
         return VELOX_ERR_UNSUPPORTED;
     const auto* wb = reinterpret_cast<const __nv_bfloat16*>(w) + row_begin * k;
     // Prefill: 128 rows per block (16 n-tiles). Up to one token tile: 8 rows per block, so a few
-    // dozen rows still spread over a dozen SMs.
+    // dozen rows still spread over a dozen SMs, and 32 warps per block to keep enough loads in
+    // flight on those few SMs (bench-linear at 8 tokens: GDN a|b [96, 5120] 18.9 -> 10.6 us,
+    // [256, 5120] 15.3 -> 9.6 us).
     if (m <= kTokens) {
-        bf16_skinny_kernel<1><<<dim3((rows + 7) / 8, 1), kW * 32>>>(x, wb, m, static_cast<int>(k), rows, y, ldy);
+        bf16_skinny_kernel<1, kWSmall><<<dim3((rows + 7) / 8, 1), kWSmall * 32>>>(x, wb, m, static_cast<int>(k), rows, y,
+                                                                                ldy);
     } else {
         const dim3 grid((rows + 127) / 128, (m + kTokens - 1) / kTokens);
-        bf16_skinny_kernel<16><<<grid, kW * 32>>>(x, wb, m, static_cast<int>(k), rows, y, ldy);
+        bf16_skinny_kernel<16, kW><<<grid, kW * 32>>>(x, wb, m, static_cast<int>(k), rows, y, ldy);
     }
     return velox_launch_status();
 }
