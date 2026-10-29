@@ -148,7 +148,11 @@ struct Raw {
 };
 
 // Warps [0, mt) each own 16 query rows; all eight fetch and decode. Packed bytes are fetched two
-// tiles ahead into registers.
+// tiles ahead into registers. KH = 2 (up to three row tiles, so up to 48 rows: one sequence's verify
+// window): warps [0, 2 mt) instead, warp w on row tile w % mt and keys 16 (w / mt) .. +15 of every
+// tile with its own online softmax, the two halves merged at the end. Twice the warps hide the
+// softmax and ldmatrix latencies that leave the tensor pipe idle with one warp per sub-partition.
+template <int KH>
 __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
     extern __shared__ __align__(128) __half smem[];
     const int group = p.heads / p.kv_heads, row0 = blockIdx.z * kBlockRows;
@@ -214,12 +218,15 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
         *reinterpret_cast<uint4*>(qs + sw(r, c * 8)) = x;
     }
 
-    const bool active = warp < mt;
-    const int r0 = warp * 16 + g, r1 = r0 + 8;
+    const int rt = KH == 2 ? warp % mt : warp, half = KH == 2 ? warp / mt : 0;
+    const bool active = warp < KH * mt;
+    const int r0 = rt * 16 + g, r1 = r0 + 8;
     const int last0 = r0 < rows ? pos0 + (row0 + r0) / group : -1;
     const int last1 = r1 < rows ? pos0 + (row0 + r1) / group : -1;
     // Last key any row of this warp sees (warp-uniform; -1 for helper warps).
-    const int wlast = active ? pos0 + (row0 + min(rows - 1, warp * 16 + 15)) / group : -1;
+    const int wlast = active ? pos0 + (row0 + min(rows - 1, rt * 16 + 15)) / group : -1;
+    constexpr int kNt = 4 / KH;  // n8 key tiles per warp per tile
+    const int kofs = half * 16;
     float o[32][4];
 #pragma unroll
     for (int i = 0; i < 32; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
@@ -227,29 +234,30 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
 
     auto compute = [&](int base) {
         // S = Q K^T: 16 rows x 32 keys, 16 k-steps.
-        float sc[4][4];
+        float sc[kNt][4];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) sc[i][0] = sc[i][1] = sc[i][2] = sc[i][3] = 0.0f;
+        for (int i = 0; i < kNt; ++i) sc[i][0] = sc[i][1] = sc[i][2] = sc[i][3] = 0.0f;
 #pragma unroll
         for (int kk = 0; kk < 16; ++kk) {
             uint32_t a[4];
-            ldsm_x4(a, qs + sw(warp * 16 + (lane & 15), kk * 16 + ((lane >> 4) << 3)));
+            ldsm_x4(a, qs + sw(rt * 16 + (lane & 15), kk * 16 + ((lane >> 4) << 3)));
 #pragma unroll
-            for (int np = 0; np < 2; ++np) {
+            for (int ni = 0; ni < 2 / KH; ++ni) {
+                const int np = KH == 2 ? half : ni;
                 uint32_t b[4];
                 ldsm_x4(b, ks + sw(np * 16 + (lane & 7) + ((lane >> 4) << 3), kk * 16 + (((lane >> 3) & 1) << 3)));
-                mma_f16(sc[2 * np], a, b[0], b[1]);
-                mma_f16(sc[2 * np + 1], a, b[2], b[3]);
+                mma_f16(sc[2 * ni], a, b[0], b[1]);
+                mma_f16(sc[2 * ni + 1], a, b[2], b[3]);
             }
         }
 
         // Mask and online softmax (base 2). Rows g (c0, c1) and g + 8 (c2, c3).
         float mx0 = -INFINITY, mx1 = -INFINITY;
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < kNt; ++nt) {
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
-                const int key = base + nt * 8 + 2 * q4 + e;
+                const int key = base + kofs + nt * 8 + 2 * q4 + e;
                 sc[nt][e] = key <= last0 ? sc[nt][e] : -INFINITY;
                 sc[nt][2 + e] = key <= last1 ? sc[nt][2 + e] : -INFINITY;
                 mx0 = fmaxf(mx0, sc[nt][e]);
@@ -266,7 +274,7 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
         m0 = mn0, m1 = mn1;
         float ps0 = 0.0f, ps1 = 0.0f;
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < kNt; ++nt) {
             sc[nt][0] = exp2f(sc[nt][0] - ref0);
             sc[nt][1] = exp2f(sc[nt][1] - ref0);
             sc[nt][2] = exp2f(sc[nt][2] - ref1);
@@ -284,10 +292,11 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
 
         // O += P V: two k-steps of 16 keys; P becomes the f16 A operand directly.
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const uint32_t a[4] = {pack_h2(sc[2 * j][0], sc[2 * j][1]), pack_h2(sc[2 * j][2], sc[2 * j][3]),
-                                   pack_h2(sc[2 * j + 1][0], sc[2 * j + 1][1]),
-                                   pack_h2(sc[2 * j + 1][2], sc[2 * j + 1][3])};
+        for (int ji = 0; ji < 2 / KH; ++ji) {
+            const int j = KH == 2 ? half : ji;
+            const uint32_t a[4] = {pack_h2(sc[2 * ji][0], sc[2 * ji][1]), pack_h2(sc[2 * ji][2], sc[2 * ji][3]),
+                                   pack_h2(sc[2 * ji + 1][0], sc[2 * ji + 1][1]),
+                                   pack_h2(sc[2 * ji + 1][2], sc[2 * ji + 1][3])};
             const int vrow = j * 16 + (lane & 7) + (((lane >> 3) & 1) << 3);
 #pragma unroll
             for (int dn = 0; dn < 16; ++dn) {
@@ -309,12 +318,40 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(VerifyArgs p) {
         step(ra, base);
         if (base + kTK < j1) step(rb, base + kTK);
     }
-    if (!active) return;
-
     l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
     l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
     l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
     l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    if constexpr (KH == 2) {
+        // Merge the key halves through shared memory (the tiles are done with): the upper half's
+        // accumulator, maxima and sums in lane-minor order, then the lower half folds them in.
+        float* mb = reinterpret_cast<float*>(smem);
+        float* ml = mb + mt * 128 * 32;
+        __syncthreads();
+        if (active && half == 1) {
+#pragma unroll
+            for (int i = 0; i < 128; ++i) mb[(rt * 128 + i) * 32 + lane] = o[i / 4][i % 4];
+            ml[(rt * 4 + 0) * 32 + lane] = m0;
+            ml[(rt * 4 + 1) * 32 + lane] = m1;
+            ml[(rt * 4 + 2) * 32 + lane] = l0;
+            ml[(rt * 4 + 3) * 32 + lane] = l1;
+        }
+        __syncthreads();
+        if (!active || half == 1) return;
+        const float pm0 = ml[(rt * 4 + 0) * 32 + lane], pm1 = ml[(rt * 4 + 1) * 32 + lane];
+        const float mn0 = fmaxf(m0, pm0), mn1 = fmaxf(m1, pm1);
+        const float a0 = m0 == -INFINITY ? 0.0f : exp2f(m0 - mn0), b0 = pm0 == -INFINITY ? 0.0f : exp2f(pm0 - mn0);
+        const float a1 = m1 == -INFINITY ? 0.0f : exp2f(m1 - mn1), b1 = pm1 == -INFINITY ? 0.0f : exp2f(pm1 - mn1);
+        l0 = l0 * a0 + ml[(rt * 4 + 2) * 32 + lane] * b0;
+        l1 = l1 * a1 + ml[(rt * 4 + 3) * 32 + lane] * b1;
+        m0 = mn0, m1 = mn1;
+#pragma unroll
+        for (int i = 0; i < 128; ++i) {
+            const float po = mb[(rt * 128 + i) * 32 + lane];
+            o[i / 4][i % 4] = o[i / 4][i % 4] * (i % 4 < 2 ? a0 : a1) + po * (i % 4 < 2 ? b0 : b1);
+        }
+    }
+    if (!active) return;
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
         const int r = half ? r1 : r0;
@@ -401,6 +438,10 @@ int sm_count() {
 }
 
 
+// Row tiles up to which warps split each key tile in two (verify_kernel<2>); its merge buffer,
+// mt * (128 + 4) * 32 floats, fits in the tile memory for these.
+constexpr int kSplitTiles = 3;
+
 size_t verify_smem(int mt) { return static_cast<size_t>(2 * kTK + mt * 16) * kD * sizeof(__half); }
 
 // Resident verify blocks per SM for `mt` row tiles (cached per mt).
@@ -409,14 +450,17 @@ int verify_occupancy(int mt) {
     if (occ[mt] == 0) {
         static bool configured = false;
         if (!configured) {
-            cudaFuncSetAttribute(verify_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(verify_smem(kBlockRows / 16)));
-            cudaFuncSetAttribute(verify_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                 static_cast<int>(cudaSharedmemCarveoutMaxShared));
+            for (auto fn : {verify_kernel<1>, verify_kernel<2>}) {
+                cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     static_cast<int>(verify_smem(kBlockRows / 16)));
+                cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     static_cast<int>(cudaSharedmemCarveoutMaxShared));
+            }
             configured = true;
         }
         int n = 0;
-        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, verify_kernel, kThreads, verify_smem(mt)) !=
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, mt <= kSplitTiles ? verify_kernel<2> : verify_kernel<1>,
+                                                          kThreads, verify_smem(mt)) !=
                 cudaSuccess ||
             n <= 0)
             n = 1;
@@ -456,7 +500,10 @@ VELOX_API int velox_5060_attention_verify_nvfp4(const float* q, const unsigned c
     prep_query<<<static_cast<unsigned>((n_rows + kPrepWarps - 1) / kPrepWarps), kPrepWarps * 32>>>(
         q, q16, tokens, heads, kv_heads, scale * kLog2e, norm);
     VerifyArgs a{q16, k, v, part_acc, part_ml, params, tokens, heads, kv_heads, pos0, splits, split_keys};
-    verify_kernel<<<dim3(splits, kv_heads, row_blocks), kThreads, verify_smem(mt)>>>(a);
+    if (mt <= kSplitTiles)
+        verify_kernel<2><<<dim3(splits, kv_heads, row_blocks), kThreads, verify_smem(mt)>>>(a);
+    else
+        verify_kernel<1><<<dim3(splits, kv_heads, row_blocks), kThreads, verify_smem(mt)>>>(a);
     combine_kernel<<<static_cast<unsigned>(n_rows), kCombineWarps * 32>>>(part_acc, part_ml, out, splits, norm);
     return velox_launch_status();
 }
