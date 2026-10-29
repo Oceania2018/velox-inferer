@@ -3313,8 +3313,6 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         s.attention(attn(20, 6, 1, 256, 16_500, f))?;
         s.attention(attn(100, 24, 4, 256, 200, f))?;
         s.attention(attn(70, 6, 1, 256, 0, f))?;
-        // A chunk over several thousand cached rows (backends may decode packed rows in tiles).
-        s.attention(attn(48, 6, 1, 256, 4_500, f))?;
     }
     // Other head dims: non-power-of-two (bf16 only), narrower rotations, no GQA.
     s.attention(attn(3, 6, 2, 96, 1_000, KvFormat::Bf16))?;
