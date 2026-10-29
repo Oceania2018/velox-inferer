@@ -114,6 +114,41 @@ struct VisionWs<B: Backend> {
     o: B::Buffer,
     f: B::Buffer,
     m: B::Buffer,
+    /// Physical memory of the buffers above beyond the text workspace's (see
+    /// [`Qwen35Vision::encode_in`]). Declared last, so the buffers mapping it drop first.
+    _own: Vec<B::Chunk>,
+}
+
+/// Buffers of `lens` f32 slots over physical memory: `shared` chunks first, then chunks of their
+/// own (returned with them). Plain allocations without virtual memory or `shared` chunks.
+fn alloc_over<B: Backend>(
+    b: &B,
+    lens: &[usize],
+    shared: &[B::Chunk],
+) -> Result<(Vec<B::Buffer>, Vec<B::Chunk>)> {
+    let chunk = b.vm_chunk_len();
+    if chunk == 0 || shared.is_empty() {
+        let bufs = lens.iter().map(|&l| b.alloc(l)).collect::<Result<_>>()?;
+        return Ok((bufs, Vec::new()));
+    }
+    let span = |len: usize| len.max(1).div_ceil(chunk);
+    let need: usize = lens.iter().map(|&l| span(l)).sum();
+    let own = (shared.len()..need)
+        .map(|_| b.alloc_chunk())
+        .collect::<Result<Vec<_>>>()?;
+    let mut at = 0;
+    let mut bufs = Vec::with_capacity(lens.len());
+    for &len in lens {
+        let mut buf = b.alloc_virtual(len)?;
+        for j in 0..span(len) {
+            let i = at + j;
+            let c = shared.get(i).unwrap_or_else(|| &own[i - shared.len()]);
+            b.map_chunk(&mut buf, j, c)?;
+        }
+        at += span(len);
+        bufs.push(buf);
+    }
+    Ok((bufs, own))
 }
 
 impl<B: Backend> Qwen35Vision<B> {
@@ -273,6 +308,21 @@ impl<B: Backend> Qwen35Vision<B> {
     /// Encodes one image: `patches` is `[gh * gw, patch_features]` in merge-group order. Returns
     /// `[gh * gw / 4, out_hidden]` embeddings, one per merged image token.
     pub fn encode(&self, b: &B, patches: &[f32], gh: usize, gw: usize) -> Result<B::Buffer> {
+        self.encode_in(b, patches, gh, gw, &[])
+    }
+
+    /// [`Self::encode`], with activation buffers allocated now mapped over `shared` (the text
+    /// workspace's [`super::Workspace::scratch_chunks`]): nothing in them outlives a call, and
+    /// encodes run between forward calls, so the tower takes no device memory of its own up to
+    /// that size. Buffers allocated by an earlier call are kept.
+    pub fn encode_in(
+        &self,
+        b: &B,
+        patches: &[f32],
+        gh: usize,
+        gw: usize,
+        shared: &[B::Chunk],
+    ) -> Result<B::Buffer> {
         let c = &self.cfg;
         let n = gh * gw;
         if gh % 2 != 0 || gw % 2 != 0 || patches.len() != n * c.patch_features() {
@@ -315,19 +365,26 @@ impl<B: Backend> Qwen35Vision<B> {
         if guard.as_ref().is_none_or(|w| w.cap < n) {
             *guard = None; // free the smaller buffers first
             let inter = c.intermediate.max(self.merger_fc1.0.rows);
+            // `pos` persists across calls with the grid, so it is not in shared memory.
+            let (hn, fn_) = (n * h, n * inter);
+            let lens = [hn, hn, hn, hn, hn, hn, hn, fn_, fn_];
+            let (bufs, own) = alloc_over(b, &lens, shared)?;
+            let [x, hb, attn, q, k, v, o, f, m]: [B::Buffer; 9] =
+                bufs.try_into().ok().expect("nine buffers");
             *guard = Some(VisionWs {
                 grid: (gh, gw),
                 cap: n,
                 pos: b.upload(&self.position_embeddings(&coords, gh, gw))?,
-                x: b.alloc(n * h)?,
-                h: b.alloc(n * h)?,
-                attn: b.alloc(n * h)?,
-                q: b.alloc(n * h)?,
-                k: b.alloc(n * h)?,
-                v: b.alloc(n * h)?,
-                o: b.alloc(n * h)?,
-                f: b.alloc(n * inter)?,
-                m: b.alloc(n * inter)?,
+                x,
+                h: hb,
+                attn,
+                q,
+                k,
+                v,
+                o,
+                f,
+                m,
+                _own: own,
             });
         }
         let ws = guard.as_mut().expect("allocated above");

@@ -1130,7 +1130,8 @@ impl<B: Backend> Core<B> {
                 let (gh, gw) = (rh / PATCH, rw / PATCH);
                 if gh % MERGE == 0 && gw % MERGE == 0 {
                     let patches = vec![0.0f32; gh * gw * 3 * TEMPORAL * PATCH * PATCH];
-                    v.encode(b, &patches, gh, gw)?;
+                    // The largest image: its buffers are the ones every later image reuses.
+                    v.encode_in(b, &patches, gh, gw, ws.scratch_chunks())?;
                 }
             }
         }

@@ -318,6 +318,13 @@ impl<B: Backend> Workspace<B> {
     pub fn max_tokens(&self) -> usize {
         self.max_tokens
     }
+
+    /// Physical memory of the per-phase scratch (empty without virtual memory). Nothing in it
+    /// outlives a forward call, so work between calls may map it too (see
+    /// [`Qwen35Vision::encode_in`]).
+    pub fn scratch_chunks(&self) -> &[B::Chunk] {
+        &self.backing
+    }
 }
 
 impl<B: Backend> BatchWorkspace<B> {
@@ -840,7 +847,7 @@ pub struct Workspace<B: Backend> {
     rows: bool,
     /// Physical memory the per-phase buffers share (see [`overlay`]); empty without virtual
     /// memory. Declared last, so the buffers mapping it drop first.
-    _overlay: Vec<B::Chunk>,
+    backing: Vec<B::Chunk>,
 }
 
 /// Allocates `groups` of buffers (f32 lengths) whose groups share physical memory: each group's
@@ -1251,7 +1258,7 @@ impl<B: Backend> Qwen35Text<B> {
             spec_rows: None,
             spec_state: None,
             rows,
-            _overlay: backing,
+            backing,
         })
     }
 
