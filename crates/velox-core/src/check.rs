@@ -76,6 +76,26 @@ pub fn rope_positions(x: usize, positions: &[u32], s: &RopePosShape) -> Result<(
     )
 }
 
+/// [`crate::backend::Backend::add_bias_rope`] with a rotary table (`[tokens, rotary_dim]`, from
+/// `rope_table`): `rope_positions`'s geometry, minus the positions the table replaces.
+pub fn add_bias_rope(x: usize, bias: Option<usize>, table: usize, s: &RopePosShape) -> Result<()> {
+    if s.rotary_dim == 0 || !s.rotary_dim.is_multiple_of(2) || s.rotary_dim > s.head_dim {
+        return Err(Error::Shape(format!(
+            "add_bias_rope: bad rotary geometry {s:?}"
+        )));
+    }
+    let width = product(&[s.heads, s.head_dim])?;
+    need("add_bias_rope x", x, product(&[s.tokens, width])?)?;
+    if let Some(b) = bias {
+        need("add_bias_rope bias", b, width)?;
+    }
+    need(
+        "add_bias_rope table",
+        table,
+        product(&[s.tokens, s.rotary_dim])?,
+    )
+}
+
 /// A weight view against its buffer (`buf_slots` f32 slots): layout shape rules, row range, and
 /// that the buffer holds the parent's full encoded payload.
 pub fn weight<B>(w: &WeightView<'_, B>, buf_slots: usize) -> Result<()> {

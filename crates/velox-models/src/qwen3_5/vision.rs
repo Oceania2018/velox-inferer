@@ -348,21 +348,29 @@ impl<B: Backend> Qwen35Vision<B> {
         self.linear_bias(b, &input, &self.patch, x, n)?;
         b.add(x, pos, n * h)?;
 
-        for l in &self.layers {
+        // Elementwise steps run fused with their neighbours: a projection's bias with the RoPE,
+        // GELU or residual add after it, and each residual add with the next layer norm (the
+        // merger's after the last layer). The rotary table is computed once for all layers.
+        let eps = 1e-6;
+        let table = b.rope_table(&positions, rope)?;
+        if let Some(first) = self.layers.first() {
             b.layer_norm(
                 x,
-                &self.params[l.norm1.0],
-                &self.params[l.norm1.1],
+                &self.params[first.norm1.0],
+                &self.params[first.norm1.1],
                 hbuf,
                 n,
                 h,
-                1e-6,
+                eps,
             )?;
-            self.linear_bias(b, hbuf, &l.q, q, n)?;
-            self.linear_bias(b, hbuf, &l.k, k, n)?;
-            self.linear_bias(b, hbuf, &l.v, v, n)?;
-            b.rope_positions(q, &positions, rope)?;
-            b.rope_positions(k, &positions, rope)?;
+        }
+        for (i, l) in self.layers.iter().enumerate() {
+            b.linear(hbuf, &self.view(&l.q.0), q, n)?;
+            b.linear(hbuf, &self.view(&l.k.0), k, n)?;
+            b.linear(hbuf, &self.view(&l.v.0), v, n)?;
+            b.add_bias_rope(q, Some(&self.params[l.q.1]), &positions, &table, rope)?;
+            b.add_bias_rope(k, Some(&self.params[l.k.1]), &positions, &table, rope)?;
+            b.add_bias(v, &self.params[l.v.1], n, l.v.0.rows)?;
             b.attention_full(
                 q,
                 k,
@@ -374,32 +382,50 @@ impl<B: Backend> Qwen35Vision<B> {
                     head_dim: d,
                 },
             )?;
-            self.linear_bias(b, attn, &l.out, o, n)?;
-            b.add(x, o, n * h)?;
-            b.layer_norm(
+            b.linear(attn, &self.view(&l.out.0), o, n)?;
+            b.add_bias_add_layer_norm(
                 x,
+                o,
+                &self.params[l.out.1],
                 &self.params[l.norm2.0],
                 &self.params[l.norm2.1],
                 hbuf,
                 n,
                 h,
-                1e-6,
+                eps,
             )?;
-            self.linear_bias(b, hbuf, &l.fc1, f, n)?;
-            b.gelu(f, n * c.intermediate, GeluKind::Tanh)?;
-            self.linear_bias(b, f, &l.fc2, o, n)?;
-            b.add(x, o, n * h)?;
+            b.linear(hbuf, &self.view(&l.fc1.0), f, n)?;
+            b.add_bias_gelu(f, &self.params[l.fc1.1], n, l.fc1.0.rows, GeluKind::Tanh)?;
+            b.linear(f, &self.view(&l.fc2.0), o, n)?;
+            let next = self
+                .layers
+                .get(i + 1)
+                .map_or(self.merger_norm, |nl| nl.norm1);
+            b.add_bias_add_layer_norm(
+                x,
+                o,
+                &self.params[l.fc2.1],
+                &self.params[next.0],
+                &self.params[next.1],
+                hbuf,
+                n,
+                h,
+                eps,
+            )?;
         }
-        // Merger: patches are merge-group ordered, so [n, h] is already [n/4, 4h].
-        b.layer_norm(
-            x,
-            &self.params[self.merger_norm.0],
-            &self.params[self.merger_norm.1],
-            hbuf,
-            n,
-            h,
-            1e-6,
-        )?;
+        if self.layers.is_empty() {
+            b.layer_norm(
+                x,
+                &self.params[self.merger_norm.0],
+                &self.params[self.merger_norm.1],
+                hbuf,
+                n,
+                h,
+                eps,
+            )?;
+        }
+        // Merger (hbuf holds its layer norm): patches are merge-group ordered, so [n, h] is
+        // already [n/4, 4h].
         let tokens = n / 4;
         self.linear_bias(b, hbuf, &self.merger_fc1, m, tokens)?;
         b.gelu(m, tokens * self.merger_fc1.0.rows, GeluKind::Erf)?;

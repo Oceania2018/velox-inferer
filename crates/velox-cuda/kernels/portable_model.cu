@@ -2165,6 +2165,120 @@ VELOX_API int velox_portable_rope_positions(float* x, const uint32_t* pos, int t
     return velox_launch_status();
 }
 
+// ---- Fused vision ops (Backend::rope_table, add_bias_rope, add_bias_gelu, add_bias_add_layer_norm) ----
+//
+// A vision encode runs every layer's elementwise steps as separate passes over [patches, width],
+// and rope_positions_kernel recomputes its angles in double precision on every call although the
+// positions are the same in every layer. Each fused kernel keeps its parts' rounding order, so the
+// results match the unfused ops.
+
+// rope_positions_kernel's per-token cos / sin, computed once: row t holds [half] cos then [half] sin.
+__global__ void rope_table_kernel(const uint32_t* __restrict__ pos, int tokens, int rotary_dim, float theta, int axes,
+                                  int layout, float* __restrict__ table) {
+    const int half = rotary_dim / 2, t = blockIdx.x;
+    float* row = table + static_cast<size_t>(t) * rotary_dim;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        int axis;
+        double freq;
+        if (layout == 0) {
+            axis = i % axes;
+            freq = pow(static_cast<double>(theta), -2.0 * i / rotary_dim);
+        } else {
+            const int per = half / axes;
+            axis = i / per;
+            freq = pow(static_cast<double>(theta), -2.0 * (i % per) / (static_cast<double>(rotary_dim) / axes));
+        }
+        double s, c;
+        sincos(static_cast<double>(pos[static_cast<size_t>(axis) * tokens + t]) * freq, &s, &c);
+        row[i] = static_cast<float>(c);
+        row[half + i] = static_cast<float>(s);
+    }
+}
+
+// x += bias (per column, when given), then rope_positions_kernel's rotation from the table.
+__global__ void add_bias_rope_kernel(float* __restrict__ x, const float* __restrict__ bias,
+                                     const float* __restrict__ table, int heads, int head_dim, int rotary_dim) {
+    const int half = rotary_dim / 2, tail = head_dim - rotary_dim, per = half + tail, t = blockIdx.x;
+    const float* cs = table + static_cast<size_t>(t) * rotary_dim;
+    for (int p = threadIdx.x; p < heads * per; p += blockDim.x) {
+        const int h = p / per, i = p % per;
+        float* base = x + (static_cast<size_t>(t) * heads + h) * head_dim;
+        const float* bb = bias ? bias + h * head_dim : nullptr;
+        if (i < half) {
+            float a = base[i], b = base[i + half];
+            if (bb) a += bb[i], b += bb[i + half];
+            const float c = cs[i], s = cs[half + i];
+            base[i] = a * c - b * s;
+            base[i + half] = a * s + b * c;
+        } else if (bb) {  // past the rotary dims: the bias only
+            const int j = rotary_dim + (i - half);
+            base[j] += bb[j];
+        }
+    }
+}
+
+__global__ void add_bias_gelu_kernel(float* __restrict__ x, const float* __restrict__ bias, long long len, int dim,
+                                     int erf_kind) {
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < len;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const float a = x[i] + bias[i % dim];
+        x[i] = erf_kind ? 0.5f * a * (1.0f + erff(a * 0.70710678118654752f))
+                        : 0.5f * a * (1.0f + tanhf(0.79788456080286536f * (a + 0.044715f * a * a * a)));
+    }
+}
+
+// x += bias, acc += x, y = layer_norm(acc): layer_norm_kernel's reduction over the updated row.
+__global__ void add_bias_add_layer_norm_kernel(float* __restrict__ acc, float* __restrict__ x,
+                                               const float* __restrict__ bias, const float* __restrict__ w,
+                                               const float* __restrict__ b, float* __restrict__ y, int dim,
+                                               float eps) {
+    __shared__ float scratch[VELOX_WARP];
+    float* ar = acc + static_cast<size_t>(blockIdx.x) * dim;
+    float* xr = x + static_cast<size_t>(blockIdx.x) * dim;
+    float* yr = y + static_cast<size_t>(blockIdx.x) * dim;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = xr[i] + bias[i];
+        xr[i] = v;
+        const float a = ar[i] + v;
+        ar[i] = a;
+        s += a;
+    }
+    const float mean = velox_block_sum(s, scratch) / dim;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float d = ar[i] - mean;
+        ss += d * d;
+    }
+    const float inv = rsqrtf(velox_block_sum(ss, scratch) / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) yr[i] = (ar[i] - mean) * inv * w[i] + b[i];
+}
+
+VELOX_API int velox_portable_rope_table(const uint32_t* pos, int tokens, int rotary_dim, float theta, int axes,
+                                        int layout, float* table) {
+    if (tokens <= 0) return 0;
+    rope_table_kernel<<<tokens, 64>>>(pos, tokens, rotary_dim, theta, axes, layout, table);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_add_bias_rope(float* x, const float* bias, const float* table, int tokens, int heads,
+                                           int head_dim, int rotary_dim) {
+    if (tokens <= 0) return 0;
+    add_bias_rope_kernel<<<tokens, 256>>>(x, bias, table, heads, head_dim, rotary_dim);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_add_bias_gelu(float* x, const float* bias, long long len, int dim, int erf_kind) {
+    add_bias_gelu_kernel<<<velox_grid_1d(len, 256), 256>>>(x, bias, len, dim, erf_kind);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_add_bias_add_layer_norm(float* acc, float* x, const float* bias, const float* w,
+                                                     const float* b, float* y, int rows, int dim, float eps) {
+    add_bias_add_layer_norm_kernel<<<rows, 256>>>(acc, x, bias, w, b, y, dim, eps);
+    return velox_launch_status();
+}
+
 // ---- MoE experts (Backend::moe_experts) ----
 //
 // Pairs p = r * k + j (row r, its j-th expert) are grouped by expert with a counting sort, then each
