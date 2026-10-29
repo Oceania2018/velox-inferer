@@ -361,24 +361,33 @@ impl<B: Backend> Suite<'_, B> {
 
     /// `linears` against the oracle: one input, destinations of `ld = parts' rows + 2` columns
     /// (the last two must stay zero), each part a view `(format, parent rows, begin, rows)` of
-    /// its own random parent under `policy`, rounded as `linear_act` reports for it.
+    /// its own random parent under `policy`, rounded as `linear_act` reports for it. With
+    /// `shared`, parts of the same format and parent rows are views of one parent (a fused
+    /// projection's parts, as artifacts store them).
     fn linears(
         &mut self,
         dsts: &[&[(WeightFormat, usize, usize, usize)]],
         k: usize,
         m: usize,
         policy: ActPolicy,
+        shared: bool,
     ) -> Result<()> {
         let x = self.rng.vec(m * k, 1.0);
         let xd = self.b.upload(&x)?;
-        let mut parents = Vec::new();
+        let (mut parents, mut keys, mut of_part) = (Vec::new(), Vec::new(), Vec::new());
         for d in dsts {
             for &(fmt, n, _, _) in *d {
+                if let Some(i) = keys.iter().position(|&key| shared && key == (fmt, n)) {
+                    of_part.push(i);
+                    continue;
+                }
                 let bytes = random_weight(&mut self.rng, fmt, n, k);
                 parents.push((
                     self.b.upload_bytes(&bytes)?,
                     CpuBackend.upload_bytes(&bytes)?,
                 ));
+                keys.push((fmt, n));
+                of_part.push(parents.len() - 1);
             }
         }
         let lds: Vec<usize> = dsts
@@ -401,7 +410,7 @@ impl<B: Backend> Suite<'_, B> {
         for (d, &ld) in dsts.iter().zip(&lds) {
             let (mut col, mut dp, mut want) = (0, Vec::new(), vec![0.0; m * ld]);
             for &(fmt, n, begin, rows) in *d {
-                let view = WeightView::full(&parents[pi].0, fmt, n, k)
+                let view = WeightView::full(&parents[of_part[pi]].0, fmt, n, k)
                     .rows(begin, rows)
                     .with_act(policy);
                 let act = self.b.linear_act(&view, m);
@@ -411,7 +420,7 @@ impl<B: Backend> Suite<'_, B> {
                 let mut part = vec![0.0; m * rows];
                 CpuBackend.linear(
                     &xq,
-                    &WeightView::full(&parents[pi].1, fmt, n, k).rows(begin, rows),
+                    &WeightView::full(&parents[of_part[pi]].1, fmt, n, k).rows(begin, rows),
                     &mut part,
                     m,
                 )?;
@@ -440,7 +449,11 @@ impl<B: Backend> Suite<'_, B> {
             got.extend(fetch(self.b, y, m * ld)?);
             want.extend_from_slice(w);
         }
-        let name = format!("linears [{}] k={k} m={m}", tags.join(" "));
+        let name = format!(
+            "linears{} [{}] k={k} m={m}",
+            if shared { " shared" } else { "" },
+            tags.join(" ")
+        );
         if permitted_all {
             self.record(name, Some(Op::Linear), &got, &want, 2e-4);
         } else {
@@ -3505,15 +3518,26 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             &[(Bf16, 48, 0, 48), (Bf16, 40, 8, 24)],
         ];
         for m in [1, 8, 70, 130] {
-            s.linears(gdn, 512, m, ActPolicy::AllowA8)?;
+            s.linears(gdn, 512, m, ActPolicy::AllowA8, false)?;
         }
-        s.linears(gdn, 512, 70, ActPolicy::A16Only)?;
+        s.linears(gdn, 512, 70, ActPolicy::A16Only, false)?;
+        // The model's layout: each projection its own destination, views of shared parents
+        // (Qwen3.8 GDN q|k and v|z, attention q|k and gate|v), a ragged last tile.
+        let fused: &[&[(WeightFormat, usize, usize, usize)]] = &[
+            &[(Q4G64, 256, 0, 128)],
+            &[(Q5G64, 232, 0, 96)],
+            &[(Q4G64, 256, 128, 128)],
+            &[(Q5G64, 232, 96, 136)],
+        ];
+        for m in [1, 2, 8, 16] {
+            s.linears(fused, 512, m, ActPolicy::AllowA8, true)?;
+        }
         let attn: &[&[(WeightFormat, usize, usize, usize)]] = &[
             &[(Iq3Xxs, 128, 0, 128)],
             &[(Q5G64, 128, 0, 128)],
             &[(Q4G64, 64, 0, 64)],
         ];
-        s.linears(attn, 768, 100, ActPolicy::AllowA8)?;
+        s.linears(attn, 768, 100, ActPolicy::AllowA8, false)?;
     }
     // Prefill widths on a grid of a few tiles with a long K (kernel sets may split K there).
     s.linear_act(WeightFormat::Fp8RowBf16, 256, 4096, 0, 256, 100, a8)?;
