@@ -79,17 +79,39 @@ __device__ __forceinline__ uint32_t pair_of(uint32_t code, uint32_t high8, int b
     return biased_pair(((code & 0xfu) | ((hb & 1u) << 4)) ^ 16u, ((code >> 4) | ((hb & 2u) << 3)) ^ 16u, 0x43104310u);
 }
 
+// Views of one parent served by one launch (a fused projection's parts: GDN q|k and v|z, attention
+// q|k and gate|v). Each view's rows take whole 16-row tiles; block b serves the view whose tiles
+// hold it. One launch instead of one per view: RTX 4090, q5 [6144, 5120] x2 at m=8 76.2 us as two
+// launches, 68.9 as one.
+constexpr int kMaxSegs = 4;
+struct Segs {
+    int n;
+    int tile0[kMaxSegs];  // first tile of each view
+    long long row_begin[kMaxSegs];
+    int rows[kMaxSegs];
+    float* y[kMaxSegs];
+    long long ldy[kMaxSegs];
+};
+
 template <int F, int T, int GPR>
 __global__ void __launch_bounds__(kThreads, 6)
 rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows,
-                 int k_rt, int kp_rt, long long view_begin, int rows, int m, float* __restrict__ y,
-                 long long ldy) {
+                 int k_rt, int kp_rt, int m, const Segs segs) {
     constexpr int NT = T / 8;
     __shared__ Smem<T> sm;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, lid = lane & 3;
     const int kp = GPR ? GPR * 64 : kp_rt, k = GPR ? kp : k_rt;
     const int gpr = kp / 64, groups = (k + 63) / 64, tiles = (groups + kW - 1) / kW;
-    const int r0 = blockIdx.x * kR;
+    // This block's view, by selects (an indexed parameter would go through local memory).
+    long long view_begin = segs.row_begin[0], ldy = segs.ldy[0];
+    int rows = segs.rows[0], tile0 = 0;
+    float* y = segs.y[0];
+#pragma unroll
+    for (int i = 1; i < kMaxSegs; ++i)
+        if (i < segs.n && static_cast<int>(blockIdx.x) >= segs.tile0[i])
+            view_begin = segs.row_begin[i], ldy = segs.ldy[i], rows = segs.rows[i], tile0 = segs.tile0[i],
+            y = segs.y[i];
+    const int r0 = (static_cast<int>(blockIdx.x) - tile0) * kR;
     const long long n_groups = parent_rows * gpr;
     const uint8_t* codes = w;
     const uint8_t* high = w + (n_groups * 32 + 255) / 256 * 256;
@@ -221,28 +243,41 @@ __global__ void to_bf16_pad(const float* __restrict__ x, int m, int k, int kp, _
 VeloxScratch g_x;
 
 template <int F, int T, int GPR>
-int launch(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, long long rb, int rows, int m,
-           float* y, long long ldy) {
-    rs_sliced_kernel<F, T, GPR><<<(rows + kR - 1) / kR, kThreads>>>(x, w, n, k, kp, rb, rows, m, y, ldy);
+int launch(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, int m, const Segs& segs, int tiles) {
+    rs_sliced_kernel<F, T, GPR><<<tiles, kThreads>>>(x, w, n, k, kp, m, segs);
     return velox_launch_status();
 }
 
 template <int F, int T>
-int launch_k(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, long long rb, int rows, int m,
-             float* y, long long ldy) {
+int launch_k(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, int m, const Segs& segs,
+             int tiles) {
     // The model's input widths as compile-time constants (the tile loop unrolls).
-    if (k == 5120 && kp == 5120) return launch<F, T, 80>(x, w, n, k, kp, rb, rows, m, y, ldy);
-    if (k == 6144 && kp == 6144) return launch<F, T, 96>(x, w, n, k, kp, rb, rows, m, y, ldy);
-    return launch<F, T, 0>(x, w, n, k, kp, rb, rows, m, y, ldy);
+    if (k == 5120 && kp == 5120) return launch<F, T, 80>(x, w, n, k, kp, m, segs, tiles);
+    if (k == 6144 && kp == 6144) return launch<F, T, 96>(x, w, n, k, kp, m, segs, tiles);
+    return launch<F, T, 0>(x, w, n, k, kp, m, segs, tiles);
 }
 
-int run(const __nv_bfloat16* xb, int m, const uint8_t* w, long long parent_rows, int ki, int kp, long long row_begin,
-        int rows, int format, float* y, long long ldy) {
+// `n` views (row_begin[i], rows[i]) of the parent into y[i] (row stride ldy[i] >= rows[i]).
+int run(const __nv_bfloat16* xb, int m, const uint8_t* w, long long parent_rows, int ki, int kp, int format, int n,
+        const long long* row_begin, const int* rows, float* const* y, const long long* ldy) {
+    if (n < 1 || n > kMaxSegs) return VELOX_ERR_UNSUPPORTED;
+    Segs segs{};
+    segs.n = n;
+    long long tiles = 0;
+    for (int i = 0; i < n; ++i) {
+        if (rows[i] <= 0 || ldy[i] < rows[i] || row_begin[i] < 0 || row_begin[i] + rows[i] > parent_rows)
+            return VELOX_ERR_UNSUPPORTED;
+        segs.tile0[i] = static_cast<int>(tiles);
+        segs.row_begin[i] = row_begin[i], segs.rows[i] = rows[i], segs.y[i] = y[i], segs.ldy[i] = ldy[i];
+        tiles += (rows[i] + kR - 1) / kR;
+    }
+    if (tiles > (1ll << 30)) return VELOX_ERR_UNSUPPORTED;
+    const int nt = static_cast<int>(tiles);
     if (format == kQ5)
-        return m <= 8 ? launch_k<kQ5, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy)
-                      : launch_k<kQ5, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy);
-    return m <= 8 ? launch_k<kQ4, 8>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy)
-                  : launch_k<kQ4, 16>(xb, w, parent_rows, ki, kp, row_begin, rows, m, y, ldy);
+        return m <= 8 ? launch_k<kQ5, 8>(xb, w, parent_rows, ki, kp, m, segs, nt)
+                      : launch_k<kQ5, 16>(xb, w, parent_rows, ki, kp, m, segs, nt);
+    return m <= 8 ? launch_k<kQ4, 8>(xb, w, parent_rows, ki, kp, m, segs, nt)
+                  : launch_k<kQ4, 16>(xb, w, parent_rows, ki, kp, m, segs, nt);
 }
 
 VeloxScratch g_shared;
@@ -260,7 +295,8 @@ VELOX_API int velox_4090_linear_rs_sliced(const float* x, int m, const uint8_t* 
     auto* xb = static_cast<__nv_bfloat16*>(g_x.get(static_cast<size_t>(m) * kp * 2));
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16_pad<<<velox_grid_1d(static_cast<long long>(m) * kp, 256), 256>>>(x, m, ki, kp, xb);
-    return run(xb, m, w, parent_rows, ki, kp, row_begin, rows, format, y, rows);
+    const long long ldy = rows;
+    return run(xb, m, w, parent_rows, ki, kp, format, 1, &row_begin, &rows, &y, &ldy);
 }
 
 // x [m, k] f32 -> bf16 (RNE) in a scratch that velox_4090_linear_rs_sliced_bf16 calls then read:
@@ -285,5 +321,18 @@ VELOX_API int velox_4090_linear_rs_sliced_bf16(const void* xb, int m, const uint
         reinterpret_cast<uintptr_t>(w) % 16 != 0 || (format != kQ4 && format != kQ5))
         return VELOX_ERR_UNSUPPORTED;
     const int ki = static_cast<int>(k);
-    return run(static_cast<const __nv_bfloat16*>(xb), m, w, parent_rows, ki, ki, row_begin, rows, format, y, ldy);
+    return run(static_cast<const __nv_bfloat16*>(xb), m, w, parent_rows, ki, ki, format, 1, &row_begin, &rows, &y,
+               &ldy);
+}
+
+// velox_4090_linear_rs_sliced_bf16 over n <= 4 views of one parent in one launch: view i is rows
+// row_begin[i] .. + rows[i], written to y[i][t * ldy[i] + r].
+VELOX_API int velox_4090_linear_rs_sliced_bf16_views(const void* xb, int m, const uint8_t* w, long long parent_rows,
+                                                     long long k, int format, int n, const long long* row_begin,
+                                                     const int* rows, float* const* y, const long long* ldy) {
+    if (m < 1 || m > 16 || k % 128 != 0 || k > (1ll << 30) || reinterpret_cast<uintptr_t>(w) % 16 != 0 ||
+        (format != kQ4 && format != kQ5))
+        return VELOX_ERR_UNSUPPORTED;
+    const int ki = static_cast<int>(k);
+    return run(static_cast<const __nv_bfloat16*>(xb), m, w, parent_rows, ki, ki, format, n, row_begin, rows, y, ldy);
 }

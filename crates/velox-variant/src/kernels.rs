@@ -321,6 +321,19 @@ extern "C" {
         y: *mut f32,
         ldy: i64,
     ) -> i32;
+    fn velox_4090_linear_rs_sliced_bf16_views(
+        xb: *const u8,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        format: i32,
+        n: i32,
+        row_begin: *const i64,
+        rows: *const i32,
+        y: *const *mut f32,
+        ldy: *const i64,
+    ) -> i32;
     fn velox_4090_linear_iq3_q8_pre(
         m: i32,
         w: *const u8,
@@ -1472,43 +1485,64 @@ impl CudaKernels for Rtx4090Kernels {
         m: usize,
     ) -> Result<()> {
         let mi = to_i32("m", m)?;
-        // q4/q5 sliced-K parts: the input's bf16 twin, or one conversion, then each GEMM into its
-        // columns.
+        // q4/q5 sliced-K parts: the input's bf16 twin, or one conversion, then one launch per
+        // parent for its views (up to four; a fused projection's parts share parents), each into
+        // its columns.
         let mut xb: *const u8 = twin.map_or(std::ptr::null(), |t| t.as_ptr().cast::<u8>());
+        let mut views = Vec::new();
         for d in dsts.iter_mut() {
-            let ld = d.ld;
-            for p in d.parts {
-                let Some(f) = rs_shared(&p.w, m) else {
-                    continue;
-                };
-                let w = &p.w;
-                if xb.is_null() {
-                    // SAFETY: x holds m * k values (CudaBackend::linears checked every part).
-                    status(
-                        unsafe { velox_4090_bf16_act(x.as_ptr(), mi, w.k as i64, &mut xb) },
-                        "rtx4090 bf16 activations",
-                    )?;
+            let (ld, parts) = (d.ld, d.parts);
+            for p in parts {
+                if let Some(f) = rs_shared(&p.w, m) {
+                    // SAFETY: the destination holds m * ld values and col + rows <= ld (checked).
+                    let y = unsafe { d.y.as_mut_ptr().add(p.col) };
+                    views.push((p.w, f, y, ld as i64));
                 }
-                // SAFETY: the destination holds m * ld values and col + rows <= ld (checked).
-                let y = unsafe { d.y.as_mut_ptr().add(p.col) };
+            }
+        }
+        let mut done = vec![false; views.len()];
+        for i in 0..views.len() {
+            if done[i] {
+                continue;
+            }
+            let (w, f) = (views[i].0, views[i].1);
+            if xb.is_null() {
+                // SAFETY: x holds m * k values (CudaBackend::linears checked every part).
                 status(
-                    unsafe {
-                        velox_4090_linear_rs_sliced_bf16(
-                            xb,
-                            mi,
-                            w.buf.as_ptr().cast::<u8>(),
-                            w.parent_rows as i64,
-                            w.k as i64,
-                            w.row_begin as i64,
-                            to_i32("rows", w.rows)?,
-                            f,
-                            y,
-                            ld as i64,
-                        )
-                    },
-                    "rtx4090 linears rs sliced",
+                    unsafe { velox_4090_bf16_act(x.as_ptr(), mi, w.k as i64, &mut xb) },
+                    "rtx4090 bf16 activations",
                 )?;
             }
+            let (mut begins, mut rows, mut ys, mut lds) = (vec![], vec![], vec![], vec![]);
+            for j in i..views.len() {
+                let (v, vf, y, ld) = views[j];
+                if !done[j] && begins.len() < 4 && vf == f && v.buf.as_ptr() == w.buf.as_ptr() {
+                    done[j] = true;
+                    begins.push(v.row_begin as i64);
+                    rows.push(to_i32("rows", v.rows)?);
+                    ys.push(y);
+                    lds.push(ld);
+                }
+            }
+            // SAFETY: views of one parent (same buffer, format and k), extents checked above.
+            status(
+                unsafe {
+                    velox_4090_linear_rs_sliced_bf16_views(
+                        xb,
+                        mi,
+                        w.buf.as_ptr().cast::<u8>(),
+                        w.parent_rows as i64,
+                        w.k as i64,
+                        f,
+                        begins.len() as i32,
+                        begins.as_ptr(),
+                        rows.as_ptr(),
+                        ys.as_ptr(),
+                        lds.as_ptr(),
+                    )
+                },
+                "rtx4090 linears rs sliced",
+            )?;
         }
         // int8 parts: the input's int8 twin when it is in the layout, else one quantization per
         // layout, then each GEMM into its columns.

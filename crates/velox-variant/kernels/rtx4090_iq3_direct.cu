@@ -56,10 +56,10 @@ __constant__ uint32_t kGrid[256] = {
 };
 
 #ifndef IQ3_DIRECT_W_SHORT
-#define IQ3_DIRECT_W_SHORT 2
+#define IQ3_DIRECT_W_SHORT 4  // RTX 4090, gate [17408, 5120] m=8: 57.5 us with 2 warps, 47.4 with 4, 49 with 8
 #endif
 #ifndef IQ3_DIRECT_W_LONG
-#define IQ3_DIRECT_W_LONG 8  // measured on this card: down 111 us with 8 warps vs 118 with 4
+#define IQ3_DIRECT_W_LONG 8  // RTX 4090, down [5120, 17408] m=8: 51.6 us with 8 warps, 55.6 with 4, 51.2 with 16
 #endif
 #ifndef IQ3_DIRECT_LONG_BLOCKS
 #define IQ3_DIRECT_LONG_BLOCKS 32
@@ -127,11 +127,11 @@ struct Up {
 // rolled K loop and table sign masks; long rows (down) with more warps, unrolled, ALU sign masks.
 __host__ __device__ constexpr bool short_rows(int kb) { return kb != 0 && kb <= IQ3_DIRECT_LONG_BLOCKS; }
 
-// Short rows declare one block per SM: ptxas then keeps the whole block's loads in flight (141
-// registers) instead of trimming to 72 for occupancy, which serialized them (gate/up pair m=8:
-// 202 -> 184 us). Long rows are fastest at the default.
+// One block per SM declared: ptxas then keeps the whole block's loads in flight instead of trimming
+// registers for occupancy, which serialized them. RTX 4090, down [5120, 17408]: m=1 56.6 -> 47.0 us,
+// m=8 57.5 -> 51.6 us against two blocks per SM (short rows were already at one).
 template <int W, int MT, int NT, int KB, typename XT, bool PAIR>
-__global__ void __launch_bounds__(W * 32, short_rows(KB) ? 1 : 2)
+__global__ void __launch_bounds__(W * 32, 1)
 iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows, int k_rt,
                   long long row_begin, int rows, int m, float* __restrict__ y, Up up) {
     const int k = KB ? KB * 256 : k_rt;
