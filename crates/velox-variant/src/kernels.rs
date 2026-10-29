@@ -3,8 +3,8 @@
 //! tries the tuned kernel and falls back to the portable one when the kernel reports the shape as unsupported.
 
 use velox_core::backend::{
-    linear_part_whole, ActPolicy, ActQuant, AttnPrecision, AttnShape, FullAttnShape, LinearDst,
-    NormKind, WeightView,
+    linear_part_whole, ActPolicy, ActQuant, AttnPrecision, AttnShape, ExpertBank, FullAttnShape,
+    LinearDst, NormKind, WeightView,
 };
 use velox_core::check::to_i32;
 use velox_core::{Error, KvFormat, Op, Result, WeightFormat};
@@ -53,6 +53,19 @@ extern "C" {
         v: *const f32,
         out: *mut f32,
         tokens: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
+    ) -> i32;
+    fn velox_5060_attention_windows(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        window: i32,
         heads: i32,
         kv_heads: i32,
         head_dim: i32,
@@ -216,6 +229,38 @@ extern "C" {
         v_heads: i32,
         k_dim: i32,
         v_dim: i32,
+    ) -> i32;
+    fn velox_5060_ggml_act(
+        x: *const f32,
+        m: i32,
+        k: i64,
+        q: *mut *const i8,
+        d: *mut *const f32,
+    ) -> i32;
+    fn velox_5060_linear_ggml_from(
+        xq: *const i8,
+        xd: *const f32,
+        m: i32,
+        w: *const u8,
+        ty: i32,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+        ldy: i64,
+        mode: i32,
+    ) -> i32;
+    fn velox_5060_linear_ggml_q8(
+        blob: *const u8,
+        m: i32,
+        w: *const u8,
+        ty: i32,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+        ldy: i64,
+        mode: i32,
     ) -> i32;
     fn velox_5060_gdn_step(
         qkv: *const f32,
@@ -525,6 +570,14 @@ fn bf16_skinny(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
         && w.k % 32 == 0
 }
 
+/// bf16 weights of many rows at prefill widths: bf16 tensor cores (rtx5060_bf16.cu; K a multiple
+/// of 16, as Qwen3-VL's ViT fc2 with K = 4304).
+fn bf16_mma(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    w.format == WeightFormat::Bf16 && m >= BF16_MMA_MIN_M && w.k % 16 == 0 && !bf16_skinny(w, m)
+}
+
+const BF16_MMA_MIN_M: usize = 64;
+
 /// IQ3_XXS at any token count: the weight-streaming bf16 kernels (prefill in 64-token tiles).
 fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
     w.format == WeightFormat::Iq3Xxs && m >= 1
@@ -548,6 +601,12 @@ fn q8_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     {
         return None;
     }
+    if let WeightFormat::Ggml(t) = w.format {
+        // The prefill kernel copies each block from the 4-byte aligned address at or below it,
+        // which stays inside the row when rows are 4-byte multiples.
+        let aligned = w.k % 1024 == 0 || t.row_bytes(w.k) % 4 == 0;
+        return (ggml_served(t) && m >= GGML_Q8_MIN_M && aligned).then(|| 16 + ggml_index(t));
+    }
     match w.format {
         WeightFormat::Iq3Xxs if m >= IQ3_Q8_MIN_M => Some(3),
         WeightFormat::Q4G64 if m >= RS_Q8_MIN_M => Some(4),
@@ -556,9 +615,22 @@ fn q8_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
     }
 }
 
+/// Gate / up for `ggml_swiglu_q8`: both on the int8 prefill kernels, GGML (formats from 16) and
+/// at most one IQ3_XXS (3).
+fn ggml_q8_pair(
+    gate: &WeightView<'_, CudaBuffer>,
+    up: &WeightView<'_, CudaBuffer>,
+    m: usize,
+) -> bool {
+    match (q8_format(gate, m), q8_format(up, m)) {
+        (Some(g), Some(u)) => (g >= 16 || u >= 16) && (g >= 16 || g == 3) && (u >= 16 || u == 3),
+        _ => false,
+    }
+}
+
 /// The int8 kernels' activation layout for a `q8_format` code (0: IQ3_XXS, 1: q4/q5).
 fn q8_layout(format: i32) -> i32 {
-    if format == 3 {
+    if format == 3 || format >= 16 {
         0
     } else {
         1
@@ -605,7 +677,10 @@ fn bf16_in(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<Bf16In> {
 /// quantization per layout), q4/q5 sliced-K ones (which share one bf16 conversion) and bf16
 /// few-row ones.
 fn linears_in_place(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
-    q8_format(w, m).is_some() || rs_shared(w, m).is_some() || bf16_skinny(w, m)
+    q8_format(w, m).is_some()
+        || rs_shared(w, m).is_some()
+        || bf16_skinny(w, m)
+        || ggml_mmvq(w, m).is_some()
 }
 
 /// NVFP4 views the FP4-activation path does not serve (A16-only, or not 128-row aligned) from
@@ -642,7 +717,348 @@ fn gdn_step(qkv: &CudaBuffer, s: &velox_core::backend::GdnShape) -> bool {
         && (qkv.as_ptr() as usize + s.row0 * s.qkv_width() * 4) % 16 == 0
 }
 
+/// From this many tokens GGML weights run the int8 prefill kernel (Int8G256 activations, the q8
+/// path's format 16 + type); below, the per-32 kernels of `ggml_mmvq`.
+const GGML_Q8_MIN_M: usize = 17;
+
+/// From this many tokens (rtx5060_ggml.cu mma_min_m, VELOX_GGML_MMA_MIN unset) the decode-width
+/// GGML linears run on int8 tensor cores instead of dp4a.
+const GGML_MMA_MIN_M: usize = 5;
+
+/// Types rtx5060_ggml.cu decodes at every width: the first nine of `GgmlType::ALL` (q2_k ..
+/// iq4_xs) and IQ1_S (dp4a up to 16 tokens, the int8 prefill kernel above). IQ4_NL runs its dp4a kernel up to 16 tokens (`ggml_mmvq`) and the MoE kernels; Q2_0
+/// only the MoE kernels; the rest (q6_k, q8_0) the portable kernels.
+fn ggml_served(t: velox_core::ggml::GgmlType) -> bool {
+    ggml_index(t) < 9 || t == velox_core::ggml::GgmlType::Iq1S
+}
+
+fn ggml_index(t: velox_core::ggml::GgmlType) -> i32 {
+    velox_core::ggml::GgmlType::ALL
+        .iter()
+        .position(|&x| x == t)
+        .map_or(0, |i| i as i32)
+}
+
+/// The GGML type code (`GgmlType::ALL` order) of a weight rtx5060_ggml.cu serves at `m` tokens
+/// (int8 activations per 32 values: dp4a up to 4 tokens, int8 tensor cores from 5, prefill
+/// included): AllowA8 (the importer's policy for GGML matrices), K a multiple of 1024 so two
+/// blocks of a row start 4-byte aligned for every block size. The dp4a kernel (up to 4 tokens)
+/// also takes K a multiple of 256 whose rows are 16-byte multiples (Qwen3.8-Flash-Next's 2560).
+/// IQ4_NL (32-value blocks) runs the dp4a kernel at every width up to 16 tokens, K a multiple of
+/// 256: model widths, not the narrow layers (K 32 / 64) of small test stacks, whose exact
+/// reference the int8 rounding would push past the end-to-end tolerance.
+fn ggml_mmvq(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
+    let WeightFormat::Ggml(t) = w.format else {
+        return None;
+    };
+    let a8 = matches!(w.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. });
+    if t == velox_core::ggml::GgmlType::Iq4Nl {
+        return (a8 && (1..GGML_Q8_MIN_M).contains(&m) && w.k % 256 == 0).then(|| ggml_index(t));
+    }
+    let dp4a_rows = m < GGML_MMA_MIN_M && w.k % 256 == 0 && t.row_bytes(w.k) % 16 == 0;
+    if !ggml_served(t) || !(1..GGML_Q8_MIN_M).contains(&m) || (w.k % 1024 != 0 && !dp4a_rows) || !a8
+    {
+        return None;
+    }
+    velox_core::ggml::GgmlType::ALL
+        .iter()
+        .position(|&x| x == t)
+        .map(|i| i as i32)
+}
+
+/// One `Int8G32` quantization of a GGML linear's input (velox_5060_ggml_act), shared by every GGML
+/// part reading the same `x` at the same K.
+struct GgmlAct {
+    q: *const i8,
+    d: *const f32,
+    k: usize,
+}
+
+impl GgmlAct {
+    fn new(x: &CudaBuffer, m: usize, k: usize) -> Result<Self> {
+        let (mut q, mut d) = (std::ptr::null(), std::ptr::null());
+        // SAFETY: x holds m * k values (the caller's linear checks); the shim writes its scratch.
+        status(
+            unsafe { velox_5060_ggml_act(x.as_ptr(), to_i32("m", m)?, k as i64, &mut q, &mut d) },
+            "rtx5060 ggml act",
+        )?;
+        Ok(GgmlAct { q, d, k })
+    }
+
+    /// `y[t * ldy + r]` for the view's rows (mode 1: `silu(y) * ..`, a SwiGLU's up projection).
+    fn run(
+        &self,
+        w: &WeightView<'_, CudaBuffer>,
+        ty: i32,
+        m: usize,
+        y: *mut f32,
+        ldy: usize,
+        mode: i32,
+    ) -> Result<()> {
+        // SAFETY: the caller checked y's extent for m rows of stride ldy; the blob matches m, k.
+        status(
+            unsafe {
+                velox_5060_linear_ggml_from(
+                    self.q,
+                    self.d,
+                    to_i32("m", m)?,
+                    w.buf.as_ptr().cast::<u8>(),
+                    ty,
+                    w.k as i64,
+                    w.row_begin as i64,
+                    to_i32("rows", w.rows)?,
+                    y,
+                    ldy as i64,
+                    mode,
+                )
+            },
+            "rtx5060 linear ggml",
+        )
+    }
+}
+
 pub struct Rtx5060Kernels;
+
+impl Rtx5060Kernels {
+    /// SwiGLU over separate gate / up parents at prefill widths, GGML and at most one of them
+    /// IQ3_XXS (GGUF imports keep GGML blocks but turn IQ3_XXS planar): one GEMM into `out`, the
+    /// GGML one second with SwiGLU in its epilogue (gate first: silu(out) * up; up first: silu(gate)
+    /// * out), both from one int8 quantization of `x` (or from `x` itself when `twin` is set: an
+    /// int8 twin in layout 0).
+    fn ggml_swiglu_q8(
+        &self,
+        x: &CudaBuffer,
+        twin: Option<()>,
+        gate: &WeightView<'_, CudaBuffer>,
+        up: &WeightView<'_, CudaBuffer>,
+        out: &mut CudaBuffer,
+        m: usize,
+    ) -> Result<()> {
+        let (Some(fg), Some(fu)) = (q8_format(gate, m), q8_format(up, m)) else {
+            return Err(Error::Unsupported("ggml swiglu q8 views".into()));
+        };
+        let (mi, rows, k) = (to_i32("m", m)?, to_i32("rows", gate.rows)?, gate.k as i64);
+        let blob = match twin {
+            Some(()) => x.as_ptr().cast::<u8>(),
+            None => {
+                // SAFETY: x holds m * k values (CudaBackend::linear_swiglu checked the views).
+                status(
+                    unsafe { velox_5060_q8_quantize(x.as_ptr(), mi, k, 0) },
+                    "rtx5060 q8 quantize",
+                )?;
+                std::ptr::null()
+            }
+        };
+        let order = if fu == 3 {
+            [(up, fu, 0), (gate, fg, 2)]
+        } else {
+            [(gate, fg, 0), (up, fu, 1)]
+        };
+        for (w, f, mode) in order {
+            let (wp, rb) = (w.buf.as_ptr().cast::<u8>(), w.row_begin as i64);
+            // SAFETY: out holds m * rows values (checked by the caller); the activations match m, k.
+            let code = unsafe {
+                match (f, twin) {
+                    (3, Some(())) => velox_5060_linear_iq3_q8_from(
+                        blob,
+                        mi,
+                        wp,
+                        w.parent_rows as i64,
+                        k,
+                        rb,
+                        rows,
+                        out.as_mut_ptr(),
+                        rows as i64,
+                    ),
+                    (3, None) => velox_5060_linear_iq3_q8_pre(
+                        mi,
+                        wp,
+                        w.parent_rows as i64,
+                        k,
+                        rb,
+                        rows,
+                        out.as_mut_ptr(),
+                        rows as i64,
+                    ),
+                    _ => velox_5060_linear_ggml_q8(
+                        blob,
+                        mi,
+                        wp,
+                        f - 16,
+                        k,
+                        rb,
+                        rows,
+                        out.as_mut_ptr(),
+                        rows as i64,
+                        mode,
+                    ),
+                }
+            };
+            status(code, "rtx5060 linear_swiglu ggml q8")?;
+        }
+        Ok(())
+    }
+}
+
+extern "C" {
+    fn velox_5060_moe_scratch(rows: i32, k: i32, width: i32, hidden: i32) -> i64;
+    fn velox_5060_linear_bf16_mma(
+        x: *const f32,
+        m: i32,
+        w: *const u16,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+        ldy: i64,
+    ) -> i32;
+    fn velox_5060_moe_grouped_scratch(
+        rows: i32,
+        k: i32,
+        width: i32,
+        hidden: i32,
+        experts: i32,
+    ) -> i64;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_5060_moe_grouped(
+        x: *const f32,
+        ids: *const f32,
+        wts: *const f32,
+        records: *const u8,
+        slots: *const u8,
+        map: *const f32,
+        record_bytes: i64,
+        slot_bytes: i64,
+        up_type: i32,
+        gate_off: i64,
+        up_off: i64,
+        down_type: i32,
+        down_off: i64,
+        width: i32,
+        hidden: i32,
+        rows: i32,
+        k: i32,
+        experts: i32,
+        y: *mut f32,
+        scratch: *mut f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_5060_moe_experts(
+        x: *const f32,
+        ids: *const f32,
+        wts: *const f32,
+        records: *const u8,
+        slots: *const u8,
+        map: *const f32,
+        record_bytes: i64,
+        slot_bytes: i64,
+        up_type: i32,
+        gate_off: i64,
+        up_off: i64,
+        down_type: i32,
+        down_off: i64,
+        width: i32,
+        hidden: i32,
+        rows: i32,
+        k: i32,
+        y: *mut f32,
+        scratch: *mut f32,
+    ) -> i32;
+}
+
+/// Most rows the decode MoE kernels take (decode and verify windows); larger chunks run the
+/// kernels grouped by expert.
+const MOE_DECODE_MAX: usize = 16;
+
+extern "C" {
+    fn velox_5060_moe_nvfp4_scratch(
+        rows: i32,
+        k: i32,
+        width: i32,
+        hidden: i32,
+        experts: i32,
+        mode: i32,
+    ) -> i64;
+    #[allow(clippy::too_many_arguments)]
+    fn velox_5060_moe_nvfp4(
+        x: *const f32,
+        ids: *const f32,
+        wts: *const f32,
+        records: *const u8,
+        slots: *const u8,
+        map: *const f32,
+        record_bytes: i64,
+        slot_bytes: i64,
+        gate_off: i64,
+        up_off: i64,
+        down_off: i64,
+        width: i32,
+        hidden: i32,
+        rows: i32,
+        k: i32,
+        experts: i32,
+        mode: i32,
+        y: *mut f32,
+        scratch: *mut f32,
+    ) -> i32;
+}
+
+/// Most rows rtx5060_moe_nvfp4.cu's GEMV kernels (exact activations) take; larger chunks run
+/// grouped by expert on tensor cores (bf16 activations).
+const MOE_NVFP4_DECODE_MAX: usize = 16;
+
+/// Most rows rtx5060_moe_nvfp4.cu's exact per-expert GEMVs take; wider verify windows stream on
+/// tensor cores.
+const MOE_NVFP4_SMALL_MAX: usize = 4;
+
+/// rtx5060_moe_nvfp4.cu's mode for `rows`: 0 a GEMV per routed pair (decode), 1 the GEMVs per
+/// routed expert over its pairs (small verify windows), 3 persistent tensor-core streams over the
+/// routed experts (verify windows), 2 grouped on tensor cores (prefill). Modes 0 and 1 keep
+/// activations exact, 2 and 3 round them to bf16.
+fn moe_nvfp4_mode(rows: usize) -> i32 {
+    match rows {
+        0 | 1 => 0,
+        r if r <= MOE_NVFP4_SMALL_MAX => 1,
+        r if r <= MOE_NVFP4_DECODE_MAX => 3,
+        _ => 2,
+    }
+}
+
+/// Whether rtx5060_moe_nvfp4.cu covers `bank`: NVFP4 gate, up and down (any activation policy:
+/// the kernels keep activations exact or round them to bf16), within the launcher's limits so
+/// moe_experts_act never reports a rounding the portable fallback would not apply.
+fn moe_nvfp4(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> bool {
+    let nv = |m: &velox_core::ExpertMatrix| m.format == WeightFormat::Nvfp4 && m.offset % 4 == 0;
+    rows > 0
+        && nv(&bank.gate)
+        && nv(&bank.up)
+        && nv(&bank.down)
+        && bank.record_bytes % 16 == 0
+        && bank.slot_bytes % 16 == 0
+        && bank.experts <= 6144
+}
+
+/// (gate/up type, down type) of rtx5060_ggml.cu's MoE kernels for `bank` at `rows` rows: GGML
+/// experts of the served types, Q2_0 or IQ4_NL, 8-bit activations allowed.
+fn moe_types(bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> Option<(i32, i32)> {
+    let ty = |f: WeightFormat| match f {
+        WeightFormat::Ggml(t) if ggml_index(t) <= 10 => Some(ggml_index(t)),
+        _ => None,
+    };
+    if rows == 0
+        || !matches!(bank.act, ActPolicy::AllowA8 | ActPolicy::AllowA4 { .. })
+        || bank.gate.format != bank.up.format
+    {
+        return None;
+    }
+    // The kernels stage rows with 4-byte loads.
+    let aligned =
+        |m: &velox_core::ExpertMatrix| m.format.payload_bytes(1, m.k) % 4 == 0 && m.offset % 4 == 0;
+    if !(aligned(&bank.gate) && aligned(&bank.up) && aligned(&bank.down)) {
+        return None;
+    }
+    Some((ty(bank.gate.format)?, ty(bank.down.format)?))
+}
 
 fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<()> {
     match r {
@@ -659,6 +1075,7 @@ impl CudaKernels for Rtx5060Kernels {
             Op::Attention,
             Op::AttentionFull,
             Op::LinearSwiglu,
+            Op::MoeExperts,
         ]
     }
 
@@ -689,6 +1106,166 @@ impl CudaKernels for Rtx5060Kernels {
             "rtx5060 matmul",
         );
         or_fallback(r, || portable::matmul(x, w, y, m, n, k))
+    }
+
+    fn moe_scratch_len(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize, k: usize) -> usize {
+        let portable = portable::moe_scratch_len(bank, rows, k);
+        if moe_nvfp4(bank, rows) {
+            // SAFETY: a pure size computation.
+            let bytes = unsafe {
+                velox_5060_moe_nvfp4_scratch(
+                    rows as i32,
+                    k as i32,
+                    bank.width() as i32,
+                    bank.hidden() as i32,
+                    bank.experts as i32,
+                    moe_nvfp4_mode(rows),
+                )
+            };
+            return portable.max((bytes as usize).div_ceil(4));
+        }
+        if moe_types(bank, rows).is_none() {
+            return portable;
+        }
+        let (r, kk, w, h) = (
+            rows as i32,
+            k as i32,
+            bank.width() as i32,
+            bank.hidden() as i32,
+        );
+        // SAFETY: pure size computations.
+        let bytes = unsafe {
+            if rows <= MOE_DECODE_MAX {
+                velox_5060_moe_scratch(r, kk, w, h)
+            } else {
+                velox_5060_moe_grouped_scratch(r, kk, w, h, bank.experts as i32)
+            }
+        };
+        portable.max((bytes as usize).div_ceil(4))
+    }
+
+    fn moe_experts_act(&self, bank: &ExpertBank<'_, CudaBuffer>, rows: usize) -> ActQuant {
+        if moe_types(bank, rows).is_some() {
+            ActQuant::Int8G32
+        } else if moe_nvfp4(bank, rows) && moe_nvfp4_mode(rows) >= 2 {
+            ActQuant::Bf16
+        } else {
+            ActQuant::Exact
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &self,
+        x: &CudaBuffer,
+        ids: &CudaBuffer,
+        weights: &CudaBuffer,
+        bank: &ExpertBank<'_, CudaBuffer>,
+        y: &mut CudaBuffer,
+        scratch: &mut CudaBuffer,
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        if moe_nvfp4(bank, rows) {
+            // SAFETY: CudaBackend validated the bank and extents (check::moe_experts); the scratch
+            // holds moe_scratch_len slots for this row count; expert ids past the bank are skipped.
+            let r = status(
+                unsafe {
+                    velox_5060_moe_nvfp4(
+                        x.as_ptr(),
+                        ids.as_ptr(),
+                        weights.as_ptr(),
+                        bank.records.as_ptr().cast(),
+                        bank.slots.as_ptr().cast(),
+                        bank.map.as_ptr(),
+                        bank.record_bytes as i64,
+                        bank.slot_bytes as i64,
+                        bank.gate.offset as i64,
+                        bank.up.offset as i64,
+                        bank.down.offset as i64,
+                        to_i32("width", bank.width())?,
+                        to_i32("hidden", bank.hidden())?,
+                        to_i32("rows", rows)?,
+                        to_i32("k", k)?,
+                        to_i32("experts", bank.experts)?,
+                        moe_nvfp4_mode(rows),
+                        y.as_mut_ptr(),
+                        scratch.as_mut_ptr(),
+                    )
+                },
+                "rtx5060 moe_experts (nvfp4)",
+            );
+            return or_fallback(r, || {
+                portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+            });
+        }
+        let Some((tu, td)) = moe_types(bank, rows) else {
+            return portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k);
+        };
+        // SAFETY: CudaBackend validated the bank and extents (check::moe_experts); the scratch
+        // holds moe_scratch_len slots; expert ids come from moe_route.
+        if rows > MOE_DECODE_MAX {
+            // SAFETY: as below; the scratch holds moe_scratch_len slots for this row count.
+            let r = status(
+                unsafe {
+                    velox_5060_moe_grouped(
+                        x.as_ptr(),
+                        ids.as_ptr(),
+                        weights.as_ptr(),
+                        bank.records.as_ptr().cast(),
+                        bank.slots.as_ptr().cast(),
+                        bank.map.as_ptr(),
+                        bank.record_bytes as i64,
+                        bank.slot_bytes as i64,
+                        tu,
+                        bank.gate.offset as i64,
+                        bank.up.offset as i64,
+                        td,
+                        bank.down.offset as i64,
+                        to_i32("width", bank.width())?,
+                        to_i32("hidden", bank.hidden())?,
+                        to_i32("rows", rows)?,
+                        k as i32,
+                        to_i32("experts", bank.experts)?,
+                        y.as_mut_ptr(),
+                        scratch.as_mut_ptr(),
+                    )
+                },
+                "rtx5060 moe_experts (grouped)",
+            );
+            return or_fallback(r, || {
+                portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+            });
+        }
+        let r = status(
+            unsafe {
+                velox_5060_moe_experts(
+                    x.as_ptr(),
+                    ids.as_ptr(),
+                    weights.as_ptr(),
+                    bank.records.as_ptr().cast(),
+                    bank.slots.as_ptr().cast(),
+                    bank.map.as_ptr(),
+                    bank.record_bytes as i64,
+                    bank.slot_bytes as i64,
+                    tu,
+                    bank.gate.offset as i64,
+                    bank.up.offset as i64,
+                    td,
+                    bank.down.offset as i64,
+                    to_i32("width", bank.width())?,
+                    to_i32("hidden", bank.hidden())?,
+                    rows as i32,
+                    k as i32,
+                    y.as_mut_ptr(),
+                    scratch.as_mut_ptr(),
+                )
+            },
+            "rtx5060 moe_experts",
+        );
+        or_fallback(r, || {
+            portable::moe_experts(x, ids, weights, bank, y, scratch, rows, k)
+        })
     }
 
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
@@ -769,6 +1346,55 @@ impl CudaKernels for Rtx5060Kernels {
         )
     }
 
+    /// Scoring windows take the flash schedule where `attention` does, over f16 operands: E4M3
+    /// scores move the candidate distributions a window is read for.
+    fn attention_windows_precision(&self, s: AttnShape) -> AttnPrecision {
+        if s.kv == KvFormat::F32
+            && s.tokens >= FLASH_MIN_TOKENS
+            && s.head_dim == 256
+            && s.heads % s.kv_heads == 0
+            && s.kv_len() <= i32::MAX as usize
+        {
+            AttnPrecision::F16
+        } else {
+            AttnPrecision::Exact
+        }
+    }
+
+    fn attention_windows(
+        &self,
+        q: &CudaBuffer,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        out: &mut CudaBuffer,
+        s: AttnShape,
+        window: usize,
+    ) -> Result<()> {
+        if self.attention_windows_precision(s) == AttnPrecision::Exact {
+            return portable::attention_windows(q, k, v, out, s, window);
+        }
+        velox_core::check::attention_windows(q.len(), k.len(), v.len(), out.len(), &s, window)?;
+        // SAFETY: extents validated above.
+        status(
+            unsafe {
+                velox_5060_attention_windows(
+                    q.as_ptr(),
+                    k.as_ptr(),
+                    v.as_ptr(),
+                    out.as_mut_ptr(),
+                    to_i32("tokens", s.tokens)?,
+                    to_i32("window", window)?,
+                    to_i32("heads", s.heads)?,
+                    to_i32("kv_heads", s.kv_heads)?,
+                    to_i32("head_dim", s.head_dim)?,
+                    to_i32("pos0", s.pos0)?,
+                    s.scale(),
+                )
+            },
+            "rtx5060 attention windows",
+        )
+    }
+
     fn attention_full_precision(&self, s: FullAttnShape) -> AttnPrecision {
         if s.tokens >= FLASH_MIN_TOKENS && s.head_dim <= 128 {
             AttnPrecision::F16
@@ -806,6 +1432,9 @@ impl CudaKernels for Rtx5060Kernels {
     }
 
     fn linear_act(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> ActQuant {
+        if ggml_mmvq(w, m).is_some() {
+            return ActQuant::Int8G32;
+        }
         if q8_format(w, m).is_some() {
             return ActQuant::Int8G256;
         }
@@ -821,7 +1450,7 @@ impl CudaKernels for Rtx5060Kernels {
         if skinny_iq3(w, m) || (m == 1 && skinny16_format(w, m).is_some()) {
             return ActQuant::Bf16;
         }
-        if bf16_skinny(w, m) {
+        if bf16_skinny(w, m) || bf16_mma(w, m) {
             return ActQuant::Bf16;
         }
         if m <= GEMV_MAX_M {
@@ -865,6 +1494,10 @@ impl CudaKernels for Rtx5060Kernels {
             > 1
             || parts()
                 .filter(|(p, _)| rs_shared(&p.w, m).is_some())
+                .count()
+                > 1
+            || parts()
+                .filter(|(p, _)| ggml_mmvq(&p.w, m).is_some())
                 .count()
                 > 1;
         let ranges = parts().any(|(p, ld)| !linear_part_whole(p, ld));
@@ -954,6 +1587,18 @@ impl CudaKernels for Rtx5060Kernels {
                     status(
                         unsafe {
                             match (blob, f) {
+                                (b, f) if f >= 16 => velox_5060_linear_ggml_q8(
+                                    b.unwrap_or(std::ptr::null()),
+                                    mi,
+                                    wp,
+                                    f - 16,
+                                    k,
+                                    rb,
+                                    rows,
+                                    y,
+                                    ld as i64,
+                                    0,
+                                ),
                                 (Some(q), 3) => velox_5060_linear_iq3_q8_from(
                                     q, mi, wp, pr, k, rb, rows, y, ld as i64,
                                 ),
@@ -973,11 +1618,32 @@ impl CudaKernels for Rtx5060Kernels {
                 }
             }
         }
+        // GGML parts: one Int8G32 quantization per K, each GEMM into its columns.
+        let mut ggml: Option<GgmlAct> = None;
+        for d in dsts.iter_mut() {
+            let ld = d.ld;
+            for p in d.parts {
+                let Some(ty) = ggml_mmvq(&p.w, m) else {
+                    continue;
+                };
+                if ggml.as_ref().is_none_or(|a| a.k != p.w.k) {
+                    ggml = Some(GgmlAct::new(x, m, p.w.k)?);
+                }
+                // SAFETY: the destination holds m * ld values and col + rows <= ld (checked).
+                let y = unsafe { d.y.as_mut_ptr().add(p.col) };
+                ggml.as_ref()
+                    .expect("set above")
+                    .run(&p.w, ty, m, y, ld, 0)?;
+            }
+        }
         for d in dsts.iter_mut() {
             let ld = d.ld;
             for p in d.parts {
                 let w = &p.w;
-                if q8_format(w, m).is_some() || rs_shared(w, m).is_some() {
+                if q8_format(w, m).is_some()
+                    || rs_shared(w, m).is_some()
+                    || ggml_mmvq(w, m).is_some()
+                {
                     continue;
                 }
                 if bf16_skinny(w, m) {
@@ -1073,7 +1739,20 @@ impl CudaKernels for Rtx5060Kernels {
         let (pr, k, rb) = (w.parent_rows as i64, w.k as i64, w.row_begin as i64);
         // SAFETY: CudaBackend::linear_q8 checked the twin, view and output extents.
         let code = unsafe {
-            if f == 3 {
+            if f >= 16 {
+                velox_5060_linear_ggml_q8(
+                    q,
+                    mi,
+                    wp,
+                    f - 16,
+                    k,
+                    rb,
+                    rows,
+                    y.as_mut_ptr(),
+                    rows as i64,
+                    0,
+                )
+            } else if f == 3 {
                 velox_5060_linear_iq3_q8_from(
                     q,
                     mi,
@@ -1114,6 +1793,9 @@ impl CudaKernels for Rtx5060Kernels {
     ) -> Result<()> {
         if self.linear_swiglu_act(gate, up, m) != Some(ActQuant::Int8G256) || layout != 0 {
             return Err(Error::Unsupported("linear_swiglu_q8 views".into()));
+        }
+        if ggml_q8_pair(gate, up, m) {
+            return self.ggml_swiglu_q8(xq, Some(()), gate, up, out, m);
         }
         // SAFETY: CudaBackend::linear_swiglu_q8 checked the twin, views and output extents.
         status(
@@ -1332,6 +2014,23 @@ impl CudaKernels for Rtx5060Kernels {
         up: &WeightView<'_, CudaBuffer>,
         m: usize,
     ) -> Option<ActQuant> {
+        // GGML gate / up at prefill widths (one of them may be IQ3_XXS): the int8 prefill kernels,
+        // one quantization, the GGML GEMM's epilogue forming silu(gate) * up in place.
+        if gate.k == up.k && gate.rows == up.rows && ggml_q8_pair(gate, up, m) {
+            return Some(ActQuant::Int8G256);
+        }
+        // GGML gate / up (GGUF imports): one Int8G32 quantization, the gate GEMM into `out`, the up
+        // GEMM's epilogue forming silu(gate) * up in place. (VELOX_GGML_NO_SWIGLU: composed, A/B.)
+        static NO_FUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fuse = !*NO_FUSE.get_or_init(|| std::env::var_os("VELOX_GGML_NO_SWIGLU").is_some());
+        if fuse
+            && gate.k == up.k
+            && gate.rows == up.rows
+            && ggml_mmvq(gate, m).is_some()
+            && ggml_mmvq(up, m).is_some()
+        {
+            return Some(ActQuant::Int8G32);
+        }
         // IQ3_XXS gate / up (the dense MLP) at decode and verify widths: the IQ3 kernels with
         // gate and up rows paired in each MMA tile and SwiGLU in the epilogue.
         let pair = gate.format == WeightFormat::Iq3Xxs
@@ -1355,6 +2054,19 @@ impl CudaKernels for Rtx5060Kernels {
     ) -> Result<()> {
         let launch = match self.linear_swiglu_act(gate, up, m) {
             None => return Err(Error::Unsupported("linear_swiglu shape".into())),
+            Some(ActQuant::Int8G32) => {
+                let (tg, tu) = (ggml_mmvq(gate, m), ggml_mmvq(up, m));
+                let (Some(tg), Some(tu)) = (tg, tu) else {
+                    return Err(Error::Unsupported("ggml swiglu shape".into()));
+                };
+                // Gate into out, then up with silu(out) * up in its epilogue (same stream order).
+                let act = GgmlAct::new(x, m, gate.k)?;
+                act.run(gate, tg, m, out.as_mut_ptr(), gate.rows, 0)?;
+                return act.run(up, tu, m, out.as_mut_ptr(), gate.rows, 1);
+            }
+            Some(ActQuant::Int8G256) if ggml_q8_pair(gate, up, m) => {
+                return self.ggml_swiglu_q8(x, None, gate, up, out, m);
+            }
             Some(ActQuant::Int8G256) => velox_5060_linear_swiglu_iq3_q8,
             Some(_) if iq3_direct(m) => velox_5060_linear_swiglu_iq3_direct,
             Some(_) => velox_5060_linear_swiglu_skinny_iq3,
@@ -1425,7 +2137,34 @@ impl CudaKernels for Rtx5060Kernels {
                 },
                 "rtx5060 linear a8",
             ),
+            ActQuant::Int8G32 => {
+                let ty = ggml_mmvq(w, m).ok_or_else(|| Error::Unsupported("ggml shape".into()))?;
+                GgmlAct::new(x, m, w.k)?.run(w, ty, m, y.as_mut_ptr(), w.rows, 0)
+            }
             ActQuant::Int8G256 => match q8_format(w, m) {
+                Some(f) if f >= 16 => {
+                    status(
+                        unsafe { velox_5060_q8_quantize(x.as_ptr(), mi, k, 0) },
+                        "rtx5060 q8 quantize",
+                    )?;
+                    status(
+                        unsafe {
+                            velox_5060_linear_ggml_q8(
+                                std::ptr::null(),
+                                mi,
+                                wp,
+                                f - 16,
+                                k,
+                                rb,
+                                rows,
+                                y.as_mut_ptr(),
+                                rows as i64,
+                                0,
+                            )
+                        },
+                        "rtx5060 linear ggml q8",
+                    )
+                }
                 Some(3) => status(
                     unsafe {
                         velox_5060_linear_iq3_q8(
@@ -1459,8 +2198,6 @@ impl CudaKernels for Rtx5060Kernels {
                 ),
                 None => Err(Error::Unsupported("int8 linear shape".into())),
             },
-            // linear_act never reports it: this kernel set has no q8_1 (32-value group) path.
-            ActQuant::Int8G32 => Err(Error::Unsupported("rtx5060 linear int8 g32".into())),
             ActQuant::Bf16 => {
                 if bf16_skinny(w, m) {
                     return status(
@@ -1477,6 +2214,23 @@ impl CudaKernels for Rtx5060Kernels {
                             )
                         },
                         "rtx5060 linear bf16 skinny",
+                    );
+                }
+                if bf16_mma(w, m) {
+                    return status(
+                        unsafe {
+                            velox_5060_linear_bf16_mma(
+                                x.as_ptr(),
+                                mi,
+                                w.buf.as_ptr().cast(),
+                                w.k as i64,
+                                w.row_begin as i64,
+                                rows,
+                                y.as_mut_ptr(),
+                                w.rows as i64,
+                            )
+                        },
+                        "rtx5060 linear bf16 mma",
                     );
                 }
                 if nvfp4_mma(w, m) {
