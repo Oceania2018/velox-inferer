@@ -1,0 +1,2 @@
+# nvcc flags for this branch's kernels: RTX 4090 (AD102) only.
+-gencode arch=compute_89,code=sm_89
