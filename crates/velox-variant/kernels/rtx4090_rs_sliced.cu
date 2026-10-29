@@ -151,7 +151,10 @@ rs_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict_
         if (slot < tiles) stage(slot, slot);
         else cp_commit();
     }
-    constexpr int kUnroll = GPR ? (GPR + kW - 1) / kW : 1;
+    // Two tiles per iteration. Unrolling the whole K loop of the model's widths (20 tiles at K = 5120)
+    // overflowed the instruction cache (ncu: warps mostly stalled on no_instruction); RTX 4090, m=8:
+    // q5 [12288, 5120] 67.7 -> 60.1 us, q4 [8192, 5120] 39.6 -> 32.3 us.
+    constexpr int kUnroll = 2;
 #pragma unroll kUnroll
     for (int tile = 0; tile < tiles; ++tile) {
         const int slot = tile % kS;

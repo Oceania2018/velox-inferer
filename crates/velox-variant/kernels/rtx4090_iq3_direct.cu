@@ -302,15 +302,10 @@ iq3_direct_kernel(const XT* __restrict__ x, const uint8_t* __restrict__ w, long 
             for (int mi = 0; mi < MT; ++mi) cur[mi][0] = next[mi][0], cur[mi][1] = next[mi][1];
         }
     };
-    // Long rows (down) run faster fully unrolled, gate/up (10 blocks per warp) rolled: gate/up
-    // pair m=8 183 vs 186 us, down m=8 104 vs 113 us.
-    if constexpr (kShort) {
+    // Rolled. RTX 4090, down [5120, 17408] m=8: 49.4 us rolled, 52.0 unrolled by 2, 51.6 fully
+    // unrolled (the 5060 Ti's choice; m=1 is 1.3 us faster unrolled, verify widths dominate).
 #pragma unroll 1
-        for (int b = warp; b < blocks; b += W) step(b);
-    } else {
-#pragma unroll
-        for (int b = warp; b < blocks; b += W) step(b);
-    }
+    for (int b = warp; b < blocks; b += W) step(b);
 
     // Cross-warp K reduction, then c0, c1: row gid, tokens 2q, 2q+1; c2, c3: row gid + 8.
 #pragma unroll
