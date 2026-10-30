@@ -90,8 +90,9 @@ pub struct EngineConfig {
     /// Directory of the NVMe tier's files.
     pub disk_context_dir: std::path::PathBuf,
     /// Identity of the loaded model (weights and kernels): records are kept across restarts in a
-    /// subdirectory named after it and the storage layout. `None`: a private subdirectory removed
-    /// on shutdown.
+    /// subdirectory named after it, the build (a hash of the executable) and the storage layout;
+    /// a new build deletes the other builds' subdirectories. `None`: a private subdirectory
+    /// removed on shutdown.
     pub disk_context_tag: Option<String>,
     /// Lanes: requests decoding at once (ninfer `--max-concurrency`), each with `capacity`
     /// tokens of KV cache.
@@ -735,6 +736,7 @@ where
                     cfg.disk_context_dir.clone(),
                     cfg.disk_context_bytes,
                     cfg.disk_context_tag.as_deref(),
+                    disk::executable_id(),
                     disk::fnv64(disk::FNV_OFFSET, layout.as_bytes()),
                 )
                 .map_err(|e| CoreError::Config(format!("disk context tier: {e}")))?,
