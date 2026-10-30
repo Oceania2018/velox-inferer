@@ -154,7 +154,7 @@ where
                 .unwrap_or_else(std::env::temp_dir)
                 .join("velox/disk-context"),
         },
-        // Records outlive the process, kept per model artifact and kernel variant (a restart
+        // Records outlive the process, kept per model artifact, kernel variant and build (a restart
         // resumes system prompts and tasks from disk instead of prefilling them).
         disk_context_tag: Some(format!(
             "{}-{}",
