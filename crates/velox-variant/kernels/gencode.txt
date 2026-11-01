@@ -1,2 +1,2 @@
-# nvcc flags for this branch's kernels: RTX 5090 (GB202) only.
+# nvcc flags for this branch's kernels: RTX PRO 6000 Blackwell (GB202) only.
 -gencode arch=compute_120a,code=sm_120a

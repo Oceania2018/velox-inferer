@@ -1,6 +1,7 @@
-//! Hardware variant of this build: **rtx-5090-32g** (branch `rtx-5090-32g`).
+//! Hardware variant of this build: **rtx-pro-6000** (branch `rtx-pro-6000`).
 //!
-//! Tuned for the 32 GB desktop RTX 5090 (GB202, 170 SMs, sm_120a). Same contract as every
+//! Tuned for the 96 GB RTX PRO 6000 Blackwell (GB202, 188 SMs, sm_120a). The kernel set is the
+//! RTX 5090's (same die); this branch differs in the cards it claims. Same contract as every
 //! branch (see main's version of this file):
 //!
 //! - `INFO: VariantInfo`;
@@ -17,17 +18,17 @@ use velox_core::{DeviceProfile, GpuArch, PlanPolicy, VariantInfo};
 mod kernels;
 
 pub static INFO: VariantInfo = VariantInfo {
-    id: "rtx-5090-32g",
-    branch: "rtx-5090-32g",
-    description: "RTX 5090 32 GB: NVFP4/FP8 tensor-core prefill linear, tiled SGEMM matmul",
-    profiles: &["rtx-5090"],
+    id: "rtx-pro-6000",
+    branch: "rtx-pro-6000",
+    description: "RTX PRO 6000 96 GB: NVFP4/FP8 tensor-core prefill linear, tiled SGEMM matmul",
+    profiles: &["rtx-pro-6000"],
     archs: &[GpuArch::Cuda { major: 12, minor: 0 }],
 };
 
 pub fn plan_policy(profile: &DeviceProfile) -> PlanPolicy {
     let mut p = PlanPolicy::for_profile(profile);
     if INFO.tunes(profile) {
-        // 32 GB leaves room for larger prefill chunks, which cut per-chunk overhead.
+        // 96 GB leaves room for larger prefill chunks, which cut per-chunk overhead.
         p.workspace_tokens = 4096;
     }
     p
