@@ -973,6 +973,47 @@ pub trait CudaKernels: Send + Sync {
         portable::rope_positions(x, positions, s)
     }
 
+    fn rope_table(&self, positions: &[u32], s: RopePosShape) -> Result<CudaBuffer> {
+        portable::rope_table(positions, s)
+    }
+
+    fn add_bias_rope(
+        &self,
+        x: &mut CudaBuffer,
+        bias: Option<&CudaBuffer>,
+        table: &CudaBuffer,
+        s: RopePosShape,
+    ) -> Result<()> {
+        portable::add_bias_rope(x, bias, table, s)
+    }
+
+    fn add_bias_gelu(
+        &self,
+        x: &mut CudaBuffer,
+        bias: &CudaBuffer,
+        rows: usize,
+        dim: usize,
+        kind: GeluKind,
+    ) -> Result<()> {
+        portable::add_bias_gelu(x, bias, rows, dim, kind)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_bias_add_layer_norm(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &mut CudaBuffer,
+        bias: &CudaBuffer,
+        weight: &CudaBuffer,
+        norm_bias: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        portable::add_bias_add_layer_norm(acc, x, bias, weight, norm_bias, y, rows, dim, eps)
+    }
+
     fn top_k(
         &self,
         x: &CudaBuffer,
@@ -2995,6 +3036,67 @@ impl Backend for CudaBackend {
         check::rope_positions(x.len, positions, &s)?;
         self.staged("rope_positions", || {
             self.kernels.rope_positions(x, positions, s)
+        })
+    }
+
+    fn rope_table(&self, positions: &[u32], s: RopePosShape) -> Result<CudaBuffer> {
+        check::rope_positions(s.tokens * s.heads * s.head_dim, positions, &s)?;
+        self.staged("rope_table", || self.kernels.rope_table(positions, s))
+    }
+
+    fn add_bias_rope(
+        &self,
+        x: &mut CudaBuffer,
+        bias: Option<&CudaBuffer>,
+        positions: &[u32],
+        table: &CudaBuffer,
+        s: RopePosShape,
+    ) -> Result<()> {
+        // No table (another backend's, or empty): the unfused ops.
+        if table.len < s.tokens * s.rotary_dim {
+            if let Some(b) = bias {
+                self.add_bias(x, b, s.tokens, s.heads * s.head_dim)?;
+            }
+            return self.rope_positions(x, positions, s);
+        }
+        check::add_bias_rope(x.len, bias.map(|b| b.len), table.len, &s)?;
+        self.timed("add_bias_rope", || {
+            self.kernels.add_bias_rope(x, bias, table, s)
+        })
+    }
+
+    fn add_bias_gelu(
+        &self,
+        x: &mut CudaBuffer,
+        bias: &CudaBuffer,
+        rows: usize,
+        dim: usize,
+        kind: GeluKind,
+    ) -> Result<()> {
+        check::add_bias(x.len, bias.len, rows, dim)?;
+        self.timed("add_bias_gelu", || {
+            self.kernels.add_bias_gelu(x, bias, rows, dim, kind)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_bias_add_layer_norm(
+        &self,
+        acc: &mut CudaBuffer,
+        x: &mut CudaBuffer,
+        bias: &CudaBuffer,
+        weight: &CudaBuffer,
+        norm_bias: &CudaBuffer,
+        y: &mut CudaBuffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        check::add_bias(x.len, bias.len, rows, dim)?;
+        check::layer_norm(acc.len, weight.len, norm_bias.len, y.len, rows, dim)?;
+        self.timed("add_bias_add_layer_norm", || {
+            self.kernels
+                .add_bias_add_layer_norm(acc, x, bias, weight, norm_bias, y, rows, dim, eps)
         })
     }
 }

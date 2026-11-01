@@ -63,6 +63,15 @@ pub struct Session<B: Backend> {
 /// chunks keep them separate, where per-matrix GEMM tiles are faster than the split copy saves.
 const FUSE_MAX_TOKENS: usize = 16;
 
+/// The encoding of a dense FFN that serves `t` tokens: its `@prefill` alternate above
+/// `FUSE_MAX_TOKENS` when the artifact has one, else the FFN itself.
+fn ffn_at(d: &DenseFfn, t: usize) -> &DenseFfn {
+    match &d.prefill {
+        Some(p) if t > FUSE_MAX_TOKENS => p,
+        _ => d,
+    }
+}
+
 /// The views of a projection's runs, at their columns of the concatenated output.
 fn run_parts<'w, Buf>(
     view: &impl Fn(&WDesc) -> WeightView<'w, Buf>,
@@ -317,6 +326,13 @@ impl<B: Backend> Workspace<B> {
     /// Most rows (tokens) one forward pass takes.
     pub fn max_tokens(&self) -> usize {
         self.max_tokens
+    }
+
+    /// Physical memory of the per-phase scratch (empty without virtual memory). Nothing in it
+    /// outlives a forward call, so work between calls may map it too (see
+    /// [`Qwen35Vision::encode_in`]).
+    pub fn scratch_chunks(&self) -> &[B::Chunk] {
+        &self.backing
     }
 }
 
@@ -750,14 +766,20 @@ impl Ids<'_> {
 
 /// Puts the GDN outputs of `t` tokens (`ws.o`, value heads grouped by key head) into the tiled
 /// order of the gate rows and output-projection columns, when the artifact stores those tiled
-/// ([`TextConfig::gdn_v_tiled`]). `ws.conv_out` is free once the recurrence has run.
-fn tile_v_heads<B: Backend>(b: &B, c: &TextConfig, ws: &mut Workspace<B>, t: usize) -> Result<()> {
+/// ([`TextConfig::gdn_v_tiled`]): into `ws.conv_out`, which is free once the recurrence has run,
+/// and which the gated norm then reads instead of `ws.o` (no copy back). Returns whether it did.
+fn tile_v_heads<B: Backend>(
+    b: &B,
+    c: &TextConfig,
+    ws: &mut Workspace<B>,
+    t: usize,
+) -> Result<bool> {
     if !c.gdn_v_tiled {
-        return Ok(());
+        return Ok(false);
     }
     let per = c.gdn_v_heads / c.gdn_k_heads;
     b.transpose_heads(&ws.o, &mut ws.conv_out, t, c.gdn_k_heads, per, c.gdn_v_dim)?;
-    b.copy(&ws.conv_out, 0, &mut ws.o, 0, t * c.gdn_v())
+    Ok(true)
 }
 
 /// A MoE FFN's buffers: router logits (`[t, experts + 1]` with the shared gate fused), the
@@ -834,7 +856,7 @@ pub struct Workspace<B: Backend> {
     rows: bool,
     /// Physical memory the per-phase buffers share (see [`overlay`]); empty without virtual
     /// memory. Declared last, so the buffers mapping it drop first.
-    _overlay: Vec<B::Chunk>,
+    backing: Vec<B::Chunk>,
 }
 
 /// Allocates `groups` of buffers (f32 lengths) whose groups share physical memory: each group's
@@ -1136,7 +1158,7 @@ impl<B: Backend> Qwen35Text<B> {
                 Mixer::Attention { query, .. } => Some(query),
             };
             let gate = match &l.ffn {
-                Ffn::Dense(d) => Some(&d.gate),
+                Ffn::Dense(d) => Some(&ffn_at(d, t).gate),
                 Ffn::Moe(_) => None,
             };
             for d in first.into_iter().chain(gate) {
@@ -1245,7 +1267,7 @@ impl<B: Backend> Qwen35Text<B> {
             spec_rows: None,
             spec_state: None,
             rows,
-            _overlay: backing,
+            backing,
         })
     }
 
@@ -1635,13 +1657,14 @@ impl<B: Backend> Qwen35Text<B> {
                         }
                         row0 = end;
                     }
-                    tile_v_heads(b, c, ws, t)?;
+                    let tiled = tile_v_heads(b, c, ws, t)?;
+                    let o = if tiled { &ws.conv_out } else { &ws.o };
                     // z = silu(z) * plain_rmsnorm(o)
                     let rows = t * c.gdn_v_heads;
                     match ws.twins.as_mut().filter(|_| b.takes_bf16(&w.view(out), t)) {
                         Some(tw) => {
                             b.rms_norm_gated_twin(
-                                &ws.o,
+                                o,
                                 w.param(*norm),
                                 &mut ws.z,
                                 &mut tw.z,
@@ -1654,7 +1677,7 @@ impl<B: Backend> Qwen35Text<B> {
                         }
                         None => {
                             b.rms_norm_gated(
-                                &ws.o,
+                                o,
                                 w.param(*norm),
                                 &mut ws.z,
                                 rows,
@@ -1687,7 +1710,7 @@ impl<B: Backend> Qwen35Text<B> {
                 }
             }
             let mlp_q8 = match &l.ffn {
-                Ffn::Dense(d) => b.int8_twin_layout(&w.view(&d.gate), t),
+                Ffn::Dense(d) => b.int8_twin_layout(&w.view(&ffn_at(d, t).gate), t),
                 Ffn::Moe(_) => None,
             };
             let h_twin = add_norm_h(b, ws, w.param(l.post_norm), t, hd, c.eps, twin, mlp_q8)?;
@@ -2087,6 +2110,7 @@ impl<B: Backend> Qwen35Text<B> {
         h_twin: HTwin,
     ) -> Result<()> {
         let w = &self.w;
+        let d = ffn_at(d, t);
         let width = d.gate.rows;
         let (gate, up) = (w.view(&d.gate), w.view(&d.up));
         let down = w.view(&d.down);
@@ -3107,9 +3131,10 @@ impl<B: Backend> Qwen35Text<B> {
                         let ow = c.gdn_v();
                         b.copy(&bw.o, 0, &mut ws.o, tp * ow, v * ow)?;
                     }
-                    tile_v_heads(b, c, ws, t)?;
+                    let tiled = tile_v_heads(b, c, ws, t)?;
+                    let o = if tiled { &ws.conv_out } else { &ws.o };
                     b.rms_norm_gated(
-                        &ws.o,
+                        o,
                         w.param(*norm),
                         &mut ws.z,
                         t * c.gdn_v_heads,

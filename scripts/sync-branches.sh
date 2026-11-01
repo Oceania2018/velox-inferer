@@ -6,7 +6,7 @@
 #   scripts/sync-branches.sh [branch ...]   (default: every hardware branch)
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-if [ $# -gt 0 ]; then branches=("$@"); else branches=(rtx-5090-32g rtx-5090-24g rtx-5060-ti rtx-4090); fi
+if [ $# -gt 0 ]; then branches=("$@"); else branches=(rtx-5090-32g rtx-pro-6000 rtx-5090-24g rtx-5060-ti rtx-4090); fi
 bash scripts/check-main-scope.sh >/dev/null
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
