@@ -234,23 +234,43 @@ pub fn compose(a: &Args) -> Result<ExitCode> {
         .split(',')
         .filter(|s| !s.is_empty())
         .collect();
+    // Bindings among the matched ones that replace the base's instead of adding an alternate.
+    let replace: Vec<&str> = a
+        .get("replace")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Bindings (globs) and components of the base to leave out (e.g. `mtp/*` and `mtp`).
+    let list = |key: &str| -> Vec<String> {
+        a.get(key)
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (drop, drop_components) = (list("drop"), list("drop-components"));
+    let drop_components: Vec<&str> = drop_components.iter().map(String::as_str).collect();
     let limit = a.parse("part-limit", velox_weights::DEFAULT_PART_LIMIT)?;
     let t0 = std::time::Instant::now();
-    let r = velox_weights::compose_alternates(
-        &base,
-        &alt,
-        &|name| patterns.iter().any(|p| glob(p, name)),
+    let spec = velox_weights::ComposeSpec {
+        pick: &|name| patterns.iter().any(|p| glob(p, name)),
+        replace: &|name| replace.iter().any(|p| glob(p, name)),
+        drop: &|name| drop.iter().any(|p| glob(p, name)),
+        drop_components: &drop_components,
         suffix,
-        output,
-        limit,
-    )
-    .map_err(|e| Error::Backend(e.to_string()))?;
+    };
+    let r = velox_weights::compose_alternates(&base, &alt, &spec, output, limit)
+        .map_err(|e| Error::Backend(e.to_string()))?;
     let out = open(&output.to_string_lossy())?;
     println!(
-        "wrote {} ({:.2} GB): {} @{suffix} bindings, {} objects ({:.2} GB) from {} in {:.1}s; structure ok",
+        "wrote {} ({:.2} GB): {} bindings taken, {} dropped, {} base objects kept, {} objects ({:.2} GB) from {} in {:.1}s; structure ok",
         output.display(),
         gb(r.payload_bytes),
         r.bindings,
+        r.dropped,
+        r.kept_base,
         r.objects,
         gb(r.bytes),
         alt.path.display(),
