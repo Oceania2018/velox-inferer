@@ -70,6 +70,9 @@ COMMANDS:
   compose                 A weight file plus another's bindings as `<name>@<suffix>` alternate
                           encodings -> .vi (Qwen3.5 `@prefill` MLP: used above 16 tokens)
       --base <path> --alt <path> --match <glob,...> --output <.vi> [--suffix prefill]
+      [--replace <glob,...>]  matched bindings that replace the base's (no alternate)
+      [--drop <glob,...>] [--drop-components <id,...>]  leave out (e.g. mtp/* and mtp); the
+                          payload keeps only referenced objects
   import-gguf             Qwen3.5/3.8 GGUF text weights + a donor artifact's config, tokenizer,
                           vision tower and DFlash2 drafter -> .vi (GGML blocks kept as stored)
       --gguf <path> --donor <.ninfer|.vi> --output <.vi>

@@ -738,10 +738,27 @@ pub fn write_container(
     result
 }
 
+/// What [`compose_alternates`] takes from the alternate artifact and leaves out of the base.
+pub struct ComposeSpec<'a> {
+    /// Bindings of the alternate artifact to take.
+    pub pick: &'a dyn Fn(&str) -> bool,
+    /// Picked bindings that replace the base's under the same name (else `<name>@<suffix>`).
+    pub replace: &'a dyn Fn(&str) -> bool,
+    /// Bindings of the result to remove.
+    pub drop: &'a dyn Fn(&str) -> bool,
+    /// Components of the base to remove.
+    pub drop_components: &'a [&'a str],
+    pub suffix: &'a str,
+}
+
 /// Summary of [`compose_alternates`].
 pub struct ComposeReport {
-    /// Bindings added as `<name>@<suffix>`.
+    /// Bindings taken from the alternate artifact (added as `<name>@<suffix>` or replacing).
     pub bindings: usize,
+    /// Bindings removed by `drop`.
+    pub dropped: usize,
+    /// Base objects still referenced (the rest are not written).
+    pub kept_base: usize,
     /// Objects copied from the alternate artifact (matrices and use auxiliaries).
     pub objects: usize,
     /// Bytes those objects add to the payload.
@@ -787,15 +804,19 @@ fn renamed_objects(v: &Value, rename: &dyn Fn(&str) -> String) -> Value {
 /// reference and the auxiliaries of their uses (an A4 input divisor, say) are copied from `alt`
 /// after `base`'s payload under ids `<suffix>/<id>`; the uses are copied with the parameter
 /// renamed. Models decide what an alternate is for (Qwen3.5's `@prefill` MLP: the encoding used
-/// above the decode widths). An existing `out` is never overwritten.
+/// above the decode widths). Picked bindings that `replace` selects take the base binding's own
+/// name instead, and their uses replace the base's: the parameter switches encoding. Bindings
+/// `drop` selects and components in `drop_components` (with their uses) are removed. The payload
+/// keeps only the objects the result references, so replaced and dropped encodings cost no bytes.
+/// An existing `out` is never overwritten.
 pub fn compose_alternates(
     base: &Artifact,
     alt: &Artifact,
-    pick: &dyn Fn(&str) -> bool,
-    suffix: &str,
+    spec: &ComposeSpec<'_>,
     out: &Path,
     part_limit: u64,
 ) -> Result<ComposeReport> {
+    let (pick, replace, suffix) = (spec.pick, spec.replace, spec.suffix);
     if suffix.is_empty() || suffix.contains(['/', '@']) {
         return bad(format!(
             "suffix '{suffix}' must be non-empty without '/' or '@'"
@@ -816,8 +837,15 @@ pub fn compose_alternates(
             .and_then(Value::as_object_mut)
             .ok_or_else(|| Error::Format("bindings must be an object".into()))?;
         for (name, v) in &picked {
-            let new = format!("{name}@{suffix}");
-            if bindings.contains_key(&new) {
+            let new = if replace(name) {
+                if !bindings.contains_key(*name) {
+                    return bad(format!("base has no binding '{name}' to replace"));
+                }
+                name.to_string()
+            } else {
+                format!("{name}@{suffix}")
+            };
+            if new != **name && bindings.contains_key(&new) {
                 return bad(format!("base already has binding '{new}'"));
             }
             wanted.extend(referenced_objects(v));
@@ -833,7 +861,9 @@ pub fn compose_alternates(
             continue;
         }
         let mut u = u.clone();
-        u["parameter"] = format!("{param}@{suffix}").into();
+        if !replace(param) {
+            u["parameter"] = format!("{param}@{suffix}").into();
+        }
         if let Some(aux) = u.get_mut("auxiliaries").and_then(Value::as_object_mut) {
             for v in aux.values_mut() {
                 wanted.extend(referenced_objects(v));
@@ -842,12 +872,71 @@ pub fn compose_alternates(
         }
         uses.push(u);
     }
-    dir.get_mut("uses")
+    let base_uses = dir
+        .get_mut("uses")
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| Error::Format("uses must be an array".into()))?
-        .extend(uses);
+        .ok_or_else(|| Error::Format("uses must be an array".into()))?;
+    base_uses.retain(|u| {
+        !u["parameter"]
+            .as_str()
+            .is_some_and(|p| replace(p) && picked.iter().any(|(n, _)| n.as_str() == p))
+    });
+    base_uses.extend(uses);
 
-    // Copied objects in `alt`'s payload order, each 256-aligned after `base`'s payload.
+    // Drops: bindings, then the uses of parameters no longer bound, then components.
+    let mut dropped = 0;
+    if let Some(b) = dir.get_mut("bindings").and_then(Value::as_object_mut) {
+        let before = b.len();
+        b.retain(|name, _| !(spec.drop)(name));
+        dropped = before - b.len();
+    }
+    let bound: std::collections::HashSet<String> = dir["bindings"]
+        .as_object()
+        .map(|b| b.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some(u) = dir.get_mut("uses").and_then(Value::as_array_mut) {
+        u.retain(|u| u["parameter"].as_str().is_some_and(|p| bound.contains(p)));
+    }
+    if let Some(c) = dir.get_mut("components").and_then(Value::as_object_mut) {
+        for id in spec.drop_components {
+            if c.remove(*id).is_none() {
+                return bad(format!("base has no component '{id}'"));
+            }
+        }
+    }
+
+    // Every object the result references: bindings, use auxiliaries, component resources.
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for v in dir["bindings"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(_, v)| v)
+    {
+        referenced.extend(referenced_objects(v));
+    }
+    for u in dir["uses"].as_array().into_iter().flatten() {
+        for (_, v) in u
+            .get("auxiliaries")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            referenced.extend(referenced_objects(v));
+        }
+    }
+    for (_, c) in dir["components"].as_object().into_iter().flatten() {
+        for (_, r) in c
+            .get("resources")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            referenced.extend(r.as_str().map(str::to_string));
+        }
+    }
+
+    // Kept objects: the base's in its order, then the copies in `alt`'s, each 256-aligned.
     wanted.sort();
     wanted.dedup();
     let mut copies: Vec<&Object> = wanted
@@ -859,34 +948,49 @@ pub fn compose_alternates(
         })
         .collect::<Result<_>>()?;
     copies.sort_by_key(|o| o.offset);
-    let alt_entries: HashMap<&str, &Value> = alt.directory["objects"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|o| Some((o.get("id")?.as_str()?, o)))
-        .collect();
-    let mut segments: Vec<(u64, u64, u64)> = Vec::with_capacity(copies.len()); // (offset, bytes, alt offset)
-    let mut cursor = base.payload_bytes();
-    let objects = dir
-        .get_mut("objects")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| Error::Format("objects must be an array".into()))?;
+    let entries = |a: &Artifact| -> HashMap<String, Value> {
+        a.directory["objects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| Some((o.get("id")?.as_str()?.to_string(), o.clone())))
+            .collect()
+    };
+    let (base_entries, alt_entries) = (entries(base), entries(alt));
+    // (offset, bytes, from alt, source offset)
+    let mut segments: Vec<(u64, u64, bool, u64)> = Vec::new();
+    let mut objects: Vec<Value> = Vec::new();
+    let mut cursor = 0u64;
+    let mut place = |id: String, o: &Object, from_alt: bool, entry: &Value| {
+        let offset = align_up(cursor, 256);
+        let mut entry = entry.clone();
+        entry["id"] = id.into();
+        entry["offset"] = offset.into();
+        objects.push(entry);
+        segments.push((offset, o.bytes, from_alt, o.offset));
+        cursor = offset + o.bytes;
+    };
+    let mut kept_base = 0;
+    for o in &base.objects {
+        if referenced.contains(&o.id) {
+            let entry = base_entries
+                .get(&o.id)
+                .ok_or_else(|| Error::Format(format!("object {} has no directory entry", o.id)))?;
+            place(o.id.clone(), o, false, entry);
+            kept_base += 1;
+        }
+    }
     for o in &copies {
         let id = rename(&o.id);
         if base.object(&id).is_some() {
             return bad(format!("base already has object {id}"));
         }
-        let offset = align_up(cursor, 256);
-        let mut entry = (*alt_entries
-            .get(o.id.as_str())
-            .ok_or_else(|| Error::Format(format!("object {} has no directory entry", o.id)))?)
-        .clone();
-        entry["id"] = id.into();
-        entry["offset"] = offset.into();
-        objects.push(entry);
-        segments.push((offset, o.bytes, o.offset));
-        cursor = offset + o.bytes;
+        let entry = alt_entries
+            .get(&o.id)
+            .ok_or_else(|| Error::Format(format!("object {} has no directory entry", o.id)))?;
+        place(id, o, true, entry);
     }
+    dir.insert("objects".into(), Value::Array(objects));
     let mut v = Map::new();
     v.insert("format_version".into(), 1.into());
     v.insert("source_container".into(), base.container.to_string().into());
@@ -895,7 +999,6 @@ pub fn compose_alternates(
     v.insert("alternates_suffix".into(), suffix.into());
     dir.insert("velox".into(), Value::Object(v));
 
-    let base_bytes = base.payload_bytes();
     let added: u64 = copies.iter().map(|o| o.bytes).sum();
     write_container(
         out,
@@ -905,27 +1008,27 @@ pub fn compose_alternates(
         new_artifact_id(),
         cursor,
         &mut |at, buf| {
-            // [at, at + len): base payload, then copied objects with zero padding between them.
+            // [at, at + len): the placed objects with zero padding between them.
             let end = at + buf.len() as u64;
-            if at < base_bytes {
-                let n = (base_bytes.min(end) - at) as usize;
-                base.read_range(at, &mut buf[..n])?;
-            }
-            let tail = base_bytes.saturating_sub(at).min(buf.len() as u64) as usize;
-            buf[tail..].fill(0);
-            for &(off, bytes, src) in &segments {
-                let (a, e) = (off.max(at), (off + bytes).min(end));
-                if a < e {
-                    let dst = &mut buf[(a - at) as usize..(e - at) as usize];
-                    alt.read_range(src + (a - off), dst)?;
+            buf.fill(0);
+            let first = segments.partition_point(|&(off, bytes, ..)| off + bytes <= at);
+            for &(off, bytes, from_alt, src) in &segments[first..] {
+                if off >= end {
+                    break;
                 }
+                let (a, e) = (off.max(at), (off + bytes).min(end));
+                let dst = &mut buf[(a - at) as usize..(e - at) as usize];
+                let from = if from_alt { alt } else { base };
+                from.read_range(src + (a - off), dst)?;
             }
             Ok(())
         },
     )?;
     Ok(ComposeReport {
         bindings: picked.len(),
+        dropped,
         objects: copies.len(),
+        kept_base,
         bytes: added,
         payload_bytes: cursor,
     })
