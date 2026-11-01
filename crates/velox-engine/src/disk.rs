@@ -5,9 +5,10 @@
 //! cold start (a restarted server finds its prompts on disk instead of prefilling them) and hot
 //! prefixes that system RAM cannot keep; one-off history points never go to disk.
 //!
-//! With a model identity ([`DiskTier::new`] `tag`), records live in a directory named after it
-//! and the storage layout and outlive the process: each file starts with a header describing it
-//! (keys, KV ranges) and is indexed again at startup. Files are named by their keys, so a prefix
+//! With a model identity ([`DiskTier::new`] `tag`), records live in a directory named after it,
+//! the build and the storage layout and outlive the process: each file starts with a header
+//! describing it (keys, KV ranges) and is indexed again at startup. A new build (other kernels or
+//! code, so other numerics) starts empty: it deletes the directories of every other build. Files are named by their keys, so a prefix
 //! already on disk is never written again. Without one, records live in a process-private
 //! directory removed on shutdown. Matching never reads the disk. Capacity is reclaimed in
 //! least-recently-used order (a write or a read counts as a use; records found at startup rank by
@@ -92,6 +93,23 @@ const STALE_TMP: Duration = Duration::from_secs(3600);
 
 pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
+/// Identity of this build: a hash of the running executable (the kernels are linked into it).
+/// 0 when it cannot be read.
+pub(crate) fn executable_id() -> u64 {
+    let Ok(mut f) = std::env::current_exe().and_then(File::open) else {
+        return 0;
+    };
+    let mut buf = vec![0u8; 1 << 20];
+    let mut h = FNV_OFFSET;
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => return h,
+            Ok(n) => h = fnv64(h, &buf[..n]),
+            Err(_) => return 0,
+        }
+    }
+}
+
 /// FNV-1a: stable across processes and toolchains (file names, layout and header checks).
 pub(crate) fn fnv64(seed: u64, bytes: &[u8]) -> u64 {
     bytes.iter().fold(seed, |h, &x| {
@@ -108,13 +126,17 @@ fn invalid(m: impl Into<String>) -> std::io::Error {
 }
 
 impl DiskTier {
-    /// A tier of at most `budget` bytes under `root`: in `<tag>-<layout>` when `tag` (the model's
-    /// identity) is given, holding the records an earlier process left there, else in a new
-    /// private directory. `layout` identifies the storage shapes the records must match.
+    /// A tier of at most `budget` bytes under `root`: in `<tag>-b<build>-<layout>` when `tag` (the
+    /// model's identity) is given, holding the records an earlier process of the same build left
+    /// there, else in a new private directory. `build` identifies the code and kernels that
+    /// computed the records; a persistent tier deletes the directories other builds left under
+    /// `root` (a process of another build sharing `root` loses its records). `layout` identifies
+    /// the storage shapes the records must match.
     pub fn new(
         root: PathBuf,
         budget: u64,
         tag: Option<&str>,
+        build: u64,
         layout: u64,
     ) -> std::io::Result<Self> {
         let dir = match tag {
@@ -123,7 +145,8 @@ impl DiskTier {
                     .chars()
                     .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
                     .collect();
-                root.join(format!("{t}-{layout:016x}"))
+                purge_other_builds(&root, build);
+                root.join(format!("{t}-b{build:016x}-{layout:016x}"))
             }
             None => root.join(format!("velox-{}", std::process::id())),
         };
@@ -506,6 +529,28 @@ impl DiskTier {
     }
 }
 
+/// Deletes the persistent directories under `root` that another build wrote (and those of the
+/// naming before builds were part of it), leaving this build's and private ones.
+fn purge_other_builds(root: &Path, build: u64) {
+    let Ok(dir) = fs::read_dir(root) else {
+        return;
+    };
+    let ours = format!("-b{build:016x}-");
+    for ent in dir.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let private = name
+            .strip_prefix("velox-")
+            .is_some_and(|pid| pid.bytes().all(|c| c.is_ascii_digit()));
+        if private || name.contains(&ours) || !ent.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        match fs::remove_dir_all(ent.path()) {
+            Ok(()) => eprintln!("disk context: deleted {name} (another build)"),
+            Err(e) => eprintln!("disk context: cannot delete {name}: {e}"),
+        }
+    }
+}
+
 impl Drop for DiskTier {
     fn drop(&mut self) {
         // Queued writes finish first: a persistent tier keeps them for the next start.
@@ -524,7 +569,7 @@ mod tests {
     use super::*;
 
     fn tier(dir: &Path, budget: u64) -> DiskTier {
-        DiskTier::new(dir.to_path_buf(), budget, Some("test"), 42).unwrap()
+        DiskTier::new(dir.to_path_buf(), budget, Some("test"), 7, 42).unwrap()
     }
 
     fn wait(t: &mut DiskTier) {
@@ -563,9 +608,38 @@ mod tests {
         assert_eq!(t.len(), 0);
         drop(t);
         // Another layout never sees the first one's directory.
-        let other = DiskTier::new(dir.clone(), 1 << 20, Some("test"), 43).unwrap();
+        let other = DiskTier::new(dir.clone(), 1 << 20, Some("test"), 7, 43).unwrap();
         assert_eq!(other.len(), 0);
         drop(other);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_build_deletes_the_records_of_other_builds() {
+        let dir = std::env::temp_dir().join(format!("velox-disk-build-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let keys: Vec<u32> = (0..50).collect();
+        let data = [3u8; 64];
+        {
+            let mut t = tier(&dir, 1 << 20);
+            t.write(&keys, 0, vec![(0, 50)], None, true, vec![(data.as_ptr(), 64)], 1);
+            wait(&mut t);
+        }
+        // Another model of the same build, the old unversioned naming and a live private tier.
+        drop(DiskTier::new(dir.clone(), 1 << 20, Some("other"), 7, 42).unwrap());
+        fs::create_dir_all(dir.join("test-000000000000002a")).unwrap();
+        fs::create_dir_all(dir.join("velox-12345")).unwrap();
+        assert_eq!(tier(&dir, 1 << 20).len(), 1, "same build keeps its records");
+        let next = DiskTier::new(dir.clone(), 1 << 20, Some("test"), 8, 42).unwrap();
+        assert_eq!(next.len(), 0);
+        drop(next);
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["test-b0000000000000008-000000000000002a", "velox-12345"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -22,6 +22,7 @@ supported card gets its own hardware branch for tuned kernels.
 |---|---|
 | `main` | any GPU with a backend, portable kernels |
 | `rtx-5090-32g` | RTX 5090 (32 GB desktop) |
+| `rtx-pro-6000` | RTX PRO 6000 Blackwell (96 GB) |
 | `rtx-5090-24g` | RTX 5090 Laptop GPU (24 GB) |
 | `rtx-5060-ti` | RTX 5060 Ti 16 GB |
 | `rtx-4090` | RTX 4090 (24 GB) |

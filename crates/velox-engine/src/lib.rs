@@ -80,14 +80,19 @@ pub struct EngineConfig {
     /// `--host-state-dtype`): bf16 holds twice as many prefixes as f32 in the same RAM, nvfp4
     /// about 5.5 times; lanes always run on f32 state.
     pub host_state_format: StateFormat,
+    /// Storage format of the device checkpoints (lane heads and spares, see [`DEVICE_HEADS`]):
+    /// bf16 halves their device memory (157 -> 81 MB each for Qwen3.8-27B) at the rounding the
+    /// context store's bf16 entries already apply on restore.
+    pub device_state_format: StateFormat,
     /// NVMe tier below the context store (see `disk`): roots and branch points several requests
     /// resumed from; 0 disables it.
     pub disk_context_bytes: u64,
     /// Directory of the NVMe tier's files.
     pub disk_context_dir: std::path::PathBuf,
     /// Identity of the loaded model (weights and kernels): records are kept across restarts in a
-    /// subdirectory named after it and the storage layout. `None`: a private subdirectory removed
-    /// on shutdown.
+    /// subdirectory named after it, the build (a hash of the executable) and the storage layout;
+    /// a new build deletes the other builds' subdirectories. `None`: a private subdirectory
+    /// removed on shutdown.
     pub disk_context_tag: Option<String>,
     /// Lanes: requests decoding at once (ninfer `--max-concurrency`), each with `capacity`
     /// tokens of KV cache.
@@ -731,6 +736,7 @@ where
                     cfg.disk_context_dir.clone(),
                     cfg.disk_context_bytes,
                     cfg.disk_context_tag.as_deref(),
+                    disk::executable_id(),
                     disk::fnv64(disk::FNV_OFFSET, layout.as_bytes()),
                 )
                 .map_err(|e| CoreError::Config(format!("disk context tier: {e}")))?,
@@ -858,7 +864,12 @@ impl<B: Backend> Core<B> {
         let device = st.spare.iter().filter(|c| !c.on_host()).count();
         for _ in device..states {
             st.spare
-                .push(st.lanes[0].session.blank_checkpoint(&self.b, 0)?);
+                .push(st.lanes[0].session.blank_checkpoint_as(
+                    &self.b,
+                    0,
+                    false,
+                    cfg.device_state_format,
+                )?);
         }
         self.b.set_graph_budget(cfg.graph_budget);
         let Some((per_set, rows_per_set)) = st.lanes[0].session.kv_set_shape() else {
@@ -1130,7 +1141,8 @@ impl<B: Backend> Core<B> {
                 let (gh, gw) = (rh / PATCH, rw / PATCH);
                 if gh % MERGE == 0 && gw % MERGE == 0 {
                     let patches = vec![0.0f32; gh * gw * 3 * TEMPORAL * PATCH * PATCH];
-                    v.encode(b, &patches, gh, gw)?;
+                    // The largest image: its buffers are the ones every later image reuses.
+                    v.encode_in(b, &patches, gh, gw, ws.scratch_chunks())?;
                 }
             }
         }

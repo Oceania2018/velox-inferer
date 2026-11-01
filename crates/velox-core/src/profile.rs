@@ -133,6 +133,22 @@ pub static CATALOG: &[DeviceProfile] = &[
         tuned_branch: Some("rtx-5090-32g"),
     },
     DeviceProfile {
+        id: "rtx-pro-6000",
+        name: "NVIDIA RTX PRO 6000 Blackwell",
+        arch: GpuArch::Cuda {
+            major: 12,
+            minor: 0,
+        },
+        form_factor: FormFactor::Desktop,
+        // Marketed as 96 GB; CUDA reports ~95 GiB (97249 MiB on the Server Edition), which is
+        // outside the detection tolerance of 96.
+        vram_gib: 95,
+        sm_count: 188,
+        mem_bandwidth_gbs: 1792,
+        reserved_mib: 1024,
+        tuned_branch: Some("rtx-pro-6000"),
+    },
+    DeviceProfile {
         id: "rtx-5090-laptop",
         name: "NVIDIA GeForce RTX 5090 Laptop GPU",
         arch: GpuArch::Cuda {
@@ -239,6 +255,16 @@ mod tests {
         assert_eq!(
             detect(SM120, 82, 24463 << 20).unwrap().id,
             "rtx-5090-laptop"
+        );
+    }
+
+    #[test]
+    fn detects_rtx_pro_6000() {
+        // Workstation, Max-Q and Server editions share the die and the 96 GB; CUDA's total on the
+        // Server Edition.
+        assert_eq!(
+            detect(SM120, 188, 101_973_819_392).unwrap().id,
+            "rtx-pro-6000"
         );
     }
 

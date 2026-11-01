@@ -67,6 +67,12 @@ COMMANDS:
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
+  compose                 A weight file plus another's bindings as `<name>@<suffix>` alternate
+                          encodings -> .vi (Qwen3.5 `@prefill` MLP: used above 16 tokens)
+      --base <path> --alt <path> --match <glob,...> --output <.vi> [--suffix prefill]
+      [--replace <glob,...>]  matched bindings that replace the base's (no alternate)
+      [--drop <glob,...>] [--drop-components <id,...>]  leave out (e.g. mtp/* and mtp); the
+                          payload keeps only referenced objects
   import-gguf             Qwen3.5/3.8 GGUF text weights + a donor artifact's config, tokenizer,
                           vision tower and DFlash2 drafter -> .vi (GGML blocks kept as stored)
       --gguf <path> --donor <.ninfer|.vi> --output <.vi>
@@ -103,6 +109,7 @@ COMMANDS:
       --stream-content on|off (on)    streaming requests get their text as it is generated
       --kv-format <fmt>     attention KV cache storage: f32 | bf16 | fp8 | nvfp4 (f32)
       --host-state-dtype <fmt>  context-store recurrent states: f32 | bf16 | nvfp4 (bf16)
+      --device-state-dtype <fmt>  device checkpoints (lane heads, spares): f32 | bf16 | nvfp4 (f32)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
       --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
       --score-branch-rows <n>  System One rank candidates per forward pass (100; 0 rejects rank)
@@ -153,6 +160,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
+        Some("compose") => weights::compose(a),
         Some("import-gguf") => weights::import_gguf(a),
         Some("import-hf") => weights::import_hf(a),
         Some("generate") => generate::run(a),
