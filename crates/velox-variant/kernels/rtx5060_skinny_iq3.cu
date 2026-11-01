@@ -16,6 +16,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+#include "rtx_device.cuh"
 #include "velox_common.cuh"
 
 namespace {
@@ -341,7 +342,6 @@ __global__ void sum_splits(const float* __restrict__ part, int splits, long long
 VeloxScratch g_x;     // bf16 activations
 VeloxScratch g_part;  // split-K partials
 
-constexpr int kSms = 170;  // RTX 5090 (GB202)
 
 long long align256(long long x) { return (x + 255) / 256 * 256; }
 
@@ -370,7 +370,7 @@ int launch(Args p) {
     const int rows_per_block = p.pair ? kBN / 2 : kBN;
     const long long blocks = (p.rows + rows_per_block - 1) / rows_per_block, stages = (p.blocks + kBlk - 1) / kBlk;
     const int tiles = (p.m + NT * 8 - 1) / (NT * 8);
-    const int splits = p.pair || tiles > 1 ? 1 : pick_splits(blocks, stages, kSms * per_sm);
+    const int splits = p.pair || tiles > 1 ? 1 : pick_splits(blocks, stages, rtx_sm_count() * per_sm);
     p.kt_per_split = static_cast<int>((stages + splits - 1) / splits);
     float* y = p.y;
     if (splits > 1) {

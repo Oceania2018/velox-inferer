@@ -15,6 +15,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "rtx_device.cuh"
 #include "velox_common.cuh"
 
 namespace {
@@ -382,7 +383,6 @@ struct Scratch {
 Scratch g_scratch;  // quantized activations
 Scratch g_part;     // split-K partial sums
 
-constexpr int kSms = 170;  // RTX 5090 (GB202)
 constexpr int kSmallMaxM = 32;
 
 // Token rows the quantizers pad to: the tile height of the configuration launch_gemm picks.
@@ -402,7 +402,7 @@ int launch_cfg(GemmArgs p) {
     int splits = 1;
     // The small tile always may split; the large one only when its grid is badly under-filled,
     // since the partial pass costs more than it saves on prefill-sized grids.
-    while ((C::BM == Small::BM || blocks < 64) && blocks * splits < 2 * kSms && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
+    while ((C::BM == Small::BM || blocks < 64) && blocks * splits < 2 * rtx_sm_count() && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
     p.kt_per_split = (kt_total + splits - 1) / splits;
     float* y = p.y;
     if (splits > 1) {
