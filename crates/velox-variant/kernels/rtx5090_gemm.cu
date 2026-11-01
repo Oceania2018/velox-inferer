@@ -129,8 +129,9 @@ __global__ void quant_fp8_kernel(const float* __restrict__ x, int m, int k, uint
 // tokens and NT x 8 weight rows, so a block is BM = WM * MT * 16 tokens by BN = WN * NT * 8 rows.
 //   Wide:  256 x 128, 256 threads, 64 x 64 per warp (prefill grids of at least wide_blocks())
 //   Big:   128 x 128, 256 threads, 64 x 32 per warp (smaller prefill grids)
-//   Small:  16 / 32 / 64 x 64, 64 threads (verify, drafts, short chunks: m <= 64), with split-K so a
-//           handful of tokens still spreads the weight stream over every SM.
+//   Small:  16 .. 96 x 64 (the batch rounded up to 16 tokens), 64 threads (verify, drafts, short
+//           chunks: m <= 96), with split-K so a handful of tokens still spreads the weight stream
+//           over every SM.
 
 
 enum Kind { kFp4 = 0, kFp8 = 1 };
@@ -158,7 +159,6 @@ template <int MT>
 using SmallT = Cfg<1, 2, MT, 4, 4>;
 template <int MT>
 using Small64T = Cfg<1, 2, MT, 3, 2>;  // K whose code bytes are not a multiple of SmallT::BK
-using Small = SmallT<1>;
 
 template <class C, bool SW>
 struct Smem {
@@ -680,7 +680,8 @@ struct Scratch {
 Scratch g_scratch;  // quantized activations
 Scratch g_part;     // split-K partial sums
 
-constexpr int kSmallMaxM = 64;  // skinny tiles up to here; prefill tiles (and fused SwiGLU) above
+constexpr int kSmallMaxM = 96;  // skinny tiles up to here; prefill tiles above
+constexpr int kSwigluMinM = 65;  // fused SwiGLU (prefill tiles only) from here
 
 // Wide tiles when their grid fills the GPU about one and a half times over (256 blocks on the
 // 5090's 170 SMs), and for at least two tile rows of tokens (m = 128 padded to one Wide tile:
@@ -695,7 +696,7 @@ bool use_wide(int m, int rows) {
 
 // Token rows the quantizers pad to: the tile height of the configuration launch_gemm picks.
 int m_tile(int m, int rows) {
-    if (m <= kSmallMaxM) return m <= 16 ? 16 : m <= 32 ? 32 : 64;
+    if (m <= kSmallMaxM) return (m + 15) / 16 * 16;
     return use_wide(m, rows) ? Wide::BM : Big::BM;
 }
 
@@ -731,16 +732,32 @@ int launch_cfg(GemmArgs p) {
     return velox_launch_status();
 }
 
+constexpr int kSmemMax = 101376;
+
+// A skinny tile as tall as the batch, rounded up to 16 tokens (up to 96: verify of 12 sequences x 8
+// rows). K whose code bytes are not a multiple of SmallT::BK, and shapes whose four 128-byte stages
+// do not fit, take three 64-byte stages.
+template <int MT, int KIND>
+int launch_skinny(const GemmArgs& p) {
+    using C = SmallT<MT>;
+    if constexpr (sizeof(Smem<C, false>) <= kSmemMax) {
+        if (p.kb % C::BK == 0) return launch_cfg<C, KIND>(p);
+    }
+    return launch_cfg<Small64T<MT>, KIND>(p);
+}
+
 template <int KIND>
 int launch_gemm(const GemmArgs& p) {
     if (use_wide(p.m, p.rows)) return launch_cfg<Wide, KIND>(p);
     if (p.m > kSmallMaxM) return launch_cfg<Big, KIND>(p);
-    if (p.kb % Small::BK != 0) {
-        if (p.m <= 16) return launch_cfg<Small64T<1>, KIND>(p);
-        return p.m <= 32 ? launch_cfg<Small64T<2>, KIND>(p) : launch_cfg<Small64T<4>, KIND>(p);
+    switch ((p.m + 15) / 16) {
+        case 1: return launch_skinny<1, KIND>(p);
+        case 2: return launch_skinny<2, KIND>(p);
+        case 3: return launch_skinny<3, KIND>(p);
+        case 4: return launch_skinny<4, KIND>(p);
+        case 5: return launch_skinny<5, KIND>(p);
+        default: return launch_skinny<6, KIND>(p);
     }
-    if (p.m <= 16) return launch_cfg<SmallT<1>, KIND>(p);
-    return p.m <= 32 ? launch_cfg<SmallT<2>, KIND>(p) : launch_cfg<SmallT<4>, KIND>(p);
 }
 
 // Quantizes x to NVFP4 codes and scales padded to the tile height mt; returns the codes (scales
@@ -921,7 +938,7 @@ VELOX_API int velox_5090_linear_swiglu_a4(const float* x, int m, const uint8_t* 
                                           long long row_begin_g, const uint8_t* wu, long long parent_rows_u,
                                           long long row_begin_u, long long k, int rows, float input_divisor,
                                           float* y) {
-    if (k % 128 != 0 || row_begin_g % 128 != 0 || row_begin_u % 128 != 0 || m <= kSmallMaxM ||
+    if (k % 128 != 0 || row_begin_g % 128 != 0 || row_begin_u % 128 != 0 || m < kSwigluMinM ||
         reinterpret_cast<uintptr_t>(x) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     // The tile the composed path would pick for the fused [2 * rows] view.
@@ -974,7 +991,7 @@ VELOX_API int velox_5090_linear_a8(const float* x, int m, const uint8_t* w, long
 VELOX_API int velox_5090_linear_swiglu_a8(const float* x, int m, const uint8_t* wg, long long parent_rows_g,
                                           long long row_begin_g, const uint8_t* wu, long long parent_rows_u,
                                           long long row_begin_u, long long k, int rows, float* y) {
-    if (k % 64 != 0 || m <= kSmallMaxM || reinterpret_cast<uintptr_t>(x) % 16 != 0) return VELOX_ERR_UNSUPPORTED;
+    if (k % 64 != 0 || m < kSwigluMinM || reinterpret_cast<uintptr_t>(x) % 16 != 0) return VELOX_ERR_UNSUPPORTED;
     const bool wide = use_wide(m, 2 * rows);
     const int mt = wide ? Wide::BM : Big::BM;
     const int m_pad = (m + mt - 1) / mt * mt;

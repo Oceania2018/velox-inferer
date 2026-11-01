@@ -1,4 +1,4 @@
-// RTX 5090 skinny linear (1..64 tokens) for FP8 E4M3 row-scaled weights with bf16 activations
+// RTX 5090 skinny linear (1..96 tokens) for FP8 E4M3 row-scaled weights with bf16 activations
 // (ActQuant::Bf16): decode, speculative verify and batched verify of several sequences.
 //
 // A block owns R = 16 * RW weight rows and every token; each stage streams R x BK weight codes and
@@ -64,24 +64,24 @@ __device__ __forceinline__ float row_scale(const A16Args& p, int row) {
     return __uint_as_float(static_cast<uint32_t>(sp[p.row_begin + row]) << 16);
 }
 
-template <int TOK, int RW, int KS, int ST>
+template <int TOK, int RW, int KS, int ST, int MT = 1>
 struct TileGeo {
-    static constexpr int R = 16 * RW;           // weight rows per block
+    static constexpr int R = 16 * MT * RW;      // weight rows per block (MT 16-row tiles per warp)
     static constexpr int BK = KS * kWarpK;      // K per stage
     static constexpr int AS = BK + 8;           // bf16 activation row stride (elements): spreads banks
     static constexpr int CODE = R * BK;         // bytes
     static constexpr int STAGE = CODE + TOK * AS * 2;
-    static constexpr int PART = KS > 1 ? RW * KS * (TOK / 8) * 32 * 16 : 0;  // cross-warp partials
+    static constexpr int PART = KS > 1 ? RW * KS * MT * (TOK / 8) * 32 * 16 : 0;  // cross-warp partials
     static constexpr int SMEM = ST * STAGE > PART ? ST * STAGE : PART;
     static constexpr int THREADS = RW * KS * 32;
 };
 
 // Split-K: blockIdx.y takes stages [y * sps, (y + 1) * sps); with several splits it writes unscaled
 // partial sums to part[y][t][row] for reduce_kernel, else the scaled outputs.
-template <int TOK, int RW, int KS, int ST>
+template <int TOK, int RW, int KS, int ST, int MT = 1>
 __global__ void __launch_bounds__(RW * KS * 32)
     a16_fp8_tile_kernel(A16Args p, const __nv_bfloat16* __restrict__ xb, float* __restrict__ part, int sps) {
-    using G = TileGeo<TOK, RW, KS, ST>;
+    using G = TileGeo<TOK, RW, KS, ST, MT>;
     extern __shared__ __align__(128) uint8_t smem[];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int gid = lane >> 2, lid = lane & 3;
@@ -108,13 +108,13 @@ __global__ void __launch_bounds__(RW * KS * 32)
         }
     };
 
-    float acc[TOK / 8][4] = {};
+    float acc[MT][TOK / 8][4] = {};
 #pragma unroll
     for (int st = 0; st < ST - 1; ++st) {
         if (st < stages) stage(st, (s0 + st) * G::BK);
         cp_commit();
     }
-    const int r = rg * 16 + gid;  // block-local rows r and r + 8
+    const int r = rg * 16 * MT + gid;  // block-local rows r + 16 * mt and r + 16 * mt + 8
     for (int g = 0; g < stages; ++g) {
         cp_wait<ST - 2>();
         __syncthreads();
@@ -128,13 +128,21 @@ __global__ void __launch_bounds__(RW * KS * 32)
 #pragma unroll
         for (int kk = 0; kk < kWarpK / 16; ++kk) {
             const int col = ks * kWarpK + kk * 16 + 2 * lid;  // within the stage
-            const uint32_t a0 = e4m3x2_bf16x2(pair(r, col)), a1 = e4m3x2_bf16x2(pair(r + 8, col));
-            const uint32_t a2 = e4m3x2_bf16x2(pair(r, col + 8)), a3 = e4m3x2_bf16x2(pair(r + 8, col + 8));
+            uint32_t a[MT][4];
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const int rr = r + 16 * mt;
+                a[mt][0] = e4m3x2_bf16x2(pair(rr, col)), a[mt][1] = e4m3x2_bf16x2(pair(rr + 8, col));
+                a[mt][2] = e4m3x2_bf16x2(pair(rr, col + 8)), a[mt][3] = e4m3x2_bf16x2(pair(rr + 8, col + 8));
+            }
+            // Each activation fragment read from shared memory feeds MT row tiles.
 #pragma unroll
             for (int nt = 0; nt < TOK / 8; ++nt) {
                 const __nv_bfloat16* xr = as + (nt * 8 + gid) * G::AS + col;
-                mma_bf16(acc[nt], a0, a1, a2, a3, *reinterpret_cast<const uint32_t*>(xr),
-                         *reinterpret_cast<const uint32_t*>(xr + 8));
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(xr);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(xr + 8);
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) mma_bf16(acc[mt][nt], a[mt][0], a[mt][1], a[mt][2], a[mt][3], b0, b1);
             }
         }
     }
@@ -144,41 +152,48 @@ __global__ void __launch_bounds__(RW * KS * 32)
         __syncthreads();
         float* pt = reinterpret_cast<float*>(smem);
 #pragma unroll
-        for (int nt = 0; nt < TOK / 8; ++nt)
-            *reinterpret_cast<float4*>(pt + (((ks * RW + rg) * (TOK / 8) + nt) * 32 + lane) * 4) =
-                make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int nt = 0; nt < TOK / 8; ++nt)
+                *reinterpret_cast<float4*>(pt + ((((ks * RW + rg) * MT + mt) * (TOK / 8) + nt) * 32 + lane) * 4) =
+                    make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
         __syncthreads();
         if (ks != 0) return;
 #pragma unroll
-        for (int nt = 0; nt < TOK / 8; ++nt) {
-            float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
-            for (int q = 0; q < KS; ++q) {
-                const float4 v = *reinterpret_cast<const float4*>(pt + (((q * RW + rg) * (TOK / 8) + nt) * 32 + lane) * 4);
-                s.x += v.x, s.y += v.y, s.z += v.z, s.w += v.w;
+            for (int nt = 0; nt < TOK / 8; ++nt) {
+                float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+                for (int q = 0; q < KS; ++q) {
+                    const float4 v = *reinterpret_cast<const float4*>(
+                        pt + ((((q * RW + rg) * MT + mt) * (TOK / 8) + nt) * 32 + lane) * 4);
+                    s.x += v.x, s.y += v.y, s.z += v.z, s.w += v.w;
+                }
+                acc[mt][nt][0] = s.x, acc[mt][nt][1] = s.y, acc[mt][nt][2] = s.z, acc[mt][nt][3] = s.w;
             }
-            acc[nt][0] = s.x, acc[nt][1] = s.y, acc[nt][2] = s.z, acc[nt][3] = s.w;
-        }
     }
-    const int ra = row0 + r, rb = ra + 8;
-    float sa = 1.0f, sb = 1.0f;
     float* out = p.y;
-    if (part != nullptr) {
-        out = part + static_cast<long long>(blockIdx.y) * p.m * p.rows;
-    } else {
-        sa = ra < p.rows ? row_scale(p, ra) : 0.0f;
-        sb = rb < p.rows ? row_scale(p, rb) : 0.0f;
-    }
+    if (part != nullptr) out = part + static_cast<long long>(blockIdx.y) * p.m * p.rows;
 #pragma unroll
-    for (int nt = 0; nt < TOK / 8; ++nt) {
-        const int t = nt * 8 + 2 * lid;
-        if (t < p.m) {
-            if (ra < p.rows) out[static_cast<long long>(t) * p.rows + ra] = acc[nt][0] * sa;
-            if (rb < p.rows) out[static_cast<long long>(t) * p.rows + rb] = acc[nt][2] * sb;
+    for (int mt = 0; mt < MT; ++mt) {
+        const int ra = row0 + r + 16 * mt, rb = ra + 8;
+        float sa = 1.0f, sb = 1.0f;
+        if (part == nullptr) {
+            sa = ra < p.rows ? row_scale(p, ra) : 0.0f;
+            sb = rb < p.rows ? row_scale(p, rb) : 0.0f;
         }
-        if (t + 1 < p.m) {
-            if (ra < p.rows) out[static_cast<long long>(t + 1) * p.rows + ra] = acc[nt][1] * sa;
-            if (rb < p.rows) out[static_cast<long long>(t + 1) * p.rows + rb] = acc[nt][3] * sb;
+#pragma unroll
+        for (int nt = 0; nt < TOK / 8; ++nt) {
+            const int t = nt * 8 + 2 * lid;
+            if (t < p.m) {
+                if (ra < p.rows) out[static_cast<long long>(t) * p.rows + ra] = acc[mt][nt][0] * sa;
+                if (rb < p.rows) out[static_cast<long long>(t) * p.rows + rb] = acc[mt][nt][2] * sb;
+            }
+            if (t + 1 < p.m) {
+                if (ra < p.rows) out[static_cast<long long>(t + 1) * p.rows + ra] = acc[mt][nt][1] * sa;
+                if (rb < p.rows) out[static_cast<long long>(t + 1) * p.rows + rb] = acc[mt][nt][3] * sb;
+            }
         }
     }
 }
@@ -215,13 +230,13 @@ const __nv_bfloat16* to_bf16(const A16Args& a) {
 
 // Row tiles below this many get their K split across blocks (about two per SM).
 
-template <int TOK, int RW, int KS, int ST>
+template <int TOK, int RW, int KS, int ST, int MT = 1>
 int launch_tile(const A16Args& a) {
-    using G = TileGeo<TOK, RW, KS, ST>;
+    using G = TileGeo<TOK, RW, KS, ST, MT>;
     if (a.k % G::BK != 0) return VELOX_ERR_UNSUPPORTED;
     static bool configured = false;
     if (!configured) {
-        cudaFuncSetAttribute(a16_fp8_tile_kernel<TOK, RW, KS, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        cudaFuncSetAttribute(a16_fp8_tile_kernel<TOK, RW, KS, ST, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              G::SMEM);
         configured = true;
     }
@@ -241,7 +256,7 @@ int launch_tile(const A16Args& a) {
         part = static_cast<float*>(parts.get(static_cast<size_t>(splits) * a.m * a.rows * sizeof(float)));
         if (part == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
     }
-    a16_fp8_tile_kernel<TOK, RW, KS, ST><<<dim3(blocks, splits), G::THREADS, G::SMEM>>>(a, xb, part, sps);
+    a16_fp8_tile_kernel<TOK, RW, KS, ST, MT><<<dim3(blocks, splits), G::THREADS, G::SMEM>>>(a, xb, part, sps);
     if (splits > 1)
         reduce_kernel<<<velox_grid_1d(static_cast<long long>(a.m) * a.rows, 256), 256>>>(a, part, splits);
     return velox_launch_status();
@@ -250,18 +265,24 @@ int launch_tile(const A16Args& a) {
 }  // namespace
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T x row scale, for an FP8 row-scaled weight. Requires
-// 1 <= m <= 64, k % 256 == 0 and 16-byte aligned x rows; returns VELOX_ERR_UNSUPPORTED otherwise.
+// 1 <= m <= 96, k % 256 == 0 and 16-byte aligned x rows; returns VELOX_ERR_UNSUPPORTED otherwise.
 VELOX_API int velox_5090_linear_a16_fp8(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                         long long row_begin, int rows, float* y) {
-    if (m < 1 || m > 64 || k % 256 != 0 || k > 0x7fffffff || reinterpret_cast<uintptr_t>(x) % 16 != 0)
+    if (m < 1 || m > 96 || k % 256 != 0 || k > 0x7fffffff || reinterpret_cast<uintptr_t>(x) % 16 != 0)
         return VELOX_ERR_UNSUPPORTED;
     const A16Args a{x, w, parent_rows, row_begin, rows, m, static_cast<int>(k), y};
     // Shapes measured on RTX 5090 (bench-linear --format fp8): 16 warps over two row groups and eight
     // K slices up to 16 tokens; wider batches trade K slices for row groups so stages fit. From 17
     // tokens, eight row groups (128 rows a block) halve the activations each weight row costs in
     // L2 traffic: m = 48 (us) [16384,5120] 106 -> 98, [5120,6144] 47.9 -> 43.0, [5120,17408] 103 -> 90.5.
+    // From 33 tokens each warp takes two 16-row tiles, so every activation fragment it reads from
+    // shared memory feeds two mma; and up to 96 tokens (12 sequences x 8-row verify windows) run in
+    // one pass over the weights. RTX PRO 6000, m = 64: [5120,17408] 85.2 -> 81.0 us; m = 80 (was
+    // 64 + 16 in two passes): [17408,5120] 159 -> 103, [5120,17408] 148 -> 91, [5120,6144] 66 -> 42.
     if (m <= 8) return launch_tile<8, 2, 8, 3>(a);
     if (m <= 16) return launch_tile<16, 2, 8, 3>(a);
     if (m <= 32) return launch_tile<32, 8, 2, 3>(a);
-    return launch_tile<64, 8, 2, 3>(a);
+    if (m <= 64) return launch_tile<64, 4, 2, 3, 2>(a);
+    if (m <= 80) return launch_tile<80, 4, 2, 2, 2>(a);
+    return launch_tile<96, 4, 2, 2, 2>(a);
 }

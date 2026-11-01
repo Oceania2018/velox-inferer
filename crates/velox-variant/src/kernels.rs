@@ -552,10 +552,10 @@ fn a16_fp8(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
         && w.k % 256 == 0
 }
 
-/// Batched speculative verify (up to 6 sequences x 16 rows) keeps the bf16-activation path: one
-/// pass over the weights per 64 rows.
+/// Batched speculative verify (up to 12 sequences x 8 rows) keeps the bf16-activation path: one
+/// pass over the weights per 96 rows.
 const A16_FP8_MAX_M: usize = 96;
-const A16_FP8_BLOCK_M: usize = 64;
+const A16_FP8_BLOCK_M: usize = 96;
 
 /// Decode and verify widths of FP8 row-scaled weights with few rows: rtx5090_stream.cu's one-launch
 /// weight-streaming kernel (bf16 activations, split K in the block). Measured at m=8 against the
@@ -578,7 +578,19 @@ fn stream_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
 /// m=2048 427 vs 327 us.
 const A4_5060_MAX_M: usize = 128;
 
-/// Fused NVFP4 / FP8 SwiGLU from here (rtx5090_gemm.cu's prefill tiles start above 64 rows).
+/// Batched verify widths (33..=96 rows: 5..12 sequences x 8) of tall NVFP4 weights run
+/// rtx5090_gemm.cu's batch-tall skinny tile instead of the rtx5060 kernel's 128 x 128 prefill tile,
+/// which pads 80 rows to 128 and leaves [34816,5120]'s 272 blocks at 1.45 waves of 188 SMs.
+/// RTX PRO 6000, m = 80 (us): [34816,5120] 108 -> 85; shorter outputs measured no better
+/// ([12288,5120] 42 -> 54), so they stay. 10 lanes' decode: 147 -> 152 tok/s per lane.
+const A4_TALL_MIN_ROWS: usize = 16384;
+
+fn a4_5060(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
+    m <= A4_5060_MAX_M && !((33..=96).contains(&m) && w.rows >= A4_TALL_MIN_ROWS)
+}
+
+/// Fused NVFP4 / FP8 SwiGLU from here (rtx5090_gemm.cu's kSwigluMinM: the fused epilogue runs on its
+/// prefill tiles only).
 const SWIGLU_MIN_M: usize = 65;
 
 /// Format code of the skinny kernel serving a weight at `m` tokens: NVFP4 (0) runs
@@ -2246,7 +2258,7 @@ impl CudaKernels for Rtx5090Kernels {
                 ),
                 None => portable::linear(x, w, y, m),
             },
-            ActQuant::Nvfp4 { divisor } if m <= A4_5060_MAX_M => status(
+            ActQuant::Nvfp4 { divisor } if a4_5060(w, m) => status(
                 unsafe {
                     velox_5060_linear_a4(
                         x.as_ptr(),

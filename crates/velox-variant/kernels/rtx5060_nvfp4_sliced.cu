@@ -195,10 +195,16 @@ nvfp4_sliced_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restri
 // rows x 16 tokens, two activation stages, four blocks per SM). Each K tile's codes and scales are
 // staged, widened once to exact bf16 weights in shared memory, then served to every warp through
 // ldmatrix + mma.m16n8k16; 8-value chunks are XOR-swizzled by row.
-constexpr int kMmaBM = 64, kMmaBN = 64, kMmaBK = 64, kMmaWT = 16;
-constexpr int kMmaSmem = kMmaBM * kMmaBK * 2 + 2 * kMmaBN * kMmaBK * 2 + kMmaBM * (kMmaBK / 2 + kMmaBK / 16);
+// The token tile kMmaBN and warp width kMmaWT are template parameters: a batched verify of 9..12
+// sequences (65..96 tokens) takes one 96-token tile, so each weight tile is fetched and widened
+// once rather than for two 64-token tiles.
+constexpr int kMmaBM = 64, kMmaBK = 64;
+template <int kMmaBN>
+constexpr int mma_smem() {
+    return kMmaBM * kMmaBK * 2 + 2 * kMmaBN * kMmaBK * 2 + kMmaBM * (kMmaBK / 2 + kMmaBK / 16);
+}
 
-template <int WR>
+template <int WR, int kMmaBN = 64, int kMmaWT = 16>
 __global__ void __launch_bounds__((kMmaBM / WR) * (kMmaBN / kMmaWT) * 32, 4)
 nvfp4_mma_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, long long parent_rows, int k,
                  long long view_begin, int rows, int m, float alpha, float* __restrict__ y) {
@@ -352,18 +358,33 @@ int launch_sliced_k(const __nv_bfloat16* xb, const uint8_t* w, long long parent_
     return launch_sliced<T, 0>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y);
 }
 
-template <int WR>
+template <int WR, int BN = 64, int WT = 16>
 int launch_mma(const __nv_bfloat16* xb, const uint8_t* w, long long parent_rows, int k, long long row_begin, int rows,
                int m, float alpha, float* y) {
+    constexpr int smem = mma_smem<BN>();
     static bool configured = false;
     if (!configured) {
-        cudaFuncSetAttribute(nvfp4_mma_kernel<WR>, cudaFuncAttributeMaxDynamicSharedMemorySize, kMmaSmem);
+        cudaFuncSetAttribute(nvfp4_mma_kernel<WR, BN, WT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         configured = true;
     }
-    const dim3 grid((rows + kMmaBM - 1) / kMmaBM, (m + kMmaBN - 1) / kMmaBN);
-    nvfp4_mma_kernel<WR><<<grid, (kMmaBM / WR) * (kMmaBN / kMmaWT) * 32, kMmaSmem>>>(xb, w, parent_rows, k, row_begin,
-                                                                                    rows, m, alpha, y);
+    const dim3 grid((rows + kMmaBM - 1) / kMmaBM, (m + BN - 1) / BN);
+    nvfp4_mma_kernel<WR, BN, WT><<<grid, (kMmaBM / WR) * (BN / WT) * 32, smem>>>(xb, w, parent_rows, k, row_begin,
+                                                                                rows, m, alpha, y);
     return velox_launch_status();
+}
+
+// ninfer on this card: 8 warps of 32 rows up to 192 tokens, then 4 warps of 64 rows. A batch of
+// 65..96 tokens over a tall view (at least two 64-row blocks per SM) takes one 96-token tile. RTX
+// PRO 6000, m = 80 (us): [34816,5120] 337 -> 254, [248320,5120] 2779 -> 1554; [5120,17408] (80
+// row blocks) measured 270 -> 291, so short views keep two token tiles.
+constexpr int kWideMinRows = 24576;
+
+int launch_mma_m(const __nv_bfloat16* xb, const uint8_t* w, long long parent_rows, int k, long long row_begin,
+                 int rows, int m, float alpha, float* y) {
+    if (m > 64 && m <= 96 && rows >= kWideMinRows)
+        return launch_mma<32, 96, 24>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y);
+    return m <= 192 ? launch_mma<32>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y)
+                    : launch_mma<64>(xb, w, parent_rows, k, row_begin, rows, m, alpha, y);
 }
 
 }  // namespace
@@ -380,9 +401,7 @@ VELOX_API int velox_5060_linear_nvfp4_mma(const float* x, int m, const uint8_t* 
     if (!xb) return static_cast<int>(cudaErrorMemoryAllocation);
     to_bf16<<<velox_grid_1d(static_cast<long long>(m) * k, 256), 256>>>(x, static_cast<long long>(m) * k, xb);
     const int ki = static_cast<int>(k);
-    // ninfer on this card: 8 warps of 32 rows up to 192 tokens, then 4 warps of 64 rows.
-    return m <= 192 ? launch_mma<32>(xb, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y)
-                    : launch_mma<64>(xb, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
+    return launch_mma_m(xb, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
 }
 
 // velox_5060_linear_nvfp4_mma on a bf16 twin xb [m, k] (no conversion launch).
@@ -395,8 +414,7 @@ VELOX_API int velox_5060_linear_nvfp4_mma_bf16(const void* xb, int m, const uint
     if (const int e = divisor_of(w, parent_rows, k, divisor)) return e;
     const auto* x16 = static_cast<const __nv_bfloat16*>(xb);
     const int ki = static_cast<int>(k);
-    return m <= 192 ? launch_mma<32>(x16, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y)
-                    : launch_mma<64>(x16, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
+    return launch_mma_m(x16, w, parent_rows, ki, row_begin, rows, m, 1.0f / divisor, y);
 }
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T / divisor for an NVFP4 parent [parent_rows, k],
