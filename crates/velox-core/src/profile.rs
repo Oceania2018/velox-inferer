@@ -140,7 +140,9 @@ pub static CATALOG: &[DeviceProfile] = &[
             minor: 0,
         },
         form_factor: FormFactor::Desktop,
-        vram_gib: 96,
+        // Marketed as 96 GB; CUDA reports ~95 GiB (97249 MiB on the Server Edition), which is
+        // outside the detection tolerance of 96.
+        vram_gib: 95,
         sm_count: 188,
         mem_bandwidth_gbs: 1792,
         reserved_mib: 1024,
@@ -258,9 +260,10 @@ mod tests {
 
     #[test]
     fn detects_rtx_pro_6000() {
-        // Workstation, Max-Q and Server editions share the die and the 96 GB.
+        // Workstation, Max-Q and Server editions share the die and the 96 GB; CUDA's total on the
+        // Server Edition.
         assert_eq!(
-            detect(SM120, 188, 97887 << 20).unwrap().id,
+            detect(SM120, 188, 101_973_819_392).unwrap().id,
             "rtx-pro-6000"
         );
     }
