@@ -84,6 +84,10 @@ pub struct DenseFfn {
     pub down: WDesc,
     /// gate and up as one view when adjacent in one parent.
     pub gate_up: Option<WDesc>,
+    /// The same FFN in another encoding for prefill widths (`<name>@prefill` bindings, written by
+    /// `velox compose`): e.g. NVFP4 for FP4 tensor-core prefill next to IQ3_XXS for
+    /// bandwidth-bound decode. Used above `FUSE_MAX_TOKENS` tokens.
+    pub prefill: Option<Box<DenseFfn>>,
 }
 
 /// A sparse MoE FFN (`Qwen3_5MoeForCausalLM`):
@@ -809,11 +813,36 @@ fn load_swiglu<B: Backend>(
     expect(&p("gate"), gate.rows, intermediate)?;
     expect(&p("up"), up.rows, intermediate)?;
     expect(&p("down"), down.rows, cfg.hidden)?;
+    // gate and up may have a prefill encoding; down too, else it serves both.
+    let prefill = if has_binding(l.art, &p("gate@prefill")) {
+        let (g, u) = (l.matrix(&p("gate@prefill"))?, l.matrix(&p("up@prefill"))?);
+        let d = if has_binding(l.art, &p("down@prefill")) {
+            l.matrix(&p("down@prefill"))?
+        } else {
+            down
+        };
+        if (g.rows, u.rows, g.k, d.rows, d.k) != (gate.rows, up.rows, gate.k, down.rows, down.k) {
+            return Err(Error::Config(format!(
+                "{}: @prefill encoding has another shape",
+                p("gate")
+            )));
+        }
+        Some(Box::new(DenseFfn {
+            gate_up: fuse(&[&g, &u]),
+            gate: g,
+            up: u,
+            down: d,
+            prefill: None,
+        }))
+    } else {
+        None
+    };
     Ok(DenseFfn {
         gate_up: fuse(&[&gate, &up]),
         gate,
         up,
         down,
+        prefill,
     })
 }
 

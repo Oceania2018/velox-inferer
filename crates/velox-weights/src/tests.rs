@@ -163,3 +163,168 @@ fn converts_to_multi_part_vi_and_back() {
         "must not overwrite"
     );
 }
+
+fn spec<'a>(
+    pick: &'a dyn Fn(&str) -> bool,
+    replace: &'a dyn Fn(&str) -> bool,
+    suffix: &'a str,
+) -> ComposeSpec<'a> {
+    ComposeSpec {
+        pick,
+        replace,
+        drop: &|_| false,
+        drop_components: &[],
+        suffix,
+    }
+}
+
+#[test]
+fn composes_alternate_encodings() {
+    let t = TempDir::new("compose");
+    let base = Artifact::open(write_ninfer(&t.0, |_| {})).unwrap();
+    let alt_dir = t.0.join("alt");
+    std::fs::create_dir_all(&alt_dir).unwrap();
+    // The alternate: the same bindings, with q's use carrying an auxiliary object.
+    let alt = Artifact::open(write_ninfer(&alt_dir, |d| {
+        d["objects"].as_array_mut().unwrap().insert(
+            1,
+            json!({"id": "aux.div", "kind": "tensor", "shape": [1], "format": "fp32", "layout": "contiguous_le_v1", "offset": 256, "bytes": 4}),
+        );
+        d["uses"][0]["auxiliaries"] = json!({"activation_input_divisor": {"object": "aux.div"}});
+    }))
+    .unwrap();
+    let out = t.0.join("hybrid.vi");
+    let r = compose_alternates(
+        &base,
+        &alt,
+        &spec(&|n| n == "text/q" || n == "text/k", &|_| false, "prefill"),
+        &out,
+        DEFAULT_PART_LIMIT,
+    )
+    .unwrap();
+    assert_eq!((r.bindings, r.objects), (2, 2));
+    let c = Artifact::open(&out).unwrap();
+    assert_eq!(c.container, Container::VeloxV1);
+    // The base's payload and bindings are unchanged.
+    let mut a = vec![0u8; 256];
+    let mut b = vec![0u8; 256];
+    base.read_range(0, &mut a).unwrap();
+    c.read_range(0, &mut b).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(
+        c.directory["bindings"]["text/q"],
+        base.directory["bindings"]["text/q"]
+    );
+    // The alternates name renamed copies holding the alternate's bytes.
+    assert_eq!(
+        c.directory["bindings"]["text/k@prefill"]["parts"][0]["object"],
+        "prefill/w.qk"
+    );
+    assert_eq!(
+        c.read_object("prefill/w.qk").unwrap(),
+        alt.read_object("w.qk").unwrap()
+    );
+    assert_eq!(
+        c.read_object("prefill/aux.div").unwrap(),
+        alt.read_object("aux.div").unwrap()
+    );
+    let uses = c.directory["uses"].as_array().unwrap();
+    let u = uses
+        .iter()
+        .find(|u| u["parameter"] == "text/q@prefill")
+        .unwrap();
+    assert_eq!(
+        u["auxiliaries"]["activation_input_divisor"]["object"],
+        "prefill/aux.div"
+    );
+    // Composing twice into the same file, or with a separator in the suffix, is refused.
+    assert!(compose_alternates(
+        &base,
+        &alt,
+        &spec(&|_| true, &|_| false, "prefill"),
+        &out,
+        DEFAULT_PART_LIMIT
+    )
+    .is_err());
+    assert!(compose_alternates(
+        &base,
+        &alt,
+        &spec(&|_| true, &|_| false, "a/b"),
+        &t.0.join("x.vi"),
+        DEFAULT_PART_LIMIT
+    )
+    .is_err());
+}
+
+#[test]
+fn composes_replacements() {
+    let t = TempDir::new("replace");
+    let base = Artifact::open(write_ninfer(&t.0, |_| {})).unwrap();
+    let alt_dir = t.0.join("alt");
+    std::fs::create_dir_all(&alt_dir).unwrap();
+    let alt = Artifact::open(write_ninfer(&alt_dir, |d| {
+        d["uses"][0]["activation_policy"] = json!("AllowA4");
+    }))
+    .unwrap();
+    let out = t.0.join("replaced.vi");
+    // q switches encoding; k gets an alternate.
+    compose_alternates(
+        &base,
+        &alt,
+        &spec(
+            &|n| n == "text/q" || n == "text/k",
+            &|n| n == "text/q",
+            "prefill",
+        ),
+        &out,
+        DEFAULT_PART_LIMIT,
+    )
+    .unwrap();
+    let c = Artifact::open(&out).unwrap();
+    assert_eq!(
+        c.directory["bindings"]["text/q"]["parts"][0]["object"],
+        "prefill/w.qk"
+    );
+    assert!(c.directory["bindings"].get("text/q@prefill").is_none());
+    assert!(c.directory["bindings"].get("text/k@prefill").is_some());
+    let uses: Vec<&Value> = c.directory["uses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["parameter"] == "text/q")
+        .collect();
+    assert_eq!(uses.len(), 1);
+    assert_eq!(uses[0]["activation_policy"], "AllowA4");
+}
+
+#[test]
+fn composes_without_dropped_or_replaced_objects() {
+    let t = TempDir::new("prune");
+    let base = Artifact::open(write_ninfer(&t.0, |_| {})).unwrap();
+    let alt_dir = t.0.join("alt");
+    std::fs::create_dir_all(&alt_dir).unwrap();
+    let alt = Artifact::open(write_ninfer(&alt_dir, |_| {})).unwrap();
+    let out = t.0.join("pruned.vi");
+    // q and k switch to the alternate's copy of w.qk; final_norm and the MTP component go.
+    let s = ComposeSpec {
+        pick: &|n| n == "text/q" || n == "text/k",
+        replace: &|_| true,
+        drop: &|n| n == "text/final_norm",
+        drop_components: &["mtp"],
+        suffix: "alt",
+    };
+    let r = compose_alternates(&base, &alt, &s, &out, DEFAULT_PART_LIMIT).unwrap();
+    assert_eq!((r.bindings, r.dropped, r.kept_base), (2, 1, 1)); // the tokenizer resource stays
+    let c = Artifact::open(&out).unwrap();
+    assert!(c.object("w.qk").is_none() && c.object("w.norm").is_none());
+    assert!(c.components().get("mtp").is_none());
+    assert_eq!(
+        c.read_object("r.tok").unwrap(),
+        base.read_object("r.tok").unwrap()
+    );
+    assert_eq!(
+        c.read_object("alt/w.qk").unwrap(),
+        alt.read_object("w.qk").unwrap()
+    );
+    assert!(c.payload_bytes() < base.payload_bytes());
+}

@@ -1443,15 +1443,18 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
     const int r0 = (wid / KW) * R;
     if (r0 >= rows) return;  // whole row groups only, so KW > 1 blocks return together
     const long long k = w.k;
-    // Groupwise Q4 (group 64) / Q8 (group 32), row_split_k128_v1: a row's base plane is gpr
-    // groups of 32 bytes over K padded to 128; one 16-byte chunk is half a group either way.
-    constexpr bool kRowSplit = FMT == VELOX_FMT_Q4 || FMT == VELOX_FMT_Q8;
+    // Groupwise Q4 / Q5 (group 64) / Q8 (group 32), row_split_k128_v1: a row's base plane is gpr
+    // groups of 32 bytes over K padded to 128; one 16-byte chunk is half a group either way. Q5's
+    // fifth bits follow in a high plane of 8 bytes per group, its FP16 scales after that.
+    constexpr bool kRowSplit = FMT == VELOX_FMT_Q4 || FMT == VELOX_FMT_Q5 || FMT == VELOX_FMT_Q8;
     const long long gpr = (k + 127) / 128 * 128 / (FMT == VELOX_FMT_Q8 ? 32 : 64);
     const long long row_bytes = kRowSplit ? gpr * 32
                                 : FMT == VELOX_FMT_NVFP4 ? k / 2
                                 : FMT == VELOX_FMT_BF16  ? 2 * k
                                                          : k;
-    constexpr int kElems = FMT == VELOX_FMT_NVFP4 || FMT == VELOX_FMT_Q4 ? 32 : FMT == VELOX_FMT_BF16 ? 8 : 16;
+    constexpr int kElems = FMT == VELOX_FMT_NVFP4 || FMT == VELOX_FMT_Q4 || FMT == VELOX_FMT_Q5 ? 32
+                           : FMT == VELOX_FMT_BF16                                            ? 8
+                                                                                              : 16;
     // Only real columns are visited (the launcher requires k % kElems == 0 for row-split).
     const long long chunks = kRowSplit ? k / kElems : row_bytes / 16;
     const uint8_t* rp[R];
@@ -1470,11 +1473,17 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
     const uint8_t* sbase[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) sbase[r] = w.base + scale_plane + nvfp4_scale_offset(row_begin + r0 + (live[r] ? r : 0), 0, k);
-    // Row-split FP16 group scales follow the base plane (no high plane for Q4/Q8).
+    // Row-split FP16 group scales follow the base plane, and Q5's high plane before them.
+    const long long high_plane = align256(w.n * gpr * 32);
+    const long long gscale_plane = high_plane + (FMT == VELOX_FMT_Q5 ? align256(w.n * gpr * 8) : 0);
     const uint16_t* gscale[R];
+    const uint32_t* high[R];
 #pragma unroll
-    for (int r = 0; r < R; ++r)
-        gscale[r] = reinterpret_cast<const uint16_t*>(w.base + align256(w.n * gpr * 32)) + (row_begin + r0 + (live[r] ? r : 0)) * gpr;
+    for (int r = 0; r < R; ++r) {
+        const long long row = row_begin + r0 + (live[r] ? r : 0);
+        gscale[r] = reinterpret_cast<const uint16_t*>(w.base + gscale_plane) + row * gpr;
+        high[r] = reinterpret_cast<const uint32_t*>(w.base + high_plane) + row * gpr * 2;  // a u32 per chunk
+    }
 
     for (long long c = kw * VELOX_WARP + lane; c < chunks; c += VELOX_WARP * KW) {
         uint4 wv[R];
@@ -1494,6 +1503,11 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
         if (kRowSplit) {
 #pragma unroll
             for (int r = 0; r < R; ++r) sc[r][0] = __half2float(__ushort_as_half(gscale[r][c >> 1]));
+        }
+        uint32_t hw[R];
+        if (FMT == VELOX_FMT_Q5) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) hw[r] = __ldg(high[r] + c);
         }
 #pragma unroll
         for (int i = 0; i < M; ++i) {
@@ -1525,6 +1539,17 @@ linear_gemv_vec_kernel(const float* __restrict__ x, WDesc w, long long row_begin
                         const int lo = static_cast<int>(byte & 0xfu) - (byte & 0x8u ? 16 : 0);
                         const int hi = static_cast<int>(byte >> 4) - (byte & 0x80u ? 16 : 0);
                         s += static_cast<float>(lo) * xv[2 * b] + static_cast<float>(hi) * xv[2 * b + 1];
+                    }
+                    acc[r][i] += s * sc[r][0];
+                } else if (FMT == VELOX_FMT_Q5) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < 16; ++b) {
+                        const uint32_t byte = (words[b / 4] >> (8 * (b % 4))) & 0xffu;
+                        const uint32_t lo = (byte & 0xfu) | (((hw[r] >> (2 * b)) & 1u) << 4);
+                        const uint32_t hi = (byte >> 4) | (((hw[r] >> (2 * b + 1)) & 1u) << 4);
+                        s += static_cast<float>(static_cast<int>(lo) - (lo & 0x10u ? 32 : 0)) * xv[2 * b] +
+                             static_cast<float>(static_cast<int>(hi) - (hi & 0x10u ? 32 : 0)) * xv[2 * b + 1];
                     }
                     acc[r][i] += s * sc[r][0];
                 } else if (FMT == VELOX_FMT_Q8) {
@@ -1676,6 +1701,107 @@ int launch_gemv_ggml(const float* x, const WDesc& d, long long row_begin, int ro
     }
 }
 
+// Small-m linear for iq3_xxs_planar_v1 (decoded as iq3_xxs_at decodes it): a warp computes R
+// consecutive output rows, each lane taking whole 32-value sub-blocks (eight grid codes, four sign
+// words and a 4-bit scale per row), so each weight is read once and each activation load serves
+// R rows. Values are decoded eight at a time to bound registers. Lanes index the grid divergently,
+// which serializes __constant__ reads, so a block copies it to shared memory first. Needs 256
+// threads and a 16-byte aligned base (the sign words are read as u64).
+template <int R, int M>
+__global__ void __launch_bounds__(256)
+linear_gemv_iq3_xxs_kernel(const float* __restrict__ x, WDesc w, long long row_begin, int rows, int m,
+                           float* __restrict__ y) {
+    __shared__ uint32_t grid[256];
+    grid[threadIdx.x] = kIq3XxsGrid[threadIdx.x];
+    __syncthreads();
+    const int r0 = (blockIdx.x * (blockDim.x / VELOX_WARP) + threadIdx.x / VELOX_WARP) * R;
+    const int lane = threadIdx.x % VELOX_WARP;
+    if (r0 >= rows) return;
+    const long long k = w.k, blocks = k / 256, subs = k / 32;
+    const uint8_t* codes[R];
+    const uint8_t* scales[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const long long row = row_begin + min(r0 + r, rows - 1);  // tail rows repeat the last one
+        codes[r] = w.base + row * blocks * 96;
+        scales[r] = w.base + align256(w.n * blocks * 96) + 2 * row * blocks;
+    }
+    float acc[R][M];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int i = 0; i < M; ++i) acc[r][i] = 0.0f;
+    for (long long u = lane; u < subs; u += VELOX_WARP) {
+        const long long b = u / 8;
+        const int s = static_cast<int>(u % 8);
+        float dl[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint64_t* signs = reinterpret_cast<const uint64_t*>(codes[r] + b * 96 + 64);
+            const float d = __half2float(__ushort_as_half(__ldg(reinterpret_cast<const unsigned short*>(scales[r] + 2 * b))));
+            const uint32_t ls = static_cast<uint32_t>(__ldg(signs + s / 2) >> (56 + 4 * (s & 1))) & 15u;
+            dl[r] = d * (0.25f + 0.5f * static_cast<float>(ls));
+        }
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            float wv[R][8];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint8_t* blk = codes[r] + b * 96;
+                const uint32_t pair = __ldg(reinterpret_cast<const unsigned short*>(blk + 16 * p + 2 * s));
+                const uint32_t sign7 =
+                    static_cast<uint32_t>(__ldg(reinterpret_cast<const uint64_t*>(blk + 64) + p) >> (7 * s)) & 127u;
+                const uint32_t sign8 = sign7 | ((__popc(sign7) & 1u) << 7);
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const uint32_t g = grid[(pair >> (8 * q)) & 0xff];
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        const float v = static_cast<float>((g >> (8 * t)) & 0xff) * dl[r];
+                        wv[r][4 * q + t] = (sign8 >> (4 * q + t)) & 1u ? -v : v;
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < M; ++i) {
+                if (i >= m) break;
+                const float4* xp = reinterpret_cast<const float4*>(x + static_cast<size_t>(i) * k + u * 32 + 8 * p);
+                const float4 a = __ldg(xp), c = __ldg(xp + 1);
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+                    acc[r][i] += wv[r][0] * a.x + wv[r][1] * a.y + wv[r][2] * a.z + wv[r][3] * a.w +
+                                 wv[r][4] * c.x + wv[r][5] * c.y + wv[r][6] * c.z + wv[r][7] * c.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int i = 0; i < M; ++i) {
+            const float s = velox_warp_sum(acc[r][i]);
+            if (lane == 0 && i < m && r0 + r < rows) y[static_cast<size_t>(i) * rows + r0 + r] = s;
+        }
+}
+
+template <int R>
+int launch_gemv_iq3_xxs_r(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
+    constexpr int kWarps = 8;
+    const dim3 grid((rows + kWarps * R - 1) / (kWarps * R));
+    if (m == 1) linear_gemv_iq3_xxs_kernel<R, 1><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else if (m == 2) linear_gemv_iq3_xxs_kernel<R, 2><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else if (m <= 4) linear_gemv_iq3_xxs_kernel<R, 4><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    else linear_gemv_iq3_xxs_kernel<R, 8><<<grid, kWarps * VELOX_WARP>>>(x, d, row_begin, rows, m, y);
+    return velox_launch_status();
+}
+
+// More rows per warp reuse each activation load across rows, while enough warps remain to fill
+// the GPU; a single token has nothing to reuse.
+int launch_gemv_iq3_xxs(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
+    if (rows >= 4096) return launch_gemv_iq3_xxs_r<4>(x, d, row_begin, rows, m, y);
+    if (rows >= 2048) return launch_gemv_iq3_xxs_r<2>(x, d, row_begin, rows, m, y);
+    return launch_gemv_iq3_xxs_r<1>(x, d, row_begin, rows, m, y);
+}
+
 template <int FMT>
 int launch_gemv_vec_m(const float* x, const WDesc& d, long long row_begin, int rows, int m, float* y) {
     if (m == 1) return launch_gemv_vec<FMT, 1>(x, d, row_begin, rows, m, y);
@@ -1774,9 +1900,13 @@ VELOX_API int velox_portable_linear(const float* x, const uint8_t* w, int format
             return launch_gemv_vec_m<VELOX_FMT_FP8_ROW_BF16>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_BF16) return launch_gemv_vec_m<VELOX_FMT_BF16>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_Q4 && k % 32 == 0) return launch_gemv_vec_m<VELOX_FMT_Q4>(x, d, row_begin, rows, m, y);
+        if (format == VELOX_FMT_Q5 && k % 32 == 0 && reinterpret_cast<uintptr_t>(w) % 4 == 0)
+            return launch_gemv_vec_m<VELOX_FMT_Q5>(x, d, row_begin, rows, m, y);
         if (format == VELOX_FMT_Q8) return launch_gemv_vec_m<VELOX_FMT_Q8>(x, d, row_begin, rows, m, y);
         if (format >= VELOX_FMT_GGML_BASE && format < VELOX_FMT_GGML_END)
             return launch_gemv_ggml(x, d, row_begin, rows, m, y);
+        if (format == VELOX_FMT_IQ3_XXS && reinterpret_cast<uintptr_t>(w) % 16 == 0)
+            return launch_gemv_iq3_xxs(x, d, row_begin, rows, m, y);
     }
     if (m <= kGemvMaxM && (format == VELOX_FMT_FP8_ROW_BF16 || format == VELOX_FMT_NVFP4)) {
         constexpr int kWarps = 8;
