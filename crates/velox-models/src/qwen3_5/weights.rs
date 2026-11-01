@@ -84,6 +84,10 @@ pub struct DenseFfn {
     pub down: WDesc,
     /// gate and up as one view when adjacent in one parent.
     pub gate_up: Option<WDesc>,
+    /// The same FFN in another encoding for prefill widths (`<name>@prefill` bindings, written by
+    /// `velox compose`): e.g. NVFP4 for FP4 tensor-core prefill next to IQ3_XXS for
+    /// bandwidth-bound decode. Used above `FUSE_MAX_TOKENS` tokens.
+    pub prefill: Option<Box<DenseFfn>>,
 }
 
 /// A sparse MoE FFN (`Qwen3_5MoeForCausalLM`):
@@ -809,11 +813,24 @@ fn load_swiglu<B: Backend>(
     expect(&p("gate"), gate.rows, intermediate)?;
     expect(&p("up"), up.rows, intermediate)?;
     expect(&p("down"), down.rows, cfg.hidden)?;
+    let prefill = if has_binding(l.art, &p("gate@prefill")) {
+        let alt = load_swiglu(l, cfg, &|s| p(&format!("{s}@prefill")), intermediate)?;
+        if (alt.gate.k, alt.down.k) != (gate.k, down.k) {
+            return Err(Error::Config(format!(
+                "{}: @prefill encoding has another shape",
+                p("gate")
+            )));
+        }
+        Some(Box::new(alt))
+    } else {
+        None
+    };
     Ok(DenseFfn {
         gate_up: fuse(&[&gate, &up]),
         gate,
         up,
         down,
+        prefill,
     })
 }
 

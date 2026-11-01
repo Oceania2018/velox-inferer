@@ -67,6 +67,9 @@ COMMANDS:
   inspect                 Validate and summarise a weight file (.vi or .ninfer)
       --artifact <path> [--component <id>] (prints its config) [--bindings <prefix>] [--uses true]
   convert                 Convert between .ninfer v3 and .vi v1 (lossless)
+  compose                 A weight file plus another's bindings as `<name>@<suffix>` alternate
+                          encodings -> .vi (Qwen3.5 `@prefill` MLP: used above 16 tokens)
+      --base <path> --alt <path> --match <glob,...> --output <.vi> [--suffix prefill]
   import-gguf             Qwen3.5/3.8 GGUF text weights + a donor artifact's config, tokenizer,
                           vision tower and DFlash2 drafter -> .vi (GGML blocks kept as stored)
       --gguf <path> --donor <.ninfer|.vi> --output <.vi>
@@ -154,6 +157,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
+        Some("compose") => weights::compose(a),
         Some("import-gguf") => weights::import_gguf(a),
         Some("import-hf") => weights::import_hf(a),
         Some("generate") => generate::run(a),

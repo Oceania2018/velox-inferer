@@ -163,3 +163,78 @@ fn converts_to_multi_part_vi_and_back() {
         "must not overwrite"
     );
 }
+
+#[test]
+fn composes_alternate_encodings() {
+    let t = TempDir::new("compose");
+    let base = Artifact::open(write_ninfer(&t.0, |_| {})).unwrap();
+    let alt_dir = t.0.join("alt");
+    std::fs::create_dir_all(&alt_dir).unwrap();
+    // The alternate: the same bindings, with q's use carrying an auxiliary object.
+    let alt = Artifact::open(write_ninfer(&alt_dir, |d| {
+        d["objects"].as_array_mut().unwrap().insert(
+            1,
+            json!({"id": "aux.div", "kind": "tensor", "shape": [1], "format": "fp32", "layout": "contiguous_le_v1", "offset": 256, "bytes": 4}),
+        );
+        d["uses"][0]["auxiliaries"] = json!({"activation_input_divisor": {"object": "aux.div"}});
+    }))
+    .unwrap();
+    let out = t.0.join("hybrid.vi");
+    let r = compose_alternates(
+        &base,
+        &alt,
+        &|n| n == "text/q" || n == "text/k",
+        "prefill",
+        &out,
+        DEFAULT_PART_LIMIT,
+    )
+    .unwrap();
+    assert_eq!((r.bindings, r.objects), (2, 2));
+    let c = Artifact::open(&out).unwrap();
+    assert_eq!(c.container, Container::VeloxV1);
+    // The base's payload and bindings are unchanged.
+    let mut a = vec![0u8; 256];
+    let mut b = vec![0u8; 256];
+    base.read_range(0, &mut a).unwrap();
+    c.read_range(0, &mut b).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(
+        c.directory["bindings"]["text/q"],
+        base.directory["bindings"]["text/q"]
+    );
+    // The alternates name renamed copies holding the alternate's bytes.
+    assert_eq!(
+        c.directory["bindings"]["text/k@prefill"]["parts"][0]["object"],
+        "prefill/w.qk"
+    );
+    assert_eq!(
+        c.read_object("prefill/w.qk").unwrap(),
+        alt.read_object("w.qk").unwrap()
+    );
+    assert_eq!(
+        c.read_object("prefill/aux.div").unwrap(),
+        alt.read_object("aux.div").unwrap()
+    );
+    let uses = c.directory["uses"].as_array().unwrap();
+    let u = uses
+        .iter()
+        .find(|u| u["parameter"] == "text/q@prefill")
+        .unwrap();
+    assert_eq!(
+        u["auxiliaries"]["activation_input_divisor"]["object"],
+        "prefill/aux.div"
+    );
+    // Composing twice into the same file, or with a separator in the suffix, is refused.
+    assert!(
+        compose_alternates(&base, &alt, &|_| true, "prefill", &out, DEFAULT_PART_LIMIT).is_err()
+    );
+    assert!(compose_alternates(
+        &base,
+        &alt,
+        &|_| true,
+        "a/b",
+        &t.0.join("x.vi"),
+        DEFAULT_PART_LIMIT
+    )
+    .is_err());
+}

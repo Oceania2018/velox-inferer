@@ -738,6 +738,199 @@ pub fn write_container(
     result
 }
 
+/// Summary of [`compose_alternates`].
+pub struct ComposeReport {
+    /// Bindings added as `<name>@<suffix>`.
+    pub bindings: usize,
+    /// Objects copied from the alternate artifact (matrices and use auxiliaries).
+    pub objects: usize,
+    /// Bytes those objects add to the payload.
+    pub bytes: u64,
+    pub payload_bytes: u64,
+}
+
+/// Object ids a binding (or a use auxiliary) references: its `object` or its parts' objects.
+fn referenced_objects(v: &Value) -> Vec<String> {
+    match v.get("object").and_then(Value::as_str) {
+        Some(id) => vec![id.to_string()],
+        None => v
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.get("object").and_then(Value::as_str).map(str::to_string))
+            .collect(),
+    }
+}
+
+/// `v` with every `object` id it (or its parts) names mapped through `rename`.
+fn renamed_objects(v: &Value, rename: &dyn Fn(&str) -> String) -> Value {
+    let mut v = v.clone();
+    if let Some(id) = v.get("object").and_then(Value::as_str).map(str::to_string) {
+        v["object"] = rename(&id).into();
+    }
+    for p in v
+        .get_mut("parts")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(id) = p.get("object").and_then(Value::as_str).map(str::to_string) {
+            p["object"] = rename(&id).into();
+        }
+    }
+    v
+}
+
+/// Writes `out` as a `.vi`: `base` unchanged, plus every binding of `alt` that `pick` selects as
+/// `<name>@<suffix>`, an alternate encoding of the same parameter. The objects those bindings
+/// reference and the auxiliaries of their uses (an A4 input divisor, say) are copied from `alt`
+/// after `base`'s payload under ids `<suffix>/<id>`; the uses are copied with the parameter
+/// renamed. Models decide what an alternate is for (Qwen3.5's `@prefill` MLP: the encoding used
+/// above the decode widths). An existing `out` is never overwritten.
+pub fn compose_alternates(
+    base: &Artifact,
+    alt: &Artifact,
+    pick: &dyn Fn(&str) -> bool,
+    suffix: &str,
+    out: &Path,
+    part_limit: u64,
+) -> Result<ComposeReport> {
+    if suffix.is_empty() || suffix.contains(['/', '@']) {
+        return bad(format!(
+            "suffix '{suffix}' must be non-empty without '/' or '@'"
+        ));
+    }
+    let empty = Map::new();
+    let alt_bindings = alt.directory["bindings"].as_object().unwrap_or(&empty);
+    let picked: Vec<(&String, &Value)> = alt_bindings.iter().filter(|(n, _)| pick(n)).collect();
+    if picked.is_empty() {
+        return bad("no binding of the alternate artifact matches");
+    }
+    let mut dir = base.directory.clone();
+    let rename = |id: &str| format!("{suffix}/{id}");
+    let mut wanted: Vec<String> = Vec::new();
+    {
+        let bindings = dir
+            .get_mut("bindings")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::Format("bindings must be an object".into()))?;
+        for (name, v) in &picked {
+            let new = format!("{name}@{suffix}");
+            if bindings.contains_key(&new) {
+                return bad(format!("base already has binding '{new}'"));
+            }
+            wanted.extend(referenced_objects(v));
+            bindings.insert(new, renamed_objects(v, &rename));
+        }
+    }
+    let mut uses: Vec<Value> = Vec::new();
+    for u in alt.directory["uses"].as_array().into_iter().flatten() {
+        let Some(param) = u["parameter"].as_str() else {
+            continue;
+        };
+        if !picked.iter().any(|(n, _)| n.as_str() == param) {
+            continue;
+        }
+        let mut u = u.clone();
+        u["parameter"] = format!("{param}@{suffix}").into();
+        if let Some(aux) = u.get_mut("auxiliaries").and_then(Value::as_object_mut) {
+            for v in aux.values_mut() {
+                wanted.extend(referenced_objects(v));
+                *v = renamed_objects(v, &rename);
+            }
+        }
+        uses.push(u);
+    }
+    dir.get_mut("uses")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| Error::Format("uses must be an array".into()))?
+        .extend(uses);
+
+    // Copied objects in `alt`'s payload order, each 256-aligned after `base`'s payload.
+    wanted.sort();
+    wanted.dedup();
+    let mut copies: Vec<&Object> = wanted
+        .iter()
+        .map(|id| {
+            alt.object(id).ok_or_else(|| {
+                Error::Format(format!("alternate binding names missing object {id}"))
+            })
+        })
+        .collect::<Result<_>>()?;
+    copies.sort_by_key(|o| o.offset);
+    let alt_entries: HashMap<&str, &Value> = alt.directory["objects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| Some((o.get("id")?.as_str()?, o)))
+        .collect();
+    let mut segments: Vec<(u64, u64, u64)> = Vec::with_capacity(copies.len()); // (offset, bytes, alt offset)
+    let mut cursor = base.payload_bytes();
+    let objects = dir
+        .get_mut("objects")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| Error::Format("objects must be an array".into()))?;
+    for o in &copies {
+        let id = rename(&o.id);
+        if base.object(&id).is_some() {
+            return bad(format!("base already has object {id}"));
+        }
+        let offset = align_up(cursor, 256);
+        let mut entry = (*alt_entries
+            .get(o.id.as_str())
+            .ok_or_else(|| Error::Format(format!("object {} has no directory entry", o.id)))?)
+        .clone();
+        entry["id"] = id.into();
+        entry["offset"] = offset.into();
+        objects.push(entry);
+        segments.push((offset, o.bytes, o.offset));
+        cursor = offset + o.bytes;
+    }
+    let mut v = Map::new();
+    v.insert("format_version".into(), 1.into());
+    v.insert("source_container".into(), base.container.to_string().into());
+    v.insert("source_artifact_id".into(), hex(&base.artifact_id).into());
+    v.insert("alternates_from".into(), hex(&alt.artifact_id).into());
+    v.insert("alternates_suffix".into(), suffix.into());
+    dir.insert("velox".into(), Value::Object(v));
+
+    let base_bytes = base.payload_bytes();
+    let added: u64 = copies.iter().map(|o| o.bytes).sum();
+    write_container(
+        out,
+        dir,
+        Container::VeloxV1,
+        part_limit,
+        new_artifact_id(),
+        cursor,
+        &mut |at, buf| {
+            // [at, at + len): base payload, then copied objects with zero padding between them.
+            let end = at + buf.len() as u64;
+            if at < base_bytes {
+                let n = (base_bytes.min(end) - at) as usize;
+                base.read_range(at, &mut buf[..n])?;
+            }
+            let tail = base_bytes.saturating_sub(at).min(buf.len() as u64) as usize;
+            buf[tail..].fill(0);
+            for &(off, bytes, src) in &segments {
+                let (a, e) = (off.max(at), (off + bytes).min(end));
+                if a < e {
+                    let dst = &mut buf[(a - at) as usize..(e - at) as usize];
+                    alt.read_range(src + (a - off), dst)?;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(ComposeReport {
+        bindings: picked.len(),
+        objects: copies.len(),
+        bytes: added,
+        payload_bytes: cursor,
+    })
+}
+
 /// A new artifact id from time and process entropy (not cryptographic; it only pairs files).
 pub fn new_artifact_id() -> [u8; 16] {
     use std::hash::{BuildHasher, Hasher};
