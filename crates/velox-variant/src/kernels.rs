@@ -658,7 +658,13 @@ fn skinny_iq3(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
 /// halve against the bf16 kernel (verify at 16k keys: 28.3 -> 26.6 ms per round, 2 x 8 rows 37.6 ->
 /// 34.4 ms). Single tokens stay on the bf16 GEMV.
 const IQ3_Q8_MIN_M: usize = 2;
-const RS_Q8_MIN_M: usize = 64;
+/// q4/q5 hand over from one sliced-K pass (up to 16 tokens) straight to int8: past 16 the sliced-K
+/// kernel re-reads the weights per 16-token block while int8 stays flat. RTX PRO 6000 with 12 lanes
+/// verifies 17..63 tokens whenever 3..7 sequences decode (the 5090's 6 lanes stay at or below 48).
+/// bench-linear --act a8, sliced-K vs int8 (us): q4 [12288,5120] m=24 68.9 vs 43.5, m=48 111.1 vs
+/// 44.1; q5 [12288,5120] m=24 79.4 vs 61.4, m=48 126.6 vs 62.8; q4 [4096,5120] m=24 36.9 vs 31.1.
+/// At m=16 sliced-K still wins (q4 [12288,5120] 38.3 vs 43.4).
+const RS_Q8_MIN_M: usize = SKINNY16_MAX_M + 1;
 
 /// Format code of the int8 prefill kernel serving `w` at `m` tokens (3: IQ3_XXS, 4/5: q4/q5), when
 /// its activation policy permits 8-bit activations. `VELOX_NO_Q8` turns the path off.
