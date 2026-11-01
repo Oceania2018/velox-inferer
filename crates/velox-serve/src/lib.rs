@@ -112,6 +112,9 @@ pub trait ChatEngine: Send + Sync {
     /// Housekeeping after a response has been delivered, while no request may be waiting (e.g.
     /// preparing memory the next one would otherwise allocate). Returns promptly once one is.
     fn idle(&self) {}
+    /// Engine gauges appended to `GET /metrics` as Prometheus text: device memory and the
+    /// context cache tiers. Nothing by default.
+    fn gauges(&self, _out: &mut String) {}
     /// Whether [`Self::score`] is implemented. Without it `POST /v1/systemone` answers 404,
     /// which llm-inference-daemon's probe reads as "unsupported".
     fn scores(&self) -> bool {
@@ -455,6 +458,8 @@ impl Server {
             "velox_request_duration_seconds",
             "Request receipt through generation settlement, including client cancellation",
         );
+        drop(l);
+        self.engine.gauges(&mut out);
         out
     }
 

@@ -361,24 +361,33 @@ impl<B: Backend> Suite<'_, B> {
 
     /// `linears` against the oracle: one input, destinations of `ld = parts' rows + 2` columns
     /// (the last two must stay zero), each part a view `(format, parent rows, begin, rows)` of
-    /// its own random parent under `policy`, rounded as `linear_act` reports for it.
+    /// its own random parent under `policy`, rounded as `linear_act` reports for it. With
+    /// `shared`, parts of the same format and parent rows are views of one parent (a fused
+    /// projection's parts, as artifacts store them).
     fn linears(
         &mut self,
         dsts: &[&[(WeightFormat, usize, usize, usize)]],
         k: usize,
         m: usize,
         policy: ActPolicy,
+        shared: bool,
     ) -> Result<()> {
         let x = self.rng.vec(m * k, 1.0);
         let xd = self.b.upload(&x)?;
-        let mut parents = Vec::new();
+        let (mut parents, mut keys, mut of_part) = (Vec::new(), Vec::new(), Vec::new());
         for d in dsts {
             for &(fmt, n, _, _) in *d {
+                if let Some(i) = keys.iter().position(|&key| shared && key == (fmt, n)) {
+                    of_part.push(i);
+                    continue;
+                }
                 let bytes = random_weight(&mut self.rng, fmt, n, k);
                 parents.push((
                     self.b.upload_bytes(&bytes)?,
                     CpuBackend.upload_bytes(&bytes)?,
                 ));
+                keys.push((fmt, n));
+                of_part.push(parents.len() - 1);
             }
         }
         let lds: Vec<usize> = dsts
@@ -401,7 +410,7 @@ impl<B: Backend> Suite<'_, B> {
         for (d, &ld) in dsts.iter().zip(&lds) {
             let (mut col, mut dp, mut want) = (0, Vec::new(), vec![0.0; m * ld]);
             for &(fmt, n, begin, rows) in *d {
-                let view = WeightView::full(&parents[pi].0, fmt, n, k)
+                let view = WeightView::full(&parents[of_part[pi]].0, fmt, n, k)
                     .rows(begin, rows)
                     .with_act(policy);
                 let act = self.b.linear_act(&view, m);
@@ -411,7 +420,7 @@ impl<B: Backend> Suite<'_, B> {
                 let mut part = vec![0.0; m * rows];
                 CpuBackend.linear(
                     &xq,
-                    &WeightView::full(&parents[pi].1, fmt, n, k).rows(begin, rows),
+                    &WeightView::full(&parents[of_part[pi]].1, fmt, n, k).rows(begin, rows),
                     &mut part,
                     m,
                 )?;
@@ -440,7 +449,11 @@ impl<B: Backend> Suite<'_, B> {
             got.extend(fetch(self.b, y, m * ld)?);
             want.extend_from_slice(w);
         }
-        let name = format!("linears [{}] k={k} m={m}", tags.join(" "));
+        let name = format!(
+            "linears{} [{}] k={k} m={m}",
+            if shared { " shared" } else { "" },
+            tags.join(" ")
+        );
         if permitted_all {
             self.record(name, Some(Op::Linear), &got, &want, 2e-4);
         } else {
@@ -2647,6 +2660,97 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `add_bias_gelu` and `add_bias_add_layer_norm` against their unfused CPU parts (the trait
+    /// defaults).
+    fn vision_fused(&mut self, rows: usize, dim: usize) -> Result<()> {
+        let len = rows * dim;
+        let (x, o, bias, w, nb) = (
+            self.rng.vec(len, 3.0),
+            self.rng.vec(len, 2.0),
+            self.rng.vec(dim, 0.5),
+            self.rng.vec(dim, 1.0),
+            self.rng.vec(dim, 0.5),
+        );
+        let (bd, wd, nbd) = (
+            self.b.upload(&bias)?,
+            self.b.upload(&w)?,
+            self.b.upload(&nb)?,
+        );
+        for kind in [GeluKind::Tanh, GeluKind::Erf] {
+            let mut want = o.clone();
+            CpuBackend.add_bias_gelu(&mut want, &bias, rows, dim, kind)?;
+            let mut d = self.b.upload(&o)?;
+            self.b.add_bias_gelu(&mut d, &bd, rows, dim, kind)?;
+            let got = fetch(self.b, &d, len)?;
+            self.record(
+                format!("add_bias_gelu {kind:?} rows={rows} dim={dim}"),
+                Some(Op::Gelu),
+                &got,
+                &want,
+                1e-5,
+            );
+        }
+        let (mut acc, mut xb, mut want) = (x.clone(), o.clone(), vec![0.0; len]);
+        CpuBackend.add_bias_add_layer_norm(
+            &mut acc, &mut xb, &bias, &w, &nb, &mut want, rows, dim, 1e-6,
+        )?;
+        let (mut accd, mut od, mut yd) =
+            (self.b.upload(&x)?, self.b.upload(&o)?, self.b.alloc(len)?);
+        self.b.add_bias_add_layer_norm(
+            &mut accd, &mut od, &bd, &wd, &nbd, &mut yd, rows, dim, 1e-6,
+        )?;
+        let got = fetch(self.b, &yd, len)?;
+        self.record(
+            format!("add_bias_add_layer_norm rows={rows} dim={dim}"),
+            Some(Op::LayerNorm),
+            &got,
+            &want,
+            1e-5,
+        );
+        let got = fetch(self.b, &accd, len)?;
+        self.record(
+            format!("add_bias_add_layer_norm residual rows={rows} dim={dim}"),
+            Some(Op::LayerNorm),
+            &got,
+            &acc,
+            1e-6,
+        );
+        Ok(())
+    }
+
+    /// `add_bias_rope` with the backend's rotary table, applied twice from one table (a vision
+    /// encode reuses it across layers), against the CPU's bias then `rope_positions`.
+    fn add_bias_rope(&mut self, s: RopePosShape, with_bias: bool) -> Result<()> {
+        let len = s.tokens * s.heads * s.head_dim;
+        let positions: Vec<u32> = (0..s.axes * s.tokens)
+            .map(|_| (self.rng.next_u64() % 5000) as u32)
+            .collect();
+        let bias = self.rng.vec(s.heads * s.head_dim, 0.5);
+        let bd = self.b.upload(&bias)?;
+        let table = self.b.rope_table(&positions, s)?;
+        let cpu_table = CpuBackend.rope_table(&positions, s)?;
+        for round in 0..2 {
+            let mut want = self.rng.vec(len, 1.0);
+            let mut xd = self.b.upload(&want)?;
+            CpuBackend.add_bias_rope(
+                &mut want,
+                with_bias.then_some(&bias),
+                &positions,
+                &cpu_table,
+                s,
+            )?;
+            self.b
+                .add_bias_rope(&mut xd, with_bias.then_some(&bd), &positions, &table, s)?;
+            let got = fetch(self.b, &xd, len)?;
+            let name = format!(
+                "add_bias_rope {:?} axes={} t={} d={} r={} bias={with_bias} round={round}",
+                s.layout, s.axes, s.tokens, s.head_dim, s.rotary_dim
+            );
+            self.record(name, Some(Op::RopePositions), &got, &want, 1e-5);
+        }
+        Ok(())
+    }
+
     /// Prefill then two decode steps through a two-layer stack, compared step by step.
     fn stack(&mut self, spec: &ModelSpec) -> Result<()> {
         let layers: Vec<HostLayer> = (0..spec.layers)
@@ -3414,15 +3518,26 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             &[(Bf16, 48, 0, 48), (Bf16, 40, 8, 24)],
         ];
         for m in [1, 8, 70, 130] {
-            s.linears(gdn, 512, m, ActPolicy::AllowA8)?;
+            s.linears(gdn, 512, m, ActPolicy::AllowA8, false)?;
         }
-        s.linears(gdn, 512, 70, ActPolicy::A16Only)?;
+        s.linears(gdn, 512, 70, ActPolicy::A16Only, false)?;
+        // The model's layout: each projection its own destination, views of shared parents
+        // (Qwen3.8 GDN q|k and v|z, attention q|k and gate|v), a ragged last tile.
+        let fused: &[&[(WeightFormat, usize, usize, usize)]] = &[
+            &[(Q4G64, 256, 0, 128)],
+            &[(Q5G64, 232, 0, 96)],
+            &[(Q4G64, 256, 128, 128)],
+            &[(Q5G64, 232, 96, 136)],
+        ];
+        for m in [1, 2, 8, 16] {
+            s.linears(fused, 512, m, ActPolicy::AllowA8, true)?;
+        }
         let attn: &[&[(WeightFormat, usize, usize, usize)]] = &[
             &[(Iq3Xxs, 128, 0, 128)],
             &[(Q5G64, 128, 0, 128)],
             &[(Q4G64, 64, 0, 64)],
         ];
-        s.linears(attn, 768, 100, ActPolicy::AllowA8)?;
+        s.linears(attn, 768, 100, ActPolicy::AllowA8, false)?;
     }
     // Prefill widths on a grid of a few tiles with a long K (kernel sets may split K there).
     s.linear_act(WeightFormat::Fp8RowBf16, 256, 4096, 0, 256, 100, a8)?;
@@ -3678,6 +3793,34 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             s.linear_act(f, 4616, 1024, 8, 4600, 250, ActPolicy::AllowA8)?;
         }
     }
+    // The vision tower's fused elementwise ops (hidden 1152, MLP 4304; 2D RoPE over all 72 dims)
+    // against their unfused parts, and a text-like rotary slice with unrotated dims and no bias.
+    s.vision_fused(5, 1152)?;
+    s.vision_fused(3, 4304)?;
+    s.add_bias_rope(
+        RopePosShape {
+            tokens: 9,
+            heads: 3,
+            head_dim: 72,
+            rotary_dim: 72,
+            theta: 10_000.0,
+            axes: 2,
+            layout: RopeLayout::Blocked,
+        },
+        true,
+    )?;
+    s.add_bias_rope(
+        RopePosShape {
+            tokens: 5,
+            heads: 3,
+            head_dim: 256,
+            rotary_dim: 64,
+            theta: 10_000_000.0,
+            axes: 3,
+            layout: RopeLayout::Interleaved,
+        },
+        false,
+    )?;
     // Its own seed: the synthetic model must not change when cases are added before it.
     let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);
