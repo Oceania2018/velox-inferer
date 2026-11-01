@@ -63,6 +63,15 @@ pub struct Session<B: Backend> {
 /// chunks keep them separate, where per-matrix GEMM tiles are faster than the split copy saves.
 const FUSE_MAX_TOKENS: usize = 16;
 
+/// The encoding of a dense FFN that serves `t` tokens: its `@prefill` alternate above
+/// `FUSE_MAX_TOKENS` when the artifact has one, else the FFN itself.
+fn ffn_at(d: &DenseFfn, t: usize) -> &DenseFfn {
+    match &d.prefill {
+        Some(p) if t > FUSE_MAX_TOKENS => p,
+        _ => d,
+    }
+}
+
 /// The views of a projection's runs, at their columns of the concatenated output.
 fn run_parts<'w, Buf>(
     view: &impl Fn(&WDesc) -> WeightView<'w, Buf>,
@@ -1149,7 +1158,7 @@ impl<B: Backend> Qwen35Text<B> {
                 Mixer::Attention { query, .. } => Some(query),
             };
             let gate = match &l.ffn {
-                Ffn::Dense(d) => Some(&d.gate),
+                Ffn::Dense(d) => Some(&ffn_at(d, t).gate),
                 Ffn::Moe(_) => None,
             };
             for d in first.into_iter().chain(gate) {
@@ -1701,7 +1710,7 @@ impl<B: Backend> Qwen35Text<B> {
                 }
             }
             let mlp_q8 = match &l.ffn {
-                Ffn::Dense(d) => b.int8_twin_layout(&w.view(&d.gate), t),
+                Ffn::Dense(d) => b.int8_twin_layout(&w.view(&ffn_at(d, t).gate), t),
                 Ffn::Moe(_) => None,
             };
             let h_twin = add_norm_h(b, ws, w.param(l.post_norm), t, hd, c.eps, twin, mlp_q8)?;
@@ -2101,6 +2110,7 @@ impl<B: Backend> Qwen35Text<B> {
         h_twin: HTwin,
     ) -> Result<()> {
         let w = &self.w;
+        let d = ffn_at(d, t);
         let width = d.gate.rows;
         let (gate, up) = (w.view(&d.gate), w.view(&d.up));
         let down = w.view(&d.down);

@@ -202,6 +202,84 @@ pub fn import_hf(a: &Args) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Whether `name` matches `pattern` as a whole, `*` standing for any run of characters.
+fn glob(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let parts: Vec<&str> = parts.collect();
+    for (i, p) in parts.iter().enumerate() {
+        if i + 1 == parts.len() {
+            return rest.ends_with(p);
+        }
+        match rest.find(p) {
+            Some(at) => rest = &rest[at + p.len()..],
+            None => return false,
+        }
+    }
+    rest.is_empty()
+}
+
+/// `compose`: `--base` plus `--alt`'s bindings whose names match one of the comma-separated
+/// `--match` globs, as `<name>@<suffix>` alternate encodings (see
+/// `velox_weights::compose_alternates`).
+pub fn compose(a: &Args) -> Result<ExitCode> {
+    let base = open(required(a, "base")?)?;
+    let alt = open(required(a, "alt")?)?;
+    let output = Path::new(required(a, "output")?);
+    let suffix = a.get("suffix").unwrap_or("prefill");
+    let patterns: Vec<&str> = required(a, "match")?
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Bindings among the matched ones that replace the base's instead of adding an alternate.
+    let replace: Vec<&str> = a
+        .get("replace")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Bindings (globs) and components of the base to leave out (e.g. `mtp/*` and `mtp`).
+    let list = |key: &str| -> Vec<String> {
+        a.get(key)
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (drop, drop_components) = (list("drop"), list("drop-components"));
+    let drop_components: Vec<&str> = drop_components.iter().map(String::as_str).collect();
+    let limit = a.parse("part-limit", velox_weights::DEFAULT_PART_LIMIT)?;
+    let t0 = std::time::Instant::now();
+    let spec = velox_weights::ComposeSpec {
+        pick: &|name| patterns.iter().any(|p| glob(p, name)),
+        replace: &|name| replace.iter().any(|p| glob(p, name)),
+        drop: &|name| drop.iter().any(|p| glob(p, name)),
+        drop_components: &drop_components,
+        suffix,
+    };
+    let r = velox_weights::compose_alternates(&base, &alt, &spec, output, limit)
+        .map_err(|e| Error::Backend(e.to_string()))?;
+    let out = open(&output.to_string_lossy())?;
+    println!(
+        "wrote {} ({:.2} GB): {} bindings taken, {} dropped, {} base objects kept, {} objects ({:.2} GB) from {} in {:.1}s; structure ok",
+        output.display(),
+        gb(r.payload_bytes),
+        r.bindings,
+        r.dropped,
+        r.kept_base,
+        r.objects,
+        gb(r.bytes),
+        alt.path.display(),
+        t0.elapsed().as_secs_f64()
+    );
+    debug_assert_eq!(out.payload_bytes(), r.payload_bytes);
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn convert(a: &Args) -> Result<ExitCode> {
     let src = open(required(a, "input")?)?;
     let output = Path::new(required(a, "output")?);
@@ -234,4 +312,20 @@ pub fn convert(a: &Args) -> Result<ExitCode> {
         t0.elapsed().as_secs_f64()
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glob;
+
+    #[test]
+    fn globs_match_whole_names() {
+        assert!(glob("text/layers/*/mlp/gate", "text/layers/12/mlp/gate"));
+        assert!(!glob("text/layers/*/mlp/gate", "dflash2/layers/0/mlp/gate"));
+        assert!(!glob(
+            "text/layers/*/mlp/gate",
+            "text/layers/1/mlp/gate@prefill"
+        ));
+        assert!(glob("a*b*c", "aXbYc") && !glob("a*b*c", "aXbYcd") && glob("abc", "abc"));
+    }
 }

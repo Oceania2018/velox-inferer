@@ -8,9 +8,12 @@
 //! - `plan_policy(&DeviceProfile) -> PlanPolicy`;
 //! - with the `cuda` feature, `cuda_kernels(&DeviceInfo) -> Result<Arc<dyn CudaKernels>>`.
 //!
-//! Native ops: MatMul (small-M GEMV tile, tiled SGEMM) and Linear (NVFP4 x NVFP4 and FP8 x FP8
-//! block-scaled MMA for prefill, where the artifact allows rounded activations). Every other op,
-//! and every shape a tuned kernel does not cover, runs the portable kernel.
+//! The kernel set combines rtx-5090-24g's (rtx-5060-ti lineage: IQ3_XXS, int8 prefill for
+//! IQ3_XXS / q4 / q5, A16 NVFP4, chunked Gated DeltaNet, MoE, NVFP4 verify attention; grids for 170
+//! SMs) with this branch's own kernels where they measure faster here (NVFP4 A4 prefill and fused
+//! SwiGLU, FP8, f32-cache flash attention, matmul, groupwise bf16 prefill); `kernels.rs`
+//! documents each choice. Every other op, and every shape a tuned kernel does not cover, runs the
+//! portable kernel.
 
 use velox_core::{DeviceProfile, GpuArch, PlanPolicy, VariantInfo};
 
@@ -20,7 +23,7 @@ mod kernels;
 pub static INFO: VariantInfo = VariantInfo {
     id: "rtx-pro-6000",
     branch: "rtx-pro-6000",
-    description: "RTX PRO 6000 96 GB: NVFP4/FP8 tensor-core prefill linear, tiled SGEMM matmul",
+    description: "RTX PRO 6000 96 GB: NVFP4/FP8/IQ3_XXS tensor-core linear, chunked GDN, skinny verify kernels",
     profiles: &["rtx-pro-6000"],
     archs: &[GpuArch::Cuda { major: 12, minor: 0 }],
 };
