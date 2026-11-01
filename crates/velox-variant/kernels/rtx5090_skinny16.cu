@@ -17,6 +17,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "rtx_device.cuh"
 #include "velox_common.cuh"
 
 namespace {
@@ -326,8 +327,6 @@ struct Scratch {
 Scratch g_x16;     // bf16 activations
 Scratch g_part16;  // split-K partials
 
-constexpr int kSms = 170;
-
 long long align256(long long x) { return (x + 255) / 256 * 256; }
 
 template <int F>
@@ -345,7 +344,7 @@ int launch(Args p, const float* x, int k) {
     const long long blocks = (p.rows + kBN - 1) / kBN;
     // Split K until the grid covers the GPU twice, keeping at least 2 stages per slice.
     int splits = 1;
-    while (blocks * splits < 2 * kSms && kt_total / (splits * 2) >= 2) splits *= 2;
+    while (blocks * splits < 2 * rtx_sm_count() && kt_total / (splits * 2) >= 2) splits *= 2;
     p.kt_per_split = (kt_total + splits - 1) / splits;
     float* y = p.y;
     if (splits > 1) {

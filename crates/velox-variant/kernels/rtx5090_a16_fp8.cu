@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+#include "rtx_device.cuh"
 #include "velox_common.cuh"
 
 namespace {
@@ -213,7 +214,6 @@ const __nv_bfloat16* to_bf16(const A16Args& a) {
 }
 
 // Row tiles below this many get their K split across blocks (about two per SM).
-constexpr int kMinBlocks = 340;
 
 template <int TOK, int RW, int KS, int ST>
 int launch_tile(const A16Args& a) {
@@ -228,7 +228,8 @@ int launch_tile(const A16Args& a) {
     const __nv_bfloat16* xb = to_bf16(a);
     if (xb == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
     const int blocks = (a.rows + G::R - 1) / G::R, total = a.k / G::BK;
-    int splits = (kMinBlocks + blocks - 1) / blocks;
+    const int min_blocks = 2 * rtx_sm_count();
+    int splits = (min_blocks + blocks - 1) / blocks;
     splits = splits < 1 ? 1 : splits > 8 ? 8 : splits;
     // Each split keeps at least two pipeline depths of stages.
     while (splits > 1 && total / splits < 2 * ST) --splits;

@@ -18,6 +18,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "rtx_device.cuh"
 #include "velox_common.cuh"
 
 namespace {
@@ -126,7 +127,7 @@ __global__ void quant_fp8_kernel(const float* __restrict__ x, int m, int k, uint
 // ---------------------------------------------------------------------------------------------
 // GEMM. Tile configurations: Cfg<WM, WN, MT, .., NT> has WM x WN warps, each covering MT x 16
 // tokens and NT x 8 weight rows, so a block is BM = WM * MT * 16 tokens by BN = WN * NT * 8 rows.
-//   Wide:  256 x 128, 256 threads, 64 x 64 per warp (prefill grids of at least kWideBlocks)
+//   Wide:  256 x 128, 256 threads, 64 x 64 per warp (prefill grids of at least wide_blocks())
 //   Big:   128 x 128, 256 threads, 64 x 32 per warp (smaller prefill grids)
 //   Small:  16 / 32 / 64 x 64, 64 threads (verify, drafts, short chunks: m <= 64), with split-K so a
 //           handful of tokens still spreads the weight stream over every SM.
@@ -679,17 +680,17 @@ struct Scratch {
 Scratch g_scratch;  // quantized activations
 Scratch g_part;     // split-K partial sums
 
-constexpr int kSms = 170;
 constexpr int kSmallMaxM = 64;  // skinny tiles up to here; prefill tiles (and fused SwiGLU) above
 
-// Wide tiles when their grid fills the GPU about one and a half times over, and for at least two
-// tile rows of tokens (m = 128 padded to one Wide tile: [34816,5120] 110 -> 150 us).
-constexpr long long kWideBlocks = 256;
+// Wide tiles when their grid fills the GPU about one and a half times over (256 blocks on the
+// 5090's 170 SMs), and for at least two tile rows of tokens (m = 128 padded to one Wide tile:
+// [34816,5120] 110 -> 150 us).
+long long wide_blocks() { return static_cast<long long>(rtx_sm_count()) * 3 / 2; }
 constexpr int kWideMinM = 2 * Wide::BM;
 
 bool use_wide(int m, int rows) {
     return m >= kWideMinM &&
-           static_cast<long long>((rows + Wide::BN - 1) / Wide::BN) * ((m + Wide::BM - 1) / Wide::BM) >= kWideBlocks;
+           static_cast<long long>((rows + Wide::BN - 1) / Wide::BN) * ((m + Wide::BM - 1) / Wide::BM) >= wide_blocks();
 }
 
 // Token rows the quantizers pad to: the tile height of the configuration launch_gemm picks.
@@ -714,7 +715,7 @@ int launch_cfg(GemmArgs p) {
     // The small tile always may split; the large one only when its grid is badly under-filled,
     // since the partial pass costs more than it saves on prefill-sized grids. SwiGLU never splits
     // (its epilogue needs the whole sums).
-    while (!SW && (C::WM == 1 || blocks < 64) && blocks * splits < 2 * kSms && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
+    while (!SW && (C::WM == 1 || blocks < 64) && blocks * splits < 2 * rtx_sm_count() && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
     p.kt_per_split = (kt_total + splits - 1) / splits;
     float* y = p.y;
     if (splits > 1) {
@@ -867,7 +868,7 @@ int launch_tma(GemmArgs p) {
     const long long blocks = static_cast<long long>((p.rows + bn - 1) / bn) * ((p.m + C::BM - 1) / C::BM);
     // Split K as launch_cfg does for an under-filled grid (never for SwiGLU).
     int splits = 1;
-    while (!SW && blocks < 64 && blocks * splits < 2 * kSms && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
+    while (!SW && blocks < 64 && blocks * splits < 2 * rtx_sm_count() && kt_total * C::BK / (splits * 2) >= 512) splits *= 2;
     p.kt_per_split = (kt_total + splits - 1) / splits;
     float* y = p.y;
     if (splits > 1) {
