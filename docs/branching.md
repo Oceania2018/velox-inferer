@@ -7,6 +7,7 @@ velox-inferer ships one build per hardware family. Users pick the branch that ma
 |---|---|---|---|
 | `main` | any | portable (`sm_89`, `sm_120` + PTX) | Generic variant: correct everywhere, tuned nowhere. All feature work lands here. |
 | `rtx-5090-32g` | `rtx-5090` (32 GB desktop) | `sm_120a` | Primary implementation branch (170 SMs). |
+| `rtx-pro-6000` | `rtx-pro-6000` (96 GB) | `sm_120a` | GB202 with 188 SMs; 5090 kernels, room for more lanes. |
 | `rtx-5090-24g` | `rtx-5090-laptop` (24 GB) | `sm_120a` | 82 SMs, larger VRAM reserve. |
 | `rtx-5060-ti` | `rtx-5060-ti-16g` | `sm_120a` | Small-SM (36) shapes. |
 | `rtx-4090` | `rtx-4090` | `sm_89` | Ada: no TMA, no FP4. |
