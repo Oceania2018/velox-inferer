@@ -112,6 +112,12 @@ pub trait ChatEngine: Send + Sync {
     /// Housekeeping after a response has been delivered, while no request may be waiting (e.g.
     /// preparing memory the next one would otherwise allocate). Returns promptly once one is.
     fn idle(&self) {}
+    /// Why the engine can no longer serve (e.g. its device context failed), if it can't. Then
+    /// `GET /health` answers 503 and the process exits after the current response, so the
+    /// container's restart policy brings up a working one.
+    fn lost(&self) -> Option<String> {
+        None
+    }
     /// Engine gauges appended to `GET /metrics` as Prometheus text: device memory and the
     /// context cache tiers. Nothing by default.
     fn gauges(&self, _out: &mut String) {}
@@ -146,6 +152,9 @@ impl ChatEngine for UnimplementedEngine {
         )))
     }
 }
+
+/// Exit status when [`ChatEngine::lost`] ends the process (EX_SOFTWARE).
+const DEVICE_LOST_EXIT: i32 = 70;
 
 pub struct Config {
     pub model_id: String,
@@ -368,21 +377,41 @@ impl Server {
         let Some(req) = read_request(&mut r)? else {
             return Ok(());
         };
+        let r = self.route(&mut w, &req);
+        if let Some(reason) = self.engine.lost() {
+            // The response (a 500 for this request) is out; nothing more can be served, so let
+            // the restart policy start a fresh process instead of failing every request.
+            let _ = w.flush();
+            eprintln!("[fatal] exiting so the container restarts: {reason}");
+            // Unit tests serve in-process; exiting would end the test binary.
+            if !cfg!(test) {
+                std::process::exit(DEVICE_LOST_EXIT);
+            }
+        }
+        r
+    }
+
+    fn route(&self, w: &mut TcpStream, req: &Request) -> std::io::Result<()> {
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/health") => respond_json(&mut w, 200, &json!({"status": "ok"})),
+            ("GET", "/health") => match self.engine.lost() {
+                None => respond_json(w, 200, &json!({"status": "ok"})),
+                Some(reason) => {
+                    respond_json(w, 503, &json!({"status": "device_lost", "reason": reason}))
+                }
+            },
             ("GET", "/v1/models") => respond_json(
-                &mut w,
+                w,
                 200,
                 &json!({"object": "list", "data": [{"id": self.cfg.model_id, "object": "model", "created": self.started, "owned_by": "velox-inferer"}]}),
             ),
             ("GET", "/metrics") => respond(
-                &mut w,
+                w,
                 200,
                 "text/plain; version=0.0.4",
                 self.metrics().as_bytes(),
             ),
             ("POST", "/v1/chat/completions") => {
-                let r = self.chat(&mut w, &req.body);
+                let r = self.chat(w, &req.body);
                 // The response is complete: let the client go before the engine's idle work.
                 let _ = w.flush();
                 let _ = w.shutdown(std::net::Shutdown::Write);
@@ -390,20 +419,20 @@ impl Server {
                 r
             }
             ("POST", "/v1/systemone") if self.engine.scores() => {
-                let r = self.systemone(&mut w, &req.body);
+                let r = self.systemone(w, &req.body);
                 let _ = w.flush();
                 let _ = w.shutdown(std::net::Shutdown::Write);
                 self.engine.idle();
                 r
             }
             (_, "/health" | "/v1/models" | "/metrics" | "/v1/chat/completions") => {
-                respond_json(&mut w, 405, &ApiError::invalid("method not allowed").body())
+                respond_json(w, 405, &ApiError::invalid("method not allowed").body())
             }
             (_, "/v1/systemone") if self.engine.scores() => {
-                respond_json(&mut w, 405, &json!({"error": "method not allowed"}))
+                respond_json(w, 405, &json!({"error": "method not allowed"}))
             }
             _ => respond_json(
-                &mut w,
+                w,
                 404,
                 &json!({"error": {"message": format!("no route {}", req.path), "type": "invalid_request_error", "code": "not_found"}}),
             ),

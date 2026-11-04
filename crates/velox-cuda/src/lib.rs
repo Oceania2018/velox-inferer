@@ -83,6 +83,13 @@ mod ffi {
 /// Launcher return codes below zero (see velox_common.cuh).
 const VELOX_ERR_UNSUPPORTED: i32 = -1;
 
+/// CUDA runtime errors that corrupt the context: once one is returned, every later call fails
+/// too and only a new process recovers (illegal address, launch timeout, context destroyed,
+/// device assert, the 714-719 kernel faults, unknown).
+fn is_sticky(code: i32) -> bool {
+    matches!(code, 700 | 702 | 709 | 710 | 714..=719 | 999)
+}
+
 /// Converts a CUDA/launcher return code into a Result. Public for variant launchers.
 pub fn status(code: i32, what: &str) -> Result<()> {
     match code {
@@ -93,10 +100,11 @@ pub fn status(code: i32, what: &str) -> Result<()> {
         c => {
             // SAFETY: cudaGetErrorString returns a static NUL-terminated string for any code.
             let msg = unsafe { CStr::from_ptr(ffi::velox_cuda_error_string(c)) };
-            Err(Error::Backend(format!(
-                "{what}: CUDA error {c}: {}",
-                msg.to_string_lossy()
-            )))
+            let m = format!("{what}: CUDA error {c}: {}", msg.to_string_lossy());
+            if is_sticky(c) {
+                velox_core::mark_device_lost(&m);
+            }
+            Err(Error::Backend(m))
         }
     }
 }
