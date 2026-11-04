@@ -181,6 +181,15 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
+// A shared-memory word. The tile structs are reached through a uintptr_t-aligned cast, so plain
+// reads of their scale words compiled to generic LD (ncu, NVFP4 SwiGLU m = 2048: 24 per stage per
+// thread); ld.shared took 1.5-2.7% off the prefill GEMMs at m = 2048 and 0.5% off a 24k prefill.
+__device__ __forceinline__ uint32_t lds32(const void* p) {
+    uint32_t v;
+    asm volatile("ld.shared.u32 %0, [%1];\n" : "=r"(v) : "r"(smem_u32(p)));
+    return v;
+}
+
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src),
                  "r"(valid ? 16 : 0));
@@ -441,7 +450,7 @@ __global__ void __launch_bounds__(C::THREADS, 1) gemm_kernel(GemmArgs p) {
             for (int mt = 0; mt < C::MT; ++mt) {
                 const int r = wm * WROWS + mt * 16 + a_row;
                 ldmatrix_x4(af[mt], s.a[st] + swz<C::BK>(r, ks * 32 + a_byte));
-                if (KIND == kFp4) sfa[mt] = s.a_scale[st][wm * WROWS + mt * 16 + sfa_row][ks];
+                if (KIND == kFp4) sfa[mt] = lds32(&s.a_scale[st][wm * WROWS + mt * 16 + sfa_row][ks]);
             }
 #pragma unroll
             for (int nt = 0; nt < C::NT; nt += 2) {
@@ -461,7 +470,7 @@ __global__ void __launch_bounds__(C::THREADS, 1) gemm_kernel(GemmArgs p) {
                     } else {
                         r = static_cast<int>((p.row_begin + n0) & 127) + wn * (C::NT * 8) + nt * 8 + sfb_row;
                     }
-                    sfb[nt] = *reinterpret_cast<const uint32_t*>(&s.b_scale[st][ks][half][(r & 31) * 16 + (r >> 5) * 4]);
+                    sfb[nt] = lds32(&s.b_scale[st][ks][half][(r & 31) * 16 + (r >> 5) * 4]);
                 }
             }
 #pragma unroll
@@ -631,7 +640,7 @@ __global__ void __launch_bounds__(C::THREADS, 1)
             for (int mt = 0; mt < C::MT; ++mt) {
                 const int r = wm * WROWS + mt * 16 + a_row;
                 ldmatrix_x4(af[mt], s.a[st] + swz<C::BK>(r, ks * 32 + a_byte));
-                if (KIND == kFp4) sfa[mt] = s.a_scale[st][ks][wm * WROWS + mt * 16 + sfa_row];
+                if (KIND == kFp4) sfa[mt] = lds32(&s.a_scale[st][ks][wm * WROWS + mt * 16 + sfa_row]);
             }
 #pragma unroll
             for (int nt = 0; nt < C::NT; nt += 2) {
@@ -651,8 +660,7 @@ __global__ void __launch_bounds__(C::THREADS, 1)
                     } else {
                         r = static_cast<int>((p.row_begin + n0) & 127) + wn * (C::NT * 8) + nt * 8 + sfb_row;
                     }
-                    sfb[nt] =
-                        *reinterpret_cast<const uint32_t*>(&s.b_scale[st][ks][half][(r & 31) * 16 + (r >> 5) * 4]);
+                    sfb[nt] = lds32(&s.b_scale[st][ks][half][(r & 31) * 16 + (r >> 5) * 4]);
                 }
             }
 #pragma unroll
