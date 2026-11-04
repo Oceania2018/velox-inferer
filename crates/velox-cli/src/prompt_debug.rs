@@ -28,8 +28,11 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     };
     let fe = Frontend::from_artifact(&art, template)?;
     let (min_px, max_px) = fe.vision_pixels.unwrap_or((0, u64::MAX));
-    // Images arrive already downscaled by llm-inference-daemon (1 Mpx); apply the same cap.
-    let image_cap: u64 = a.parse("image-max-pixels", 1_048_576)?;
+    // Images arrive at full size (llm-inference-daemon no longer resizes); apply serve's cap.
+    let image_cap: u64 = a.parse(
+        "image-max-pixels",
+        crate::serve::DEFAULT_MAX_VISION_TOKENS * 1024,
+    )?;
     let pad = fe.encode("<|image_pad|>")?[0];
     let im_start = fe.encode("<|im_start|>")?[0];
     let vision_start = fe.encode("<|vision_start|>")?[0];
