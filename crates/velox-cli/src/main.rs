@@ -113,7 +113,9 @@ COMMANDS:
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
       --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
       --score-branch-rows <n>  System One rank candidates per forward pass (100; 0 rejects rank)
-  replay                 Replay a recorded agent session against an OpenAI-compatible server
+      --max-vision-tokens <n>  merged vision tokens per image (32x32 px each) before it is
+                            downscaled (1280: 1920x1080 -> 1504x832)
+  replay                Replay a recorded agent session against an OpenAI-compatible server
       --session <dir>       directory with session.json and screenshots/
       --endpoint <url>      e.g. http://127.0.0.1:8010 (default)
       --out <file>          JSON report (default target/replay/<label>.json)
