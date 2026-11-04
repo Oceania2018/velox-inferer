@@ -1,4 +1,4 @@
-// Tuned kernels for the RTX 5090 Laptop GPU (GB203, 82 SMs, 896 GB/s GDDR7), from rtx-5060-ti (names kept).
+// Tuned kernels from rtx-5090-32g (names kept), on the RTX 5090 Laptop GPU (GB203, 82 SMs, 896 GB/s GDDR7).
 // Shapes outside each kernel's domain return VELOX_ERR_UNSUPPORTED and the Rust side falls back to the portable kernel.
 #include <math.h>
 #include <stdint.h>
@@ -173,7 +173,7 @@ bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 
 }  // namespace
 
 // Small-M path. Unsupported (fallback) when m > 8, k % 4 != 0 or pointers are not 16-byte aligned.
-VELOX_API int velox_5060_matmul_small_m(const float* x, const float* w, float* y, int m, int n, int k) {
+VELOX_API int velox_5090_matmul_small_m(const float* x, const float* w, float* y, int m, int n, int k) {
     if (m > 8 || k % 4 != 0 || !aligned16(x) || !aligned16(w)) return VELOX_ERR_UNSUPPORTED;
     const dim3 grid((n + kGemvWarps - 1) / kGemvWarps);
     const dim3 block(kGemvWarps * VELOX_WARP);
@@ -187,14 +187,14 @@ VELOX_API int velox_5060_matmul_small_m(const float* x, const float* w, float* y
     return velox_launch_status();
 }
 
-VELOX_API int velox_5060_matmul_tiled(const float* x, const float* w, float* y, int m, int n, int k) {
+VELOX_API int velox_5090_matmul_tiled(const float* x, const float* w, float* y, int m, int n, int k) {
     if ((m + kBM - 1) / kBM > 65535) return VELOX_ERR_UNSUPPORTED;
     const dim3 grid((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
     sgemm_nt_kernel<<<grid, 256>>>(x, w, y, m, n, k);
     return velox_launch_status();
 }
 
-VELOX_API int velox_5060_attention(const float* q, const float* k, const float* v, float* out, int tokens, int heads,
+VELOX_API int velox_5090_attention(const float* q, const float* k, const float* v, float* out, int tokens, int heads,
                                    int kv_heads, int head_dim, int pos0, float scale) {
     if (tokens > 65535) return VELOX_ERR_UNSUPPORTED;
     const dim3 grid(heads, tokens), block(kAttnWarps * VELOX_WARP);

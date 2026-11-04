@@ -1,6 +1,13 @@
-//! RTX 5090 Laptop GPU kernel set, taken from rtx-5060-ti (itself ported from rtx-5090-32g) with grids for 82 SMs.
-//! File and symbol names stay rtx5060 / velox_5060 so rtx-5060-ti kernel commits apply here unchanged. Each override
-//! tries the tuned kernel and falls back to the portable one when the kernel reports the shape as unsupported.
+//! RTX 5090 Laptop GPU kernel set, taken from rtx-5090-32g with grids for 82 SMs: the rtx-5060-ti
+//! lineage (IQ3_XXS, int8 prefill, A16 NVFP4, chunked Gated DeltaNet, MoE), plus rtx-5090-32g's own
+//! kernels where they measured faster on the desktop card (thresholds below were measured there):
+//! NVFP4 A4 prefill and its fused SwiGLU, FP8 (A16 and A8), f32-cache flash attention, matmul and
+//! the groupwise bf16 prefill kernel. GGML runs the rtx5060 int8 kernels (Int8G32 / Int8G256, as
+//! the importer's AllowA8 permits): q4_k [17408,5120] m=8 52 vs 76 us, m=512 360 vs 4672 us against
+//! rtx-5090-32g's former bf16 kernel. File and symbol names keep their origin (rtx5060 /
+//! velox_5060, rtx5090 / velox_5090) so commits from either branch apply unchanged. Each override
+//! tries the tuned kernel and falls back to the portable one when the kernel reports the shape as
+//! unsupported.
 
 use velox_core::backend::{
     linear_part_whole, ActPolicy, ActQuant, AttnPrecision, AttnShape, ExpertBank, FullAttnShape,
@@ -11,22 +18,6 @@ use velox_core::{Error, KvFormat, Op, Result, WeightFormat};
 use velox_cuda::{graph_mode, portable, status, CudaBuffer, CudaKernels, GraphMode};
 
 extern "C" {
-    fn velox_5060_matmul_small_m(
-        x: *const f32,
-        w: *const f32,
-        y: *mut f32,
-        m: i32,
-        n: i32,
-        k: i32,
-    ) -> i32;
-    fn velox_5060_matmul_tiled(
-        x: *const f32,
-        w: *const f32,
-        y: *mut f32,
-        m: i32,
-        n: i32,
-        k: i32,
-    ) -> i32;
     fn velox_5060_linear_a4(
         x: *const f32,
         m: i32,
@@ -37,40 +28,6 @@ extern "C" {
         rows: i32,
         input_divisor: f32,
         y: *mut f32,
-    ) -> i32;
-    fn velox_5060_attention_full(
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        out: *mut f32,
-        tokens: i32,
-        heads: i32,
-        head_dim: i32,
-    ) -> i32;
-    fn velox_5060_attention_prefill(
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        out: *mut f32,
-        tokens: i32,
-        heads: i32,
-        kv_heads: i32,
-        head_dim: i32,
-        pos0: i32,
-        scale: f32,
-    ) -> i32;
-    fn velox_5060_attention_windows(
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        out: *mut f32,
-        tokens: i32,
-        window: i32,
-        heads: i32,
-        kv_heads: i32,
-        head_dim: i32,
-        pos0: i32,
-        scale: f32,
     ) -> i32;
     fn velox_5060_attention_verify_nvfp4(
         q: *const f32,
@@ -86,16 +43,6 @@ extern "C" {
         norm: f32,
         params: *const i64,
         kv_grid: i32,
-    ) -> i32;
-    fn velox_5060_linear_a16_fp8(
-        x: *const f32,
-        m: i32,
-        w: *const u8,
-        parent_rows: i64,
-        k: i64,
-        row_begin: i64,
-        rows: i32,
-        y: *mut f32,
     ) -> i32;
     fn velox_5060_linear_skinny16(
         x: *const f32,
@@ -396,17 +343,6 @@ extern "C" {
         rows: i32,
         y: *mut f32,
     ) -> i32;
-    fn velox_5060_linear_rowsplit(
-        x: *const f32,
-        m: i32,
-        w: *const u8,
-        parent_rows: i64,
-        k: i64,
-        row_begin: i64,
-        rows: i32,
-        bits: i32,
-        y: *mut f32,
-    ) -> i32;
     fn velox_5060_linear_nvfp4_mma(
         x: *const f32,
         m: i32,
@@ -451,7 +387,117 @@ extern "C" {
         format: i32,
         y: *mut f32,
     ) -> i32;
-    fn velox_5060_linear_a8(
+}
+
+// This branch's own kernels (rtx5090_*.cu).
+extern "C" {
+    fn velox_5090_linear_stream(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        fmt: i32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5090_matmul_small_m(x: *const f32, w: *const f32, y: *mut f32, m: i32, n: i32, k: i32) -> i32;
+    fn velox_5090_matmul_tiled(x: *const f32, w: *const f32, y: *mut f32, m: i32, n: i32, k: i32) -> i32;
+    fn velox_5090_linear_a4(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        input_divisor: f32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5090_linear_swiglu_a4(
+        x: *const f32,
+        m: i32,
+        wg: *const u8,
+        parent_rows_g: i64,
+        row_begin_g: i64,
+        wu: *const u8,
+        parent_rows_u: i64,
+        row_begin_u: i64,
+        k: i64,
+        rows: i32,
+        input_divisor: f32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5090_linear_swiglu_a8(
+        x: *const f32,
+        m: i32,
+        wg: *const u8,
+        parent_rows_g: i64,
+        row_begin_g: i64,
+        wu: *const u8,
+        parent_rows_u: i64,
+        row_begin_u: i64,
+        k: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5090_attention_full(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+    ) -> i32;
+    fn velox_5090_attention_prefill(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
+    ) -> i32;
+    fn velox_5090_attention_windows(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        tokens: i32,
+        window: i32,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        pos0: i32,
+        scale: f32,
+    ) -> i32;
+    fn velox_5090_linear_a16_fp8(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5090_linear_rowsplit(
+        x: *const f32,
+        m: i32,
+        w: *const u8,
+        parent_rows: i64,
+        k: i64,
+        row_begin: i64,
+        rows: i32,
+        bits: i32,
+        y: *mut f32,
+    ) -> i32;
+    fn velox_5090_linear_a8(
         x: *const f32,
         m: i32,
         w: *const u8,
@@ -511,6 +557,30 @@ fn a16_fp8(w: &WeightView<'_, CudaBuffer>, m: usize) -> bool {
 /// pass over the weights per 64 rows.
 const A16_FP8_MAX_M: usize = 96;
 const A16_FP8_BLOCK_M: usize = 64;
+
+/// Decode and verify widths of FP8 row-scaled weights with few rows: rtx5090_stream.cu's one-launch
+/// weight-streaming kernel (bf16 activations, split K in the block). Measured at m=8 against the
+/// a16-FP8 kernel: [5120,6144] 26.2 vs 35.5 us, [5120,17408] 66.7 vs 69.3; from [14336,5120] up
+/// they tie (about 1.3 TB/s). NVFP4 stays on the A4 kernel ([34816,5120] 77 vs 91 us here: bf16
+/// MMAs per byte double against FP8). `VELOX_NO_STREAM` turns it off.
+const STREAM_MAX_M: usize = 16;
+const STREAM_MAX_ROWS: usize = 6144;
+
+fn stream_format(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<i32> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VELOX_NO_STREAM").is_none()) || !(2..=STREAM_MAX_M).contains(&m) {
+        return None;
+    }
+    (w.format == WeightFormat::Fp8RowBf16 && w.k % 64 == 0 && w.rows <= STREAM_MAX_ROWS).then_some(0)
+}
+
+/// NVFP4 A4 linears up to this many tokens run the rtx5060 kernel, above it this branch's GEMM.
+/// Measured (bench-linear, A4): [12288,5120] m=8 32.1 vs 36.4 us, m=128 41.6 vs 41.3; [17408,5120]
+/// m=2048 427 vs 327 us.
+const A4_5060_MAX_M: usize = 128;
+
+/// Fused NVFP4 / FP8 SwiGLU from here (rtx5090_gemm.cu's prefill tiles start above 64 rows).
+const SWIGLU_MIN_M: usize = 65;
 
 /// Format code of the skinny kernel serving a weight at `m` tokens: NVFP4 (0) runs
 /// `velox_5060_linear_skinny16`, groupwise q4/q5/q8 (4/5/8) `velox_5060_linear_skinny_rs`. Single
@@ -658,6 +728,9 @@ enum Bf16In {
 }
 
 fn bf16_in(w: &WeightView<'_, CudaBuffer>, m: usize) -> Option<Bf16In> {
+    if stream_format(w, m).is_some() {
+        return None;
+    }
     if nvfp4_mma(w, m) {
         return Some(Bf16In::Nvfp4Mma);
     }
@@ -817,9 +890,9 @@ impl GgmlAct {
     }
 }
 
-pub struct Rtx5060Kernels;
+pub struct Rtx5090Kernels;
 
-impl Rtx5060Kernels {
+impl Rtx5090Kernels {
     /// SwiGLU over separate gate / up parents at prefill widths, GGML and at most one of them
     /// IQ3_XXS (GGUF imports keep GGML blocks but turn IQ3_XXS planar): one GEMM into `out`, the
     /// GGML one second with SwiGLU in its epilogue (gate first: silu(out) * up; up first: silu(gate)
@@ -1067,7 +1140,7 @@ fn or_fallback(r: Result<()>, fallback: impl FnOnce() -> Result<()>) -> Result<(
     }
 }
 
-impl CudaKernels for Rtx5060Kernels {
+impl CudaKernels for Rtx5090Kernels {
     fn native_ops(&self) -> &'static [Op] {
         &[
             Op::MatMul,
@@ -1096,14 +1169,14 @@ impl CudaKernels for Rtx5060Kernels {
             return portable::matmul(x, w, y, m, n, k);
         }
         let launch = if m <= SMALL_M_MAX {
-            velox_5060_matmul_small_m
+            velox_5090_matmul_small_m
         } else {
-            velox_5060_matmul_tiled
+            velox_5090_matmul_tiled
         };
         // SAFETY: extents validated by CudaBackend; kernels guard their own edges.
         let r = status(
             unsafe { launch(x.as_ptr(), w.as_ptr(), y.as_mut_ptr(), mi, ni, ki) },
-            "rtx5060 matmul",
+            "rtx5090 matmul",
         );
         or_fallback(r, || portable::matmul(x, w, y, m, n, k))
     }
@@ -1329,7 +1402,7 @@ impl CudaKernels for Rtx5060Kernels {
         // SAFETY: extents validated by CudaBackend (check::attention).
         status(
             unsafe {
-                velox_5060_attention_prefill(
+                velox_5090_attention_prefill(
                     q.as_ptr(),
                     k.as_ptr(),
                     v.as_ptr(),
@@ -1377,7 +1450,7 @@ impl CudaKernels for Rtx5060Kernels {
         // SAFETY: extents validated above.
         status(
             unsafe {
-                velox_5060_attention_windows(
+                velox_5090_attention_windows(
                     q.as_ptr(),
                     k.as_ptr(),
                     v.as_ptr(),
@@ -1417,7 +1490,7 @@ impl CudaKernels for Rtx5060Kernels {
         // SAFETY: extents validated by CudaBackend (check::attention_full).
         status(
             unsafe {
-                velox_5060_attention_full(
+                velox_5090_attention_full(
                     q.as_ptr(),
                     k.as_ptr(),
                     v.as_ptr(),
@@ -1432,6 +1505,9 @@ impl CudaKernels for Rtx5060Kernels {
     }
 
     fn linear_act(&self, w: &WeightView<'_, CudaBuffer>, m: usize) -> ActQuant {
+        if stream_format(w, m).is_some() {
+            return ActQuant::Bf16;
+        }
         if ggml_mmvq(w, m).is_some() {
             return ActQuant::Int8G32;
         }
@@ -2014,6 +2090,18 @@ impl CudaKernels for Rtx5060Kernels {
         up: &WeightView<'_, CudaBuffer>,
         m: usize,
     ) -> Option<ActQuant> {
+        // Prefill widths of NVFP4 / FP8 gate / up views this branch's A4 / A8 GEMM serves with one
+        // rounding.
+        let act = self.linear_act(gate, m);
+        if m >= SWIGLU_MIN_M
+            && matches!(act, ActQuant::Nvfp4 { .. } | ActQuant::Fp8Row)
+            && self.linear_act(up, m) == act
+            && gate.format == up.format
+            && gate.rows == up.rows
+            && gate.k == up.k
+        {
+            return Some(act);
+        }
         // GGML gate / up at prefill widths (one of them may be IQ3_XXS): the int8 prefill kernels,
         // one quantization, the GGML GEMM's epilogue forming silu(gate) * up in place.
         if gate.k == up.k && gate.rows == up.rows && ggml_q8_pair(gate, up, m) {
@@ -2063,6 +2151,49 @@ impl CudaKernels for Rtx5060Kernels {
                 let act = GgmlAct::new(x, m, gate.k)?;
                 act.run(gate, tg, m, out.as_mut_ptr(), gate.rows, 0)?;
                 return act.run(up, tu, m, out.as_mut_ptr(), gate.rows, 1);
+            }
+            Some(ActQuant::Nvfp4 { divisor }) => {
+                // SAFETY: both views and the output were validated by CudaBackend (check::linear).
+                return status(
+                    unsafe {
+                        velox_5090_linear_swiglu_a4(
+                            x.as_ptr(),
+                            to_i32("m", m)?,
+                            gate.buf.as_ptr().cast(),
+                            gate.parent_rows as i64,
+                            gate.row_begin as i64,
+                            up.buf.as_ptr().cast(),
+                            up.parent_rows as i64,
+                            up.row_begin as i64,
+                            gate.k as i64,
+                            to_i32("rows", gate.rows)?,
+                            divisor,
+                            out.as_mut_ptr(),
+                        )
+                    },
+                    "rtx5090 linear_swiglu a4",
+                );
+            }
+            Some(ActQuant::Fp8Row) => {
+                // SAFETY: as above.
+                return status(
+                    unsafe {
+                        velox_5090_linear_swiglu_a8(
+                            x.as_ptr(),
+                            to_i32("m", m)?,
+                            gate.buf.as_ptr().cast(),
+                            gate.parent_rows as i64,
+                            gate.row_begin as i64,
+                            up.buf.as_ptr().cast(),
+                            up.parent_rows as i64,
+                            up.row_begin as i64,
+                            gate.k as i64,
+                            to_i32("rows", gate.rows)?,
+                            out.as_mut_ptr(),
+                        )
+                    },
+                    "rtx5090 linear_swiglu a8",
+                );
             }
             Some(ActQuant::Int8G256) if ggml_q8_pair(gate, up, m) => {
                 return self.ggml_swiglu_q8(x, None, gate, up, out, m);
@@ -2115,7 +2246,7 @@ impl CudaKernels for Rtx5060Kernels {
                 ),
                 None => portable::linear(x, w, y, m),
             },
-            ActQuant::Nvfp4 { divisor } => status(
+            ActQuant::Nvfp4 { divisor } if m <= A4_5060_MAX_M => status(
                 unsafe {
                     velox_5060_linear_a4(
                         x.as_ptr(),
@@ -2131,11 +2262,27 @@ impl CudaKernels for Rtx5060Kernels {
                 },
                 "rtx5060 linear a4",
             ),
+            ActQuant::Nvfp4 { divisor } => status(
+                unsafe {
+                    velox_5090_linear_a4(
+                        x.as_ptr(),
+                        mi,
+                        wp,
+                        pr,
+                        k,
+                        rb,
+                        rows,
+                        divisor,
+                        y.as_mut_ptr(),
+                    )
+                },
+                "rtx5090 linear a4",
+            ),
             ActQuant::Fp8Row => status(
                 unsafe {
-                    velox_5060_linear_a8(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr())
+                    velox_5090_linear_a8(x.as_ptr(), mi, wp, pr, k, rb, rows, y.as_mut_ptr())
                 },
-                "rtx5060 linear a8",
+                "rtx5090 linear a8",
             ),
             ActQuant::Int8G32 => {
                 let ty = ggml_mmvq(w, m).ok_or_else(|| Error::Unsupported("ggml shape".into()))?;
@@ -2199,6 +2346,14 @@ impl CudaKernels for Rtx5060Kernels {
                 None => Err(Error::Unsupported("int8 linear shape".into())),
             },
             ActQuant::Bf16 => {
+                if let Some(f) = stream_format(w, m) {
+                    return status(
+                        unsafe {
+                            velox_5090_linear_stream(x.as_ptr(), mi, wp, pr, k, rb, rows, f, y.as_mut_ptr())
+                        },
+                        "rtx5090 linear stream",
+                    );
+                }
                 if bf16_skinny(w, m) {
                     return status(
                         unsafe {
@@ -2298,8 +2453,8 @@ impl CudaKernels for Rtx5060Kernels {
                         let (xp, yp) =
                             unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
                         status(
-                            unsafe { velox_5060_linear_a16_fp8(xp, mb, wp, pr, k, rb, rows, yp) },
-                            "rtx5060 linear a16 fp8",
+                            unsafe { velox_5090_linear_a16_fp8(xp, mb, wp, pr, k, rb, rows, yp) },
+                            "rtx5090 linear a16 fp8",
                         )?;
                     }
                     return Ok(());
@@ -2352,9 +2507,10 @@ impl CudaKernels for Rtx5060Kernels {
                     return Ok(());
                 }
                 let bits = w.format.row_split().map_or(0, |r| r.bits as i32);
+                // This branch's kernel: q8 [6144,5120] m=64 156 vs 230 us, m=512 348 vs 451 us.
                 status(
                     unsafe {
-                        velox_5060_linear_rowsplit(
+                        velox_5090_linear_rowsplit(
                             x.as_ptr(),
                             mi,
                             wp,
@@ -2366,7 +2522,7 @@ impl CudaKernels for Rtx5060Kernels {
                             y.as_mut_ptr(),
                         )
                     },
-                    "rtx5060 linear rowsplit",
+                    "rtx5090 linear rowsplit",
                 )
             }
         }

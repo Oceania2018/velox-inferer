@@ -283,7 +283,9 @@ int launch_k(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int k
 }
 
 // Up to 8 tokens one row tile per block, 16 tokens two (measured, verify at 16k keys: batched
-// 2 x 8 rows 38.4 -> 37.7 ms per round; one sequence slower with two).
+// 2 x 8 rows 38.4 -> 37.7 ms per round; one sequence slower with two). RTX 5090: two at 8 tokens
+// won bench-linear for q5 ([12288,5120] 37.4 vs 43.6 us) but lost end to end (replay decode
+// +15.6% -> +7% against the NVFP4 baseline), so one stays.
 template <int F, int T>
 int launch_rt(const __nv_bfloat16* x, const uint8_t* w, long long n, int k, int kp, long long rb, int rows, int m,
               float* y, long long ldy) {
