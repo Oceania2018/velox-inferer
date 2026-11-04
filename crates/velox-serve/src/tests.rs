@@ -55,6 +55,41 @@ fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
     (status, out.split_once("\r\n\r\n").unwrap().1.to_string())
 }
 
+/// An engine whose device context has failed: every generation errors like a sticky CUDA error.
+struct Lost;
+
+impl ChatEngine for Lost {
+    fn architecture(&self) -> &str {
+        "Lost"
+    }
+
+    fn generate(&self, _: &Value, _: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
+        Err(ApiError {
+            status: 500,
+            kind: "server_error",
+            code: "engine_error",
+            message: "backend error: x: CUDA error 999: unknown error".into(),
+        })
+    }
+
+    fn lost(&self) -> Option<String> {
+        Some("x: CUDA error 999: unknown error".into())
+    }
+}
+
+#[test]
+fn health_reports_a_lost_device() {
+    let port = start(Box::new(Lost));
+    let (s, body) = http(port, "GET", "/health", "");
+    assert_eq!(s, 503);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["status"], "device_lost");
+    assert!(v["reason"].as_str().unwrap().contains("999"), "{body}");
+    // The failing request still gets its 500 before the process would exit.
+    let chat = r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#;
+    assert_eq!(http(port, "POST", "/v1/chat/completions", chat).0, 500);
+}
+
 #[test]
 fn models_health_metrics() {
     let port = start(Box::new(Scripted));
