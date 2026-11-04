@@ -68,8 +68,9 @@ pub struct EngineConfig {
     pub chain_superseded: usize,
     /// Keep checkpoints in system RAM (pinned, device-mapped) rather than device memory.
     pub host_checkpoints: bool,
-    /// Take no checkpoints at or after the prompt's last image: agent screenshots are replaced in the
-    /// next request's history, so state past them is never shared (ninfer's media-tail skip).
+    /// Take no checkpoints at or after the prompt's last image, the prompt's end included: agent
+    /// screenshots are replaced in the next request's history, so state past them is never shared
+    /// (ninfer's media-tail skip).
     pub skip_media_tail: bool,
     /// System RAM for the context store (prefixes any lane can resume after other conversations
     /// overwrote it; see `store`). 0 disables it.
@@ -2219,19 +2220,13 @@ impl<B: Backend> Core<B> {
     /// Positions worth checkpointing in `ids` after `after`: every turn boundary (`<|im_start|>`,
     /// where agent loops rewrite history) and the last image.
     fn checkpoint_positions(&self, ids: &[u32], after: usize) -> Vec<usize> {
-        let image = self
-            .special
-            .vision_start
-            .and_then(|t| ids.iter().rposition(|&x| x == t));
+        let image = self.last_image(ids);
         let turns = ids
             .iter()
             .enumerate()
             .filter(|&(_, &t)| Some(t) == self.special.im_start)
             .map(|(i, _)| i);
-        let tail = match image {
-            Some(p) if self.cfg.skip_media_tail => p,
-            _ => usize::MAX,
-        };
+        let tail = self.media_tail(ids).unwrap_or(usize::MAX);
         let mut v: Vec<usize> = turns
             .chain(image)
             .filter(|&p| p > after && p < ids.len() && p < tail)
@@ -2239,6 +2234,19 @@ impl<B: Backend> Core<B> {
         v.sort_unstable();
         v.dedup();
         v
+    }
+
+    /// Position of the last `<|vision_start|>` in `ids`.
+    fn last_image(&self, ids: &[u32]) -> Option<usize> {
+        self.special
+            .vision_start
+            .and_then(|t| ids.iter().rposition(|&x| x == t))
+    }
+
+    /// With `skip_media_tail`, the position from which no state goes to the context store (the
+    /// last image).
+    fn media_tail(&self, ids: &[u32]) -> Option<usize> {
+        self.last_image(ids).filter(|_| self.cfg.skip_media_tail)
     }
 
     /// Keeps at most `max` checkpoints, dropping the one closest to its predecessor so the rest
@@ -2555,13 +2563,15 @@ impl<B: Backend> Core<B> {
         // The end of the prompt (less the token fed for logits): an exact retry or replay of this
         // request resumes there (see `place_checkpoints`). Not for scoring: exact repeats are
         // answered from the engine's results, and a prompt end per question would crowd chat
-        // out of the context store.
+        // out of the context store. Not past the media tail either: the next agent step replaces
+        // that screenshot, so only a retry would resume there (ninfer skips its end-of-input too).
         let tail = p.ids.len() - 1;
         if self.cfg.host_checkpoints
             && !scoring
             && store.enabled()
             && tail > start
             && Some(tail) > deepest
+            && self.media_tail(&p.ids).is_none()
             && !store.holds(&p.keys[..tail])
         {
             positions.push(tail);
