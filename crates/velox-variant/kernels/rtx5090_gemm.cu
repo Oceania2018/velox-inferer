@@ -244,6 +244,7 @@ struct GemmArgs {
     long long row_begin2;
     float alpha2;
     int m_pad;                // TMA path: activation rows as quantized (its scales are k64-major)
+    int m_major;              // block order (block_order); 0: weight tiles fastest
 };
 
 __device__ __forceinline__ const uint8_t* fp4_scale_plane(const uint8_t* w, long long parent_rows, int kb) {
@@ -395,7 +396,10 @@ template <class C, int KIND, bool SW>
 __global__ void __launch_bounds__(C::THREADS, 1) gemm_kernel(GemmArgs p) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
     Smem<C, SW>& s = *reinterpret_cast<Smem<C, SW>*>(smem_raw);
-    const int n0 = blockIdx.x * (SW ? C::BN / 2 : C::BN), m0 = blockIdx.y * C::BM;
+    // p.m_major: consecutive blocks walk the m tiles of one weight tile (see block_order).
+    const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+    const int nb = p.m_major ? tile / gridDim.y : blockIdx.x, mb = p.m_major ? tile % gridDim.y : blockIdx.y;
+    const int n0 = nb * (SW ? C::BN / 2 : C::BN), m0 = mb * C::BM;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int wm = warp / C::WN, wn = warp % C::WN;
     const int kt_begin = blockIdx.z * p.kt_per_split;
@@ -542,7 +546,10 @@ __global__ void __launch_bounds__(C::THREADS, 1)
     extern __shared__ uint8_t smem_raw[];
     TmaSmem<C, SW>& s =
         *reinterpret_cast<TmaSmem<C, SW>*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
-    const int n0 = blockIdx.x * (SW ? C::BN / 2 : C::BN), m0 = blockIdx.y * C::BM;
+    // p.m_major: consecutive blocks walk the m tiles of one weight tile (see block_order).
+    const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+    const int nb = p.m_major ? tile / gridDim.y : blockIdx.x, mb = p.m_major ? tile % gridDim.y : blockIdx.y;
+    const int n0 = nb * (SW ? C::BN / 2 : C::BN), m0 = mb * C::BM;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     constexpr int kConsumers = C::WM * C::WN;  // every warp computes; thread 0 also issues the copies
     // Split-K: blockIdx.z takes stages [z * kt_per_split, ...) and writes its partial sums.
@@ -680,6 +687,14 @@ struct Scratch {
 Scratch g_scratch;  // quantized activations
 Scratch g_part;     // split-K partial sums
 
+// Block order. Weight tiles fastest (the default) lets the resident blocks share one activation
+// tile, but when a grid has more weight tiles than SMs, each weight tile then comes back for every
+// m tile after the whole weight has streamed past, which outgrows the L2. M-major order then
+// reads each weight tile from DRAM about once. RTX 5090, [34816,5120] at m = 1489 / 2048 (us):
+// NVFP4 562 / 737 -> 461 / 601, FP8 974 / 1278 -> 856 / 1120; a 24k-token Qwen3.8-27B prefill in
+// 2048-token chunks 2.26 -> 2.17 s. Grids within the SMs keep the default order.
+inline int block_order(int weight_tiles) { return weight_tiles > rtx_sm_count() ? 1 : 0; }
+
 constexpr int kSmallMaxM = 96;  // skinny tiles up to here; prefill tiles above
 constexpr int kSwigluMinM = 65;  // fused SwiGLU (prefill tiles only) from here
 
@@ -724,6 +739,7 @@ int launch_cfg(GemmArgs p) {
         if (!p.y) return static_cast<int>(cudaErrorMemoryAllocation);
     }
     const dim3 grid((p.rows + bn - 1) / bn, (p.m + C::BM - 1) / C::BM, splits);
+    p.m_major = block_order(static_cast<int>(grid.x));
     gemm_kernel<C, KIND, SW><<<grid, C::THREADS, sizeof(Smem<C, SW>)>>>(p);
     if (splits > 1) {
         const long long n = static_cast<long long>(p.m) * p.rows;
@@ -893,6 +909,7 @@ int launch_tma(GemmArgs p) {
         if (!p.y) return static_cast<int>(cudaErrorMemoryAllocation);
     }
     const dim3 grid((p.rows + bn - 1) / bn, (p.m + C::BM - 1) / C::BM, splits);
+    p.m_major = block_order(static_cast<int>(grid.x));
     gemm_tma_kernel<C, KIND, SW><<<grid, C::THREADS, smem>>>(ta, tb, tb2, p);
     if (splits > 1) {
         const long long n = static_cast<long long>(p.m) * p.rows;
