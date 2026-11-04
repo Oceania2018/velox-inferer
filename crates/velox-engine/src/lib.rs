@@ -3089,6 +3089,10 @@ where
         "Qwen3_5ForCausalLM"
     }
 
+    fn lost(&self) -> Option<String> {
+        velox_core::device_lost().map(str::to_owned)
+    }
+
     fn gauges(&self, out: &mut String) {
         use std::fmt::Write as _;
         let g = &self.core.gauges;

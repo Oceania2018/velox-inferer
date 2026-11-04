@@ -27,7 +27,7 @@ pub use backend::{
     QsaSelectShape, RopeLayout, RopePosShape, RopeShape, RowGateShape, WeightView, GRAPH_KV_BUCKET,
     GRAPH_STATIC,
 };
-pub use error::{Error, Result};
+pub use error::{device_lost, mark_device_lost, Error, Result};
 pub use format::WeightFormat;
 pub use kv::KvFormat;
 pub use op::Op;
