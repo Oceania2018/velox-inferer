@@ -17,6 +17,16 @@ use velox_weights::Artifact;
 use crate::args::Args;
 use crate::select::Selected;
 
+/// Most merged vision tokens per image (32 x 32 px each) before `serve` downscales it.
+///
+/// 1280 tokens = 1,310,720 px: 1920x1080 becomes 1504x832. At the old 1024 (≈1 Mpx, 1344x768) the
+/// ~18 px toolbar icons of a 1080p screenshot shrank under half a token, and look-alike glyphs
+/// merged: the planner named the tag icon and pressed the ⋮ beside it. Replaying 13 production
+/// requests that had missed (2026-11-04, same artifact): 1024 hit 5/13, 1280 10/13, 2048
+/// (unscaled 1920x1088) 10/13, with 40 ordinary clicks unchanged. 1280 costs ~170 more prefill
+/// tokens per screenshot than 1024; 2048 costs ~1000.
+pub(crate) const DEFAULT_MAX_VISION_TOKENS: u64 = 1280;
+
 /// "; device in use X GiB" (every process, as nvidia-smi counts), when the backend can tell.
 fn in_use<B: Backend>(b: &B) -> String {
     b.device_in_use().map_or(String::new(), |used| {
@@ -40,10 +50,10 @@ where
         None => None,
     };
     let mut fe = Frontend::from_artifact(art, template)?;
-    // --max-vision-tokens N (default 1024, ninfer NINFER_MAX_VISION_ITEM_TOKENS as deployed): images
-    // with more merged tokens are downscaled to fit (one token covers 32 x 32 pixels), which bounds
-    // the vision tower's device workspace.
-    let max_vision: u64 = a.parse("max-vision-tokens", 1024)?;
+    // --max-vision-tokens N (default DEFAULT_MAX_VISION_TOKENS): images with more merged tokens are
+    // downscaled to fit (one token covers 32 x 32 pixels), which bounds the vision tower's device
+    // workspace. This is the only pixel budget: llm-inference-daemon no longer resizes screenshots.
+    let max_vision: u64 = a.parse("max-vision-tokens", DEFAULT_MAX_VISION_TOKENS)?;
     if let Some((lo, hi)) = fe.vision_pixels {
         fe.vision_pixels = Some((lo.min(max_vision * 1024), hi.min(max_vision * 1024)));
     }
