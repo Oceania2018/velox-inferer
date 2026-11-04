@@ -87,6 +87,10 @@ pub fn parse_output(text: &str, tools: Option<&Value>) -> ParsedOutput {
         None => (None, text),
     };
     let mut tool_calls = Vec::new();
+    // Calls that do not parse (an unclosed call cut at max_tokens, a missing `</parameter>`) are
+    // returned verbatim after the content instead of being dropped: a reply truncated mid-call
+    // used to come back as an empty message, hiding what the model had written.
+    let mut unparsed: Vec<&str> = Vec::new();
     let content_end = after.find("<tool_call>").unwrap_or(after.len());
     let mut rest = &after[content_end..];
     while let Some(s) = rest.find("<tool_call>") {
@@ -95,16 +99,26 @@ pub fn parse_output(text: &str, tools: Option<&Value>) -> ParsedOutput {
             .find("</tool_call>")
             .map(|e| body_start + e);
         let body = &rest[body_start..end.unwrap_or(rest.len())];
-        if let Some(call) = parse_call(body, tools, tool_calls.len()) {
-            tool_calls.push(call);
+        let call_end = end.map_or(rest.len(), |e| e + "</tool_call>".len());
+        match parse_call(body, tools, tool_calls.len()) {
+            // An unclosed call is incomplete even when its finished parameters parse.
+            Some(call) if end.is_some() => tool_calls.push(call),
+            _ => unparsed.push(rest[s..call_end].trim()),
         }
         match end {
-            Some(e) => rest = &rest[e + "</tool_call>".len()..],
+            Some(_) => rest = &rest[call_end..],
             None => break,
         }
     }
+    let mut content = after[..content_end].trim().to_string();
+    for raw in unparsed.into_iter().filter(|r| !r.is_empty()) {
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str(raw);
+    }
     ParsedOutput {
-        content: after[..content_end].trim().to_string(),
+        content,
         reasoning,
         tool_calls,
     }
@@ -145,6 +159,25 @@ mod tests {
             "{\"t\":\"line1\\nline2\"}"
         );
         assert_eq!(p.tool_calls[1]["id"], "call_1");
+    }
+
+    #[test]
+    fn truncated_call_is_returned_as_content() {
+        // Cut at max_tokens inside a parameter value: nothing parses, the text is kept.
+        let text = "<tool_call>\n<function=finished>\n<parameter=fields>\n{\"evidence\": \"B1; B2";
+        let p = parse_output(text, None);
+        assert!(p.tool_calls.is_empty());
+        assert_eq!(p.content, text);
+        // Cut after a finished parameter: the partial call is not reported as a call.
+        let text = "Done.\n<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n<parameter=y>";
+        let p = parse_output(text, None);
+        assert!(p.tool_calls.is_empty());
+        assert_eq!(p.content, format!("Done.\n\n{}", &text["Done.\n".len()..]));
+        // A complete call before the cut one is kept as a call; the cut one follows the content.
+        let text = "<tool_call>\n<function=a>\n</function>\n</tool_call>\n<tool_call>\n<function=b>\n<parameter=x>\n12";
+        let p = parse_output(text, None);
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.content, "<tool_call>\n<function=b>\n<parameter=x>\n12");
     }
 
     #[test]
