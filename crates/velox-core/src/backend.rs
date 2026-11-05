@@ -232,6 +232,61 @@ pub struct Copy2dShape {
     pub dst_stride: usize,
 }
 
+/// Patches of a 3x3, stride 2, pad 1 convolution over `images` NHWC images `[h, w, c]`: row
+/// `(i, oy, ox)` of `[images * ceil(h/2) * ceil(w/2), 9 * c]` holds column `(ky * 3 + kx) * c + ci`
+/// = `x[i][2oy + ky - 1][2ox + kx - 1][ci]`, zero outside the image. A convolution is then
+/// `linear` against weights in that column order, and its output is NHWC again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Im2colShape {
+    pub images: usize,
+    pub h: usize,
+    pub w: usize,
+    pub c: usize,
+}
+
+impl Im2colShape {
+    pub fn out_h(&self) -> usize {
+        self.h.div_ceil(2)
+    }
+    pub fn out_w(&self) -> usize {
+        self.w.div_ceil(2)
+    }
+    pub fn in_len(&self) -> usize {
+        self.images * self.h * self.w * self.c
+    }
+    pub fn out_len(&self) -> usize {
+        self.images * self.out_h() * self.out_w() * 9 * self.c
+    }
+}
+
+/// Host reference of [`Backend::im2col_3x3s2`].
+pub fn im2col_3x3s2_host(x: &[f32], s: Im2colShape) -> Vec<f32> {
+    let (ho, wo, c) = (s.out_h(), s.out_w(), s.c);
+    let mut y = vec![0f32; s.out_len()];
+    for i in 0..s.images {
+        for oy in 0..ho {
+            for ox in 0..wo {
+                let row = &mut y[((i * ho + oy) * wo + ox) * 9 * c..][..9 * c];
+                for ky in 0..3 {
+                    let iy = (2 * oy + ky) as isize - 1;
+                    if iy < 0 || iy >= s.h as isize {
+                        continue;
+                    }
+                    for kx in 0..3 {
+                        let ix = (2 * ox + kx) as isize - 1;
+                        if ix < 0 || ix >= s.w as isize {
+                            continue;
+                        }
+                        let src = ((i * s.h + iy as usize) * s.w + ix as usize) * c;
+                        row[(ky * 3 + kx) * c..][..c].copy_from_slice(&x[src..src + c]);
+                    }
+                }
+            }
+        }
+    }
+    y
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FullAttnShape {
     pub tokens: usize,
@@ -1565,6 +1620,22 @@ pub trait Backend {
             }
         }
         Ok(())
+    }
+    /// Convolution patches; see [`Im2colShape`]. The default runs on the host through a download
+    /// and an upload (the CPU backend's implementation); device backends override it.
+    fn im2col_3x3s2(
+        &self,
+        x: &Self::Buffer,
+        y: &mut Self::Buffer,
+        shape: Im2colShape,
+    ) -> Result<()> {
+        crate::check::im2col_3x3s2(self.len(x), self.len(y), &shape)?;
+        let mut host = vec![0f32; self.len(x)];
+        self.synchronize()?;
+        self.download(x, &mut host)?;
+        let out = im2col_3x3s2_host(&host[..shape.in_len()], shape);
+        let tmp = self.upload(&out)?;
+        self.copy(&tmp, 0, y, 0, out.len())
     }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;

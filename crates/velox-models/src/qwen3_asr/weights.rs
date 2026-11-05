@@ -14,19 +14,28 @@ fn werr(e: velox_weights::Error) -> Error {
     Error::Config(e.to_string())
 }
 
-/// A stored matrix `[rows, k]`.
+/// A stored matrix `[rows, k]` and the activation rounding its use permits.
 pub struct Mat<B: Backend> {
     pub buf: B::Buffer,
     pub format: WeightFormat,
     pub rows: usize,
     pub k: usize,
+    pub act: ActPolicy,
 }
 
 impl<B: Backend> Mat<B> {
     pub fn view(&self) -> WeightView<'_, B::Buffer> {
-        // A16Only keeps activations exact; reduced-precision activations are a later, measured
-        // opt-in per backend.
-        WeightView::full(&self.buf, self.format, self.rows, self.k).with_act(ActPolicy::A16Only)
+        WeightView::full(&self.buf, self.format, self.rows, self.k).with_act(self.act)
+    }
+}
+
+/// Activation policy for GGML-quantized matrices: 8-bit activations (what llama.cpp's MMQ /
+/// MMVQ kernels do with these weights) unless `VELOX_ASR_A16` is set. Float matrices stay exact.
+fn ggml_act() -> ActPolicy {
+    if std::env::var_os("VELOX_ASR_A16").is_some() {
+        ActPolicy::A16Only
+    } else {
+        ActPolicy::AllowA8
     }
 }
 
@@ -48,8 +57,11 @@ pub struct EncLayer<B: Backend> {
 }
 
 pub struct EncWeights<B: Backend> {
-    /// Conv kernels `[480, cin * 9]` (F32), row index `cin * 9 + ky * 3 + kx`, and biases (host).
-    pub conv: [(Mat<B>, Vec<f32>); 3],
+    /// Conv kernels `[480, 9 * cin]` (F32) in `im2col_3x3s2` column order `(ky * 3 + kx) * cin +
+    /// ci`, and their biases.
+    pub conv: [(Mat<B>, B::Buffer); 3],
+    /// `[d, freq * ch]` (F32) with column `f * ch + c` (the checkpoint's is `c * freq + f`), so it
+    /// reads NHWC conv output after a `[freq, time]` transpose.
     pub conv_out: Mat<B>,
     pub layers: Vec<EncLayer<B>>,
     pub ln_post: (B::Buffer, B::Buffer),
@@ -195,11 +207,51 @@ impl<B: Backend> Loader<'_, B> {
                 (self.b.upload_bytes(&bytes)?, f)
             }
         };
+        let act = match format {
+            WeightFormat::Ggml(_) => ggml_act(),
+            _ => ActPolicy::A16Only,
+        };
         Ok(Mat {
             buf,
             format,
             rows,
             k,
+            act,
+        })
+    }
+
+    /// A float matrix `[rows, k]` as F32 with its columns permuted: column `j` of the result is
+    /// column `src(j)` of the tensor.
+    fn permuted(
+        &mut self,
+        name: &str,
+        rows: usize,
+        k: usize,
+        src: impl Fn(usize) -> usize,
+    ) -> Result<Mat<B>> {
+        let t = self.tensor(name)?;
+        if extents(t) != (k, rows) {
+            return Err(Error::Config(format!(
+                "{name}: {:?}, expected [{rows}, {k}]",
+                t.dims
+            )));
+        }
+        let v = self.values(name)?;
+        let map: Vec<usize> = (0..k).map(src).collect();
+        let mut out = vec![0f32; rows * k];
+        for r in 0..rows {
+            let (row, dst) = (&v[r * k..][..k], &mut out[r * k..][..k]);
+            for (j, d) in dst.iter_mut().enumerate() {
+                *d = row[map[j]];
+            }
+        }
+        self.bytes += 4 * out.len() as u64;
+        Ok(Mat {
+            buf: self.b.upload(&out)?,
+            format: WeightFormat::F32,
+            rows,
+            k,
+            act: ActPolicy::A16Only,
         })
     }
 
@@ -236,23 +288,23 @@ pub fn load_encoder<B: Backend>(b: &B, f: &Files, c: &AsrConfig) -> Result<(EncW
         bytes: 0,
     };
     let e = &c.enc;
-    let conv = |l: &mut Loader<'_, B>, i: usize, cin: usize| -> Result<(Mat<B>, Vec<f32>)> {
-        let w = l.matrix(&format!("a.conv2d.{i}.weight"), e.conv_ch, cin * 9)?;
-        let bias = l.values(&format!("a.conv2d.{i}.bias"))?;
-        if bias.len() != e.conv_ch {
-            return Err(Error::Config(format!(
-                "a.conv2d.{i}.bias: {} values",
-                bias.len()
-            )));
-        }
-        Ok((w, bias))
+    let conv = |l: &mut Loader<'_, B>, i: usize, cin: usize| -> Result<(Mat<B>, B::Buffer)> {
+        // Checkpoint column ci * 9 + tap -> im2col column tap * cin + ci.
+        let w = l.permuted(&format!("a.conv2d.{i}.weight"), e.conv_ch, cin * 9, |j| {
+            (j % cin) * 9 + j / cin
+        })?;
+        Ok((w, l.vector(&format!("a.conv2d.{i}.bias"), e.conv_ch)?))
     };
     let conv = [
         conv(&mut l, 1, 1)?,
         conv(&mut l, 2, e.conv_ch)?,
         conv(&mut l, 3, e.conv_ch)?,
     ];
-    let conv_out = l.matrix("a.conv_out.weight", e.d, e.conv_ch * e.conv_freq())?;
+    let (ch, fq) = (e.conv_ch, e.conv_freq());
+    // Checkpoint column c * fq + f -> f * ch + c.
+    let conv_out = l.permuted("a.conv_out.weight", e.d, ch * fq, |j| {
+        (j % ch) * fq + j / ch
+    })?;
     let (d, ff) = (e.d, e.ffn);
     let mut layers = Vec::with_capacity(e.layers);
     for n in 0..e.layers {

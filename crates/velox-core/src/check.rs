@@ -470,6 +470,17 @@ pub fn copy2d(src: usize, dst: usize, s: &Copy2dShape) -> Result<()> {
     need("copy2d dst", dst, end(s.dst_offset, s.dst_stride)?)
 }
 
+/// `im2col_3x3s2`: the NHWC input and the patch matrix fit their buffers.
+pub fn im2col_3x3s2(x: usize, y: usize, s: &crate::backend::Im2colShape) -> Result<()> {
+    if s.images == 0 || s.h == 0 || s.w == 0 || s.c == 0 {
+        return Err(Error::Shape(format!("im2col_3x3s2: empty shape {s:?}")));
+    }
+    let n_in = product(&[s.images, s.h, s.w, s.c])?;
+    let n_out = product(&[s.images, s.out_h(), s.out_w(), 9, s.c])?;
+    need("im2col_3x3s2 x", x, n_in)?;
+    need("im2col_3x3s2 y", y, n_out)
+}
+
 /// `transpose_heads`: `rows` rows of `a * b` heads of `dim` values in both buffers.
 pub fn transpose_heads(
     x: usize,

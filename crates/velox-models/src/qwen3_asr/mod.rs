@@ -10,10 +10,12 @@ pub mod weights;
 
 use std::path::Path;
 
-use velox_core::backend::{AttnShape, FullAttnShape, GeluKind, KvStoreShape, NormKind, RopeShape};
-use velox_core::{Backend, Error, KvFormat, Result};
+use velox_core::backend::{
+    AttnShape, FullAttnShape, GeluKind, Im2colShape, KvStoreShape, NormKind, RopeShape,
+};
+use velox_core::{Backend, Error, KvFormat, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
-use config::{half, EncConfig};
+use config::EncConfig;
 pub use config::{AsrConfig, ASR_TEXT, AUDIO_END, AUDIO_PAD, AUDIO_START, IM_END, IM_START};
 use mel::MelFrontend;
 use weights::{DecWeights, EncWeights, Files, Linear};
@@ -23,6 +25,11 @@ pub struct Qwen3Asr<B: Backend> {
     enc: EncWeights<B>,
     dec: DecWeights<B>,
     mel: MelFrontend,
+    /// [`chunk_positions`] for [`POS_CHUNKS`] chunks, on the device.
+    pos: B::Buffer,
+    pos_rows: usize,
+    /// The decoder workspace every request uses: static decode graphs replay on its buffers.
+    dec_ws: std::sync::Mutex<DecWorkspace<B>>,
     pub bytes: u64,
 }
 
@@ -51,86 +58,17 @@ fn sinusoids(rows: usize, d: usize) -> Vec<f32> {
     out
 }
 
-/// im2col of a 3x3, stride 2, pad 1 convolution: `img` is `[images, cin, h, w]`; returns
-/// `[images * ho * wo, cin * 9]` with column `ci * 9 + ky * 3 + kx` (PyTorch's weight order).
-fn im2col(img: &[f32], images: usize, cin: usize, h: usize, w: usize) -> Vec<f32> {
-    let (ho, wo) = (half(h), half(w));
-    let k = cin * 9;
-    let mut out = vec![0f32; images * ho * wo * k];
-    for i in 0..images {
-        for oy in 0..ho {
-            for ox in 0..wo {
-                let row = &mut out[((i * ho + oy) * wo + ox) * k..][..k];
-                for ci in 0..cin {
-                    let plane = &img[(i * cin + ci) * h * w..][..h * w];
-                    for ky in 0..3 {
-                        let y = (2 * oy + ky) as isize - 1;
-                        if y < 0 || y >= h as isize {
-                            continue;
-                        }
-                        for kx in 0..3 {
-                            let x = (2 * ox + kx) as isize - 1;
-                            if x >= 0 && x < w as isize {
-                                row[ci * 9 + ky * 3 + kx] = plane[y as usize * w + x as usize];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
+/// Conv chunks per device pass: bounds the im2col scratch (conv2's patches are ~28 MB per chunk).
+const CONV_GROUP: usize = 4;
 
-/// Exact (erf) GELU on the host, evaluated in f64: the conv stack runs here until it has a device op.
-fn gelu_erf(x: f32) -> f32 {
-    let x = f64::from(x);
-    (0.5 * x * (1.0 + erf(x / std::f64::consts::SQRT_2))) as f32
-}
+/// Chunks the device position table covers; longer clips build theirs per call.
+const POS_CHUNKS: usize = 120;
 
-/// erf with ~1e-15 error (series below 3, continued-fraction tail above), host-side.
-fn erf(x: f64) -> f64 {
-    let a = x.abs();
-    let r = if a < 3.0 {
-        // Maclaurin series.
-        let mut sum = a;
-        let mut term = a;
-        let a2 = a * a;
-        let mut n = 0.0;
-        loop {
-            n += 1.0;
-            term *= -a2 / n;
-            let add = term / (2.0 * n + 1.0);
-            sum += add;
-            // `<=` so erf(0), whose terms are all zero, terminates.
-            if add.abs() <= 1e-17 * sum.abs() {
-                break;
-            }
-        }
-        sum * 2.0 / std::f64::consts::PI.sqrt()
-    } else {
-        // erfc continued fraction (Lentz).
-        let a2 = a * a;
-        let mut f = a;
-        let (mut c, mut d) = (a, 0.0);
-        for n in 1..200 {
-            let an = n as f64 / 2.0;
-            d = a + an * d;
-            d = if d == 0.0 { 1e-300 } else { 1.0 / d };
-            c = a + an / c;
-            let delta = c * d;
-            f *= delta;
-            if (delta - 1.0).abs() < 1e-16 {
-                break;
-            }
-        }
-        1.0 - (-a2).exp() / (f * std::f64::consts::PI.sqrt())
-    };
-    if x < 0.0 {
-        -r
-    } else {
-        r
-    }
+/// Encoder positions for `chunks` full chunks: the per-chunk table repeated, so any clip's
+/// positions (a tail chunk included) are a prefix of it.
+fn chunk_positions(chunks: usize, per_chunk: usize, d: usize) -> Vec<f32> {
+    let table = sinusoids(per_chunk, d);
+    (0..chunks).flat_map(|_| table.iter().copied()).collect()
 }
 
 impl<B: Backend> Qwen3Asr<B> {
@@ -139,7 +77,13 @@ impl<B: Backend> Qwen3Asr<B> {
         let cfg = AsrConfig::from_gguf(&files.text, &files.mmproj)?;
         let (enc, eb) = weights::load_encoder(b, &files, &cfg)?;
         let (dec, db) = weights::load_decoder(b, &files, &cfg)?;
+        let per = EncConfig::chunk_tokens(cfg.enc.chunk_frames);
+        let pos = b.upload(&chunk_positions(POS_CHUNKS, per, cfg.enc.d))?;
+        let dec_ws = std::sync::Mutex::new(DecWorkspace::new(b, &cfg)?);
         Ok(Qwen3Asr {
+            dec_ws,
+            pos,
+            pos_rows: POS_CHUNKS * per,
             cfg,
             enc,
             dec,
@@ -156,49 +100,14 @@ impl<B: Backend> Qwen3Asr<B> {
         Ok(())
     }
 
-    /// One conv stage over `images` images `[cin, h, w]` (host), with bias and GELU; returns
-    /// `[images, cout, ho, wo]` on the host.
-    #[allow(clippy::too_many_arguments)]
-    fn conv(
-        &self,
-        b: &B,
-        stage: usize,
-        img: &[f32],
-        images: usize,
-        cin: usize,
-        h: usize,
-        w: usize,
-    ) -> Result<Vec<f32>> {
-        let (wm, bias) = &self.enc.conv[stage];
-        let (ho, wo) = (half(h), half(w));
-        let cout = wm.rows;
-        let rows = images * ho * wo;
-        let cols = b.upload(&im2col(img, images, cin, h, w))?;
-        let mut y = b.alloc(rows * cout)?;
-        b.linear(&cols, &wm.view(), &mut y, rows)?;
-        let mut host = vec![0f32; rows * cout];
-        b.synchronize()?;
-        b.download(&y, &mut host)?;
-        // [images, ho, wo, cout] -> [images, cout, ho, wo], with bias and GELU.
-        let mut out = vec![0f32; images * cout * ho * wo];
-        for i in 0..images {
-            for p in 0..ho * wo {
-                for c in 0..cout {
-                    out[(i * cout + c) * ho * wo + p] =
-                        gelu_erf(host[(i * ho * wo + p) * cout + c] + bias[c]);
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// Mel -> encoder input rows (conv stack, conv_out, per-chunk positions), `[tokens, d]`.
+    /// Everything after the host-built mel image runs on the device, `CONV_GROUP` chunks per pass.
     fn conv_stack(&self, b: &B, mel: &[f32], frames: usize) -> Result<(B::Buffer, usize)> {
         let e = &self.cfg.enc;
         let chunk = e.chunk_frames;
         let chunks = frames.div_ceil(chunk);
         let pad_to = if frames >= chunk { chunk } else { frames };
-        // [chunks, 1, mels, pad_to], zero padded on the right.
+        // NHWC [chunks, mels, pad_to, 1], zero padded on the right (docs: tail chunks).
         let mut img = vec![0f32; chunks * e.mels * pad_to];
         for c in 0..chunks {
             let (t0, len) = (c * chunk, (frames - c * chunk).min(chunk));
@@ -207,56 +116,77 @@ impl<B: Backend> Qwen3Asr<B> {
                 img[(c * e.mels + m) * pad_to..][..len].copy_from_slice(src);
             }
         }
-        let (mut h, mut w) = (e.mels, pad_to);
-        let mut x = self.conv(b, 0, &img, chunks, 1, h, w)?;
-        for stage in 1..3 {
-            x = self.conv(
-                b,
-                stage,
-                &x,
-                chunks,
-                e.conv_ch,
-                h.div_ceil(2),
-                w.div_ceil(2),
-            )?;
-            h = h.div_ceil(2);
-            w = w.div_ceil(2);
-        }
-        let (fq, t) = (half(h), half(w));
+        let ch = e.conv_ch;
+        let shapes = |g: usize| {
+            let s1 = Im2colShape {
+                images: g,
+                h: e.mels,
+                w: pad_to,
+                c: 1,
+            };
+            let s2 = Im2colShape {
+                images: g,
+                h: s1.out_h(),
+                w: s1.out_w(),
+                c: ch,
+            };
+            let s3 = Im2colShape {
+                images: g,
+                h: s2.out_h(),
+                w: s2.out_w(),
+                c: ch,
+            };
+            [s1, s2, s3]
+        };
+        let group = CONV_GROUP.min(chunks);
+        let full = shapes(group);
+        let act = |s: &Im2colShape| s.images * s.out_h() * s.out_w() * ch;
+        let cols_len = full.iter().map(Im2colShape::out_len).max().unwrap_or(0);
+        let mut cols = b.alloc(cols_len)?;
+        let mut acts = [
+            b.alloc(act(&full[0]))?,
+            b.alloc(act(&full[1]))?,
+            b.alloc(act(&full[2]))?,
+        ];
+        let mut tr = b.alloc(act(&full[2]))?;
+        let (fq, t) = (full[2].out_h(), full[2].out_w());
         debug_assert_eq!(fq, e.conv_freq());
-        // Keep the valid rows of each chunk, channel-major features c * fq + f.
-        let feat = e.conv_ch * fq;
+        let feat = ch * fq;
         let tokens = e.tokens(frames);
-        let mut rows = vec![0f32; tokens * feat];
+        let mut rows = b.alloc(tokens * feat)?;
         let mut at = 0;
-        for c in 0..chunks {
-            let len = (frames - c * chunk).min(chunk);
-            for tt in 0..EncConfig::chunk_tokens(len) {
-                let row = &mut rows[at * feat..][..feat];
-                for ch in 0..e.conv_ch {
-                    for f in 0..fq {
-                        row[ch * fq + f] = x[((c * e.conv_ch + ch) * fq + f) * t + tt];
-                    }
-                }
-                at += 1;
+        let image = e.mels * pad_to;
+        for g0 in (0..chunks).step_by(group) {
+            let gn = group.min(chunks - g0);
+            let sh = shapes(gn);
+            let x0 = b.upload(&img[g0 * image..(g0 + gn) * image])?;
+            for (stage, s) in sh.iter().enumerate() {
+                let src = if stage == 0 { &x0 } else { &acts[stage - 1] };
+                b.im2col_3x3s2(src, &mut cols, *s)?;
+                let (wm, bias) = &self.enc.conv[stage];
+                let m = s.images * s.out_h() * s.out_w();
+                b.linear(&cols, &wm.view(), &mut acts[stage], m)?;
+                b.add_bias_gelu(&mut acts[stage], bias, m, ch, GeluKind::Erf)?;
+            }
+            // [gn, fq, t, ch] -> [gn, t, fq, ch]: each time step's features f * ch + c.
+            b.transpose_heads(&acts[2], &mut tr, gn, fq, t, ch)?;
+            for c in g0..g0 + gn {
+                let valid = EncConfig::chunk_tokens((frames - c * chunk).min(chunk));
+                b.copy(&tr, (c - g0) * t * feat, &mut rows, at * feat, valid * feat)?;
+                at += valid;
             }
         }
         debug_assert_eq!(at, tokens);
-        let cols = b.upload(&rows)?;
         let mut out = b.alloc(tokens * e.d)?;
-        b.linear(&cols, &self.enc.conv_out.view(), &mut out, tokens)?;
-        // Positions restart in every chunk.
-        let table = sinusoids(EncConfig::chunk_tokens(chunk), e.d);
-        let mut pos = vec![0f32; tokens * e.d];
-        let mut at = 0;
-        for c in 0..chunks {
-            let len = (frames - c * chunk).min(chunk);
-            for tt in 0..EncConfig::chunk_tokens(len) {
-                pos[at * e.d..][..e.d].copy_from_slice(&table[tt * e.d..][..e.d]);
-                at += 1;
-            }
+        b.linear(&rows, &self.enc.conv_out.view(), &mut out, tokens)?;
+        // Positions restart in every chunk: a prefix of the repeated table.
+        if tokens <= self.pos_rows {
+            b.add(&mut out, &self.pos, tokens * e.d)?;
+        } else {
+            let per = EncConfig::chunk_tokens(chunk);
+            let pos = b.upload(&chunk_positions(chunks, per, e.d))?;
+            b.add(&mut out, &pos, tokens * e.d)?;
         }
-        b.add(&mut out, &b.upload(&pos)?, tokens * e.d)?;
         Ok((out, tokens))
     }
 
@@ -384,12 +314,72 @@ impl<B: Backend> Qwen3Asr<B> {
     }
 }
 
-/// A single-request decoder session: an F32 KV cache sized for `cap` positions.
+/// Rows one decoder pass handles; longer prompts prefill in chunks of this many.
+pub const PREFILL_ROWS: usize = 512;
+
+const GRAPH_DECODE: u64 = 1 << 16;
+
+/// A decoder session: its KV cache (F32, `cap` positions) and position.
 pub struct Session<B: Backend> {
     k_cache: Vec<B::Buffer>,
     v_cache: Vec<B::Buffer>,
     pub pos: usize,
     cap: usize,
+}
+
+/// Decoder activations, reused by every pass: freeing device memory synchronizes the device,
+/// and a static graph replays on the same buffers.
+pub struct DecWorkspace<B: Backend> {
+    rows: usize,
+    x: B::Buffer,
+    hb: B::Buffer,
+    q: B::Buffer,
+    qn: B::Buffer,
+    k: B::Buffer,
+    kn: B::Buffer,
+    v: B::Buffer,
+    attn: B::Buffer,
+    o: B::Buffer,
+    g: B::Buffer,
+    u: B::Buffer,
+    last: B::Buffer,
+    normed: B::Buffer,
+    pub logits: B::Buffer,
+    /// The latest greedy id (u32 bits), which the next decode step embeds from.
+    next_id: B::Buffer,
+}
+
+impl<B: Backend> DecWorkspace<B> {
+    pub fn new(b: &B, cfg: &AsrConfig) -> Result<Self> {
+        let t = &cfg.dec;
+        let n = PREFILL_ROWS;
+        let (h, qd, kvd) = (t.hidden, t.heads * t.head_dim, t.kv_heads * t.head_dim);
+        Ok(DecWorkspace {
+            rows: n,
+            x: b.alloc(n * h)?,
+            hb: b.alloc(n * h)?,
+            q: b.alloc(n * qd)?,
+            qn: b.alloc(n * qd)?,
+            k: b.alloc(n * kvd)?,
+            kn: b.alloc(n * kvd)?,
+            v: b.alloc(n * kvd)?,
+            attn: b.alloc(n * qd)?,
+            o: b.alloc(n * h)?,
+            g: b.alloc(n * t.ffn)?,
+            u: b.alloc(n * t.ffn)?,
+            last: b.alloc(h)?,
+            normed: b.alloc(h)?,
+            logits: b.alloc(t.vocab)?,
+            next_id: b.alloc(1)?,
+        })
+    }
+}
+
+/// Where a pass's input ids come from.
+enum Ids<'a> {
+    Host(&'a [u32]),
+    /// One id from the workspace's device slot.
+    Slot,
 }
 
 impl<B: Backend> Qwen3Asr<B> {
@@ -410,75 +400,73 @@ impl<B: Backend> Qwen3Asr<B> {
         })
     }
 
-    /// Runs `ids` through the decoder at the session's position (audio rows from `audio`
-    /// replacing the embeddings of `<|audio_pad|>` ids, in order) and returns the logits of the
-    /// last position.
-    pub fn forward(
+    /// One decoder pass of `n` rows at the session's position, ending with the last row's logits
+    /// in `ws.logits` and their greedy id in `ws.next_id`. `audio` rows replace the embeddings of
+    /// `<|audio_pad|>` ids, the second value being the encoder row of the first pad in `ids`.
+    fn pass(
         &self,
         b: &B,
         s: &mut Session<B>,
-        ids: &[u32],
-        audio: Option<&B::Buffer>,
-    ) -> Result<Vec<f32>> {
+        ws: &mut DecWorkspace<B>,
+        ids: Ids<'_>,
+        audio: Option<(&B::Buffer, usize)>,
+    ) -> Result<()> {
         let t = &self.cfg.dec;
-        let n = ids.len();
-        if n == 0 || s.pos + n > s.cap {
+        let n = match ids {
+            Ids::Host(v) => v.len(),
+            Ids::Slot => 1,
+        };
+        if n == 0 || n > ws.rows || s.pos + n > s.cap {
             return Err(Error::Shape(format!(
-                "decoder step of {n} at {} past capacity {}",
-                s.pos, s.cap
+                "decoder pass of {n} rows at {} (workspace {}, capacity {})",
+                s.pos, ws.rows, s.cap
             )));
         }
         let (h, hd) = (t.hidden, t.head_dim);
-        let (qd, kvd) = (t.heads * hd, t.kv_heads * hd);
-        let mut x = b.alloc(n * h)?;
-        b.embed(ids, &self.dec.embed.view(), &mut x)?;
-        if let Some(audio) = audio {
-            // Pads are contiguous in the prompt; copy runs in order.
-            let mut src = 0;
-            let mut i = 0;
-            while i < n {
-                if ids[i] != AUDIO_PAD {
-                    i += 1;
-                    continue;
+        match ids {
+            Ids::Host(v) => {
+                b.embed(v, &self.dec.embed.view(), &mut ws.x)?;
+                if let Some((audio, mut src)) = audio {
+                    let mut i = 0;
+                    while i < n {
+                        if v[i] != AUDIO_PAD {
+                            i += 1;
+                            continue;
+                        }
+                        let start = i;
+                        while i < n && v[i] == AUDIO_PAD {
+                            i += 1;
+                        }
+                        let len = i - start;
+                        b.copy(audio, src * h, &mut ws.x, start * h, len * h)?;
+                        src += len;
+                    }
                 }
-                let start = i;
-                while i < n && ids[i] == AUDIO_PAD {
-                    i += 1;
-                }
-                let len = i - start;
-                b.copy(audio, src * h, &mut x, start * h, len * h)?;
-                src += len;
             }
+            Ids::Slot => b.embed_from(&ws.next_id, 0, 1, &self.dec.embed.view(), &mut ws.x)?,
         }
-        let mut hb = b.alloc(n * h)?;
-        let (mut q, mut qn) = (b.alloc(n * qd)?, b.alloc(n * qd)?);
-        let (mut k, mut kn) = (b.alloc(n * kvd)?, b.alloc(n * kvd)?);
-        let mut v = b.alloc(n * kvd)?;
-        let mut attn = b.alloc(n * qd)?;
-        let mut o = b.alloc(n * h)?;
-        let (mut g, mut u) = (b.alloc(n * t.ffn)?, b.alloc(n * t.ffn)?);
         let eps = t.rms_eps;
+        let pos0 = s.pos;
         let rope = |heads| RopeShape {
             tokens: n,
             heads,
             head_dim: hd,
             rotary_dim: hd,
-            pos0: s.pos,
+            pos0,
             theta: t.rope_theta,
         };
-        let pos0 = s.pos;
         for (li, l) in self.dec.layers.iter().enumerate() {
-            b.rms_norm(&x, &l.attn_norm, &mut hb, n, h, eps, NormKind::Plain)?;
-            b.linear(&hb, &l.q.view(), &mut q, n)?;
-            b.linear(&hb, &l.k.view(), &mut k, n)?;
-            b.linear(&hb, &l.v.view(), &mut v, n)?;
-            b.rms_norm_groups(&q, &l.q_norm, &mut qn, n, t.heads, hd, eps)?;
-            b.rms_norm_groups(&k, &l.k_norm, &mut kn, n, t.kv_heads, hd, eps)?;
-            b.rope(&mut qn, rope(t.heads))?;
-            b.rope(&mut kn, rope(t.kv_heads))?;
+            b.rms_norm(&ws.x, &l.attn_norm, &mut ws.hb, n, h, eps, NormKind::Plain)?;
+            b.linear(&ws.hb, &l.q.view(), &mut ws.q, n)?;
+            b.linear(&ws.hb, &l.k.view(), &mut ws.k, n)?;
+            b.linear(&ws.hb, &l.v.view(), &mut ws.v, n)?;
+            b.rms_norm_groups(&ws.q, &l.q_norm, &mut ws.qn, n, t.heads, hd, eps)?;
+            b.rms_norm_groups(&ws.k, &l.k_norm, &mut ws.kn, n, t.kv_heads, hd, eps)?;
+            b.rope(&mut ws.qn, rope(t.heads))?;
+            b.rope(&mut ws.kn, rope(t.kv_heads))?;
             b.kv_store(
-                &kn,
-                &v,
+                &ws.kn,
+                &ws.v,
                 &mut s.k_cache[li],
                 &mut s.v_cache[li],
                 KvStoreShape {
@@ -490,10 +478,10 @@ impl<B: Backend> Qwen3Asr<B> {
                 },
             )?;
             b.attention(
-                &qn,
+                &ws.qn,
                 &s.k_cache[li],
                 &s.v_cache[li],
-                &mut attn,
+                &mut ws.attn,
                 AttnShape {
                     tokens: n,
                     heads: t.heads,
@@ -503,33 +491,62 @@ impl<B: Backend> Qwen3Asr<B> {
                     kv: KvFormat::F32,
                 },
             )?;
-            b.linear(&attn, &l.o.view(), &mut o, n)?;
-            b.add_rms_norm(&mut x, &o, &l.ffn_norm, &mut hb, n, h, eps, NormKind::Plain)?;
-            b.linear(&hb, &l.gate.view(), &mut g, n)?;
-            b.linear(&hb, &l.up.view(), &mut u, n)?;
-            b.silu_mul(&mut g, &u, n * t.ffn)?;
-            b.linear(&g, &l.down.view(), &mut o, n)?;
-            b.add(&mut x, &o, n * h)?;
+            b.linear(&ws.attn, &l.o.view(), &mut ws.o, n)?;
+            b.add_rms_norm(
+                &mut ws.x,
+                &ws.o,
+                &l.ffn_norm,
+                &mut ws.hb,
+                n,
+                h,
+                eps,
+                NormKind::Plain,
+            )?;
+            b.linear(&ws.hb, &l.gate.view(), &mut ws.g, n)?;
+            b.linear(&ws.hb, &l.up.view(), &mut ws.u, n)?;
+            b.silu_mul(&mut ws.g, &ws.u, n * t.ffn)?;
+            b.linear(&ws.g, &l.down.view(), &mut ws.o, n)?;
+            b.add(&mut ws.x, &ws.o, n * h)?;
         }
         s.pos += n;
-        let mut last = b.alloc(h)?;
-        b.copy(&x, (n - 1) * h, &mut last, 0, h)?;
-        let mut normed = b.alloc(h)?;
+        b.copy(&ws.x, (n - 1) * h, &mut ws.last, 0, h)?;
         b.rms_norm(
-            &last,
+            &ws.last,
             &self.dec.norm,
-            &mut normed,
+            &mut ws.normed,
             1,
             h,
             eps,
             NormKind::Plain,
         )?;
-        let mut logits = b.alloc(t.vocab)?;
-        b.linear(&normed, &self.dec.lm_head.view(), &mut logits, 1)?;
-        let mut host = vec![0f32; t.vocab];
-        b.synchronize()?;
-        b.download(&logits, &mut host)?;
-        Ok(host)
+        b.linear(&ws.normed, &self.dec.lm_head.view(), &mut ws.logits, 1)?;
+        b.argmax_to(&ws.logits, t.vocab, &mut ws.next_id, 0)
+    }
+
+    /// Prefills `ids` (chunks of [`PREFILL_ROWS`]); the greedy id is left in `ws.next_id`.
+    pub fn prefill(
+        &self,
+        b: &B,
+        s: &mut Session<B>,
+        ws: &mut DecWorkspace<B>,
+        ids: &[u32],
+        audio: Option<&B::Buffer>,
+    ) -> Result<()> {
+        let mut src = 0;
+        for part in ids.chunks(ws.rows) {
+            self.pass(b, s, ws, Ids::Host(part), audio.map(|a| (a, src)))?;
+            src += part.iter().filter(|&&id| id == AUDIO_PAD).count();
+        }
+        Ok(())
+    }
+
+    /// One greedy decode step from the id in `ws.next_id`, recorded as a static graph (one
+    /// recording per KV bucket serves every session and position).
+    pub fn step(&self, b: &B, s: &mut Session<B>, ws: &mut DecWorkspace<B>) -> Result<()> {
+        let kv = s.pos + 1;
+        let key =
+            GRAPH_DECODE | GRAPH_STATIC | ((kv.div_ceil(GRAPH_KV_BUCKET) as u64) & 0xffff) << 24;
+        b.graph(key, &mut || self.pass(b, s, ws, Ids::Slot, None))
     }
 
     /// Greedy transcription: prompt prefill, then one token per step until `<|im_end|>` or
@@ -542,15 +559,51 @@ impl<B: Backend> Qwen3Asr<B> {
         audio: &B::Buffer,
         max_new: usize,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
-        let mut s = self.session(b, prompt.len() + max_new + 1)?;
-        let first = self.forward(b, &mut s, prompt, Some(audio))?;
-        let mut out = Vec::new();
-        let mut next = argmax(&first);
-        while next != IM_END && out.len() < max_new {
-            out.push(next);
-            next = argmax(&self.forward(b, &mut s, &[next], None)?);
-        }
+        let (out, first, _) = self.generate_timed(b, prompt, audio, max_new)?;
         Ok((out, first))
+    }
+
+    /// [`Self::generate`], also returning the prefill's wall time. Steps are pipelined: the next
+    /// step is queued before the current id is read back, so the device never waits for the
+    /// host (one step past `<|im_end|>` is computed and discarded).
+    pub fn generate_timed(
+        &self,
+        b: &B,
+        prompt: &[u32],
+        audio: &B::Buffer,
+        max_new: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>, std::time::Duration)> {
+        let t0 = std::time::Instant::now();
+        let mut s = self.session(b, prompt.len() + max_new + 2)?;
+        let mut guard = self
+            .dec_ws
+            .lock()
+            .map_err(|_| Error::Backend("decoder workspace poisoned".into()))?;
+        let ws = &mut *guard;
+        self.prefill(b, &mut s, ws, prompt, Some(audio))?;
+        let mut first = vec![0f32; self.cfg.dec.vocab];
+        b.synchronize()?;
+        b.download(&ws.logits, &mut first)?;
+        let prefill = t0.elapsed();
+        let mut out = Vec::new();
+        b.fetch_u32_begin(&ws.next_id, 0, 0)?;
+        let mut slot = 0;
+        loop {
+            let pending = slot;
+            let more = out.len() < max_new;
+            if more {
+                self.step(b, &mut s, ws)?;
+                slot = (slot + 1) % 8;
+                b.fetch_u32_begin(&ws.next_id, 0, slot)?;
+            }
+            let id = b.fetch_u32(&ws.next_id, 0, pending)?;
+            if id == IM_END || !more {
+                break;
+            }
+            out.push(id);
+        }
+        b.synchronize()?;
+        Ok((out, first, prefill))
     }
 }
 
@@ -570,44 +623,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn erf_matches_known_values() {
-        for (x, want) in [
-            (0.0, 0.0),
-            (0.5, 0.520_499_877_813_046_5),
-            (1.0, 0.842_700_792_949_714_9),
-            (2.5, 0.999_593_047_982_555),
-            (3.5, 0.999_999_256_901_627_7),
-            (-1.0, -0.842_700_792_949_714_9),
-        ] {
-            assert!((erf(x) - want).abs() < 1e-13, "erf({x}) = {}", erf(x));
-        }
-    }
-
-    #[test]
-    fn im2col_matches_direct_convolution() {
-        let (cin, h, w) = (2, 5, 4);
-        let img: Vec<f32> = (0..cin * h * w).map(|i| (i as f32 * 0.37).sin()).collect();
-        let cols = im2col(&img, 1, cin, h, w);
-        let wts: Vec<f32> = (0..cin * 9).map(|i| (i as f32 * 0.11).cos()).collect();
-        let (ho, wo) = (half(h), half(w));
-        for oy in 0..ho {
-            for ox in 0..wo {
-                let mut direct = 0f32;
-                for ci in 0..cin {
-                    for ky in 0..3 {
-                        for kx in 0..3 {
-                            let (y, x) = ((2 * oy + ky) as isize - 1, (2 * ox + kx) as isize - 1);
-                            if (0..h as isize).contains(&y) && (0..w as isize).contains(&x) {
-                                direct += img[(ci * h + y as usize) * w + x as usize]
-                                    * wts[ci * 9 + ky * 3 + kx];
-                            }
-                        }
-                    }
-                }
-                let row = &cols[(oy * wo + ox) * cin * 9..][..cin * 9];
-                let via: f32 = row.iter().zip(&wts).map(|(a, b)| a * b).sum();
-                assert!((direct - via).abs() < 1e-5);
-            }
-        }
+    fn chunk_positions_restart_every_chunk() {
+        let (per, d) = (13, 8);
+        let p = chunk_positions(3, per, d);
+        assert_eq!(p.len(), 3 * per * d);
+        assert_eq!(&p[..per * d], &p[per * d..2 * per * d]);
+        // Row 0 of each chunk is sin(0) = 0 and cos(0) = 1.
+        assert_eq!(
+            &p[per * d..per * d + d],
+            &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+        );
     }
 }

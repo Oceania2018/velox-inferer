@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, CopySpec, DilatedConvShape, DynConvShape, ExpertBank, FullAttnShape,
-    GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape, LinearDst, MoeRouteShape,
-    NormKind, QsaPoolShape, QsaSelectShape, RopePosShape, RopeShape, RowGateShape, WeightView,
-    GRAPH_STATIC,
+    GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, Im2colShape, KvStoreShape, LinearDst,
+    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopePosShape, RopeShape, RowGateShape,
+    WeightView, GRAPH_STATIC,
 };
 use velox_core::{
     check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, StateFormat, VariantInfo,
@@ -1096,6 +1096,10 @@ pub trait CudaKernels: Send + Sync {
         portable::transpose_heads(x, y, rows, a, b, dim)
     }
 
+    fn im2col_3x3s2(&self, x: &CudaBuffer, y: &mut CudaBuffer, shape: Im2colShape) -> Result<()> {
+        portable::im2col_3x3s2(x, y, shape)
+    }
+
     fn dyn_conv(
         &self,
         x: &CudaBuffer,
@@ -2062,6 +2066,11 @@ impl Backend for CudaBackend {
         self.staged("transpose_heads", || {
             self.kernels.transpose_heads(x, y, rows, a, b, dim)
         })
+    }
+
+    fn im2col_3x3s2(&self, x: &CudaBuffer, y: &mut CudaBuffer, shape: Im2colShape) -> Result<()> {
+        check::im2col_3x3s2(x.len, y.len, &shape)?;
+        self.staged("im2col_3x3s2", || self.kernels.im2col_3x3s2(x, y, shape))
     }
 
     fn dyn_conv(

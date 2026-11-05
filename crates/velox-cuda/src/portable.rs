@@ -3,9 +3,9 @@
 
 use velox_core::backend::{
     AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank,
-    ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape,
-    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
-    RowGateShape, WeightView,
+    ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, Im2colShape,
+    KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape,
+    RopeShape, RowGateShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
 use velox_core::kv::{hadamard_norm, KvFormat};
@@ -1669,6 +1669,14 @@ extern "C" {
         accumulate: i32,
         block: i32,
     ) -> i32;
+    fn velox_portable_im2col_3x3s2(
+        x: *const f32,
+        y: *mut f32,
+        images: i32,
+        h: i32,
+        w: i32,
+        c: i32,
+    ) -> i32;
     fn velox_portable_transpose_heads(
         x: *const f32,
         y: *mut f32,
@@ -1784,6 +1792,24 @@ pub fn dyn_conv(
             )
         },
         "portable dyn_conv",
+    )
+}
+
+pub fn im2col_3x3s2(x: &CudaBuffer, y: &mut CudaBuffer, s: Im2colShape) -> Result<()> {
+    check::im2col_3x3s2(x.len(), y.len(), &s)?;
+    // SAFETY: both buffers hold the shape's values (checked).
+    status(
+        unsafe {
+            velox_portable_im2col_3x3s2(
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                to_i32("images", s.images)?,
+                to_i32("h", s.h)?,
+                to_i32("w", s.w)?,
+                to_i32("c", s.c)?,
+            )
+        },
+        "portable im2col_3x3s2",
     )
 }
 

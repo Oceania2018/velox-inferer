@@ -1626,6 +1626,25 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn im2col_3x3s2(&mut self, images: usize, h: usize, w: usize, c: usize) -> Result<()> {
+        let shape = velox_core::Im2colShape { images, h, w, c };
+        let x = self.rng.vec(shape.in_len(), 1.0);
+        let mut want = vec![0.0; shape.out_len()];
+        CpuBackend.im2col_3x3s2(&x, &mut want, shape)?;
+        let xd = self.b.upload(&x)?;
+        let mut yd = self.b.alloc(shape.out_len())?;
+        self.b.im2col_3x3s2(&xd, &mut yd, shape)?;
+        let got = fetch(self.b, &yd, shape.out_len())?;
+        self.record(
+            format!("im2col_3x3s2 {images}x[{h}x{w}x{c}]"),
+            None,
+            &got,
+            &want,
+            0.0,
+        );
+        Ok(())
+    }
+
     fn transpose_heads(&mut self, rows: usize, a: usize, b: usize, dim: usize) -> Result<()> {
         let n = rows * a * b * dim;
         let x = self.rng.vec(n, 1.0);
@@ -3625,6 +3644,12 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         1,
     )?;
     // Gated DeltaNet outputs into llama.cpp's tiled value-head order (16 key heads x 3).
+    // Qwen3-ASR conv stack (docs/qwen3_asr.md): the mel image, the 480-channel layers, a short
+    // single chunk and odd sizes that exercise the zero border.
+    s.im2col_3x3s2(2, 128, 100, 1)?;
+    s.im2col_3x3s2(3, 64, 50, 480)?;
+    s.im2col_3x3s2(1, 32, 13, 480)?;
+    s.im2col_3x3s2(2, 7, 5, 3)?;
     s.transpose_heads(1, 16, 3, 128)?;
     s.transpose_heads(37, 16, 3, 128)?;
     s.transpose_heads(5, 2, 3, 7)?;

@@ -1207,6 +1207,32 @@ __global__ void transpose_heads_kernel(const float* __restrict__ x, float* __res
 }
 }  // namespace
 
+namespace {
+// Patches of a 3x3, stride 2, pad 1 convolution over NHWC images (velox_core::Im2colShape): one
+// thread per output value, zero outside the image.
+__global__ void im2col_3x3s2_kernel(const float* __restrict__ x, float* __restrict__ y, int images, int h, int w,
+                                    int c) {
+    const int ho = (h + 1) / 2, wo = (w + 1) / 2, k = 9 * c;
+    const long long n = static_cast<long long>(images) * ho * wo * k;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long row = i / k;
+        const int col = static_cast<int>(i % k), tap = col / c, ci = col % c;
+        const int ox = static_cast<int>(row % wo), oy = static_cast<int>((row / wo) % ho);
+        const long long img = row / (static_cast<long long>(wo) * ho);
+        const int iy = 2 * oy + tap / 3 - 1, ix = 2 * ox + tap % 3 - 1;
+        y[i] = (iy >= 0 && iy < h && ix >= 0 && ix < w) ? x[((img * h + iy) * w + ix) * c + ci] : 0.0f;
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_im2col_3x3s2(const float* x, float* y, int images, int h, int w, int c) {
+    const long long n = static_cast<long long>(images) * ((h + 1) / 2) * ((w + 1) / 2) * 9 * c;
+    if (n == 0) return 0;
+    im2col_3x3s2_kernel<<<velox_grid_1d(n, 256), 256>>>(x, y, images, h, w, c);
+    return velox_launch_status();
+}
+
 VELOX_API int velox_portable_transpose_heads(const float* x, float* y, long long rows, int a, int b, int dim) {
     const long long n = rows * a * b * dim;
     if (n == 0) return 0;

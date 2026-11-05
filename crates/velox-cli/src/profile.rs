@@ -687,6 +687,14 @@ impl<B: Backend> Backend for Profiled<B> {
             self.inner.add_bias_rope(x, bias, p, table, s)
         })
     }
+    fn im2col_3x3s2(
+        &self,
+        x: &B::Buffer,
+        y: &mut B::Buffer,
+        s: velox_core::Im2colShape,
+    ) -> Result<()> {
+        self.time("im2col_3x3s2", || self.inner.im2col_3x3s2(x, y, s))
+    }
     fn add_bias_gelu(
         &self,
         x: &mut B::Buffer,
