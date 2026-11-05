@@ -1,5 +1,6 @@
 //! Whisper-style log-mel features (docs/qwen3_asr.md#log-mel-whisperfeatureextractor), computed
-//! on the host in f64.
+//! on the host: an f32 DFT over frames split across threads, then sparse mel filters and the
+//! log in f64.
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const N_FFT: usize = 400;
@@ -7,13 +8,18 @@ pub const HOP: usize = 160;
 pub const N_MELS: usize = 128;
 const BINS: usize = N_FFT / 2 + 1;
 
+/// Frames per thread below which splitting does not pay for the spawn.
+const FRAMES_PER_THREAD: usize = 64;
+
 /// Precomputed window, DFT twiddles and mel filters; build once and reuse.
 pub struct MelFrontend {
-    window: Vec<f64>,
-    cos: Vec<f64>,
-    sin: Vec<f64>,
-    /// `[N_MELS, BINS]`
-    filters: Vec<f64>,
+    window: Vec<f32>,
+    /// `[BINS, N_FFT]` each.
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+    /// Per mel band: first FFT bin and the weights from there (the non-zero span of its
+    /// triangle).
+    filters: Vec<(usize, Vec<f64>)>,
 }
 
 fn hz_to_mel(f: f64) -> f64 {
@@ -66,20 +72,22 @@ impl MelFrontend {
         let edges: Vec<f64> = (0..N_MELS + 2)
             .map(|i| mel_to_hz(m0 + (m1 - m0) * i as f64 / (N_MELS + 1) as f64))
             .collect();
-        let mut filters = vec![0.0; N_MELS * BINS];
+        let mut filters = Vec::with_capacity(N_MELS);
         for m in 0..N_MELS {
             let (lo, c, hi) = (edges[m], edges[m + 1], edges[m + 2]);
             let norm = 2.0 / (hi - lo);
-            for (b, &f) in fft_freqs.iter().enumerate() {
-                let down = (f - lo) / (c - lo);
-                let up = (hi - f) / (hi - c);
-                filters[m * BINS + b] = down.min(up).max(0.0) * norm;
-            }
+            let w: Vec<f64> = fft_freqs
+                .iter()
+                .map(|&f| ((f - lo) / (c - lo)).min((hi - f) / (hi - c)).max(0.0) * norm)
+                .collect();
+            let first = w.iter().position(|&v| v > 0.0).unwrap_or(0);
+            let last = w.iter().rposition(|&v| v > 0.0).map_or(first, |i| i + 1);
+            filters.push((first, w[first..last.max(first)].to_vec()));
         }
         MelFrontend {
-            window,
-            cos,
-            sin,
+            window: window.iter().map(|&v| v as f32).collect(),
+            cos: cos.iter().map(|&v| v as f32).collect(),
+            sin: sin.iter().map(|&v| v as f32).collect(),
             filters,
         }
     }
@@ -89,21 +97,16 @@ impl MelFrontend {
         samples / HOP
     }
 
-    /// `[N_MELS, frames]` row-major log-mel of 16 kHz mono PCM.
-    pub fn compute(&self, pcm: &[i16]) -> Vec<f32> {
-        let frames = Self::frames(pcm.len());
-        if frames == 0 {
-            return Vec::new();
-        }
-        let x: Vec<f64> = pcm.iter().map(|&s| f64::from(s) / 32768.0).collect();
-        let pad = N_FFT / 2;
-        // Reflect padding (numpy / torch "reflect": the edge sample is not repeated).
-        let at = |i: isize| -> f64 {
-            let n = x.len() as isize;
-            let mut j = i - pad as isize;
+    /// Power spectra of frames `t0 .. t0 + out.len() / BINS` into `out` (`[frames, BINS]`).
+    fn power(&self, x: &[f32], t0: usize, out: &mut [f64]) {
+        let n = x.len() as isize;
+        let pad = (N_FFT / 2) as isize;
+        // numpy / torch "reflect": the edge sample is not repeated.
+        let at = |i: isize| -> f32 {
             if n == 1 {
                 return x[0];
             }
+            let mut j = i - pad;
             while j < 0 || j >= n {
                 if j < 0 {
                     j = -j;
@@ -114,28 +117,60 @@ impl MelFrontend {
             }
             x[j as usize]
         };
-        let mut logmel = vec![0f64; N_MELS * frames];
-        let mut frame = vec![0f64; N_FFT];
-        let mut power = vec![0f64; BINS];
-        for t in 0..frames {
-            for (n, v) in frame.iter_mut().enumerate() {
-                *v = at((t * HOP + n) as isize) * self.window[n];
+        let mut frame = [0f32; N_FFT];
+        for (f, p) in out.chunks_exact_mut(BINS).enumerate() {
+            let start = ((t0 + f) * HOP) as isize;
+            for (i, v) in frame.iter_mut().enumerate() {
+                *v = at(start + i as isize) * self.window[i];
             }
-            for (k, p) in power.iter_mut().enumerate() {
+            for (k, pk) in p.iter_mut().enumerate() {
                 let (c, s) = (
-                    &self.cos[k * N_FFT..(k + 1) * N_FFT],
-                    &self.sin[k * N_FFT..(k + 1) * N_FFT],
+                    &self.cos[k * N_FFT..][..N_FFT],
+                    &self.sin[k * N_FFT..][..N_FFT],
                 );
-                let (mut re, mut im) = (0.0, 0.0);
-                for n in 0..N_FFT {
-                    re += frame[n] * c[n];
-                    im -= frame[n] * s[n];
+                // Eight partial sums keep the loop vectorizable and the f32 error small.
+                let (mut re, mut im) = ([0f32; 8], [0f32; 8]);
+                for ((fr, cc), ss) in frame
+                    .chunks_exact(8)
+                    .zip(c.chunks_exact(8))
+                    .zip(s.chunks_exact(8))
+                {
+                    for j in 0..8 {
+                        re[j] += fr[j] * cc[j];
+                        im[j] += fr[j] * ss[j];
+                    }
                 }
-                *p = re * re + im * im;
+                let re: f64 = re.iter().map(|&v| f64::from(v)).sum();
+                let im: f64 = im.iter().map(|&v| f64::from(v)).sum();
+                *pk = re * re + im * im;
             }
-            for m in 0..N_MELS {
-                let f = &self.filters[m * BINS..(m + 1) * BINS];
-                let e: f64 = f.iter().zip(&power).map(|(a, b)| a * b).sum();
+        }
+    }
+
+    /// `[N_MELS, frames]` row-major log-mel of 16 kHz mono PCM.
+    pub fn compute(&self, pcm: &[i16]) -> Vec<f32> {
+        let frames = Self::frames(pcm.len());
+        if frames == 0 {
+            return Vec::new();
+        }
+        let x: Vec<f32> = pcm.iter().map(|&s| f32::from(s) / 32768.0).collect();
+        let mut power = vec![0f64; frames * BINS];
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(frames.div_ceil(FRAMES_PER_THREAD))
+            .max(1);
+        let per = frames.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (i, part) in power.chunks_mut(per * BINS).enumerate() {
+                let x = &x;
+                sc.spawn(move || self.power(x, i * per, part));
+            }
+        });
+        let mut logmel = vec![0f64; N_MELS * frames];
+        for t in 0..frames {
+            let p = &power[t * BINS..][..BINS];
+            for (m, (first, w)) in self.filters.iter().enumerate() {
+                let e: f64 = w.iter().zip(&p[*first..]).map(|(a, b)| a * b).sum();
                 logmel[m * frames + t] = e.max(1e-10).log10();
             }
         }

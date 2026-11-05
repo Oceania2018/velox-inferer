@@ -11,7 +11,8 @@ pub mod weights;
 use std::path::Path;
 
 use velox_core::backend::{
-    AttnShape, FullAttnShape, GeluKind, Im2colShape, KvStoreShape, NormKind, RopeShape,
+    AttnShape, FullAttnShape, GeluKind, Im2colShape, KvStoreShape, NormKind, PoolShape, RopeLayout,
+    RopePosShape, RopeShape,
 };
 use velox_core::{Backend, Error, KvFormat, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
@@ -202,12 +203,39 @@ impl<B: Backend> Qwen3Asr<B> {
         pcm: &[i16],
         trace: bool,
     ) -> Result<(B::Buffer, usize, Option<EncodeTrace>)> {
-        let e = &self.cfg.enc;
         let frames = MelFrontend::frames(pcm.len());
         if frames == 0 {
             return Err(Error::Shape("audio shorter than one mel frame".into()));
         }
         let mel = self.mel.compute(pcm);
+        self.encode_mel_traced(b, mel, frames, trace)
+    }
+
+    /// The host mel frontend (a server computes features on its request threads).
+    pub fn mel(&self) -> &MelFrontend {
+        &self.mel
+    }
+
+    /// Audio embeddings `[tokens, hidden]` from `[N_MELS, frames]` log-mel.
+    pub fn encode_mel(&self, b: &B, mel: Vec<f32>, frames: usize) -> Result<(B::Buffer, usize)> {
+        let (out, tokens, _) = self.encode_mel_traced(b, mel, frames, false)?;
+        Ok((out, tokens))
+    }
+
+    fn encode_mel_traced(
+        &self,
+        b: &B,
+        mel: Vec<f32>,
+        frames: usize,
+        trace: bool,
+    ) -> Result<(B::Buffer, usize, Option<EncodeTrace>)> {
+        let e = &self.cfg.enc;
+        if frames == 0 || mel.len() != e.mels * frames {
+            return Err(Error::Shape(format!(
+                "mel of {} values for {frames} frames",
+                mel.len()
+            )));
+        }
         let (mut x, n) = self.conv_stack(b, &mel, frames)?;
         let mut tr = if trace {
             let mut conv = vec![0f32; n * e.d];
@@ -325,6 +353,18 @@ pub struct Session<B: Backend> {
     v_cache: Vec<B::Buffer>,
     pub pos: usize,
     cap: usize,
+}
+
+impl<B: Backend> Session<B> {
+    /// Positions the cache holds.
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Starts over at position 0 (the cache is overwritten as it fills again).
+    pub fn reset(&mut self) {
+        self.pos = 0;
+    }
 }
 
 /// Decoder activations, reused by every pass: freeing device memory synchronizes the device,
@@ -604,6 +644,297 @@ impl<B: Backend> Qwen3Asr<B> {
         }
         b.synchronize()?;
         Ok((out, first, prefill))
+    }
+}
+
+/// Sequences one batched decode step serves at most.
+pub const MAX_BATCH: usize = 32;
+
+/// Positions the prefill scratch session holds (prompts are encoder rows plus ~20 tokens: 13 per
+/// second of audio, so 2048 covers about two and a half minutes).
+pub const PREFILL_CAP: usize = 2048;
+
+const GRAPH_DECODE_BATCH: u64 = 2 << 16;
+
+/// One F32 KV pool for all serving sequences: per layer `[rows, kv_heads, head_dim]` K and V, and
+/// first-fit ranges of rows handed to sequences.
+pub struct KvPool<B: Backend> {
+    k: Vec<B::Buffer>,
+    v: Vec<B::Buffer>,
+    rows: usize,
+    /// Free ranges `(start, len)`, sorted by start, coalesced.
+    free: Vec<(usize, usize)>,
+}
+
+/// A sequence living in a [`KvPool`]: rows `base .. base + cap`, `pos` of them filled.
+pub struct PoolSeq {
+    base: usize,
+    cap: usize,
+    pub pos: usize,
+}
+
+impl PoolSeq {
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+}
+
+impl<B: Backend> KvPool<B> {
+    pub fn new(b: &B, cfg: &AsrConfig, rows: usize) -> Result<Self> {
+        let t = &cfg.dec;
+        let row = t.kv_heads * t.head_dim;
+        let mut k = Vec::with_capacity(t.layers);
+        let mut v = Vec::with_capacity(t.layers);
+        for _ in 0..t.layers {
+            k.push(b.alloc(rows * row)?);
+            v.push(b.alloc(rows * row)?);
+        }
+        Ok(KvPool {
+            k,
+            v,
+            rows,
+            free: vec![(0, rows)],
+        })
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Rows still free.
+    pub fn free_rows(&self) -> usize {
+        self.free.iter().map(|r| r.1).sum()
+    }
+
+    /// A range of `cap` rows, or `None` when no free range is that long.
+    pub fn alloc(&mut self, cap: usize) -> Option<PoolSeq> {
+        let i = self.free.iter().position(|r| r.1 >= cap)?;
+        let (start, len) = self.free[i];
+        if len == cap {
+            self.free.remove(i);
+        } else {
+            self.free[i] = (start + cap, len - cap);
+        }
+        Some(PoolSeq {
+            base: start,
+            cap,
+            pos: 0,
+        })
+    }
+
+    pub fn release(&mut self, s: PoolSeq) {
+        let i = self.free.partition_point(|r| r.0 < s.base);
+        self.free.insert(i, (s.base, s.cap));
+        // Coalesce with the neighbours.
+        if i + 1 < self.free.len() && self.free[i].0 + self.free[i].1 == self.free[i + 1].0 {
+            self.free[i].1 += self.free[i + 1].1;
+            self.free.remove(i + 1);
+        }
+        if i > 0 && self.free[i - 1].0 + self.free[i - 1].1 == self.free[i].0 {
+            self.free[i - 1].1 += self.free[i].1;
+            self.free.remove(i);
+        }
+    }
+}
+
+/// Buffers of [`Qwen3Asr::step_batch`] beyond the decoder workspace's.
+pub struct BatchWorkspace<B: Backend> {
+    /// `[MAX_BATCH, hidden]` final-norm rows, `[MAX_BATCH, vocab]` logits, one logits row, ids.
+    normed: B::Buffer,
+    logits: B::Buffer,
+    row: B::Buffer,
+    ids: B::Buffer,
+    /// The prefill session every admission reuses (its rows are then copied into the pool).
+    prefill: Session<B>,
+}
+
+impl<B: Backend> BatchWorkspace<B> {
+    pub fn new(b: &B, m: &Qwen3Asr<B>) -> Result<Self> {
+        let t = &m.cfg.dec;
+        Ok(BatchWorkspace {
+            normed: b.alloc(MAX_BATCH * t.hidden)?,
+            logits: b.alloc(MAX_BATCH * t.vocab)?,
+            row: b.alloc(t.vocab)?,
+            ids: b.alloc(MAX_BATCH)?,
+            prefill: m.session(b, PREFILL_CAP)?,
+        })
+    }
+}
+
+impl<B: Backend> Qwen3Asr<B> {
+    /// Prefills `prompt` (audio rows from `audio`) into the scratch session, copies its KV rows
+    /// into `seq`'s range of the pool and returns the first greedy id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_pooled(
+        &self,
+        b: &B,
+        pool: &mut KvPool<B>,
+        seq: &mut PoolSeq,
+        ws: &mut DecWorkspace<B>,
+        bw: &mut BatchWorkspace<B>,
+        prompt: &[u32],
+        audio: &B::Buffer,
+    ) -> Result<u32> {
+        let n = prompt.len();
+        if n > PREFILL_CAP || n >= seq.cap {
+            return Err(Error::Shape(format!(
+                "prompt of {n} tokens (prefill cap {PREFILL_CAP}, sequence cap {})",
+                seq.cap
+            )));
+        }
+        let s = &mut bw.prefill;
+        s.reset();
+        self.prefill(b, s, ws, prompt, Some(audio))?;
+        let row = self.cfg.dec.kv_heads * self.cfg.dec.head_dim;
+        for li in 0..self.cfg.dec.layers {
+            b.copy(&s.k_cache[li], 0, &mut pool.k[li], seq.base * row, n * row)?;
+            b.copy(&s.v_cache[li], 0, &mut pool.v[li], seq.base * row, n * row)?;
+        }
+        seq.pos = n;
+        b.fetch_u32_begin(&ws.next_id, 0, 0)?;
+        b.fetch_u32(&ws.next_id, 0, 0)
+    }
+
+    /// One greedy decode step for every sequence in `seqs` at once: `ids[i]` is sequence `i`'s
+    /// last token. Projections and the MLP run on all rows together (each weight is read once per
+    /// step); the sequences store and attend in the pool with one call per layer. Returns each
+    /// sequence's next id. Recorded as a static graph per (batch size, KV bucket): ids, positions
+    /// and ranges are per-call values.
+    pub fn step_batch(
+        &self,
+        b: &B,
+        pool: &mut KvPool<B>,
+        seqs: &mut [&mut PoolSeq],
+        ids: &[u32],
+        ws: &mut DecWorkspace<B>,
+        bw: &mut BatchWorkspace<B>,
+    ) -> Result<Vec<u32>> {
+        let n = seqs.len();
+        if n == 0 || n != ids.len() || n > MAX_BATCH || n > ws.rows {
+            return Err(Error::Shape(format!(
+                "step_batch: {n} sequences, {} ids (max {MAX_BATCH})",
+                ids.len()
+            )));
+        }
+        if let Some(s) = seqs.iter().find(|s| s.pos + 1 > s.cap) {
+            return Err(Error::Shape(format!(
+                "sequence at {} past capacity {}",
+                s.pos, s.cap
+            )));
+        }
+        let positions: Vec<u32> = seqs.iter().map(|s| s.pos as u32).collect();
+        let dst: Vec<u32> = seqs.iter().map(|s| (s.base + s.pos) as u32).collect();
+        let ranges: Vec<(u32, u32)> = seqs
+            .iter()
+            .map(|s| (s.base as u32, (s.pos + 1) as u32))
+            .collect();
+        let kv = seqs.iter().map(|s| s.pos + 1).max().unwrap_or(1);
+        let key = GRAPH_DECODE_BATCH
+            | GRAPH_STATIC
+            | (n as u64) << 8
+            | ((kv.div_ceil(GRAPH_KV_BUCKET) as u64) & 0xffff) << 24;
+        b.graph(key, &mut || {
+            self.batch_pass(b, pool, ids, &positions, &dst, &ranges, ws, bw)
+        })?;
+        for s in seqs.iter_mut() {
+            s.pos += 1;
+        }
+        let mut host = vec![0f32; n];
+        b.synchronize()?;
+        b.download(&bw.ids, &mut host)?;
+        Ok(host[..n].iter().map(|v| v.to_bits()).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batch_pass(
+        &self,
+        b: &B,
+        pool: &mut KvPool<B>,
+        ids: &[u32],
+        positions: &[u32],
+        dst: &[u32],
+        ranges: &[(u32, u32)],
+        ws: &mut DecWorkspace<B>,
+        bw: &mut BatchWorkspace<B>,
+    ) -> Result<()> {
+        let t = &self.cfg.dec;
+        let n = ids.len();
+        let (h, hd) = (t.hidden, t.head_dim);
+        let eps = t.rms_eps;
+        let rope = |heads| RopePosShape {
+            tokens: n,
+            heads,
+            head_dim: hd,
+            rotary_dim: hd,
+            theta: t.rope_theta,
+            axes: 1,
+            layout: RopeLayout::Interleaved,
+        };
+        let shape = PoolShape {
+            rows: n,
+            heads: t.heads,
+            kv_heads: t.kv_heads,
+            head_dim: hd,
+            pool_rows: pool.rows,
+        };
+        b.embed(ids, &self.dec.embed.view(), &mut ws.x)?;
+        for (li, l) in self.dec.layers.iter().enumerate() {
+            b.rms_norm(&ws.x, &l.attn_norm, &mut ws.hb, n, h, eps, NormKind::Plain)?;
+            b.linear(&ws.hb, &l.q.view(), &mut ws.q, n)?;
+            b.linear(&ws.hb, &l.k.view(), &mut ws.k, n)?;
+            b.linear(&ws.hb, &l.v.view(), &mut ws.v, n)?;
+            b.rms_norm_groups(&ws.q, &l.q_norm, &mut ws.qn, n, t.heads, hd, eps)?;
+            b.rms_norm_groups(&ws.k, &l.k_norm, &mut ws.kn, n, t.kv_heads, hd, eps)?;
+            b.rope_positions(&mut ws.qn, positions, rope(t.heads))?;
+            b.rope_positions(&mut ws.kn, positions, rope(t.kv_heads))?;
+            b.kv_scatter(&ws.kn, &ws.v, &mut pool.k[li], &mut pool.v[li], dst, shape)?;
+            b.attention_ranges(
+                &ws.qn,
+                &pool.k[li],
+                &pool.v[li],
+                &mut ws.attn,
+                ranges,
+                shape,
+            )?;
+            b.linear(&ws.attn, &l.o.view(), &mut ws.o, n)?;
+            b.add_rms_norm(
+                &mut ws.x,
+                &ws.o,
+                &l.ffn_norm,
+                &mut ws.hb,
+                n,
+                h,
+                eps,
+                NormKind::Plain,
+            )?;
+            b.linear(&ws.hb, &l.gate.view(), &mut ws.g, n)?;
+            b.linear(&ws.hb, &l.up.view(), &mut ws.u, n)?;
+            b.silu_mul(&mut ws.g, &ws.u, n * t.ffn)?;
+            b.linear(&ws.g, &l.down.view(), &mut ws.o, n)?;
+            b.add(&mut ws.x, &ws.o, n * h)?;
+        }
+        b.rms_norm(
+            &ws.x,
+            &self.dec.norm,
+            &mut bw.normed,
+            n,
+            h,
+            eps,
+            NormKind::Plain,
+        )?;
+        b.linear(&bw.normed, &self.dec.lm_head.view(), &mut bw.logits, n)?;
+        for i in 0..n {
+            b.copy(&bw.logits, i * t.vocab, &mut bw.row, 0, t.vocab)?;
+            b.argmax_to(&bw.row, t.vocab, &mut bw.ids, i)?;
+        }
+        Ok(())
+    }
+
+    /// The model's decoder workspace (static graphs replay on its buffers).
+    pub fn decoder_workspace(&self) -> Result<std::sync::MutexGuard<'_, DecWorkspace<B>>> {
+        self.dec_ws
+            .lock()
+            .map_err(|_| Error::Backend("decoder workspace poisoned".into()))
     }
 }
 

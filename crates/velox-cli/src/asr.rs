@@ -111,6 +111,10 @@ fn asr<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Result<Ex
         let want_enc = f32s(&dir.join("enc.f32"))?;
         let want_logits = f32s(&dir.join("logits0.f32"))?;
         let audio_s = pcm.len() as f64 / 16_000.0;
+        let fe = velox_models::qwen3_asr::mel::MelFrontend::new();
+        let t = Instant::now();
+        let _ = fe.compute(&pcm);
+        println!("{name}: host mel {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         for run in 0..repeat {
             let t = Instant::now();
             let (enc, n) = m.encode(b, &pcm)?;

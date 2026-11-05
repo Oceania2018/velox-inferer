@@ -29,6 +29,26 @@ impl<B: Backend> Mat<B> {
     }
 }
 
+/// Q8_0 as `q8_g32_fp16` / `row_split_k128_v1`: the same codes and per-32 FP16 scales (Q8_0
+/// quantizes with d = amax / 127, so codes stay in [-127, 127]), relaid into a code plane and a
+/// scale plane, which the tuned int8 / tensor-core kernels read. Lossless. `k % 128 == 0`.
+/// `VELOX_ASR_GGML` keeps the GGML blocks instead.
+fn q8_0_to_q8g32(blocks: &[u8], rows: usize, k: usize) -> Option<Vec<u8>> {
+    if std::env::var_os("VELOX_ASR_GGML").is_some() || k % 128 != 0 {
+        return None;
+    }
+    let rs = WeightFormat::Q8G32.row_split()?;
+    let gpr = rs.groups_per_row(k);
+    debug_assert_eq!(gpr, k / 32);
+    let (_, scale_off, total) = rs.planes(rows, k);
+    let mut out = vec![0u8; total];
+    for (g, b) in blocks.chunks_exact(34).enumerate() {
+        out[scale_off + 2 * g..][..2].copy_from_slice(&b[..2]);
+        out[g * 32..][..32].copy_from_slice(&b[2..]);
+    }
+    (blocks.len() == rows * gpr * 34).then_some(out)
+}
+
 /// Activation policy for GGML-quantized matrices: 8-bit activations (what llama.cpp's MMQ /
 /// MMVQ kernels do with these weights) unless `VELOX_ASR_A16` is set. Float matrices stay exact.
 fn ggml_act() -> ActPolicy {
@@ -203,12 +223,23 @@ impl<B: Backend> Loader<'_, B> {
                 let f = WeightFormat::Ggml(g);
                 f.check_shape(rows, k)?;
                 let bytes = self.raw(t, rows * g.row_bytes(k))?;
-                self.bytes += bytes.len() as u64;
-                (self.b.upload_bytes(&bytes)?, f)
+                let converted = (g == GgmlType::Q8_0)
+                    .then(|| q8_0_to_q8g32(&bytes, rows, k))
+                    .flatten();
+                match converted {
+                    Some(rs) => {
+                        self.bytes += rs.len() as u64;
+                        (self.b.upload_bytes(&rs)?, WeightFormat::Q8G32)
+                    }
+                    None => {
+                        self.bytes += bytes.len() as u64;
+                        (self.b.upload_bytes(&bytes)?, f)
+                    }
+                }
             }
         };
         let act = match format {
-            WeightFormat::Ggml(_) => ggml_act(),
+            WeightFormat::Ggml(_) | WeightFormat::Q8G32 => ggml_act(),
             _ => ActPolicy::A16Only,
         };
         Ok(Mat {
@@ -396,4 +427,40 @@ pub fn load_decoder<B: Backend>(b: &B, f: &Files, c: &AsrConfig) -> Result<(DecW
         },
         bytes,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velox_core::format::row_split_at;
+
+    #[test]
+    fn q8_0_relayout_is_lossless() {
+        let (rows, k) = (3, 256);
+        let mut blocks = Vec::new();
+        let mut want = Vec::new();
+        for r in 0..rows {
+            for j in 0..k / 32 {
+                // Scale bits straight from a binary16 pattern (~0.016 and up).
+                let h: u16 = 0x2400 + (r * 8 + j) as u16;
+                blocks.extend_from_slice(&h.to_le_bytes());
+                for i in 0..32 {
+                    let q = ((r * 31 + j * 7 + i * 13) % 255) as i32 - 127;
+                    blocks.push(q as i8 as u8);
+                    want.push(f16_to_f32(h) * q as f32);
+                }
+            }
+        }
+        let out = q8_0_to_q8g32(&blocks, rows, k).expect("convertible");
+        let rs = WeightFormat::Q8G32.row_split().unwrap();
+        for r in 0..rows {
+            for c in 0..k {
+                assert_eq!(
+                    row_split_at(rs, &out, rows, k, r, c),
+                    want[r * k + c],
+                    "[{r}, {c}]"
+                );
+            }
+        }
+    }
 }

@@ -687,6 +687,43 @@ impl<B: Backend> Backend for Profiled<B> {
             self.inner.add_bias_rope(x, bias, p, table, s)
         })
     }
+    fn transpose_heads(
+        &self,
+        x: &B::Buffer,
+        y: &mut B::Buffer,
+        rows: usize,
+        a: usize,
+        b: usize,
+        dim: usize,
+    ) -> Result<()> {
+        self.time("transpose_heads", || {
+            self.inner.transpose_heads(x, y, rows, a, b, dim)
+        })
+    }
+    fn kv_scatter(
+        &self,
+        k: &B::Buffer,
+        v: &B::Buffer,
+        kp: &mut B::Buffer,
+        vp: &mut B::Buffer,
+        dst: &[u32],
+        s: velox_core::PoolShape,
+    ) -> Result<()> {
+        self.time("kv_scatter", || self.inner.kv_scatter(k, v, kp, vp, dst, s))
+    }
+    fn attention_ranges(
+        &self,
+        q: &B::Buffer,
+        kp: &B::Buffer,
+        vp: &B::Buffer,
+        out: &mut B::Buffer,
+        ranges: &[(u32, u32)],
+        s: velox_core::PoolShape,
+    ) -> Result<()> {
+        self.time("attention_ranges", || {
+            self.inner.attention_ranges(q, kp, vp, out, ranges, s)
+        })
+    }
     fn im2col_3x3s2(
         &self,
         x: &B::Buffer,

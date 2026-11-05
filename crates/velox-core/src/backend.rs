@@ -287,6 +287,62 @@ pub fn im2col_3x3s2_host(x: &[f32], s: Im2colShape) -> Vec<f32> {
     y
 }
 
+/// Rows of a shared F32 KV pool (`[pool_rows, kv_heads, head_dim]` per cache) that several
+/// sequences live in, one contiguous range each: decode steps of many sequences then attend and
+/// store with one call per layer. See [`Backend::attention_ranges`] and [`Backend::kv_scatter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolShape {
+    /// Query / K / V rows of the call (one per sequence).
+    pub rows: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub pool_rows: usize,
+}
+
+/// Host reference of [`Backend::attention_ranges`]: query row `r` (`[rows, heads, head_dim]`)
+/// attends, causally complete, to pool rows `ranges[r].0 .. ranges[r].0 + ranges[r].1`; query head
+/// `h` reads kv head `h / (heads / kv_heads)`. Scale `1 / sqrt(head_dim)`.
+pub fn attention_ranges_host(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    ranges: &[(u32, u32)],
+    s: PoolShape,
+) -> Vec<f32> {
+    let (h, kvh, d) = (s.heads, s.kv_heads, s.head_dim);
+    let group = h / kvh;
+    let scale = 1.0 / (d as f64).sqrt();
+    let mut out = vec![0f32; s.rows * h * d];
+    for (r, &(start, len)) in ranges.iter().enumerate() {
+        let (start, len) = (start as usize, len as usize);
+        for hh in 0..h {
+            let kh = hh / group;
+            let qv = &q[(r * h + hh) * d..][..d];
+            let scores: Vec<f64> = (0..len)
+                .map(|j| {
+                    let kr = &k[((start + j) * kvh + kh) * d..][..d];
+                    qv.iter()
+                        .zip(kr)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum::<f64>()
+                        * scale
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = scores.iter().map(|x| (x - max).exp()).collect();
+            let sum: f64 = e.iter().sum();
+            for c in 0..d {
+                let acc: f64 = (0..len)
+                    .map(|j| e[j] * f64::from(v[((start + j) * kvh + kh) * d + c]))
+                    .sum();
+                out[(r * h + hh) * d + c] = (acc / sum) as f32;
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FullAttnShape {
     pub tokens: usize,
@@ -1620,6 +1676,64 @@ pub trait Backend {
             }
         }
         Ok(())
+    }
+    /// Stores row `r` of `k` and `v` (`[rows, kv_heads, head_dim]` f32) at row `dst[r]` of the F32
+    /// pools; other pool rows are untouched. The default runs on the host (CPU backend).
+    fn kv_scatter(
+        &self,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        dst: &[u32],
+        shape: PoolShape,
+    ) -> Result<()> {
+        crate::check::kv_scatter(
+            self.len(k),
+            self.len(v),
+            self.len(k_pool),
+            self.len(v_pool),
+            dst,
+            &shape,
+        )?;
+        let row = shape.kv_heads * shape.head_dim;
+        for (r, &d) in dst.iter().enumerate() {
+            self.copy(k, r * row, k_pool, d as usize * row, row)?;
+            self.copy(v, r * row, v_pool, d as usize * row, row)?;
+        }
+        Ok(())
+    }
+    /// Decode attention of many sequences over one F32 KV pool: query row `r` attends to pool rows
+    /// `ranges[r].0 .. ranges[r].0 + ranges[r].1` (see [`attention_ranges_host`], the default, which
+    /// runs on the host).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_ranges(
+        &self,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        ranges: &[(u32, u32)],
+        shape: PoolShape,
+    ) -> Result<()> {
+        crate::check::attention_ranges(
+            self.len(q),
+            self.len(k_pool),
+            self.len(v_pool),
+            self.len(out),
+            ranges,
+            &shape,
+        )?;
+        let fetch = |b: &Self::Buffer| -> Result<Vec<f32>> {
+            let mut h = vec![0f32; self.len(b)];
+            self.download(b, &mut h)?;
+            Ok(h)
+        };
+        self.synchronize()?;
+        let (qh, kh, vh) = (fetch(q)?, fetch(k_pool)?, fetch(v_pool)?);
+        let o = attention_ranges_host(&qh, &kh, &vh, ranges, shape);
+        let tmp = self.upload(&o)?;
+        self.copy(&tmp, 0, out, 0, o.len())
     }
     /// Convolution patches; see [`Im2colShape`]. The default runs on the host through a download
     /// and an upload (the CPU backend's implementation); device backends override it.

@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::{Arc, Mutex};
 
+use velox_core::backend::PoolShape;
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, CopySpec, DilatedConvShape, DynConvShape, ExpertBank, FullAttnShape,
@@ -1100,6 +1101,30 @@ pub trait CudaKernels: Send + Sync {
         portable::im2col_3x3s2(x, y, shape)
     }
 
+    fn kv_scatter(
+        &self,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        kp: &mut CudaBuffer,
+        vp: &mut CudaBuffer,
+        dst: &[u32],
+        shape: PoolShape,
+    ) -> Result<()> {
+        portable::kv_scatter(k, v, kp, vp, dst, shape)
+    }
+
+    fn attention_ranges(
+        &self,
+        q: &CudaBuffer,
+        kp: &CudaBuffer,
+        vp: &CudaBuffer,
+        out: &mut CudaBuffer,
+        ranges: &[(u32, u32)],
+        shape: PoolShape,
+    ) -> Result<()> {
+        portable::attention_ranges(q, kp, vp, out, ranges, shape)
+    }
+
     fn dyn_conv(
         &self,
         x: &CudaBuffer,
@@ -2071,6 +2096,36 @@ impl Backend for CudaBackend {
     fn im2col_3x3s2(&self, x: &CudaBuffer, y: &mut CudaBuffer, shape: Im2colShape) -> Result<()> {
         check::im2col_3x3s2(x.len, y.len, &shape)?;
         self.staged("im2col_3x3s2", || self.kernels.im2col_3x3s2(x, y, shape))
+    }
+
+    fn kv_scatter(
+        &self,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        kp: &mut CudaBuffer,
+        vp: &mut CudaBuffer,
+        dst: &[u32],
+        shape: PoolShape,
+    ) -> Result<()> {
+        check::kv_scatter(k.len, v.len, kp.len, vp.len, dst, &shape)?;
+        self.staged("kv_scatter", || {
+            self.kernels.kv_scatter(k, v, kp, vp, dst, shape)
+        })
+    }
+
+    fn attention_ranges(
+        &self,
+        q: &CudaBuffer,
+        kp: &CudaBuffer,
+        vp: &CudaBuffer,
+        out: &mut CudaBuffer,
+        ranges: &[(u32, u32)],
+        shape: PoolShape,
+    ) -> Result<()> {
+        check::attention_ranges(q.len, kp.len, vp.len, out.len, ranges, &shape)?;
+        self.staged("attention_ranges", || {
+            self.kernels.attention_ranges(q, kp, vp, out, ranges, shape)
+        })
     }
 
     fn dyn_conv(

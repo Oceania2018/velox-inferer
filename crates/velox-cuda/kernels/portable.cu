@@ -1226,6 +1226,107 @@ __global__ void im2col_3x3s2_kernel(const float* __restrict__ x, float* __restri
 }
 }  // namespace
 
+namespace {
+// Row r of k / v ([rows, row] f32) to pool row dst[r] (velox_core::Backend::kv_scatter).
+__global__ void kv_scatter_kernel(const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ kp,
+                                  float* __restrict__ vp, const uint32_t* __restrict__ dst, int rows, int row) {
+    const long long n = static_cast<long long>(rows) * row;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const int r = static_cast<int>(i / row), j = static_cast<int>(i % row);
+        const long long o = static_cast<long long>(dst[r]) * row + j;
+        kp[o] = k[i];
+        vp[o] = v[i];
+    }
+}
+
+constexpr int kRaWarps = 4, kRaMaxGroup = 8, kRaMaxPer = 8;  // head_dim <= 256, heads / kv_heads <= 8
+
+// Decode attention over pool ranges (velox_core::attention_ranges_host): block (row, kv head), the
+// group's query heads together so each K / V row is read once. Warps split the keys with an
+// online softmax (lane holds head_dim / 32 dims), then combine through shared memory.
+__global__ void __launch_bounds__(kRaWarps * 32)
+attention_ranges_kernel(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                        float* __restrict__ out, const uint32_t* __restrict__ ranges, int heads, int kv_heads, int d,
+                        float scale) {
+    const int r = blockIdx.x, kh = blockIdx.y, g = heads / kv_heads;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, per = d / 32;
+    const long long start = ranges[2 * r], len = ranges[2 * r + 1];
+    __shared__ float sm_m[kRaWarps][kRaMaxGroup], sm_l[kRaWarps][kRaMaxGroup];
+    __shared__ float sm_acc[kRaWarps][kRaMaxGroup][kRaMaxPer * 32];
+    float qv[kRaMaxGroup][kRaMaxPer], acc[kRaMaxGroup][kRaMaxPer], m[kRaMaxGroup], l[kRaMaxGroup];
+#pragma unroll
+    for (int hg = 0; hg < kRaMaxGroup; ++hg) {
+        m[hg] = -INFINITY, l[hg] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < kRaMaxPer; ++e) {
+            acc[hg][e] = 0.0f;
+            qv[hg][e] = (hg < g && e < per)
+                            ? q[(static_cast<long long>(r) * heads + kh * g + hg) * d + lane + 32 * e] * scale
+                            : 0.0f;
+        }
+    }
+    for (long long j = warp; j < len; j += kRaWarps) {
+        const long long base = ((start + j) * kv_heads + kh) * d;
+        float kk[kRaMaxPer], vv[kRaMaxPer];
+#pragma unroll
+        for (int e = 0; e < kRaMaxPer; ++e) {
+            kk[e] = e < per ? k[base + lane + 32 * e] : 0.0f;
+            vv[e] = e < per ? v[base + lane + 32 * e] : 0.0f;
+        }
+#pragma unroll
+        for (int hg = 0; hg < kRaMaxGroup; ++hg) {
+            if (hg >= g) break;
+            float sc = 0.0f;
+#pragma unroll
+            for (int e = 0; e < kRaMaxPer; ++e) sc += qv[hg][e] * kk[e];
+            sc = velox_warp_sum(sc);
+            const float mn = fmaxf(m[hg], sc), c = __expf(m[hg] - mn), p = __expf(sc - mn);
+            l[hg] = l[hg] * c + p;
+#pragma unroll
+            for (int e = 0; e < kRaMaxPer; ++e) acc[hg][e] = acc[hg][e] * c + p * vv[e];
+            m[hg] = mn;
+        }
+    }
+    for (int hg = 0; hg < g; ++hg) {
+        if (lane == 0) sm_m[warp][hg] = m[hg], sm_l[warp][hg] = l[hg];
+        for (int e = 0; e < per; ++e) sm_acc[warp][hg][lane + 32 * e] = acc[hg][e];
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < g * d; idx += blockDim.x) {
+        const int hg = idx / d, c = idx % d;
+        float mx = -INFINITY;
+        for (int w = 0; w < kRaWarps; ++w) mx = fmaxf(mx, sm_m[w][hg]);
+        float lsum = 0.0f, a = 0.0f;
+        for (int w = 0; w < kRaWarps; ++w) {
+            const float f = sm_m[w][hg] == -INFINITY ? 0.0f : __expf(sm_m[w][hg] - mx);
+            lsum += sm_l[w][hg] * f;
+            a += sm_acc[w][hg][c] * f;
+        }
+        out[(static_cast<long long>(r) * heads + kh * g + hg) * d + c] = a / lsum;
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_kv_scatter(const float* k, const float* v, float* kp, float* vp, const uint32_t* dst,
+                                        int rows, int row) {
+    const long long n = static_cast<long long>(rows) * row;
+    if (n == 0) return 0;
+    kv_scatter_kernel<<<velox_grid_1d(n, 256), 256>>>(k, v, kp, vp, dst, rows, row);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_attention_ranges(const float* q, const float* k, const float* v, float* out,
+                                              const uint32_t* ranges, int rows, int heads, int kv_heads, int d) {
+    if (rows == 0) return 0;
+    if (d % 32 != 0 || d > kRaMaxPer * 32 || kv_heads <= 0 || heads % kv_heads != 0 ||
+        heads / kv_heads > kRaMaxGroup)
+        return VELOX_ERR_UNSUPPORTED;
+    attention_ranges_kernel<<<dim3(rows, kv_heads), kRaWarps * 32>>>(q, k, v, out, ranges, heads, kv_heads, d,
+                                                                    rsqrtf(static_cast<float>(d)));
+    return velox_launch_status();
+}
+
 VELOX_API int velox_portable_im2col_3x3s2(const float* x, float* y, int images, int h, int w, int c) {
     const long long n = static_cast<long long>(images) * ((h + 1) / 2) * ((w + 1) / 2) * 9 * c;
     if (n == 0) return 0;
