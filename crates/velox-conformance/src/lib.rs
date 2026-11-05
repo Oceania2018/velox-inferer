@@ -1626,6 +1626,81 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn pool_ops(&mut self, lens: &[u32], heads: usize, kv_heads: usize, d: usize) -> Result<()> {
+        let rows = lens.len();
+        let row = kv_heads * d;
+        // Ranges laid out with gaps; each sequence's new row goes right after its range.
+        let mut ranges = Vec::new();
+        let mut at = 3u32;
+        for &l in lens {
+            ranges.push((at, l));
+            at += l + 5;
+        }
+        let pool_rows = at as usize;
+        let dst: Vec<u32> = ranges.iter().map(|&(a, l)| a + l - 1).collect();
+        let shape = velox_core::PoolShape {
+            rows,
+            heads,
+            kv_heads,
+            head_dim: d,
+            pool_rows,
+        };
+        let (k, v) = (self.rng.vec(rows * row, 1.0), self.rng.vec(rows * row, 1.0));
+        let (kp0, vp0) = (
+            self.rng.vec(pool_rows * row, 1.0),
+            self.rng.vec(pool_rows * row, 1.0),
+        );
+        let q = self.rng.vec(rows * heads * d, 1.0);
+        let (mut kw, mut vw) = (kp0.clone(), vp0.clone());
+        CpuBackend.kv_scatter(&k, &v, &mut kw, &mut vw, &dst, shape)?;
+        let mut want = vec![0.0; rows * heads * d];
+        CpuBackend.attention_ranges(&q, &kw, &vw, &mut want, &ranges, shape)?;
+        let (kd, vd) = (self.b.upload(&k)?, self.b.upload(&v)?);
+        let (mut kpd, mut vpd) = (self.b.upload(&kp0)?, self.b.upload(&vp0)?);
+        self.b
+            .kv_scatter(&kd, &vd, &mut kpd, &mut vpd, &dst, shape)?;
+        let got_k = fetch(self.b, &kpd, pool_rows * row)?;
+        self.record(
+            format!("kv_scatter {rows} rows of {row}"),
+            None,
+            &got_k,
+            &kw,
+            0.0,
+        );
+        let qd = self.b.upload(&q)?;
+        let mut od = self.b.alloc(rows * heads * d)?;
+        self.b
+            .attention_ranges(&qd, &kpd, &vpd, &mut od, &ranges, shape)?;
+        let got = fetch(self.b, &od, rows * heads * d)?;
+        self.record(
+            format!("attention_ranges lens {lens:?} heads {heads}/{kv_heads} x {d}"),
+            None,
+            &got,
+            &want,
+            1e-4,
+        );
+        Ok(())
+    }
+
+    fn im2col_3x3s2(&mut self, images: usize, h: usize, w: usize, c: usize) -> Result<()> {
+        let shape = velox_core::Im2colShape { images, h, w, c };
+        let x = self.rng.vec(shape.in_len(), 1.0);
+        let mut want = vec![0.0; shape.out_len()];
+        CpuBackend.im2col_3x3s2(&x, &mut want, shape)?;
+        let xd = self.b.upload(&x)?;
+        let mut yd = self.b.alloc(shape.out_len())?;
+        self.b.im2col_3x3s2(&xd, &mut yd, shape)?;
+        let got = fetch(self.b, &yd, shape.out_len())?;
+        self.record(
+            format!("im2col_3x3s2 {images}x[{h}x{w}x{c}]"),
+            None,
+            &got,
+            &want,
+            0.0,
+        );
+        Ok(())
+    }
+
     fn transpose_heads(&mut self, rows: usize, a: usize, b: usize, dim: usize) -> Result<()> {
         let n = rows * a * b * dim;
         let x = self.rng.vec(n, 1.0);
@@ -3625,6 +3700,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         1,
     )?;
     // Gated DeltaNet outputs into llama.cpp's tiled value-head order (16 key heads x 3).
+    // Qwen3-ASR conv stack (docs/qwen3_asr.md): the mel image, the 480-channel layers, a short
+    // single chunk and odd sizes that exercise the zero border.
     s.transpose_heads(1, 16, 3, 128)?;
     s.transpose_heads(37, 16, 3, 128)?;
     s.transpose_heads(5, 2, 3, 7)?;
@@ -3821,6 +3898,16 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         },
         false,
     )?;
+    // Qwen3-ASR (docs/qwen3_asr.md), last so the cases above keep their random inputs: batched
+    // decode over one KV pool (sequences of one key, a block boundary and long; GQA 16 / 8 x 128;
+    // a narrow odd case) and the conv stack's patches (the mel image, the 480-channel layers, a
+    // short single chunk, odd sizes for the zero border).
+    s.pool_ops(&[1, 4, 129, 300], 16, 8, 128)?;
+    s.pool_ops(&[2, 7], 4, 1, 64)?;
+    s.im2col_3x3s2(2, 128, 100, 1)?;
+    s.im2col_3x3s2(3, 64, 50, 480)?;
+    s.im2col_3x3s2(1, 32, 13, 480)?;
+    s.im2col_3x3s2(2, 7, 5, 3)?;
     // Its own seed: the synthetic model must not change when cases are added before it.
     let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);
