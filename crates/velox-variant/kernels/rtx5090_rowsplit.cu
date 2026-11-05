@@ -10,11 +10,12 @@
 // K advances 64 values per step: activations by cp.async, weights decoded by the block into
 // shared memory. Rows are 72 bf16 (9 chunks of 16 bytes, odd), so ldmatrix is conflict-free.
 //
-// Split K: a block is about as fast as its SM's bf16 MMAs allow, so a grid of fewer blocks than
-// SMs leaves the card idle (Qwen3-ASR prefill groups of ~250 tokens on [2048, 2048]: 64 blocks for
-// 170 SMs, 65 us whether m is 64 or 512). Short grids then split K over gridDim.z: each slice
-// writes its partial sums to scratch (in L2 at these sizes) and a second kernel adds the slices in
-// slice order, so results do not depend on scheduling.
+// Split K (opt-in: VELOX_SPLITK=1): a block is about as fast as its SM's bf16 MMAs allow, so a
+// grid of fewer blocks than SMs leaves the card idle (Qwen3-ASR prefill groups of ~250 tokens on
+// [2048, 2048]: 64 blocks for 170 SMs, 65 us whether m is 64 or 512). Short grids then split K over
+// gridDim.z: each slice writes its partial sums to scratch (in L2 at these sizes) and a second
+// kernel adds the slices in slice order, so results do not depend on scheduling. Off by default,
+// the kernel runs one slice exactly as before (other models' numerics and timings unchanged).
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -123,12 +124,14 @@ __device__ __forceinline__ void decode_step(RsSmem& s, const RsArgs& p, int n0, 
             __floats2bfloat162_rn(static_cast<float>(q[i]), static_cast<float>(q[i + 1]));
 }
 
+// kSplit false: the original kernel (one slice over all of K, straight into y), compiled as before.
+template <bool kSplit>
 __global__ void __launch_bounds__(kThreads) rowsplit_bf16_kernel(RsArgs p) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
     RsSmem& s = *reinterpret_cast<RsSmem*>(smem_raw);
     const int n0 = blockIdx.x * kBN, m0 = blockIdx.y * kBM;
-    const int k_begin = blockIdx.z * p.steps_per_split * kBK;
-    const int k_end = min(p.kp, k_begin + p.steps_per_split * kBK);
+    const int k_begin = kSplit ? blockIdx.z * p.steps_per_split * kBK : 0;
+    const int k_end = kSplit ? min(p.kp, k_begin + p.steps_per_split * kBK) : p.kp;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int wm = warp >> 1, wn = warp & 1;
     const int g = lane >> 2, q4 = lane & 3;
@@ -200,7 +203,7 @@ __global__ void __launch_bounds__(kThreads) rowsplit_bf16_kernel(RsArgs p) {
             for (int h = 0; h < 2; ++h) {
                 const int t = m0 + wm * 32 + mt * 16 + g + 8 * h;
                 if (t >= p.m) continue;
-                float* out = p.y + (static_cast<long long>(blockIdx.z) * p.m + t) * p.rows + n;
+                float* out = p.y + ((kSplit ? static_cast<long long>(blockIdx.z) * p.m : 0LL) + t) * p.rows + n;
                 if (n < p.rows) out[0] = acc[mt][nt][2 * h];
                 if (n + 1 < p.rows) out[1] = acc[mt][nt][2 * h + 1];
             }
@@ -238,10 +241,11 @@ Scratch g_rs, g_part;
 
 long long align256(long long x) { return (x + 255) / 256 * 256; }
 
-// `VELOX_NO_SPLITK`: one slice always (A/B against the unsplit kernel).
-bool no_split() {
-    static const bool off = getenv("VELOX_NO_SPLITK") != nullptr;
-    return off;
+// Opt-in (`VELOX_SPLITK=1`, set by the qwen3-asr-velox service): other models keep the unsplit
+// kernel, so their numerics and timings stay exactly as they were.
+bool split_on() {
+    static const bool on = getenv("VELOX_SPLITK") != nullptr;
+    return on;
 }
 
 }  // namespace
@@ -262,14 +266,15 @@ VELOX_API int velox_5090_linear_rowsplit(const float* x, int m, const uint8_t* w
         x, m, static_cast<int>(k), m_pad, static_cast<int>(kp), xb);
     static bool configured = false;
     if (!configured) {
-        cudaFuncSetAttribute(rowsplit_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(RsSmem));
+        cudaFuncSetAttribute(rowsplit_bf16_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(RsSmem));
+        cudaFuncSetAttribute(rowsplit_bf16_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(RsSmem));
         configured = true;
     }
     // Split K until the grid covers the card twice, keeping at least kMinSteps steps per slice.
     const int bx = (rows + kBN - 1) / kBN, by = m_pad / kBM, steps = static_cast<int>(kp / kBK);
     constexpr int kMinSteps = 4, kMaxSplits = 16;
     int splits = 1;
-    if (!no_split()) {
+    if (split_on()) {
         const int blocks = bx * by, target = 2 * sm_count();
         if (blocks < target) splits = (target + blocks - 1) / blocks;
         splits = max(1, min(splits, min(kMaxSplits, steps / kMinSteps)));
@@ -283,8 +288,12 @@ VELOX_API int velox_5090_linear_rowsplit(const float* x, int m, const uint8_t* w
     }
     const RsArgs a{xb, w, parent_rows, row_begin, rows, m, static_cast<int>(kp), bits, group, high, gpr, high_off,
                    scale_off, out, per};
-    rowsplit_bf16_kernel<<<dim3(bx, by, splits), kThreads, sizeof(RsSmem)>>>(a);
-    if (splits > 1) {
+    if (splits == 1) {
+        rowsplit_bf16_kernel<false><<<dim3(bx, by), kThreads, sizeof(RsSmem)>>>(a);
+        return velox_launch_status();
+    }
+    rowsplit_bf16_kernel<true><<<dim3(bx, by, splits), kThreads, sizeof(RsSmem)>>>(a);
+    {
         const long long n = static_cast<long long>(m) * rows;
         sum_splits<<<velox_grid_1d(n, 256), 256>>>(out, splits, n, y);
     }
