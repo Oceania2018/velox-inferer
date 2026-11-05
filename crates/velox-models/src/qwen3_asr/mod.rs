@@ -11,8 +11,8 @@ pub mod weights;
 use std::path::Path;
 
 use velox_core::backend::{
-    AttnShape, FullAttnShape, GeluKind, Im2colShape, KvStoreShape, NormKind, PoolShape, RopeLayout,
-    RopePosShape, RopeShape,
+    AttnShape, GeluKind, Im2colShape, KvStoreShape, NormKind, PoolShape, RopeLayout, RopePosShape,
+    RopeShape,
 };
 use velox_core::{Backend, Error, KvFormat, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
@@ -317,35 +317,25 @@ impl<B: Backend> Qwen3Asr<B> {
         let mut attn = b.alloc(n * d)?;
         let mut o = b.alloc(n * d)?;
         let mut f = b.alloc(n * e.ffn)?;
-        let wmax = windows.iter().map(|w| w.1).max().unwrap_or(1);
-        let (mut qw, mut kw, mut vw, mut aw) = (
-            b.alloc(wmax * d)?,
-            b.alloc(wmax * d)?,
-            b.alloc(wmax * d)?,
-            b.alloc(wmax * d)?,
-        );
+        // Every token attends to its whole window: one ranges call per layer instead of five
+        // launches (three copies in, attention, one copy out) per window.
+        let ranges: Vec<(u32, u32)> = windows
+            .iter()
+            .flat_map(|&(s, len)| std::iter::repeat_n((s as u32, len as u32), len))
+            .collect();
+        let shape = PoolShape {
+            rows: n,
+            heads: e.heads,
+            kv_heads: e.heads,
+            head_dim: hd,
+            pool_rows: n,
+        };
         for l in &self.enc.layers {
             b.layer_norm(&x, &l.ln1.0, &l.ln1.1, &mut hbuf, n, d, e.ln_eps)?;
             Self::linear(b, &hbuf, &l.q, &mut q, n)?;
             Self::linear(b, &hbuf, &l.k, &mut k, n)?;
             Self::linear(b, &hbuf, &l.v, &mut v, n)?;
-            for &(s, len) in &windows {
-                b.copy(&q, s * d, &mut qw, 0, len * d)?;
-                b.copy(&k, s * d, &mut kw, 0, len * d)?;
-                b.copy(&v, s * d, &mut vw, 0, len * d)?;
-                b.attention_full(
-                    &qw,
-                    &kw,
-                    &vw,
-                    &mut aw,
-                    FullAttnShape {
-                        tokens: len,
-                        heads: e.heads,
-                        head_dim: hd,
-                    },
-                )?;
-                b.copy(&aw, 0, &mut attn, s * d, len * d)?;
-            }
+            b.attention_ranges(&q, &k, &v, &mut attn, &ranges, shape)?;
             Self::linear(b, &attn, &l.out, &mut o, n)?;
             b.add(&mut x, &o, n * d)?;
             b.layer_norm(&x, &l.ln2.0, &l.ln2.1, &mut hbuf, n, d, e.ln_eps)?;

@@ -202,9 +202,17 @@ fn engine<B: Backend>(
     drop(warm_tx);
     let (mut warm_left, t_warm) = (warm_n, Instant::now());
     let mut serving = false;
+    // `VELOX_ASR_PHASES`: wall time spent admitting (encode + prefill) vs decoding, by decode batch
+    // size, printed whenever the engine goes idle. Both phases end in a host readback, so the split
+    // is exact with graphs on.
+    let phases = std::env::var_os("VELOX_ASR_PHASES").is_some();
+    let mut ph = Phases::default();
     loop {
         // Take what arrived: block while idle.
         if active.is_empty() && waiting.is_empty() {
+            if phases && serving {
+                ph.report();
+            }
             match rx.recv() {
                 Ok(j) => waiting.push_back(j),
                 Err(_) => return Ok(()),
@@ -251,7 +259,21 @@ fn engine<B: Backend>(
         }
         if !group.is_empty() {
             let replies: Vec<_> = group.iter().map(|g| g.1.reply.clone()).collect();
-            match admit_group(b, &m, &mut pool, &mut bw, group) {
+            let (t, n, rows0) = (Instant::now(), group.len(), rows);
+            let mut enc_s = 0.0;
+            let admitted = admit_group(
+                b,
+                &m,
+                &mut pool,
+                &mut bw,
+                group,
+                phases.then_some(&mut enc_s),
+            );
+            if serving {
+                ph.admit(t.elapsed().as_secs_f64(), n, rows0);
+                ph.enc_s += enc_s;
+            }
+            match admitted {
                 Ok(done) => active.extend(done),
                 Err(e) => {
                     eprintln!("request failed: {e}");
@@ -273,11 +295,15 @@ fn engine<B: Backend>(
             continue;
         }
         let ids: Vec<u32> = active.iter().map(|a| a.last).collect();
+        let t_step = Instant::now();
         let next = {
             let mut ws = m.decoder_workspace()?;
             let mut seqs: Vec<&mut PoolSeq> = active.iter_mut().map(|a| &mut a.seq).collect();
             m.step_batch(b, &mut pool, &mut seqs, &ids, &mut ws, &mut bw)?
         };
+        if serving {
+            ph.step(t_step.elapsed().as_secs_f64(), active.len());
+        }
         steps += 1;
         let mut i = 0;
         let mut next = next.into_iter();
@@ -318,6 +344,56 @@ fn engine<B: Backend>(
     }
 }
 
+#[derive(Default)]
+struct Phases {
+    admit_s: f64,
+    /// Of `admit_s`, the encoder (synchronized).
+    enc_s: f64,
+    admits: usize,
+    admitted: usize,
+    admit_rows: usize,
+    /// Decode time and steps by batch size.
+    steps: std::collections::BTreeMap<usize, (f64, usize)>,
+}
+
+impl Phases {
+    fn admit(&mut self, s: f64, n: usize, rows: usize) {
+        self.admit_s += s;
+        self.admits += 1;
+        self.admitted += n;
+        self.admit_rows += rows;
+    }
+    fn step(&mut self, s: f64, batch: usize) {
+        let e = self.steps.entry(batch).or_default();
+        e.0 += s;
+        e.1 += 1;
+    }
+    fn report(&mut self) {
+        let dec: f64 = self.steps.values().map(|v| v.0).sum();
+        let n: usize = self.steps.values().map(|v| v.1).sum();
+        if self.admits == 0 && n == 0 {
+            return;
+        }
+        eprintln!(
+            "[phases] admit {:.3}s enc {:.3}s ({} groups, {} requests, {} rows, {:.1} us/row)  decode {:.3}s ({n} steps)",
+            self.admit_s,
+            self.enc_s,
+            self.admits,
+            self.admitted,
+            self.admit_rows,
+            1e6 * self.admit_s / self.admit_rows.max(1) as f64,
+            dec
+        );
+        let line: Vec<String> = self
+            .steps
+            .iter()
+            .map(|(b, (s, n))| format!("{b}:{n}x{:.2}ms", 1e3 * s / *n as f64))
+            .collect();
+        eprintln!("[phases] decode by batch {}", line.join(" "));
+        *self = Phases::default();
+    }
+}
+
 /// Requests admitted per round at most.
 const ADMIT_MAX: usize = 8;
 
@@ -329,11 +405,17 @@ fn admit_group<B: Backend>(
     pool: &mut KvPool<B>,
     bw: &mut BatchWorkspace<B>,
     mut group: Vec<(PoolSeq, Job)>,
+    enc_s: Option<&mut f64>,
 ) -> Result<Vec<Active>> {
+    let t_enc = Instant::now();
     let r = (|| -> Result<Vec<u32>> {
         let clips: Vec<(&[f32], usize)> =
             group.iter().map(|g| (&g.1.mel[..], g.1.frames)).collect();
         let (audio, counts) = m.encode_many(b, &clips)?;
+        if let Some(e) = enc_s {
+            b.synchronize()?;
+            *e = t_enc.elapsed().as_secs_f64();
+        }
         for (g, &n) in group.iter_mut().zip(&counts) {
             g.1.prompt = expand(&g.1.prompt, n);
             g.1.mel = Vec::new();
