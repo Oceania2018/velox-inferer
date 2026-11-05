@@ -10,16 +10,15 @@
 // K advances 64 values per step: activations by cp.async, weights decoded by the block into
 // shared memory. Rows are 72 bf16 (9 chunks of 16 bytes, odd), so ldmatrix is conflict-free.
 //
-// Split K (opt-in: VELOX_SPLITK=1): a block is about as fast as its SM's bf16 MMAs allow, so a
-// grid of fewer blocks than SMs leaves the card idle (Qwen3-ASR prefill groups of ~250 tokens on
-// [2048, 2048]: 64 blocks for 170 SMs, 65 us whether m is 64 or 512). Short grids then split K over
-// gridDim.z: each slice writes its partial sums to scratch (in L2 at these sizes) and a second
-// kernel adds the slices in slice order, so results do not depend on scheduling. Off by default,
-// the kernel runs one slice exactly as before (other models' numerics and timings unchanged).
+// Split K: a block is about as fast as its SM's bf16 MMAs allow, so a grid of fewer blocks than
+// SMs leaves the card idle (Qwen3-ASR prefill groups of ~250 tokens on [2048, 2048]: 64 blocks for
+// 170 SMs, 65 us whether m is 64 or 512). Short grids then split K over gridDim.z: each slice
+// writes its partial sums to scratch (in L2 at these sizes) and a second kernel adds the slices in
+// slice order, so results do not depend on scheduling. Grids that already cover the card run the
+// unsplit instance, compiled as the kernel was before.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-#include <cstdlib>
 #include <mutex>
 
 #include "velox_common.cuh"
@@ -241,12 +240,6 @@ Scratch g_rs, g_part;
 
 long long align256(long long x) { return (x + 255) / 256 * 256; }
 
-// Opt-in (`VELOX_SPLITK=1`, set by the qwen3-asr-velox service): other models keep the unsplit
-// kernel, so their numerics and timings stay exactly as they were.
-bool split_on() {
-    static const bool on = getenv("VELOX_SPLITK") != nullptr;
-    return on;
-}
 
 }  // namespace
 
@@ -274,7 +267,7 @@ VELOX_API int velox_5090_linear_rowsplit(const float* x, int m, const uint8_t* w
     const int bx = (rows + kBN - 1) / kBN, by = m_pad / kBM, steps = static_cast<int>(kp / kBK);
     constexpr int kMinSteps = 4, kMaxSplits = 16;
     int splits = 1;
-    if (split_on()) {
+    {
         const int blocks = bx * by, target = 2 * sm_count();
         if (blocks < target) splits = (target + blocks - 1) / blocks;
         splits = max(1, min(splits, min(kMaxSplits, steps / kMinSteps)));
