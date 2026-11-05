@@ -85,3 +85,38 @@ encoder output, first-step logits and greedy tokens against dumps of the referen
 GGUF's dequantized weights (two clips from real calls: 9.37 s over two windows with a partial
 tail chunk, and 6.5 s in one window). The dumps are produced by `scripts/qwen3_asr_golden.py` and
 are not committed (call audio).
+
+## Serving (`velox serve-asr`)
+
+llama-server's `/v1/chat/completions` as the qwen3-asr sidecar calls it: a WAV in an
+`input_audio` part, an optional system message (the bias context) and an optional final
+assistant message (`language X<asr_text>`, continued by the model). The content returned is that
+prefix plus the transcription, as llama-server returns it. The prompt is the processor's template
+above: the system turn is written even when empty. llama-server drops it without a system message
+(the GGUF's template); on 52 call segments that alone moved 24% of words away from the reference.
+
+- Request threads decode the WAV (16-bit PCM, mixed to mono, resampled to 16 kHz), compute the
+  log-mel and tokenize. One engine thread owns the device.
+- Q8_0 matrices are relaid as `q8_g32_fp16` (same codes and per-32 scales; lossless), which the
+  5090 variant runs on its tuned kernels. Activations may be int8 / bf16 there (`AllowA8`);
+  `VELOX_ASR_A16` keeps them exact, `VELOX_ASR_GGML` keeps the GGML blocks.
+- Decoding sequences share one F32 KV pool (`--kv-rows`, 229 KB per row for 1.7B): each request
+  reserves its prompt plus `min(max_tokens, 6 x seconds + 32)` output rows, first fit; a request
+  that does not fit yet waits. A request prefills in a reused scratch session (prefill KV kept
+  contiguous for the oracle-checked path), its rows are copied into its pool range, then it joins
+  the batch.
+- Every step advances all active requests at once (`step_batch`): projections and MLP over all
+  rows, `kv_scatter` + `attention_ranges` once per layer, recorded as a static graph per (batch
+  size, KV bucket). Up to 4 requests are admitted between steps.
+
+### Results (RTX 5090 shared with the 27B, 2026-11-05)
+
+52 segments (497 s) cut from two real calls, identical requests to each server, Q8_0 weights:
+
+| | conc 1 | conc 4 | conc 16 |
+|---|---|---|---|
+| llama.cpp b11347 (`-np 1`) | 40.3x realtime, p50 0.21 s | 96.8x | 114.8x |
+| velox serve-asr | 87.6x, p50 0.109 s | 154.9x | 199.1x |
+
+Against the reference (transformers, fp32, official prompt) on the same segments: velox 50 / 52
+identical, 0.12% of words differ (int8 and exact activations alike); llama.cpp 22 / 52, 12.5%.

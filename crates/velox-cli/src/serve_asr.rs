@@ -452,17 +452,11 @@ fn chat(
         return Err(bad("audio shorter than 10 ms".into()));
     }
     let features = mel.compute(&pcm);
-    // The checkpoint's processor template always opens with a system turn; llama-server renders
-    // the GGUF's template, which writes one only when a system message is sent.
-    // VELOX_ASR_SYSTEM=auto reproduces llama-server.
-    let omit = system.is_empty() && std::env::var("VELOX_ASR_SYSTEM").as_deref() == Ok("auto");
-    let system_turn = if omit {
-        String::new()
-    } else {
-        format!("<|im_start|>system\n{system}<|im_end|>\n")
-    };
+    // The checkpoint's processor template: the system turn is always there, empty included.
+    // (llama-server renders the GGUF's template, which drops it when no system message is sent;
+    // on 52 call segments that alone moved 24% of words away from the reference.)
     let rendered = format!(
-        "{system_turn}<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n{prefix}"
+        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n{prefix}"
     );
     let prompt = tok.encode(&rendered).map_err(|e| bad(e.to_string()))?;
     let max_new = req["max_tokens"]
