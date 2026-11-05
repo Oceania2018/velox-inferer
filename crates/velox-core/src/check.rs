@@ -507,6 +507,69 @@ pub fn kv_scatter(
     Ok(())
 }
 
+/// `rope_cos_sin`: an even head dim and a table of a row per position.
+pub fn rope_cos_sin(table: usize, rows: usize, head_dim: usize) -> Result<()> {
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return Err(Error::Shape(format!("rope_cos_sin: head_dim {head_dim}")));
+    }
+    need("rope_cos_sin table", table, product(&[rows, head_dim])?)
+}
+
+/// `qk_norm_rope_kv`: buffers `[qkv, q_norm, k_norm, table, q_out, k_pool, v_pool]` fit, one
+/// destination per row, each inside the pools.
+pub fn qk_norm_rope_kv(
+    lens: [usize; 7],
+    dst: &[u32],
+    s: &crate::backend::QkvRopeShape,
+) -> Result<()> {
+    let [qkv, q_norm, k_norm, table, q_out, k_pool, v_pool] = lens;
+    if s.rows == 0 || s.heads == 0 || s.kv_heads == 0 || s.head_dim == 0 || s.head_dim % 2 != 0 {
+        return Err(Error::Shape(format!("qk_norm_rope_kv: {s:?}")));
+    }
+    if dst.len() != s.rows {
+        return Err(Error::Shape(format!(
+            "qk_norm_rope_kv: {} destinations for {} rows",
+            dst.len(),
+            s.rows
+        )));
+    }
+    let kv = product(&[s.kv_heads, s.head_dim])?;
+    need("qk_norm_rope_kv qkv", qkv, product(&[s.rows, s.row()])?)?;
+    need(
+        "qk_norm_rope_kv q_norm",
+        q_norm,
+        product(&[s.heads, s.head_dim])?,
+    )?;
+    need("qk_norm_rope_kv k_norm", k_norm, kv)?;
+    need(
+        "qk_norm_rope_kv table",
+        table,
+        product(&[s.rows, s.head_dim])?,
+    )?;
+    need(
+        "qk_norm_rope_kv q_out",
+        q_out,
+        product(&[s.rows, s.heads, s.head_dim])?,
+    )?;
+    need(
+        "qk_norm_rope_kv k_pool",
+        k_pool,
+        product(&[s.pool_rows, kv])?,
+    )?;
+    need(
+        "qk_norm_rope_kv v_pool",
+        v_pool,
+        product(&[s.pool_rows, kv])?,
+    )?;
+    if let Some(d) = dst.iter().find(|&&d| d as usize >= s.pool_rows) {
+        return Err(Error::Shape(format!(
+            "qk_norm_rope_kv: row {d} past pool of {}",
+            s.pool_rows
+        )));
+    }
+    Ok(())
+}
+
 /// `attention_ranges`: buffers fit and every range is non-empty and inside the pools.
 pub fn attention_ranges(
     q: usize,

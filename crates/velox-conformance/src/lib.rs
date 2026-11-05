@@ -1682,6 +1682,82 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    /// `rope_cos_sin` then `qk_norm_rope_kv` (fused q | k | v rows into scattered pool rows) against
+    /// the CPU oracle; untouched pool rows must stay as they were.
+    fn qkv_rope_pool(
+        &mut self,
+        positions: &[u32],
+        heads: usize,
+        kv_heads: usize,
+        d: usize,
+    ) -> Result<()> {
+        let rows = positions.len();
+        let pool_rows = 4 * rows + 3;
+        let dst: Vec<u32> = (0..rows).map(|r| (4 * r + 1) as u32).collect();
+        let shape = velox_core::QkvRopeShape {
+            rows,
+            heads,
+            kv_heads,
+            head_dim: d,
+            pool_rows,
+            eps: 1e-6,
+        };
+        let row = kv_heads * d;
+        let qkv = self.rng.vec(rows * shape.row(), 2.0);
+        let (qn, kn) = (
+            self.rng.vec(heads * d, 1.0),
+            self.rng.vec(kv_heads * d, 1.0),
+        );
+        let (kp0, vp0) = (
+            self.rng.vec(pool_rows * row, 1.0),
+            self.rng.vec(pool_rows * row, 1.0),
+        );
+        let theta = 1_000_000.0;
+        let mut table = vec![0.0; rows * d];
+        CpuBackend.rope_cos_sin(positions, d, theta, &mut table)?;
+        let (mut q_want, mut kw, mut vw) = (vec![0.0; rows * heads * d], kp0.clone(), vp0.clone());
+        CpuBackend.qk_norm_rope_kv(
+            &qkv,
+            &qn,
+            &kn,
+            &table,
+            &mut q_want,
+            &mut kw,
+            &mut vw,
+            &dst,
+            shape,
+        )?;
+        let mut td = self.b.alloc(rows * d)?;
+        self.b.rope_cos_sin(positions, d, theta, &mut td)?;
+        let got_t = fetch(self.b, &td, rows * d)?;
+        self.record(
+            format!("rope_cos_sin {rows} positions x {d}"),
+            None,
+            &got_t,
+            &table,
+            1e-6,
+        );
+        let (xd, qnd, knd) = (
+            self.b.upload(&qkv)?,
+            self.b.upload(&qn)?,
+            self.b.upload(&kn)?,
+        );
+        let (mut kpd, mut vpd) = (self.b.upload(&kp0)?, self.b.upload(&vp0)?);
+        let mut qd = self.b.alloc(rows * heads * d)?;
+        // The device table (rounded once, like the oracle's) so the case checks this op alone.
+        self.b.qk_norm_rope_kv(
+            &xd, &qnd, &knd, &td, &mut qd, &mut kpd, &mut vpd, &dst, shape,
+        )?;
+        let name = format!("qk_norm_rope_kv {rows} rows heads {heads}/{kv_heads} x {d}");
+        let got_q = fetch(self.b, &qd, rows * heads * d)?;
+        self.record(format!("{name} q"), None, &got_q, &q_want, 1e-5);
+        let got_k = fetch(self.b, &kpd, pool_rows * row)?;
+        self.record(format!("{name} k pool"), None, &got_k, &kw, 1e-5);
+        let got_v = fetch(self.b, &vpd, pool_rows * row)?;
+        self.record(format!("{name} v pool"), None, &got_v, &vw, 0.0);
+        Ok(())
+    }
+
     fn im2col_3x3s2(&mut self, images: usize, h: usize, w: usize, c: usize) -> Result<()> {
         let shape = velox_core::Im2colShape { images, h, w, c };
         let x = self.rng.vec(shape.in_len(), 1.0);
@@ -3908,6 +3984,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.im2col_3x3s2(3, 64, 50, 480)?;
     s.im2col_3x3s2(1, 32, 13, 480)?;
     s.im2col_3x3s2(2, 7, 5, 3)?;
+    // The fused q | k | v decode post-processing: decode positions (one row, a batch with long
+    // positions) and a narrow odd case.
+    s.qkv_rope_pool(&[0], 16, 8, 128)?;
+    s.qkv_rope_pool(&[5, 130, 999, 4095, 17], 16, 8, 128)?;
+    s.qkv_rope_pool(&[3, 1], 4, 1, 64)?;
     // Its own seed: the synthetic model must not change when cases are added before it.
     let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);

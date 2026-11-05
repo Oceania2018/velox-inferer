@@ -11,8 +11,7 @@ pub mod weights;
 use std::path::Path;
 
 use velox_core::backend::{
-    AttnShape, GeluKind, Im2colShape, KvStoreShape, NormKind, PoolShape, RopeLayout, RopePosShape,
-    RopeShape,
+    AttnShape, GeluKind, Im2colShape, KvStoreShape, NormKind, PoolShape, QkvRopeShape, RopeShape,
 };
 use velox_core::{Backend, Error, KvFormat, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
@@ -429,6 +428,11 @@ pub struct DecWorkspace<B: Backend> {
     o: B::Buffer,
     g: B::Buffer,
     u: B::Buffer,
+    /// Pooled passes (`batch_pass`): the fused `q | k | v` and `gate | up` projections, and the
+    /// rotary cos / sin of each row's position (one table per pass, read by every layer).
+    qkv: B::Buffer,
+    gu: B::Buffer,
+    rope: B::Buffer,
     last: B::Buffer,
     normed: B::Buffer,
     pub logits: B::Buffer,
@@ -457,6 +461,9 @@ impl<B: Backend> DecWorkspace<B> {
             o: b.alloc(n * h)?,
             g: b.alloc(n * t.ffn)?,
             u: b.alloc(n * t.ffn)?,
+            qkv: b.alloc(n * (qd + 2 * kvd))?,
+            gu: b.alloc(n * 2 * t.ffn)?,
+            rope: b.alloc(n * t.head_dim)?,
             last: b.alloc(h)?,
             normed: b.alloc(h)?,
             logits: b.alloc(t.vocab)?,
@@ -548,9 +555,9 @@ impl<B: Backend> Qwen3Asr<B> {
         };
         for (li, l) in self.dec.layers.iter().enumerate() {
             b.rms_norm(&ws.x, &l.attn_norm, &mut ws.hb, n, h, eps, NormKind::Plain)?;
-            b.linear(&ws.hb, &l.q.view(), &mut ws.q, n)?;
-            b.linear(&ws.hb, &l.k.view(), &mut ws.k, n)?;
-            b.linear(&ws.hb, &l.v.view(), &mut ws.v, n)?;
+            b.linear(&ws.hb, &l.q(), &mut ws.q, n)?;
+            b.linear(&ws.hb, &l.k(), &mut ws.k, n)?;
+            b.linear(&ws.hb, &l.v(), &mut ws.v, n)?;
             b.rms_norm_groups(&ws.q, &l.q_norm, &mut ws.qn, n, t.heads, hd, eps)?;
             b.rms_norm_groups(&ws.k, &l.k_norm, &mut ws.kn, n, t.kv_heads, hd, eps)?;
             b.rope(&mut ws.qn, rope(t.heads))?;
@@ -593,8 +600,8 @@ impl<B: Backend> Qwen3Asr<B> {
                 eps,
                 NormKind::Plain,
             )?;
-            b.linear(&ws.hb, &l.gate.view(), &mut ws.g, n)?;
-            b.linear(&ws.hb, &l.up.view(), &mut ws.u, n)?;
+            b.linear(&ws.hb, &l.gate(), &mut ws.g, n)?;
+            b.linear(&ws.hb, &l.up(), &mut ws.u, n)?;
             b.silu_mul(&mut ws.g, &ws.u, n * t.ffn)?;
             b.linear(&ws.g, &l.down.view(), &mut ws.o, n)?;
             b.add(&mut ws.x, &ws.o, n * h)?;
@@ -921,15 +928,6 @@ impl<B: Backend> Qwen3Asr<B> {
         let n = ids.len();
         let (h, hd) = (t.hidden, t.head_dim);
         let eps = t.rms_eps;
-        let rope = |heads| RopePosShape {
-            tokens: n,
-            heads,
-            head_dim: hd,
-            rotary_dim: hd,
-            theta: t.rope_theta,
-            axes: 1,
-            layout: RopeLayout::Interleaved,
-        };
         let shape = PoolShape {
             rows: n,
             heads: t.heads,
@@ -937,22 +935,48 @@ impl<B: Backend> Qwen3Asr<B> {
             head_dim: hd,
             pool_rows: pool.rows,
         };
+        let qkv_shape = QkvRopeShape {
+            rows: n,
+            heads: t.heads,
+            kv_heads: t.kv_heads,
+            head_dim: hd,
+            pool_rows: pool.rows,
+            eps,
+        };
+        let (qkv_cols, gu_cols) = (qkv_shape.row(), 2 * t.ffn);
         b.embed(ids, &self.dec.embed.view(), &mut ws.x)?;
         if let Some((enc, copies)) = audio {
             for &(src, dst_row, len) in copies {
                 b.copy(enc, src * h, &mut ws.x, dst_row * h, len * h)?;
             }
         }
-        for (li, l) in self.dec.layers.iter().enumerate() {
-            b.rms_norm(&ws.x, &l.attn_norm, &mut ws.hb, n, h, eps, NormKind::Plain)?;
-            b.linear(&ws.hb, &l.q.view(), &mut ws.q, n)?;
-            b.linear(&ws.hb, &l.k.view(), &mut ws.k, n)?;
-            b.linear(&ws.hb, &l.v.view(), &mut ws.v, n)?;
-            b.rms_norm_groups(&ws.q, &l.q_norm, &mut ws.qn, n, t.heads, hd, eps)?;
-            b.rms_norm_groups(&ws.k, &l.k_norm, &mut ws.kn, n, t.kv_heads, hd, eps)?;
-            b.rope_positions(&mut ws.qn, positions, rope(t.heads))?;
-            b.rope_positions(&mut ws.kn, positions, rope(t.kv_heads))?;
-            b.kv_scatter(&ws.kn, &ws.v, &mut pool.k[li], &mut pool.v[li], dst, shape)?;
+        // Every layer rotates with the same positions: one cos / sin table per pass.
+        b.rope_cos_sin(positions, hd, t.rope_theta, &mut ws.rope)?;
+        let layers = &self.dec.layers;
+        b.rms_norm(
+            &ws.x,
+            &layers[0].attn_norm,
+            &mut ws.hb,
+            n,
+            h,
+            eps,
+            NormKind::Plain,
+        )?;
+        for (li, l) in layers.iter().enumerate() {
+            // One GEMV for q | k | v, then one kernel: per-head norms, rotary, K / V into the pool.
+            b.linear(&ws.hb, &l.qkv.view(), &mut ws.qkv, n)?;
+            debug_assert_eq!(l.qkv.rows, qkv_cols);
+            b.qk_norm_rope_kv(
+                &ws.qkv,
+                &l.q_norm,
+                &l.k_norm,
+                &ws.rope,
+                &mut ws.qn,
+                &mut pool.k[li],
+                &mut pool.v[li],
+                dst,
+                qkv_shape,
+            )?;
             b.attention_ranges(
                 &ws.qn,
                 &pool.k[li],
@@ -972,25 +996,38 @@ impl<B: Backend> Qwen3Asr<B> {
                 eps,
                 NormKind::Plain,
             )?;
-            b.linear(&ws.hb, &l.gate.view(), &mut ws.g, n)?;
-            b.linear(&ws.hb, &l.up.view(), &mut ws.u, n)?;
-            b.silu_mul(&mut ws.g, &ws.u, n * t.ffn)?;
+            // One GEMV for gate | up, then SwiGLU over its halves.
+            b.linear(&ws.hb, &l.gate_up.view(), &mut ws.gu, n)?;
+            b.swiglu(&ws.gu, n, gu_cols, 0, t.ffn, t.ffn, &mut ws.g)?;
             b.linear(&ws.g, &l.down.view(), &mut ws.o, n)?;
-            b.add(&mut ws.x, &ws.o, n * h)?;
-        }
-        let heads = match last {
-            None => {
-                b.rms_norm(
-                    &ws.x,
+            // The residual add fused with the next norm (the next layer's, or the final one when
+            // every row needs logits).
+            match (layers.get(li + 1), last) {
+                (Some(next), _) => b.add_rms_norm(
+                    &mut ws.x,
+                    &ws.o,
+                    &next.attn_norm,
+                    &mut ws.hb,
+                    n,
+                    h,
+                    eps,
+                    NormKind::Plain,
+                )?,
+                (None, None) => b.add_rms_norm(
+                    &mut ws.x,
+                    &ws.o,
                     &self.dec.norm,
                     &mut bw.normed,
                     n,
                     h,
                     eps,
                     NormKind::Plain,
-                )?;
-                n
+                )?,
+                (None, Some(_)) => b.add(&mut ws.x, &ws.o, n * h)?,
             }
+        }
+        let heads = match last {
+            None => n,
             Some(rows) => {
                 // Gather the rows that need logits into hb, then norm them.
                 for (i, &r) in rows.iter().enumerate() {
