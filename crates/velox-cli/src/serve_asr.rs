@@ -62,6 +62,14 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     // F32 KV costs layers * 2 * kv_heads * head_dim * 4 bytes per row (229 KB for 1.7B).
     let kv_rows: usize = a.parse("kv-rows", 8192)?;
     let tok = Arc::new(PlainTokenizer::from_file(&tok_path)?);
+    let warm_prompt = tok.encode(
+        "<|im_start|>system
+<|im_end|>
+<|im_start|>user
+<|audio_start|><|audio_pad|><|audio_end|><|im_end|>
+<|im_start|>assistant
+language English<asr_text>",
+    )?;
     let mel = Arc::new(MelFrontend::new());
     let (tx, rx) = mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -75,9 +83,27 @@ pub fn run(a: &Args) -> Result<ExitCode> {
                 }
             };
             let r = match sel {
-                Selected::Cpu(b) => engine(&b, &text, &mmproj, rx, max_batch, kv_rows, &ready_tx),
+                Selected::Cpu(b) => engine(
+                    &b,
+                    &text,
+                    &mmproj,
+                    rx,
+                    max_batch,
+                    kv_rows,
+                    warm_prompt.clone(),
+                    &ready_tx,
+                ),
                 #[cfg(feature = "cuda")]
-                Selected::Cuda(b) => engine(&b, &text, &mmproj, rx, max_batch, kv_rows, &ready_tx),
+                Selected::Cuda(b) => engine(
+                    &b,
+                    &text,
+                    &mmproj,
+                    rx,
+                    max_batch,
+                    kv_rows,
+                    warm_prompt.clone(),
+                    &ready_tx,
+                ),
             };
             if let Err(e) = r {
                 eprintln!("engine stopped: {e}");
@@ -128,6 +154,7 @@ fn engine<B: Backend>(
     rx: Receiver<Job>,
     max_batch: usize,
     kv_rows: usize,
+    warm_prompt: Vec<u32>,
     ready: &Sender<Result<()>>,
 ) -> Result<()> {
     b.bind_thread()?;
@@ -141,10 +168,40 @@ fn engine<B: Backend>(
         t0.elapsed(),
         b.describe()
     );
-    let _ = ready.send(Ok(()));
     let mut waiting: VecDeque<Job> = VecDeque::new();
     let mut active: Vec<Active> = Vec::new();
     let mut steps = 0u64;
+    // Warm-up before serving: kernels load lazily and each (batch size, KV bucket) records its
+    // graph on first use, which cost the first requests ~25%. Synthetic 10 s clips with staggered
+    // limits end one by one, so decode steps run at every batch size from WARM down to 1.
+    let warm_n = max_batch.min(16);
+    let (warm_tx, warm_rx) = mpsc::channel();
+    {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let pcm: Vec<i16> = (0..10 * SAMPLE_RATE)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 40) as i32 % 2000) as i16
+            })
+            .collect();
+        let frames = MelFrontend::frames(pcm.len());
+        let mel = m.mel().compute(&pcm);
+        for i in 0..warm_n {
+            waiting.push_back(Job {
+                prompt: warm_prompt.clone(),
+                mel: mel.clone(),
+                frames,
+                max_new: i + 2,
+                received: Instant::now(),
+                reply: warm_tx.clone(),
+            });
+        }
+    }
+    drop(warm_tx);
+    let (mut warm_left, t_warm) = (warm_n, Instant::now());
+    let mut serving = false;
     loop {
         // Take what arrived: block while idle.
         if active.is_empty() && waiting.is_empty() {
@@ -205,6 +262,14 @@ fn engine<B: Backend>(
             }
         }
         if active.is_empty() {
+            while warm_rx.try_recv().is_ok() {
+                warm_left -= 1;
+            }
+            if !serving && warm_left == 0 && waiting.is_empty() {
+                serving = true;
+                eprintln!("warmed up in {:.1?}", t_warm.elapsed());
+                let _ = ready.send(Ok(()));
+            }
             continue;
         }
         let ids: Vec<u32> = active.iter().map(|a| a.last).collect();
@@ -233,6 +298,14 @@ fn engine<B: Backend>(
                 continue;
             }
             i += 1;
+        }
+        while warm_rx.try_recv().is_ok() {
+            warm_left -= 1;
+        }
+        if !serving && warm_left == 0 {
+            serving = true;
+            eprintln!("warmed up in {:.1?}", t_warm.elapsed());
+            let _ = ready.send(Ok(()));
         }
         if steps % 5000 == 0 {
             eprintln!(
