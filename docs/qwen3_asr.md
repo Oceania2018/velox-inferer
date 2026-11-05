@@ -118,9 +118,10 @@ above: the system turn is written even when empty. llama-server drops it without
   `attention_ranges` query over its rows `0 ..= j`), within 512 prompt rows. A longer prompt, or a
   clip under one second, is admitted alone. The encoder's windowed attention is one
   `attention_ranges` call per layer (each token's range is its window).
-- On the 5090 the row-split GEMM splits K when the grid is short of the card (prefill groups of
+- On the 5090 the row-split GEMM can split K when the grid is short of the card (prefill groups of
   ~250 rows on 1024- and 2048-row weights); slices sum in order, so results stay deterministic.
-  `VELOX_NO_SPLITK=1` turns it off.
+  Opt-in with `VELOX_SPLITK=1` (the qwen3-asr-velox service sets it): other models on that kernel
+  (the 27B's vision tower and drafter) keep the unsplit kernel unchanged.
 - `VELOX_ASR_PHASES=1` prints, whenever the engine goes idle, wall time admitting (encode +
   prefill) vs decoding by batch size. At 16 requests admission was 75% of the time before the
   split-K and encoder changes.
