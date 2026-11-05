@@ -3,4 +3,5 @@
 
 pub mod experts;
 pub mod qwen3_5;
+pub mod qwen3_asr;
 pub mod qwen4_exp;
