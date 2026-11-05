@@ -105,14 +105,25 @@ above: the system turn is written even when empty. llama-server drops it without
   that does not fit yet waits. A request prefills in a reused scratch session (prefill KV kept
   contiguous for the oracle-checked path), its rows are copied into its pool range, then it joins
   the batch.
-- Every step advances all active requests at once (`step_batch`): projections and MLP over all
-  rows, `kv_scatter` + `attention_ranges` once per layer, recorded as a static graph per (batch
-  size, KV bucket).
+- Every step advances all active requests at once (`step_batch`), recorded as a static graph per
+  (batch size, KV bucket). q | k | v and gate | up are stacked by rows at load (row views keep the
+  session path), so a layer is 9 kernels: the q|k|v GEMV, `qk_norm_rope_kv` (per-head norms,
+  rotary from a cos / sin table `rope_cos_sin` computes once per pass, K / V straight into the
+  pool), `attention_ranges`, o, `add_rms_norm`, the gate|up GEMV, `swiglu`, down, and the
+  residual add fused into the next layer's norm. (Before: 17 per layer, and `rope_positions`
+  recomputing its angles in f64 twice per layer; 3.0 -> 2.5 ms per batch-1 step.)
 - Between steps, up to 8 waiting requests are admitted together: one `encode_many` pass (chunks
   of all clips through the conv stack, rows through the encoder, windows inside each clip) and
   one `prefill_many` pass straight into the pool (prefill row `j` of a request is an
   `attention_ranges` query over its rows `0 ..= j`), within 512 prompt rows. A longer prompt, or a
-  clip under one second, is admitted alone.
+  clip under one second, is admitted alone. The encoder's windowed attention is one
+  `attention_ranges` call per layer (each token's range is its window).
+- On the 5090 the row-split GEMM splits K when the grid is short of the card (prefill groups of
+  ~250 rows on 1024- and 2048-row weights); slices sum in order, so results stay deterministic.
+  `VELOX_NO_SPLITK=1` turns it off.
+- `VELOX_ASR_PHASES=1` prints, whenever the engine goes idle, wall time admitting (encode +
+  prefill) vs decoding by batch size. At 16 requests admission was 75% of the time before the
+  split-K and encoder changes.
 - Tried and dropped: an int8 (dp4a, Int8G32) kernel for q8_g32 at 2-16 tokens. End to end it was
   ~10% slower at 16 requests than the variant's bf16 skinny kernel and moved 3-6 of 52 segments
   off the reference.
@@ -126,11 +137,21 @@ paired runs (each server restarted, two rounds each, alternating):
 |---|---|---|---|
 | llama.cpp b11347 (`-np 1`) | 43.8 / 48.5x realtime, p50 0.22 / 0.19 s | 109.0 / 126.8x | 127.6 / 127.8x |
 | velox serve-asr | 87.9x, p50 0.11 s | 161.0 / 164.1x | 257.5 / 271.5x |
+| velox, + split-K, encoder ranges, fused decode | 110.5 / 112.1x, p50 0.086 s | 225.5x | 354-367x |
 
 The first run after a restart is slower at conc 1 (graph recordings; 57-70x). Through the
 qwen3-asr sidecar (`ASR_DECODE_CONCURRENCY=16`), 20 concurrent realtime streams of distinct audio
 for 9 minutes: 20 / 20 complete, final latency p50 0.88 s, p90 1.71 s, p99 4.4 s (llama.cpp behind
-the stock sidecar: 1 / 20 complete, the rest dropped on keepalive timeouts, p90 17.7 s).
+the stock sidecar: 1 / 20 complete, the rest dropped on keepalive timeouts, p90 17.7 s). With the
+fused build, 32 streams (3 minutes, staggered over 5 s): 32 / 32 complete, 1060 finals, p50
+0.76 s, p90 1.34 s, p99 2.27 s, no drift.
 
 Against the reference (transformers, fp32, official prompt) on the same segments: velox 50 / 52
 identical, 0.12% of words differ (int8 and exact activations alike); llama.cpp 22 / 52, 12.5%.
+Segments that flip between velox builds or batch compositions (18, 23, 27, 36 of the set) are
+near-ties: top-2 logit gaps of 0.001-0.04 at the deciding step (36: "." vs "," after "ten", 0.001),
+below f32 noise; the f64 golden check is unchanged across builds (enc 4-5e-3, logits ~3e-3).
+
+Deployment note (Windows / WDDM): the 27B sizes itself device-wide at startup, so start
+serve-asr first; started after the 27B it oversubscribes VRAM, the driver pages to system RAM and
+serve-asr runs ~3x slower without any error.
