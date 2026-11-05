@@ -3702,14 +3702,6 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     // Gated DeltaNet outputs into llama.cpp's tiled value-head order (16 key heads x 3).
     // Qwen3-ASR conv stack (docs/qwen3_asr.md): the mel image, the 480-channel layers, a short
     // single chunk and odd sizes that exercise the zero border.
-    // Qwen3-ASR batched decode: sequences of different lengths in one pool (one key, a block
-    // boundary, long), GQA 16 / 8 x 128, and a narrow odd case.
-    s.pool_ops(&[1, 4, 129, 300], 16, 8, 128)?;
-    s.pool_ops(&[2, 7], 4, 1, 64)?;
-    s.im2col_3x3s2(2, 128, 100, 1)?;
-    s.im2col_3x3s2(3, 64, 50, 480)?;
-    s.im2col_3x3s2(1, 32, 13, 480)?;
-    s.im2col_3x3s2(2, 7, 5, 3)?;
     s.transpose_heads(1, 16, 3, 128)?;
     s.transpose_heads(37, 16, 3, 128)?;
     s.transpose_heads(5, 2, 3, 7)?;
@@ -3906,6 +3898,16 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         },
         false,
     )?;
+    // Qwen3-ASR (docs/qwen3_asr.md), last so the cases above keep their random inputs: batched
+    // decode over one KV pool (sequences of one key, a block boundary and long; GQA 16 / 8 x 128;
+    // a narrow odd case) and the conv stack's patches (the mel image, the 480-channel layers, a
+    // short single chunk, odd sizes for the zero border).
+    s.pool_ops(&[1, 4, 129, 300], 16, 8, 128)?;
+    s.pool_ops(&[2, 7], 4, 1, 64)?;
+    s.im2col_3x3s2(2, 128, 100, 1)?;
+    s.im2col_3x3s2(3, 64, 50, 480)?;
+    s.im2col_3x3s2(1, 32, 13, 480)?;
+    s.im2col_3x3s2(2, 7, 5, 3)?;
     // Its own seed: the synthetic model must not change when cases are added before it.
     let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);
