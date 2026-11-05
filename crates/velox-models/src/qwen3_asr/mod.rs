@@ -101,22 +101,39 @@ impl<B: Backend> Qwen3Asr<B> {
         Ok(())
     }
 
-    /// Mel -> encoder input rows (conv stack, conv_out, per-chunk positions), `[tokens, d]`.
-    /// Everything after the host-built mel image runs on the device, `CONV_GROUP` chunks per pass.
-    fn conv_stack(&self, b: &B, mel: &[f32], frames: usize) -> Result<(B::Buffer, usize)> {
+    /// Mel -> encoder input rows (conv stack, conv_out, per-chunk positions) of several clips,
+    /// concatenated `[sum tokens, d]`, and each clip's token count. Every clip pads its tail chunk
+    /// to the same width (docs: tail chunks), so clips batch when all have at least one full
+    /// chunk; a shorter clip must come alone. Everything after the host-built mel image runs on the
+    /// device, `CONV_GROUP` chunks per pass.
+    fn conv_stack(&self, b: &B, clips: &[(&[f32], usize)]) -> Result<(B::Buffer, Vec<usize>)> {
         let e = &self.cfg.enc;
         let chunk = e.chunk_frames;
-        let chunks = frames.div_ceil(chunk);
-        let pad_to = if frames >= chunk { chunk } else { frames };
-        // NHWC [chunks, mels, pad_to, 1], zero padded on the right (docs: tail chunks).
-        let mut img = vec![0f32; chunks * e.mels * pad_to];
-        for c in 0..chunks {
-            let (t0, len) = (c * chunk, (frames - c * chunk).min(chunk));
-            for m in 0..e.mels {
-                let src = &mel[m * frames + t0..][..len];
-                img[(c * e.mels + m) * pad_to..][..len].copy_from_slice(src);
+        let pad_to = match clips {
+            [(_, frames)] if *frames < chunk => *frames,
+            _ if clips.iter().all(|c| c.1 >= chunk) => chunk,
+            _ => {
+                return Err(Error::Shape(
+                    "a clip shorter than one chunk must be encoded alone".into(),
+                ))
+            }
+        };
+        // NHWC [chunks, mels, pad_to, 1] over all clips, and each chunk's valid rows.
+        let mut img = Vec::new();
+        let mut valid = Vec::new();
+        for &(mel, frames) in clips {
+            for c in 0..frames.div_ceil(chunk) {
+                let (t0, len) = (c * chunk, (frames - c * chunk).min(chunk));
+                let base = img.len();
+                img.resize(base + e.mels * pad_to, 0.0);
+                for m in 0..e.mels {
+                    let src = &mel[m * frames + t0..][..len];
+                    img[base + m * pad_to..][..len].copy_from_slice(src);
+                }
+                valid.push(EncConfig::chunk_tokens(len));
             }
         }
+        let chunks = valid.len();
         let ch = e.conv_ch;
         let shapes = |g: usize| {
             let s1 = Im2colShape {
@@ -153,7 +170,7 @@ impl<B: Backend> Qwen3Asr<B> {
         let (fq, t) = (full[2].out_h(), full[2].out_w());
         debug_assert_eq!(fq, e.conv_freq());
         let feat = ch * fq;
-        let tokens = e.tokens(frames);
+        let tokens: usize = valid.iter().sum();
         let mut rows = b.alloc(tokens * feat)?;
         let mut at = 0;
         let image = e.mels * pad_to;
@@ -172,23 +189,39 @@ impl<B: Backend> Qwen3Asr<B> {
             // [gn, fq, t, ch] -> [gn, t, fq, ch]: each time step's features f * ch + c.
             b.transpose_heads(&acts[2], &mut tr, gn, fq, t, ch)?;
             for c in g0..g0 + gn {
-                let valid = EncConfig::chunk_tokens((frames - c * chunk).min(chunk));
-                b.copy(&tr, (c - g0) * t * feat, &mut rows, at * feat, valid * feat)?;
-                at += valid;
+                b.copy(
+                    &tr,
+                    (c - g0) * t * feat,
+                    &mut rows,
+                    at * feat,
+                    valid[c] * feat,
+                )?;
+                at += valid[c];
             }
         }
         debug_assert_eq!(at, tokens);
         let mut out = b.alloc(tokens * e.d)?;
         b.linear(&rows, &self.enc.conv_out.view(), &mut out, tokens)?;
-        // Positions restart in every chunk: a prefix of the repeated table.
-        if tokens <= self.pos_rows {
-            b.add(&mut out, &self.pos, tokens * e.d)?;
-        } else {
-            let per = EncConfig::chunk_tokens(chunk);
-            let pos = b.upload(&chunk_positions(chunks, per, e.d))?;
-            b.add(&mut out, &pos, tokens * e.d)?;
+        // Positions restart in every chunk: each clip's are a prefix of the repeated table.
+        let counts: Vec<usize> = clips.iter().map(|c| e.tokens(c.1)).collect();
+        if let [n] = counts[..] {
+            if n <= self.pos_rows {
+                b.add(&mut out, &self.pos, n * e.d)?;
+                return Ok((out, counts));
+            }
         }
-        Ok((out, tokens))
+        let per = EncConfig::chunk_tokens(chunk);
+        let pos: Vec<f32> = clips
+            .iter()
+            .zip(&counts)
+            .flat_map(|(c, &n)| {
+                chunk_positions(c.1.div_ceil(chunk), per, e.d)
+                    .into_iter()
+                    .take(n * e.d)
+            })
+            .collect();
+        b.add(&mut out, &b.upload(&pos)?, tokens * e.d)?;
+        Ok((out, counts))
     }
 
     /// Audio embeddings `[tokens, hidden]` for 16 kHz mono PCM.
@@ -208,7 +241,9 @@ impl<B: Backend> Qwen3Asr<B> {
             return Err(Error::Shape("audio shorter than one mel frame".into()));
         }
         let mel = self.mel.compute(pcm);
-        self.encode_mel_traced(b, mel, frames, trace)
+        let (out, counts, tr) = self.encode_clips(b, &[(&mel, frames)], trace)?;
+        let tr = tr.map(|t| EncodeTrace { mel, frames, ..t });
+        Ok((out, counts[0], tr))
     }
 
     /// The host mel frontend (a server computes features on its request threads).
@@ -218,46 +253,71 @@ impl<B: Backend> Qwen3Asr<B> {
 
     /// Audio embeddings `[tokens, hidden]` from `[N_MELS, frames]` log-mel.
     pub fn encode_mel(&self, b: &B, mel: Vec<f32>, frames: usize) -> Result<(B::Buffer, usize)> {
-        let (out, tokens, _) = self.encode_mel_traced(b, mel, frames, false)?;
-        Ok((out, tokens))
+        let (out, counts, _) = self.encode_clips(b, &[(&mel, frames)], false)?;
+        Ok((out, counts[0]))
     }
 
-    fn encode_mel_traced(
+    /// Audio embeddings of several clips in one pass, `[sum tokens, hidden]` in clip order, and
+    /// each clip's token count. Clips shorter than one second (one conv chunk) must come alone.
+    /// Attention windows never cross clips, so the rows equal each clip encoded on its own.
+    pub fn encode_many(&self, b: &B, clips: &[(&[f32], usize)]) -> Result<(B::Buffer, Vec<usize>)> {
+        let (out, counts, _) = self.encode_clips(b, clips, false)?;
+        Ok((out, counts))
+    }
+
+    fn encode_clips(
         &self,
         b: &B,
-        mel: Vec<f32>,
-        frames: usize,
+        clips: &[(&[f32], usize)],
         trace: bool,
-    ) -> Result<(B::Buffer, usize, Option<EncodeTrace>)> {
+    ) -> Result<(B::Buffer, Vec<usize>, Option<EncodeTrace>)> {
         let e = &self.cfg.enc;
-        if frames == 0 || mel.len() != e.mels * frames {
-            return Err(Error::Shape(format!(
-                "mel of {} values for {frames} frames",
-                mel.len()
-            )));
+        if clips.is_empty() {
+            return Err(Error::Shape("no clips to encode".into()));
         }
-        let (mut x, n) = self.conv_stack(b, &mel, frames)?;
+        for &(mel, frames) in clips {
+            if frames == 0 || mel.len() != e.mels * frames {
+                return Err(Error::Shape(format!(
+                    "mel of {} values for {frames} frames",
+                    mel.len()
+                )));
+            }
+        }
+        let (mut x, counts) = self.conv_stack(b, clips)?;
+        let n: usize = counts.iter().sum();
         let mut tr = if trace {
             let mut conv = vec![0f32; n * e.d];
             b.synchronize()?;
             b.download(&x, &mut conv)?;
             Some(EncodeTrace {
-                mel,
-                frames,
+                mel: Vec::new(),
+                frames: 0,
                 conv,
                 layers: Vec::new(),
             })
         } else {
             None
         };
+        // Attention windows: consecutive blocks inside each clip.
+        let mut windows = Vec::new();
+        let mut at = 0;
+        for (&(_, frames), &cn) in clips.iter().zip(&counts) {
+            let win = e.window_tokens(frames);
+            let mut s = 0;
+            while s < cn {
+                let len = win.min(cn - s);
+                windows.push((at + s, len));
+                s += len;
+            }
+            at += cn;
+        }
         let (d, hd) = (e.d, e.head_dim());
-        let win = e.window_tokens(frames);
         let mut hbuf = b.alloc(n * d)?;
         let (mut q, mut k, mut v) = (b.alloc(n * d)?, b.alloc(n * d)?, b.alloc(n * d)?);
         let mut attn = b.alloc(n * d)?;
         let mut o = b.alloc(n * d)?;
         let mut f = b.alloc(n * e.ffn)?;
-        let wmax = win.min(n);
+        let wmax = windows.iter().map(|w| w.1).max().unwrap_or(1);
         let (mut qw, mut kw, mut vw, mut aw) = (
             b.alloc(wmax * d)?,
             b.alloc(wmax * d)?,
@@ -269,9 +329,7 @@ impl<B: Backend> Qwen3Asr<B> {
             Self::linear(b, &hbuf, &l.q, &mut q, n)?;
             Self::linear(b, &hbuf, &l.k, &mut k, n)?;
             Self::linear(b, &hbuf, &l.v, &mut v, n)?;
-            let mut s = 0;
-            while s < n {
-                let len = win.min(n - s);
+            for &(s, len) in &windows {
                 b.copy(&q, s * d, &mut qw, 0, len * d)?;
                 b.copy(&k, s * d, &mut kw, 0, len * d)?;
                 b.copy(&v, s * d, &mut vw, 0, len * d)?;
@@ -287,7 +345,6 @@ impl<B: Backend> Qwen3Asr<B> {
                     },
                 )?;
                 b.copy(&aw, 0, &mut attn, s * d, len * d)?;
-                s += len;
             }
             Self::linear(b, &attn, &l.out, &mut o, n)?;
             b.add(&mut x, &o, n * d)?;
@@ -309,7 +366,7 @@ impl<B: Backend> Qwen3Asr<B> {
         b.gelu(&mut o, n * d, GeluKind::Erf)?;
         let mut out = b.alloc(n * self.cfg.dec.hidden)?;
         Self::linear(b, &o, &self.enc.proj2, &mut out, n)?;
-        Ok((out, n, tr))
+        Ok((out, counts, tr))
     }
 
     /// Prompt ids for one clip of `audio_tokens` encoder rows (docs/qwen3_asr.md#prompt).
@@ -387,6 +444,9 @@ pub struct DecWorkspace<B: Backend> {
     pub logits: B::Buffer,
     /// The latest greedy id (u32 bits), which the next decode step embeds from.
     next_id: B::Buffer,
+    /// Each step's id copied out of `next_id` (8 slots), so a queued step cannot overwrite the one
+    /// still being read back on backends whose fetch reads the buffer itself (the CPU oracle).
+    id_history: B::Buffer,
 }
 
 impl<B: Backend> DecWorkspace<B> {
@@ -411,6 +471,7 @@ impl<B: Backend> DecWorkspace<B> {
             normed: b.alloc(h)?,
             logits: b.alloc(t.vocab)?,
             next_id: b.alloc(1)?,
+            id_history: b.alloc(8)?,
         })
     }
 }
@@ -626,7 +687,8 @@ impl<B: Backend> Qwen3Asr<B> {
         b.download(&ws.logits, &mut first)?;
         let prefill = t0.elapsed();
         let mut out = Vec::new();
-        b.fetch_u32_begin(&ws.next_id, 0, 0)?;
+        b.copy(&ws.next_id, 0, &mut ws.id_history, 0, 1)?;
+        b.fetch_u32_begin(&ws.id_history, 0, 0)?;
         let mut slot = 0;
         loop {
             let pending = slot;
@@ -634,9 +696,10 @@ impl<B: Backend> Qwen3Asr<B> {
             if more {
                 self.step(b, &mut s, ws)?;
                 slot = (slot + 1) % 8;
-                b.fetch_u32_begin(&ws.next_id, 0, slot)?;
+                b.copy(&ws.next_id, 0, &mut ws.id_history, slot, 1)?;
+                b.fetch_u32_begin(&ws.id_history, slot, slot)?;
             }
-            let id = b.fetch_u32(&ws.next_id, 0, pending)?;
+            let id = b.fetch_u32(&ws.id_history, pending, pending)?;
             if id == IM_END || !more {
                 break;
             }
@@ -650,9 +713,10 @@ impl<B: Backend> Qwen3Asr<B> {
 /// Sequences one batched decode step serves at most.
 pub const MAX_BATCH: usize = 32;
 
-/// Positions the prefill scratch session holds (prompts are encoder rows plus ~20 tokens: 13 per
-/// second of audio, so 2048 covers about two and a half minutes).
-pub const PREFILL_CAP: usize = 2048;
+/// Positions the prefill scratch session holds: a prompt is its encoder rows (13 per second of
+/// audio) plus ~20 tokens, so 1024 covers ~77 s (the sidecar cuts segments at 60 s). F32 KV: 229 KB
+/// per position.
+pub const PREFILL_CAP: usize = 1024;
 
 const GRAPH_DECODE_BATCH: u64 = 2 << 16;
 
@@ -834,7 +898,7 @@ impl<B: Backend> Qwen3Asr<B> {
             | (n as u64) << 8
             | ((kv.div_ceil(GRAPH_KV_BUCKET) as u64) & 0xffff) << 24;
         b.graph(key, &mut || {
-            self.batch_pass(b, pool, ids, &positions, &dst, &ranges, ws, bw)
+            self.batch_pass(b, pool, ids, &positions, &dst, &ranges, None, None, ws, bw)
         })?;
         for s in seqs.iter_mut() {
             s.pos += 1;
@@ -845,6 +909,10 @@ impl<B: Backend> Qwen3Asr<B> {
         Ok(host[..n].iter().map(|v| v.to_bits()).collect())
     }
 
+    /// One decoder pass of `ids.len()` rows over the pool: row `r` is position `positions[r]` of a
+    /// sequence, stored at pool row `dst[r]`, attending to `ranges[r]`. `audio` replaces the
+    /// embeddings of rows `dst_row .. dst_row + len` by encoder rows `src_row ..`. Logits and
+    /// greedy ids are computed for the rows in `last` (all rows when `None`), in that order.
     #[allow(clippy::too_many_arguments)]
     fn batch_pass(
         &self,
@@ -854,6 +922,8 @@ impl<B: Backend> Qwen3Asr<B> {
         positions: &[u32],
         dst: &[u32],
         ranges: &[(u32, u32)],
+        audio: Option<(&B::Buffer, &[(usize, usize, usize)])>,
+        last: Option<&[usize]>,
         ws: &mut DecWorkspace<B>,
         bw: &mut BatchWorkspace<B>,
     ) -> Result<()> {
@@ -878,6 +948,11 @@ impl<B: Backend> Qwen3Asr<B> {
             pool_rows: pool.rows,
         };
         b.embed(ids, &self.dec.embed.view(), &mut ws.x)?;
+        if let Some((enc, copies)) = audio {
+            for &(src, dst_row, len) in copies {
+                b.copy(enc, src * h, &mut ws.x, dst_row * h, len * h)?;
+            }
+        }
         for (li, l) in self.dec.layers.iter().enumerate() {
             b.rms_norm(&ws.x, &l.attn_norm, &mut ws.hb, n, h, eps, NormKind::Plain)?;
             b.linear(&ws.hb, &l.q.view(), &mut ws.q, n)?;
@@ -913,21 +988,117 @@ impl<B: Backend> Qwen3Asr<B> {
             b.linear(&ws.g, &l.down.view(), &mut ws.o, n)?;
             b.add(&mut ws.x, &ws.o, n * h)?;
         }
-        b.rms_norm(
-            &ws.x,
-            &self.dec.norm,
-            &mut bw.normed,
-            n,
-            h,
-            eps,
-            NormKind::Plain,
-        )?;
-        b.linear(&bw.normed, &self.dec.lm_head.view(), &mut bw.logits, n)?;
-        for i in 0..n {
+        let heads = match last {
+            None => {
+                b.rms_norm(
+                    &ws.x,
+                    &self.dec.norm,
+                    &mut bw.normed,
+                    n,
+                    h,
+                    eps,
+                    NormKind::Plain,
+                )?;
+                n
+            }
+            Some(rows) => {
+                // Gather the rows that need logits into hb, then norm them.
+                for (i, &r) in rows.iter().enumerate() {
+                    b.copy(&ws.x, r * h, &mut ws.hb, i * h, h)?;
+                }
+                let m = rows.len();
+                b.rms_norm(
+                    &ws.hb,
+                    &self.dec.norm,
+                    &mut bw.normed,
+                    m,
+                    h,
+                    eps,
+                    NormKind::Plain,
+                )?;
+                m
+            }
+        };
+        b.linear(&bw.normed, &self.dec.lm_head.view(), &mut bw.logits, heads)?;
+        for i in 0..heads {
             b.copy(&bw.logits, i * t.vocab, &mut bw.row, 0, t.vocab)?;
             b.argmax_to(&bw.row, t.vocab, &mut bw.ids, i)?;
         }
         Ok(())
+    }
+
+    /// Prefills several requests in one pass straight into their pool ranges (prefill row `j` of a
+    /// request attends to its rows `0 ..= j`, as a decode row does) and returns each one's first
+    /// greedy id. `reqs[i]` is (sequence, prompt with pads expanded, encoder row of its first pad
+    /// in `audio`); all prompts together must fit the workspace ([`PREFILL_ROWS`]).
+    pub fn prefill_many(
+        &self,
+        b: &B,
+        pool: &mut KvPool<B>,
+        reqs: &mut [(&mut PoolSeq, &[u32], usize)],
+        audio: &B::Buffer,
+        ws: &mut DecWorkspace<B>,
+        bw: &mut BatchWorkspace<B>,
+    ) -> Result<Vec<u32>> {
+        let rows: usize = reqs.iter().map(|r| r.1.len()).sum();
+        if reqs.is_empty() || reqs.len() > MAX_BATCH || rows > ws.rows {
+            return Err(Error::Shape(format!(
+                "prefill_many: {} requests, {rows} rows (workspace {})",
+                reqs.len(),
+                ws.rows
+            )));
+        }
+        let (mut ids, mut positions, mut dst, mut ranges) = (
+            Vec::with_capacity(rows),
+            Vec::with_capacity(rows),
+            Vec::with_capacity(rows),
+            Vec::with_capacity(rows),
+        );
+        let (mut copies, mut last) = (Vec::new(), Vec::new());
+        for (seq, prompt, audio_row0) in reqs.iter() {
+            if seq.pos + prompt.len() >= seq.cap {
+                return Err(Error::Shape(format!(
+                    "prompt of {} tokens in a sequence of {} rows",
+                    prompt.len(),
+                    seq.cap
+                )));
+            }
+            let row0 = ids.len();
+            if let Some(first) = prompt.iter().position(|&id| id == AUDIO_PAD) {
+                let pads = prompt[first..]
+                    .iter()
+                    .take_while(|&&id| id == AUDIO_PAD)
+                    .count();
+                copies.push((*audio_row0, row0 + first, pads));
+            }
+            for (j, &id) in prompt.iter().enumerate() {
+                let p = seq.pos + j;
+                ids.push(id);
+                positions.push(p as u32);
+                dst.push((seq.base + p) as u32);
+                ranges.push((seq.base as u32, (p + 1) as u32));
+            }
+            last.push(ids.len() - 1);
+        }
+        self.batch_pass(
+            b,
+            pool,
+            &ids,
+            &positions,
+            &dst,
+            &ranges,
+            Some((audio, &copies)),
+            Some(&last),
+            ws,
+            bw,
+        )?;
+        for (seq, prompt, _) in reqs.iter_mut() {
+            seq.pos += prompt.len();
+        }
+        let mut host = vec![0f32; reqs.len()];
+        b.synchronize()?;
+        b.download(&bw.ids, &mut host)?;
+        Ok(host.iter().map(|v| v.to_bits()).collect())
     }
 
     /// The model's decoder workspace (static graphs replay on its buffers).

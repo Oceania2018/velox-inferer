@@ -107,16 +107,30 @@ above: the system turn is written even when empty. llama-server drops it without
   the batch.
 - Every step advances all active requests at once (`step_batch`): projections and MLP over all
   rows, `kv_scatter` + `attention_ranges` once per layer, recorded as a static graph per (batch
-  size, KV bucket). Up to 4 requests are admitted between steps.
+  size, KV bucket).
+- Between steps, up to 8 waiting requests are admitted together: one `encode_many` pass (chunks
+  of all clips through the conv stack, rows through the encoder, windows inside each clip) and
+  one `prefill_many` pass straight into the pool (prefill row `j` of a request is an
+  `attention_ranges` query over its rows `0 ..= j`), within 512 prompt rows. A longer prompt, or a
+  clip under one second, is admitted alone.
+- Tried and dropped: an int8 (dp4a, Int8G32) kernel for q8_g32 at 2-16 tokens. End to end it was
+  ~10% slower at 16 requests than the variant's bf16 skinny kernel and moved 3-6 of 52 segments
+  off the reference.
 
 ### Results (RTX 5090 shared with the 27B, 2026-11-05)
 
-52 segments (497 s) cut from two real calls, identical requests to each server, Q8_0 weights:
+52 segments (497 s) cut from two real calls, identical requests to each server, Q8_0 weights;
+paired runs (each server restarted, two rounds each, alternating):
 
 | | conc 1 | conc 4 | conc 16 |
 |---|---|---|---|
-| llama.cpp b11347 (`-np 1`) | 40.3x realtime, p50 0.21 s | 96.8x | 114.8x |
-| velox serve-asr | 87.6x, p50 0.109 s | 154.9x | 199.1x |
+| llama.cpp b11347 (`-np 1`) | 43.8 / 48.5x realtime, p50 0.22 / 0.19 s | 109.0 / 126.8x | 127.6 / 127.8x |
+| velox serve-asr | 87.9x, p50 0.11 s | 161.0 / 164.1x | 257.5 / 271.5x |
+
+The first run after a restart is slower at conc 1 (graph recordings; 57-70x). Through the
+qwen3-asr sidecar (`ASR_DECODE_CONCURRENCY=16`), 20 concurrent realtime streams of distinct audio
+for 9 minutes: 20 / 20 complete, final latency p50 0.88 s, p90 1.71 s, p99 4.4 s (llama.cpp behind
+the stock sidecar: 1 / 20 complete, the rest dropped on keepalive timeouts, p90 17.7 s).
 
 Against the reference (transformers, fp32, official prompt) on the same segments: velox 50 / 52
 identical, 0.12% of words differ (int8 and exact activations alike); llama.cpp 22 / 52, 12.5%.

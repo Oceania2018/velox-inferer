@@ -21,7 +21,7 @@ use velox_core::{Backend, Error, Result};
 use velox_frontend::PlainTokenizer;
 use velox_models::qwen3_asr::mel::{MelFrontend, SAMPLE_RATE};
 use velox_models::qwen3_asr::{
-    BatchWorkspace, KvPool, PoolSeq, Qwen3Asr, AUDIO_PAD, IM_END, MAX_BATCH,
+    BatchWorkspace, KvPool, PoolSeq, Qwen3Asr, AUDIO_PAD, IM_END, MAX_BATCH, PREFILL_ROWS,
 };
 
 use crate::args::Args;
@@ -163,13 +163,15 @@ fn engine<B: Backend>(
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        // Admit in arrival order while the batch and the pool have room (a few per step, so
-        // running requests keep advancing).
-        let mut admitted = 0;
-        while active.len() < max_batch && admitted < 4 {
+        // Admit in arrival order while the batch and the pool have room: one encoder pass and one
+        // prefill pass for a group (prompts within PREFILL_ROWS, every clip at least a second
+        // long); a prompt longer than that, or a shorter clip, goes alone on the chunked path.
+        let mut group: Vec<(PoolSeq, Job)> = Vec::new();
+        let mut rows = 0;
+        while active.len() + group.len() < max_batch && group.len() < ADMIT_MAX {
             let Some(job) = waiting.front() else { break };
-            let need =
-                job.prompt.len() + job.frames / 8 + output_reserve(job.frames, job.max_new) + 2;
+            let prompt_rows = job.prompt.len() - 1 + m.cfg.enc.tokens(job.frames);
+            let need = prompt_rows + output_reserve(job.frames, job.max_new) + 2;
             if need > pool.rows() {
                 let job = waiting.pop_front().expect("front");
                 let _ = job.reply.send(Err(format!(
@@ -178,16 +180,27 @@ fn engine<B: Backend>(
                 )));
                 continue;
             }
+            let alone = prompt_rows > PREFILL_ROWS || job.frames < m.cfg.enc.chunk_frames;
+            if !group.is_empty() && (alone || rows + prompt_rows > PREFILL_ROWS) {
+                break;
+            }
             let Some(seq) = pool.alloc(need) else { break };
             let job = waiting.pop_front().expect("front");
-            admitted += 1;
-            let reply = job.reply.clone();
-            match admit(b, &m, &mut pool, &mut bw, seq, job) {
-                Ok(Some(a)) => active.push(a),
-                Ok(None) => {}
+            rows += prompt_rows;
+            group.push((seq, job));
+            if alone {
+                break;
+            }
+        }
+        if !group.is_empty() {
+            let replies: Vec<_> = group.iter().map(|g| g.1.reply.clone()).collect();
+            match admit_group(b, &m, &mut pool, &mut bw, group) {
+                Ok(done) => active.extend(done),
                 Err(e) => {
                     eprintln!("request failed: {e}");
-                    let _ = reply.send(Err(e.to_string()));
+                    for r in replies {
+                        let _ = r.send(Err(e.to_string()));
+                    }
                 }
             }
         }
@@ -232,47 +245,79 @@ fn engine<B: Backend>(
     }
 }
 
-/// Encodes and prefills a request into `seq`; `None` when it is already complete (stopped at its
-/// first token or at its limit).
-fn admit<B: Backend>(
+/// Requests admitted per round at most.
+const ADMIT_MAX: usize = 8;
+
+/// Encodes and prefills a group of requests (one pass each when several; the chunked path for a
+/// single one) and returns those still decoding. On error every sequence goes back to the pool.
+fn admit_group<B: Backend>(
     b: &B,
     m: &Qwen3Asr<B>,
     pool: &mut KvPool<B>,
     bw: &mut BatchWorkspace<B>,
-    mut seq: PoolSeq,
-    mut job: Job,
-) -> Result<Option<Active>> {
-    let r = (|| {
-        let (audio, n) = m.encode_mel(b, std::mem::take(&mut job.mel), job.frames)?;
-        job.prompt = expand(&job.prompt, n);
+    mut group: Vec<(PoolSeq, Job)>,
+) -> Result<Vec<Active>> {
+    let r = (|| -> Result<Vec<u32>> {
+        let clips: Vec<(&[f32], usize)> =
+            group.iter().map(|g| (&g.1.mel[..], g.1.frames)).collect();
+        let (audio, counts) = m.encode_many(b, &clips)?;
+        for (g, &n) in group.iter_mut().zip(&counts) {
+            g.1.prompt = expand(&g.1.prompt, n);
+            g.1.mel = Vec::new();
+        }
         let mut ws = m.decoder_workspace()?;
-        m.start_pooled(b, pool, &mut seq, &mut ws, bw, &job.prompt, &audio)
+        if let [(seq, job)] = &mut group[..] {
+            if job.prompt.len() > PREFILL_ROWS {
+                return Ok(vec![m.start_pooled(
+                    b,
+                    pool,
+                    seq,
+                    &mut ws,
+                    bw,
+                    &job.prompt,
+                    &audio,
+                )?]);
+            }
+        }
+        let mut at = 0;
+        let mut reqs: Vec<(&mut PoolSeq, &[u32], usize)> = Vec::with_capacity(group.len());
+        for ((seq, job), &n) in group.iter_mut().zip(&counts) {
+            reqs.push((seq, &job.prompt[..], at));
+            at += n;
+        }
+        m.prefill_many(b, pool, &mut reqs, &audio, &mut ws, bw)
     })();
-    let first = match r {
+    let firsts = match r {
         Ok(f) => f,
         Err(e) => {
-            pool.release(seq);
+            for (seq, _) in group {
+                pool.release(seq);
+            }
             return Err(e);
         }
     };
-    let room = seq.capacity() - seq.pos - 1;
-    let mut a = Active {
-        seq,
-        job,
-        ids: Vec::new(),
-        last: first,
-        room,
-    };
-    if first == IM_END {
-        finish(pool, a, false);
-        return Ok(None);
+    let mut out = Vec::new();
+    for ((seq, job), first) in group.into_iter().zip(firsts) {
+        let room = seq.capacity() - seq.pos - 1;
+        let mut a = Active {
+            seq,
+            job,
+            ids: Vec::new(),
+            last: first,
+            room,
+        };
+        if first == IM_END {
+            finish(pool, a, false);
+            continue;
+        }
+        a.ids.push(first);
+        if a.ids.len() >= a.job.max_new || a.room == 0 {
+            finish(pool, a, true);
+            continue;
+        }
+        out.push(a);
     }
-    a.ids.push(first);
-    if a.ids.len() >= a.job.max_new || a.room == 0 {
-        finish(pool, a, true);
-        return Ok(None);
-    }
-    Ok(Some(a))
+    Ok(out)
 }
 
 fn finish<B: Backend>(pool: &mut KvPool<B>, a: Active, truncated: bool) {
