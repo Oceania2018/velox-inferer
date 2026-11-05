@@ -711,6 +711,35 @@ impl<B: Backend> Backend for Profiled<B> {
     ) -> Result<()> {
         self.time("kv_scatter", || self.inner.kv_scatter(k, v, kp, vp, dst, s))
     }
+    fn rope_cos_sin(
+        &self,
+        positions: &[u32],
+        head_dim: usize,
+        theta: f32,
+        table: &mut B::Buffer,
+    ) -> Result<()> {
+        self.time("rope_cos_sin", || {
+            self.inner.rope_cos_sin(positions, head_dim, theta, table)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv(
+        &self,
+        qkv: &B::Buffer,
+        qn: &B::Buffer,
+        kn: &B::Buffer,
+        table: &B::Buffer,
+        q_out: &mut B::Buffer,
+        kp: &mut B::Buffer,
+        vp: &mut B::Buffer,
+        dst: &[u32],
+        s: velox_core::QkvRopeShape,
+    ) -> Result<()> {
+        self.time("qk_norm_rope_kv", || {
+            self.inner
+                .qk_norm_rope_kv(qkv, qn, kn, table, q_out, kp, vp, dst, s)
+        })
+    }
     fn attention_ranges(
         &self,
         q: &B::Buffer,

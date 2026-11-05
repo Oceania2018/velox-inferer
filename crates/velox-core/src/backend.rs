@@ -303,6 +303,101 @@ pub struct PoolShape {
 /// Host reference of [`Backend::attention_ranges`]: query row `r` (`[rows, heads, head_dim]`)
 /// attends, causally complete, to pool rows `ranges[r].0 .. ranges[r].0 + ranges[r].1`; query head
 /// `h` reads kv head `h / (heads / kv_heads)`. Scale `1 / sqrt(head_dim)`.
+/// Shape of [`Backend::qk_norm_rope_kv`]: `rows` rows of a fused `q | k | v` projection
+/// (`[rows, (heads + 2 * kv_heads) * head_dim]`), stored into F32 pools of `pool_rows` rows of
+/// `[kv_heads, head_dim]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QkvRopeShape {
+    pub rows: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub pool_rows: usize,
+    /// Of the per-head RMS norms.
+    pub eps: f32,
+}
+
+impl QkvRopeShape {
+    /// Values per fused row.
+    pub fn row(&self) -> usize {
+        (self.heads + 2 * self.kv_heads) * self.head_dim
+    }
+}
+
+/// Host reference of [`Backend::rope_cos_sin`]: row `r` is `[head_dim / 2]` cos then sin of
+/// `positions[r] * theta^(-2i / head_dim)`: the angles of [`Backend::rope_positions`] (one axis,
+/// [`RopeLayout::Interleaved`], full rotary width), in f64 and rounded to f32.
+pub fn rope_cos_sin_host(positions: &[u32], head_dim: usize, theta: f32) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut out = vec![0f32; positions.len() * head_dim];
+    for (r, &p) in positions.iter().enumerate() {
+        for i in 0..half {
+            let freq = f64::from(theta).powf(-2.0 * i as f64 / head_dim as f64);
+            let (s, c) = (f64::from(p) * freq).sin_cos();
+            out[r * head_dim + i] = c as f32;
+            out[r * head_dim + half + i] = s as f32;
+        }
+    }
+    out
+}
+
+/// Host reference of [`Backend::qk_norm_rope_kv`]: per row, each q head and k head is RMS-normed
+/// with its slice of `q_norm` / `k_norm` (`[heads * head_dim]` / `[kv_heads * head_dim]`, as
+/// [`Backend::rms_norm_groups`] takes them; rounded to f32), then rotated with the row's `table`
+/// entry (pairs `i`, `i + half`, as `rope_positions`); v passes through. Returns q
+/// (`[rows, heads, head_dim]`), k and v (`[rows, kv_heads, head_dim]`).
+pub fn qk_norm_rope_kv_host(
+    qkv: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    table: &[f32],
+    s: QkvRopeShape,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (h, kvh, d) = (s.heads, s.kv_heads, s.head_dim);
+    let half = d / 2;
+    let row = s.row();
+    let (mut q, mut k, mut v) = (
+        vec![0f32; s.rows * h * d],
+        vec![0f32; s.rows * kvh * d],
+        vec![0f32; s.rows * kvh * d],
+    );
+    let head = |x: &[f32], w: &[f32], cs: &[f32], out: &mut [f32]| {
+        let ms = x.iter().map(|&a| f64::from(a) * f64::from(a)).sum::<f64>() / d as f64;
+        let inv = 1.0 / (ms + f64::from(s.eps)).sqrt();
+        let n: Vec<f32> = (0..d)
+            .map(|c| (f64::from(x[c]) * inv * f64::from(w[c])) as f32)
+            .collect();
+        for i in 0..half {
+            let (a, b) = (f64::from(n[i]), f64::from(n[i + half]));
+            let (c, sn) = (f64::from(cs[i]), f64::from(cs[half + i]));
+            out[i] = (a * c - b * sn) as f32;
+            out[i + half] = (a * sn + b * c) as f32;
+        }
+    };
+    for r in 0..s.rows {
+        let x = &qkv[r * row..][..row];
+        let cs = &table[r * d..][..d];
+        for hh in 0..h {
+            head(
+                &x[hh * d..][..d],
+                &q_norm[hh * d..][..d],
+                cs,
+                &mut q[(r * h + hh) * d..][..d],
+            );
+        }
+        for kh in 0..kvh {
+            head(
+                &x[(h + kh) * d..][..d],
+                &k_norm[kh * d..][..d],
+                cs,
+                &mut k[(r * kvh + kh) * d..][..d],
+            );
+        }
+        v[r * kvh * d..][..kvh * d].copy_from_slice(&x[(h + kvh) * d..][..kvh * d]);
+    }
+    (q, k, v)
+}
+
 pub fn attention_ranges_host(
     q: &[f32],
     k: &[f32],
@@ -1700,6 +1795,70 @@ pub trait Backend {
         for (r, &d) in dst.iter().enumerate() {
             self.copy(k, r * row, k_pool, d as usize * row, row)?;
             self.copy(v, r * row, v_pool, d as usize * row, row)?;
+        }
+        Ok(())
+    }
+    /// [`rope_cos_sin_host`] of `positions` into `table` (`[positions.len(), head_dim]`): one
+    /// table per decode step serves every layer's [`Self::qk_norm_rope_kv`]. The default runs on
+    /// the host.
+    fn rope_cos_sin(
+        &self,
+        positions: &[u32],
+        head_dim: usize,
+        theta: f32,
+        table: &mut Self::Buffer,
+    ) -> Result<()> {
+        crate::check::rope_cos_sin(self.len(table), positions.len(), head_dim)?;
+        let t = rope_cos_sin_host(positions, head_dim, theta);
+        let tmp = self.upload(&t)?;
+        self.copy(&tmp, 0, table, 0, t.len())
+    }
+    /// A fused `q | k | v` projection's post-processing for pooled decode: per-head RMS norm and
+    /// rotary embedding of q (into `q_out`, `[rows, heads, head_dim]`) and k, then k and v stored
+    /// at pool row `dst[r]` (see [`qk_norm_rope_kv_host`]; `table` from [`Self::rope_cos_sin`]).
+    /// Replaces a split, two `rms_norm_groups`, two `rope_positions` and `kv_scatter`. The default
+    /// runs on the host.
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv(
+        &self,
+        qkv: &Self::Buffer,
+        q_norm: &Self::Buffer,
+        k_norm: &Self::Buffer,
+        table: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        dst: &[u32],
+        shape: QkvRopeShape,
+    ) -> Result<()> {
+        crate::check::qk_norm_rope_kv(
+            [
+                self.len(qkv),
+                self.len(q_norm),
+                self.len(k_norm),
+                self.len(table),
+                self.len(q_out),
+                self.len(k_pool),
+                self.len(v_pool),
+            ],
+            dst,
+            &shape,
+        )?;
+        let fetch = |b: &Self::Buffer| -> Result<Vec<f32>> {
+            let mut h = vec![0f32; self.len(b)];
+            self.download(b, &mut h)?;
+            Ok(h)
+        };
+        self.synchronize()?;
+        let (x, qn, kn, t) = (fetch(qkv)?, fetch(q_norm)?, fetch(k_norm)?, fetch(table)?);
+        let (q, k, v) = qk_norm_rope_kv_host(&x, &qn, &kn, &t, shape);
+        let tmp = self.upload(&q)?;
+        self.copy(&tmp, 0, q_out, 0, q.len())?;
+        let (kt, vt) = (self.upload(&k)?, self.upload(&v)?);
+        let row = shape.kv_heads * shape.head_dim;
+        for (r, &d) in dst.iter().enumerate() {
+            self.copy(&kt, r * row, k_pool, d as usize * row, row)?;
+            self.copy(&vt, r * row, v_pool, d as usize * row, row)?;
         }
         Ok(())
     }

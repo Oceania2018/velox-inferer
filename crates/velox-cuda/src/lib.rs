@@ -9,6 +9,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::sync::{Arc, Mutex};
 
 use velox_core::backend::PoolShape;
+use velox_core::backend::QkvRopeShape;
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, CopySpec, DilatedConvShape, DynConvShape, ExpertBank, FullAttnShape,
@@ -1113,6 +1114,32 @@ pub trait CudaKernels: Send + Sync {
         portable::kv_scatter(k, v, kp, vp, dst, shape)
     }
 
+    fn rope_cos_sin(
+        &self,
+        positions: &[u32],
+        head_dim: usize,
+        theta: f32,
+        table: &mut CudaBuffer,
+    ) -> Result<()> {
+        portable::rope_cos_sin(positions, head_dim, theta, table)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv(
+        &self,
+        qkv: &CudaBuffer,
+        qn: &CudaBuffer,
+        kn: &CudaBuffer,
+        table: &CudaBuffer,
+        q_out: &mut CudaBuffer,
+        kp: &mut CudaBuffer,
+        vp: &mut CudaBuffer,
+        dst: &[u32],
+        shape: QkvRopeShape,
+    ) -> Result<()> {
+        portable::qk_norm_rope_kv(qkv, qn, kn, table, q_out, kp, vp, dst, shape)
+    }
+
     fn attention_ranges(
         &self,
         q: &CudaBuffer,
@@ -2110,6 +2137,45 @@ impl Backend for CudaBackend {
         check::kv_scatter(k.len, v.len, kp.len, vp.len, dst, &shape)?;
         self.staged("kv_scatter", || {
             self.kernels.kv_scatter(k, v, kp, vp, dst, shape)
+        })
+    }
+
+    fn rope_cos_sin(
+        &self,
+        positions: &[u32],
+        head_dim: usize,
+        theta: f32,
+        table: &mut CudaBuffer,
+    ) -> Result<()> {
+        check::rope_cos_sin(table.len, positions.len(), head_dim)?;
+        self.staged("rope_cos_sin", || {
+            self.kernels.rope_cos_sin(positions, head_dim, theta, table)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv(
+        &self,
+        qkv: &CudaBuffer,
+        qn: &CudaBuffer,
+        kn: &CudaBuffer,
+        table: &CudaBuffer,
+        q_out: &mut CudaBuffer,
+        kp: &mut CudaBuffer,
+        vp: &mut CudaBuffer,
+        dst: &[u32],
+        shape: QkvRopeShape,
+    ) -> Result<()> {
+        check::qk_norm_rope_kv(
+            [
+                qkv.len, qn.len, kn.len, table.len, q_out.len, kp.len, vp.len,
+            ],
+            dst,
+            &shape,
+        )?;
+        self.staged("qk_norm_rope_kv", || {
+            self.kernels
+                .qk_norm_rope_kv(qkv, qn, kn, table, q_out, kp, vp, dst, shape)
         })
     }
 

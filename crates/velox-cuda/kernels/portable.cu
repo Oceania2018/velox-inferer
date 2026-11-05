@@ -1306,7 +1306,76 @@ attention_ranges_kernel(const float* __restrict__ q, const float* __restrict__ k
         out[(static_cast<long long>(r) * heads + kh * g + hg) * d + c] = a / lsum;
     }
 }
+
+// Row r: [half] cos, then [half] sin of pos[r] * theta^(-2i / head_dim), in double
+// (velox_core::rope_cos_sin_host; rope_positions_kernel's angles).
+__global__ void rope_cos_sin_kernel(const uint32_t* __restrict__ pos, int head_dim, float theta,
+                                    float* __restrict__ table) {
+    const int half = head_dim / 2, r = blockIdx.x;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const double freq = pow(static_cast<double>(theta), -2.0 * i / head_dim);
+        double s, c;
+        sincos(static_cast<double>(pos[r]) * freq, &s, &c);
+        table[static_cast<size_t>(r) * head_dim + i] = static_cast<float>(c);
+        table[static_cast<size_t>(r) * head_dim + half + i] = static_cast<float>(s);
+    }
+}
+
+// One block per (row, head of q | k | v): q / k heads RMS-normed (rms_norm_groups_kernel's
+// arithmetic) and rotated with the row's table entry (rope_positions_kernel's), q into q_out, k
+// into pool row dst[r]; v heads copied there (velox_core::Backend::qk_norm_rope_kv).
+__global__ void qk_norm_rope_kv_kernel(const float* __restrict__ qkv, const float* __restrict__ qn,
+                                       const float* __restrict__ kn, const float* __restrict__ table,
+                                       float* __restrict__ q_out, float* __restrict__ kp, float* __restrict__ vp,
+                                       const uint32_t* __restrict__ dst, int heads, int kv_heads, int d, float eps) {
+    extern __shared__ float y[];  // d normed values
+    __shared__ float scratch[VELOX_WARP];
+    const int r = blockIdx.x, g = blockIdx.y;
+    const size_t row = static_cast<size_t>(heads + 2 * kv_heads) * d;
+    const float* x = qkv + r * row + static_cast<size_t>(g) * d;
+    const size_t prow = static_cast<size_t>(dst[r]) * kv_heads * d;
+    if (g >= heads + kv_heads) {
+        float* out = vp + prow + static_cast<size_t>(g - heads - kv_heads) * d;
+        for (int c = threadIdx.x; c < d; c += blockDim.x) out[c] = x[c];
+        return;
+    }
+    const bool is_q = g < heads;
+    const float* w = is_q ? qn + static_cast<size_t>(g) * d : kn + static_cast<size_t>(g - heads) * d;
+    float ss = 0.0f;
+    for (int c = threadIdx.x; c < d; c += blockDim.x) ss += x[c] * x[c];
+    ss = velox_block_sum(ss, scratch);
+    const float inv = rsqrtf(ss / static_cast<float>(d) + eps);
+    for (int c = threadIdx.x; c < d; c += blockDim.x) y[c] = x[c] * inv * w[c];
+    __syncthreads();
+    float* out = is_q ? q_out + (static_cast<size_t>(r) * heads + g) * d
+                      : kp + prow + static_cast<size_t>(g - heads) * d;
+    const float* cs = table + static_cast<size_t>(r) * d;
+    const int half = d / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const float a = y[i], b = y[i + half], c = cs[i], s = cs[half + i];
+        out[i] = a * c - b * s;
+        out[i + half] = a * s + b * c;
+    }
+}
 }  // namespace
+
+VELOX_API int velox_portable_rope_cos_sin(const uint32_t* pos, int rows, int head_dim, float theta, float* table) {
+    if (rows == 0) return 0;
+    if (head_dim <= 0 || head_dim % 2 != 0) return VELOX_ERR_UNSUPPORTED;
+    rope_cos_sin_kernel<<<rows, 64>>>(pos, head_dim, theta, table);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_qk_norm_rope_kv(const float* qkv, const float* qn, const float* kn, const float* table,
+                                             float* q_out, float* kp, float* vp, const uint32_t* dst, int rows,
+                                             int heads, int kv_heads, int d, float eps) {
+    if (rows == 0) return 0;
+    if (d <= 0 || d % 2 != 0 || d > 1024 || rows > 65535 * 32) return VELOX_ERR_UNSUPPORTED;
+    const int threads = d >= 256 ? 256 : (d + VELOX_WARP - 1) / VELOX_WARP * VELOX_WARP;
+    qk_norm_rope_kv_kernel<<<dim3(rows, heads + 2 * kv_heads), threads, d * sizeof(float)>>>(
+        qkv, qn, kn, table, q_out, kp, vp, dst, heads, kv_heads, d, eps);
+    return velox_launch_status();
+}
 
 VELOX_API int velox_portable_kv_scatter(const float* k, const float* v, float* kp, float* vp, const uint32_t* dst,
                                         int rows, int row) {

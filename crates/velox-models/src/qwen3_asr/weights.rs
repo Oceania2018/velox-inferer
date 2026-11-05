@@ -92,17 +92,39 @@ pub struct EncWeights<B: Backend> {
 pub struct DecLayer<B: Backend> {
     pub attn_norm: B::Buffer,
     pub ffn_norm: B::Buffer,
-    pub q: Mat<B>,
-    pub k: Mat<B>,
-    pub v: Mat<B>,
+    /// `q | k | v` stacked by rows (`[(heads + 2 * kv_heads) * head_dim, hidden]`): one GEMV per
+    /// decode step; [`Self::q`], [`Self::k`], [`Self::v`] are its row views.
+    pub qkv: Mat<B>,
+    /// Rows of q and of k in `qkv`.
+    pub qd: usize,
+    pub kvd: usize,
     pub o: Mat<B>,
     /// Per-head norm weights tiled over the heads (`[heads * head_dim]`, as `rms_norm_groups`
     /// takes them).
     pub q_norm: B::Buffer,
     pub k_norm: B::Buffer,
-    pub gate: Mat<B>,
-    pub up: Mat<B>,
+    /// `gate | up` stacked by rows (`[2 * ffn, hidden]`); [`Self::gate`], [`Self::up`] view it.
+    pub gate_up: Mat<B>,
+    pub ffn: usize,
     pub down: Mat<B>,
+}
+
+impl<B: Backend> DecLayer<B> {
+    pub fn q(&self) -> WeightView<'_, B::Buffer> {
+        self.qkv.view().rows(0, self.qd)
+    }
+    pub fn k(&self) -> WeightView<'_, B::Buffer> {
+        self.qkv.view().rows(self.qd, self.kvd)
+    }
+    pub fn v(&self) -> WeightView<'_, B::Buffer> {
+        self.qkv.view().rows(self.qd + self.kvd, self.kvd)
+    }
+    pub fn gate(&self) -> WeightView<'_, B::Buffer> {
+        self.gate_up.view().rows(0, self.ffn)
+    }
+    pub fn up(&self) -> WeightView<'_, B::Buffer> {
+        self.gate_up.view().rows(self.ffn, self.ffn)
+    }
 }
 
 pub struct DecWeights<B: Backend> {
@@ -223,6 +245,76 @@ impl<B: Backend> Loader<'_, B> {
                 let f = WeightFormat::Ggml(g);
                 f.check_shape(rows, k)?;
                 let bytes = self.raw(t, rows * g.row_bytes(k))?;
+                let converted = (g == GgmlType::Q8_0)
+                    .then(|| q8_0_to_q8g32(&bytes, rows, k))
+                    .flatten();
+                match converted {
+                    Some(rs) => {
+                        self.bytes += rs.len() as u64;
+                        (self.b.upload_bytes(&rs)?, WeightFormat::Q8G32)
+                    }
+                    None => {
+                        self.bytes += bytes.len() as u64;
+                        (self.b.upload_bytes(&bytes)?, f)
+                    }
+                }
+            }
+        };
+        let act = match format {
+            WeightFormat::Ggml(_) | WeightFormat::Q8G32 => ggml_act(),
+            _ => ActPolicy::A16Only,
+        };
+        Ok(Mat {
+            buf,
+            format,
+            rows,
+            k,
+            act,
+        })
+    }
+
+    /// Several matrices of the same K and type stacked by rows into one (`[sum rows, k]`): GGML
+    /// rows are independent, so the stacked blocks are those of one tensor (then relaid as
+    /// `matrix` relays them); float tensors stack their values.
+    fn stacked(&mut self, parts: &[(&str, usize)], k: usize) -> Result<Mat<B>> {
+        let rows: usize = parts.iter().map(|p| p.1).sum();
+        let mut types = Vec::new();
+        for &(name, r) in parts {
+            let t = self.tensor(name)?;
+            if extents(t) != (k, r) {
+                return Err(Error::Config(format!(
+                    "{name}: {:?}, expected [{r}, {k}]",
+                    t.dims
+                )));
+            }
+            types.push(t.ggml_type);
+        }
+        if types.iter().any(|&t| t != types[0]) {
+            return Err(Error::Config(format!(
+                "{}: parts of different types {types:?}",
+                parts[0].0
+            )));
+        }
+        let (buf, format) = match types[0] {
+            0 | 1 | 30 => {
+                let mut v = Vec::with_capacity(rows * k);
+                for &(name, _) in parts {
+                    v.extend(self.values(name)?);
+                }
+                self.bytes += 4 * v.len() as u64;
+                (self.b.upload(&v)?, WeightFormat::F32)
+            }
+            id => {
+                let g = GgmlType::from_gguf_id(id).ok_or_else(|| {
+                    Error::Unsupported(format!("{}: ggml type {id} is not supported", parts[0].0))
+                })?;
+                let f = WeightFormat::Ggml(g);
+                f.check_shape(rows, k)?;
+                let mut bytes = Vec::with_capacity(rows * g.row_bytes(k));
+                for &(name, r) in parts {
+                    let t = self.tensor(name)?;
+                    bytes.extend_from_slice(&self.raw(t, r * g.row_bytes(k))?);
+                }
                 let converted = (g == GgmlType::Q8_0)
                     .then(|| q8_0_to_q8g32(&bytes, rows, k))
                     .flatten();
@@ -401,14 +493,17 @@ pub fn load_decoder<B: Backend>(b: &B, f: &Files, c: &AsrConfig) -> Result<(DecW
         layers.push(DecLayer {
             attn_norm: l.vector(&p("attn_norm"), h)?,
             ffn_norm: l.vector(&p("ffn_norm"), h)?,
-            q: l.matrix(&p("attn_q"), qd, h)?,
-            k: l.matrix(&p("attn_k"), kvd, h)?,
-            v: l.matrix(&p("attn_v"), kvd, h)?,
+            qkv: l.stacked(
+                &[(&p("attn_q"), qd), (&p("attn_k"), kvd), (&p("attn_v"), kvd)],
+                h,
+            )?,
+            qd,
+            kvd,
             o: l.matrix(&p("attn_output"), h, qd)?,
             q_norm: l.tiled(&p("attn_q_norm"), hd, t.heads)?,
             k_norm: l.tiled(&p("attn_k_norm"), hd, t.kv_heads)?,
-            gate: l.matrix(&p("ffn_gate"), t.ffn, h)?,
-            up: l.matrix(&p("ffn_up"), t.ffn, h)?,
+            gate_up: l.stacked(&[(&p("ffn_gate"), t.ffn), (&p("ffn_up"), t.ffn)], h)?,
+            ffn: t.ffn,
             down: l.matrix(&p("ffn_down"), h, t.ffn)?,
         });
     }
