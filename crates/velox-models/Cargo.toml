@@ -1,6 +1,6 @@
 [package]
 name = "velox-models"
-description = "Model architectures written against the Backend contract (Qwen3.5/3.8 text)"
+description = "Model architectures written against the Backend contract (Qwen3.5/3.8 text, Qwen3-ASR)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

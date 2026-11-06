@@ -21,9 +21,11 @@
 //!   that step); each chain keeps its newest `superseded` such points (ninfer `--ctx-checkpoints`)
 //!   and a second adoption makes one a branch, kept under the general rules.
 //!
-//! An optional NVMe tier ([`DiskTier`]) keeps copies of the hot entries (see [`Entry::hot`]):
-//! written while they are still resident ([`ContextStore::persist`]) or when they are evicted,
-//! for a cold start and for hot prefixes system RAM cannot keep.
+//! An optional NVMe tier ([`DiskTier`]) serves a cold start: a restarted server reads the
+//! common roots (system prompts several conversations used, see [`Entry::common`]) back instead
+//! of prefilling them. At most `disk_roots` of them, the most common, are written while resident
+//! ([`ContextStore::persist`]); nothing else goes to disk (copies of what system RAM evicted
+//! served about 1% of prompt tokens in production and made most of the NVMe writes).
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -44,7 +46,7 @@ use velox_models::qwen3_5::{
     Checkpoint, DFlashModel, DFlashState, DraftContext, KvSegment, Session, KV_PAGE_ROWS,
 };
 
-use crate::disk::{DiskStats, DiskTier};
+use crate::disk::{DiskStats, DiskTier, Payload};
 
 pub(crate) struct Entry<B: Backend> {
     pub id: u64,
@@ -68,9 +70,20 @@ pub(crate) struct Entry<B: Backend> {
     /// Disk record being written from this entry's memory (which must stay put until then).
     writing: Option<u64>,
     /// [`ContextStore::persist`] tried it (not again if the disk drops it: a tier too small for
-    /// every hot entry would rewrite them all the time).
+    /// every common root would rewrite them all the time).
     written: bool,
+    /// Fingerprints of the [`FORK_KEYS`] keys after `pos` of the requests that covered this root
+    /// (at most [`MAX_FORKS`]): the conversations it served (the steps of one conversation share
+    /// what follows it).
+    forks: Vec<u64>,
 }
+
+/// Keys after a root that tell one conversation from another (see [`Entry::forks`]).
+const FORK_KEYS: usize = 64;
+/// Conversations a root must have served to be worth a disk copy (see [`Entry::common`]).
+const MIN_FORKS: usize = 3;
+/// Conversations counted per root: enough to rank the common ones.
+const MAX_FORKS: usize = 64;
 
 impl<B: Backend> Entry<B> {
     pub fn pos(&self) -> usize {
@@ -81,11 +94,20 @@ impl<B: Backend> Entry<B> {
         keys.len() >= self.keys.len() && keys[..self.keys.len()] == self.keys[..]
     }
 
-    /// Worth a disk copy: a root (system prompt, task) a request resumed from, or a branch point
-    /// more than one request resumed from. A root no request reused yet (a one-off task) and
-    /// one-off history points are not: NVMe writes go to prefixes that come back.
-    fn hot(&self) -> bool {
-        !self.superseded && self.adopted >= if self.root { 1 } else { 2 }
+    /// Worth a disk copy: a root (system prompt) at least [`MIN_FORKS`] conversations used. A
+    /// task's own root (its steps share what follows it) and history points are not: a restart
+    /// loses them with the conversations they belong to.
+    fn common(&self) -> bool {
+        self.root && self.forks.len() >= MIN_FORKS
+    }
+
+    /// Counts a request over `keys` (which this entry is a prefix of) as a conversation it served.
+    fn fork(&mut self, keys: &[u32]) {
+        if let Some(f) = fork_print(keys, self.pos()) {
+            if self.forks.len() < MAX_FORKS && !self.forks.contains(&f) {
+                self.forks.push(f);
+            }
+        }
     }
 }
 
@@ -97,6 +119,8 @@ pub(crate) struct ContextStore<B: Backend> {
     /// Shortest prefix worth a disk copy: a request reads a record back only when it covers this
     /// many tokens more than every resident source.
     disk_min: usize,
+    /// Most common roots kept on disk (see [`Self::persist`]).
+    disk_roots: usize,
     /// Entries no longer resident whose disk copy is still being written, by record id (their
     /// memory must stay put).
     inflight: Vec<(u64, Entry<B>)>,
@@ -175,19 +199,21 @@ where
 
 impl<B: Backend> ContextStore<B> {
     /// A store of at most `budget` bytes ranking entries by LRFU with decay `lambda` per request,
-    /// keeping recurrent states in `format`, and hot prefixes of at least `disk_min` tokens on
-    /// `disk`.
+    /// keeping recurrent states in `format`, and the `disk_roots` most common roots of at least
+    /// `disk_min` tokens on `disk`.
     pub fn new(
         budget: usize,
         lambda: f64,
         disk: Option<DiskTier>,
         disk_min: usize,
+        disk_roots: usize,
         format: StateFormat,
     ) -> Self {
         ContextStore {
             pinner: None,
             disk,
             disk_min,
+            disk_roots,
             inflight: Vec::new(),
             entries: Vec::new(),
             spare: Vec::new(),
@@ -228,22 +254,30 @@ impl<B: Backend> ContextStore<B> {
         }
     }
 
-    /// Write-through of a persistent disk tier: queues a background copy of every resident hot
-    /// entry the disk does not hold yet, so a restarted server finds it. Cheap when there is
-    /// nothing new (a scan of the entries); call once per request and when idle.
+    /// Cold-start copies on a persistent disk tier: queues a background copy of each of the
+    /// `disk_roots` most common resident roots (see [`Entry::common`]; fewer when fewer are) the
+    /// disk does not hold yet, so a restarted server finds them. Cheap when there is nothing new
+    /// (a scan of the entries); call once per request and when idle.
     pub fn persist(&mut self, b: &B) -> Result<(), CoreError> {
         self.reap();
         let Some(disk) = self.disk.as_ref().filter(|d| d.persistent()) else {
             return Ok(());
         };
-        let new: Vec<usize> = (0..self.entries.len())
+        let mut common: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| self.entries[i].common() && self.entries[i].pos() >= self.disk_min)
+            .collect();
+        common.sort_by(|&x, &y| {
+            let (x, y) = (&self.entries[x], &self.entries[y]);
+            (y.forks.len(), self.demand(y))
+                .partial_cmp(&(x.forks.len(), self.demand(x)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        common.truncate(self.disk_roots);
+        let new: Vec<usize> = common
+            .into_iter()
             .filter(|&i| {
                 let e = &self.entries[i];
-                e.hot()
-                    && e.pos() >= self.disk_min
-                    && !e.written
-                    && e.writing.is_none()
-                    && !disk.holds(&e.keys)
+                !e.written && e.writing.is_none() && !disk.holds(&e.keys)
             })
             .collect();
         if new.is_empty() {
@@ -388,6 +422,7 @@ impl<B: Backend> ContextStore<B> {
             crf: 1.0,
             writing: None,
             written: true,
+            forks: Vec::new(),
         });
         self.evict(b, id)?;
         Ok(true)
@@ -601,6 +636,9 @@ impl<B: Backend> ContextStore<B> {
         for e in &mut self.entries {
             if e.pos() <= start && e.prefix_of(keys) {
                 Self::reference(lambda, now, e);
+                if e.root {
+                    e.fork(keys);
+                }
                 if Some(e.id) == adopted {
                     e.adopted += 1;
                     // A second reader makes a superseded point a branch.
@@ -829,6 +867,7 @@ impl<B: Backend> ContextStore<B> {
             crf: 1.0,
             writing: None,
             written: false,
+            forks: Vec::new(),
         };
         if !root {
             if let Some(p) = chain.and_then(|c| self.entries.iter_mut().find(|e| e.id == c)) {
@@ -913,9 +952,7 @@ impl<B: Backend> ContextStore<B> {
             }
             let e = self.entries.swap_remove(i);
             self.held.set(None);
-            if let Some(e) = self.spill(b, e) {
-                self.retire(e);
-            }
+            self.retire(e);
         }
         self.shared.retain(|_, w| w.strong_count() > 0);
         Ok(())
@@ -933,25 +970,6 @@ impl<B: Backend> ContextStore<B> {
         }
         if let Some(d) = e.draft {
             self.draft_pages.extend(d.into_pages());
-        }
-    }
-
-    /// Queues an evicted hot entry for the disk tier; returns it back when it is not written (no
-    /// tier, not hot, too short, already on disk or being written, no room, device storage).
-    fn spill(&mut self, b: &B, mut e: Entry<B>) -> Option<Entry<B>> {
-        let Some(disk) = self.disk.as_mut() else {
-            return Some(e);
-        };
-        if !e.hot() || e.pos() < self.disk_min || e.writing.is_some() || disk.holds(&e.keys) {
-            return Some(e);
-        }
-        match write(b, disk, &e, self.now) {
-            Some(id) => {
-                e.writing = Some(id);
-                self.inflight.push((id, e));
-                None
-            }
-            None => Some(e),
         }
     }
 
@@ -979,27 +997,36 @@ impl<B: Backend> ContextStore<B> {
     }
 }
 
-/// Queues a disk copy of entry `e` (state, KV pages, drafter context, in that order); its
-/// storage must be in system RAM and stay unchanged until the copy completes.
+/// Queues a disk copy of entry `e` (state, KV pages, drafter context); its storage must be in
+/// system RAM and stay unchanged until the copy completes.
 fn write<B: Backend>(b: &B, disk: &mut DiskTier, e: &Entry<B>, now: u64) -> Option<u64> {
-    let parts: Option<Vec<(*const u8, usize)>> = e
-        .state
-        .buffers()
-        .chain(e.kv.iter().flat_map(|s| s.buffers()))
-        .chain(e.draft.iter().flat_map(|d| d.buffers()))
-        .map(|buf| b.host_bytes(buf).map(|x| (x.as_ptr(), x.len())))
-        .collect();
-    let segs = e.kv.iter().map(|s| (s.lo, s.hi)).collect();
-    let draft = e.draft.as_ref().map(|d| (d.lo, d.hi));
-    disk.write(
-        &e.keys,
-        e.state.rope_delta,
-        segs,
+    let host = |bufs: &mut dyn Iterator<Item = &B::Buffer>| -> Option<Vec<(*const u8, usize)>> {
+        bufs.map(|buf| b.host_bytes(buf).map(|x| (x.as_ptr(), x.len())))
+            .collect()
+    };
+    let kv =
+        e.kv.iter()
+            .map(|s| Some(((s.lo, s.hi), host(&mut s.buffers())?)))
+            .collect::<Option<_>>()?;
+    let draft = match &e.draft {
+        Some(d) => Some(((d.lo, d.hi), host(&mut d.buffers())?)),
+        None => None,
+    };
+    let payload = Payload {
+        state: host(&mut e.state.buffers())?,
+        kv,
         draft,
-        e.root,
-        parts?,
-        now,
-    )
+    };
+    disk.write(&e.keys, e.state.rope_delta, e.root, payload, now)
+}
+
+/// Fingerprint of the [`FORK_KEYS`] keys after `pos` (see [`Entry::forks`]); `None` when the
+/// request does not reach that far past the root.
+fn fork_print(keys: &[u32], pos: usize) -> Option<u64> {
+    let after = keys.get(pos..pos + FORK_KEYS)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    after.hash(&mut h);
+    Some(h.finish())
 }
 
 /// Hash of the keys of every full KV page's whole prefix: entry `i` covers keys
@@ -1029,6 +1056,20 @@ mod tests {
         // A change in the first page changes every later page's address.
         assert!(ha.iter().zip(&hb).all(|(x, y)| x != y));
         assert_eq!(ha, super::page_hashes(&a[..3 * super::KV_PAGE_ROWS]));
+    }
+
+    #[test]
+    fn steps_of_one_conversation_share_a_fork_print() {
+        use super::{fork_print, FORK_KEYS};
+        let root: Vec<u32> = (0..100).collect();
+        let task = |t: u32| -> Vec<u32> { (0..FORK_KEYS as u32).map(|i| t * 1000 + i).collect() };
+        let req = |t: u32, history: u32| [root.clone(), task(t), vec![history; 50]].concat();
+        // Two steps of one conversation (the history after the task grows), one other task.
+        let (a1, a2, b) = (req(1, 7), req(1, 8), req(2, 7));
+        assert_eq!(fork_print(&a1, 100), fork_print(&a2, 100));
+        assert_ne!(fork_print(&a1, 100), fork_print(&b, 100));
+        // A request that stops short of the fingerprint counts nothing.
+        assert_eq!(fork_print(&a1[..100 + FORK_KEYS - 1], 100), None);
     }
 
     #[test]

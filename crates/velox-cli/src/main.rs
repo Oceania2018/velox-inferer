@@ -1,6 +1,7 @@
 //! `velox` command line.
 
 mod args;
+mod asr;
 mod bench;
 mod bench_verify;
 mod generate;
@@ -10,6 +11,7 @@ mod qwen4;
 mod replay;
 mod select;
 mod serve;
+mod serve_asr;
 mod weights;
 
 use std::process::ExitCode;
@@ -80,6 +82,12 @@ COMMANDS:
                           FP8 / NVFP4) text stack, MTP head, tokenizer and chat template -> .vi
       --hf-dir <dir> --output <.vi>
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
+  asr                     Qwen3-ASR on golden clips: stage timings and reference checks
+      --gguf <Qwen3-ASR text .gguf> --mmproj <its mmproj .gguf> --golden <dir>
+      [--repeat 2] [--enc-tol 2e-2] [--logit-tol 2e-2] [--profile-ops] (docs/qwen3_asr.md)
+  serve-asr               Qwen3-ASR behind llama-server's /v1/chat/completions (input_audio)
+      --gguf <text .gguf> --mmproj <mmproj .gguf> --tokenizer <tokenizer.json>
+      [--host 0.0.0.0] [--port 8080] [--max-batch 32] [--max-tokens 512] [--kv-rows 8192]
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
       [--max-tokens 64] [--chunk 256] [--capacity 4096] [--mtp N | --dflash N] (speculative)
@@ -166,6 +174,8 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("import-gguf") => weights::import_gguf(a),
         Some("import-hf") => weights::import_hf(a),
         Some("generate") => generate::run(a),
+        Some("asr") => asr::run(a),
+        Some("serve-asr") => serve_asr::run(a),
         Some("serve") => serve::run(a),
         Some("prompt-debug") => prompt_debug::run(a),
         Some("replay") => replay::run(a),

@@ -26,3 +26,20 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Set once the device runtime reports an error it cannot recover from (a CUDA "sticky" error
+/// such as 700 or 999): every later call on the context fails the same way, so the process
+/// must restart to serve again. Process-wide because a context is.
+static DEVICE_LOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Records that the device context is unusable; the first reason is kept.
+pub fn mark_device_lost(reason: &str) {
+    if DEVICE_LOST.set(reason.to_owned()).is_ok() {
+        eprintln!("[fatal] device lost: {reason}");
+    }
+}
+
+/// The reason the device context became unusable, if it has.
+pub fn device_lost() -> Option<&'static str> {
+    DEVICE_LOST.get().map(String::as_str)
+}

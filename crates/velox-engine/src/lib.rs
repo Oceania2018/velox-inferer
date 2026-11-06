@@ -85,9 +85,11 @@ pub struct EngineConfig {
     /// bf16 halves their device memory (157 -> 81 MB each for Qwen3.8-27B) at the rounding the
     /// context store's bf16 entries already apply on restore.
     pub device_state_format: StateFormat,
-    /// NVMe tier below the context store (see `disk`): roots and branch points several requests
-    /// resumed from; 0 disables it.
+    /// NVMe tier below the context store for a cold start (see `disk`): its most common roots;
+    /// 0 disables it.
     pub disk_context_bytes: u64,
+    /// Common roots kept on the NVMe tier at most (see `ContextStore::persist`).
+    pub disk_context_roots: usize,
     /// Directory of the NVMe tier's files.
     pub disk_context_dir: std::path::PathBuf,
     /// Identity of the loaded model (weights and kernels): records are kept across restarts in a
@@ -309,6 +311,9 @@ struct Gauges {
     disk_read_tokens: AtomicU64,
     disk_writes: AtomicU64,
     disk_written_bytes: AtomicU64,
+    disk_pages: AtomicU64,
+    disk_root_writes: AtomicU64,
+    disk_shared_bytes: AtomicU64,
 }
 
 /// How often a busy worker refreshes [`Gauges`]; an idle one does before it waits.
@@ -720,7 +725,10 @@ where
             vision_start: single_token(&fe, "<|vision_start|>"),
             image_pad: single_token(&fe, "<|image_pad|>"),
         };
-        let disk = if cfg.disk_context_bytes > 0 && cfg.host_context_bytes > 0 {
+        let disk = if cfg.disk_context_bytes > 0
+            && cfg.disk_context_roots > 0
+            && cfg.host_context_bytes > 0
+        {
             // Records hold raw storage: they only fit sessions of the same shapes and formats.
             let session = &lanes[0].session;
             let layout = format!(
@@ -736,6 +744,7 @@ where
                 DiskTier::new(
                     cfg.disk_context_dir.clone(),
                     cfg.disk_context_bytes,
+                    cfg.disk_context_roots,
                     cfg.disk_context_tag.as_deref(),
                     disk::executable_id(),
                     disk::fnv64(disk::FNV_OFFSET, layout.as_bytes()),
@@ -750,6 +759,7 @@ where
             cfg.lrfu_lambda,
             disk,
             DISK_GAIN,
+            cfg.disk_context_roots,
             cfg.host_state_format,
         );
         // Pin the store's memory before serving: until the store fills, every capture would
@@ -864,13 +874,12 @@ impl<B: Backend> Core<B> {
         let states = DEVICE_HEADS.min(lanes) + DEVICE_SPARE.min(lanes);
         let device = st.spare.iter().filter(|c| !c.on_host()).count();
         for _ in device..states {
-            st.spare
-                .push(st.lanes[0].session.blank_checkpoint_as(
-                    &self.b,
-                    0,
-                    false,
-                    cfg.device_state_format,
-                )?);
+            st.spare.push(st.lanes[0].session.blank_checkpoint_as(
+                &self.b,
+                0,
+                false,
+                cfg.device_state_format,
+            )?);
         }
         self.b.set_graph_budget(cfg.graph_budget);
         let Some((per_set, rows_per_set)) = st.lanes[0].session.kv_set_shape() else {
@@ -1022,6 +1031,9 @@ impl<B: Backend> Core<B> {
             set(&g.disk_read_tokens, d.read_tokens);
             set(&g.disk_writes, d.writes);
             set(&g.disk_written_bytes, d.written_bytes);
+            set(&g.disk_pages, d.pages);
+            set(&g.disk_root_writes, d.root_writes);
+            set(&g.disk_shared_bytes, d.shared_bytes);
             g.disk.store(true, Ordering::Relaxed);
         }
     }
@@ -3089,6 +3101,10 @@ where
         "Qwen3_5ForCausalLM"
     }
 
+    fn lost(&self) -> Option<String> {
+        velox_core::device_lost().map(str::to_owned)
+    }
+
     fn gauges(&self, out: &mut String) {
         use std::fmt::Write as _;
         let g = &self.core.gauges;
@@ -3137,7 +3153,7 @@ where
         put(
             "velox_disk_context_used_bytes",
             "gauge",
-            "NVMe context tier bytes of complete records",
+            "NVMe context tier bytes of complete records and their KV pages",
             &g.disk_used,
         );
         put(
@@ -3181,6 +3197,24 @@ where
             "counter",
             "Bytes written to the NVMe tier",
             &g.disk_written_bytes,
+        );
+        put(
+            "velox_disk_context_root_writes_total",
+            "counter",
+            "Records written to the NVMe tier that are roots (system prompt, task)",
+            &g.disk_root_writes,
+        );
+        put(
+            "velox_disk_context_shared_bytes_total",
+            "counter",
+            "KV bytes records written to the NVMe tier shared with pages already on it (not written)",
+            &g.disk_shared_bytes,
+        );
+        put(
+            "velox_disk_context_pages",
+            "gauge",
+            "NVMe context tier KV page files of complete records",
+            &g.disk_pages,
         );
     }
 
