@@ -232,6 +232,212 @@ pub struct Copy2dShape {
     pub dst_stride: usize,
 }
 
+/// Patches of a 3x3, stride 2, pad 1 convolution over `images` NHWC images `[h, w, c]`: row
+/// `(i, oy, ox)` of `[images * ceil(h/2) * ceil(w/2), 9 * c]` holds column `(ky * 3 + kx) * c + ci`
+/// = `x[i][2oy + ky - 1][2ox + kx - 1][ci]`, zero outside the image. A convolution is then
+/// `linear` against weights in that column order, and its output is NHWC again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Im2colShape {
+    pub images: usize,
+    pub h: usize,
+    pub w: usize,
+    pub c: usize,
+}
+
+impl Im2colShape {
+    pub fn out_h(&self) -> usize {
+        self.h.div_ceil(2)
+    }
+    pub fn out_w(&self) -> usize {
+        self.w.div_ceil(2)
+    }
+    pub fn in_len(&self) -> usize {
+        self.images * self.h * self.w * self.c
+    }
+    pub fn out_len(&self) -> usize {
+        self.images * self.out_h() * self.out_w() * 9 * self.c
+    }
+}
+
+/// Host reference of [`Backend::im2col_3x3s2`].
+pub fn im2col_3x3s2_host(x: &[f32], s: Im2colShape) -> Vec<f32> {
+    let (ho, wo, c) = (s.out_h(), s.out_w(), s.c);
+    let mut y = vec![0f32; s.out_len()];
+    for i in 0..s.images {
+        for oy in 0..ho {
+            for ox in 0..wo {
+                let row = &mut y[((i * ho + oy) * wo + ox) * 9 * c..][..9 * c];
+                for ky in 0..3 {
+                    let iy = (2 * oy + ky) as isize - 1;
+                    if iy < 0 || iy >= s.h as isize {
+                        continue;
+                    }
+                    for kx in 0..3 {
+                        let ix = (2 * ox + kx) as isize - 1;
+                        if ix < 0 || ix >= s.w as isize {
+                            continue;
+                        }
+                        let src = ((i * s.h + iy as usize) * s.w + ix as usize) * c;
+                        row[(ky * 3 + kx) * c..][..c].copy_from_slice(&x[src..src + c]);
+                    }
+                }
+            }
+        }
+    }
+    y
+}
+
+/// Rows of a shared F32 KV pool (`[pool_rows, kv_heads, head_dim]` per cache) that several
+/// sequences live in, one contiguous range each: decode steps of many sequences then attend and
+/// store with one call per layer. See [`Backend::attention_ranges`] and [`Backend::kv_scatter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolShape {
+    /// Query / K / V rows of the call (one per sequence).
+    pub rows: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub pool_rows: usize,
+}
+
+/// Host reference of [`Backend::attention_ranges`]: query row `r` (`[rows, heads, head_dim]`)
+/// attends, causally complete, to pool rows `ranges[r].0 .. ranges[r].0 + ranges[r].1`; query head
+/// `h` reads kv head `h / (heads / kv_heads)`. Scale `1 / sqrt(head_dim)`.
+/// Shape of [`Backend::qk_norm_rope_kv`]: `rows` rows of a fused `q | k | v` projection
+/// (`[rows, (heads + 2 * kv_heads) * head_dim]`), stored into F32 pools of `pool_rows` rows of
+/// `[kv_heads, head_dim]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QkvRopeShape {
+    pub rows: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub pool_rows: usize,
+    /// Of the per-head RMS norms.
+    pub eps: f32,
+}
+
+impl QkvRopeShape {
+    /// Values per fused row.
+    pub fn row(&self) -> usize {
+        (self.heads + 2 * self.kv_heads) * self.head_dim
+    }
+}
+
+/// Host reference of [`Backend::rope_cos_sin`]: row `r` is `[head_dim / 2]` cos then sin of
+/// `positions[r] * theta^(-2i / head_dim)`: the angles of [`Backend::rope_positions`] (one axis,
+/// [`RopeLayout::Interleaved`], full rotary width), in f64 and rounded to f32.
+pub fn rope_cos_sin_host(positions: &[u32], head_dim: usize, theta: f32) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut out = vec![0f32; positions.len() * head_dim];
+    for (r, &p) in positions.iter().enumerate() {
+        for i in 0..half {
+            let freq = f64::from(theta).powf(-2.0 * i as f64 / head_dim as f64);
+            let (s, c) = (f64::from(p) * freq).sin_cos();
+            out[r * head_dim + i] = c as f32;
+            out[r * head_dim + half + i] = s as f32;
+        }
+    }
+    out
+}
+
+/// Host reference of [`Backend::qk_norm_rope_kv`]: per row, each q head and k head is RMS-normed
+/// with its slice of `q_norm` / `k_norm` (`[heads * head_dim]` / `[kv_heads * head_dim]`, as
+/// [`Backend::rms_norm_groups`] takes them; rounded to f32), then rotated with the row's `table`
+/// entry (pairs `i`, `i + half`, as `rope_positions`); v passes through. Returns q
+/// (`[rows, heads, head_dim]`), k and v (`[rows, kv_heads, head_dim]`).
+pub fn qk_norm_rope_kv_host(
+    qkv: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    table: &[f32],
+    s: QkvRopeShape,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (h, kvh, d) = (s.heads, s.kv_heads, s.head_dim);
+    let half = d / 2;
+    let row = s.row();
+    let (mut q, mut k, mut v) = (
+        vec![0f32; s.rows * h * d],
+        vec![0f32; s.rows * kvh * d],
+        vec![0f32; s.rows * kvh * d],
+    );
+    let head = |x: &[f32], w: &[f32], cs: &[f32], out: &mut [f32]| {
+        let ms = x.iter().map(|&a| f64::from(a) * f64::from(a)).sum::<f64>() / d as f64;
+        let inv = 1.0 / (ms + f64::from(s.eps)).sqrt();
+        let n: Vec<f32> = (0..d)
+            .map(|c| (f64::from(x[c]) * inv * f64::from(w[c])) as f32)
+            .collect();
+        for i in 0..half {
+            let (a, b) = (f64::from(n[i]), f64::from(n[i + half]));
+            let (c, sn) = (f64::from(cs[i]), f64::from(cs[half + i]));
+            out[i] = (a * c - b * sn) as f32;
+            out[i + half] = (a * sn + b * c) as f32;
+        }
+    };
+    for r in 0..s.rows {
+        let x = &qkv[r * row..][..row];
+        let cs = &table[r * d..][..d];
+        for hh in 0..h {
+            head(
+                &x[hh * d..][..d],
+                &q_norm[hh * d..][..d],
+                cs,
+                &mut q[(r * h + hh) * d..][..d],
+            );
+        }
+        for kh in 0..kvh {
+            head(
+                &x[(h + kh) * d..][..d],
+                &k_norm[kh * d..][..d],
+                cs,
+                &mut k[(r * kvh + kh) * d..][..d],
+            );
+        }
+        v[r * kvh * d..][..kvh * d].copy_from_slice(&x[(h + kvh) * d..][..kvh * d]);
+    }
+    (q, k, v)
+}
+
+pub fn attention_ranges_host(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    ranges: &[(u32, u32)],
+    s: PoolShape,
+) -> Vec<f32> {
+    let (h, kvh, d) = (s.heads, s.kv_heads, s.head_dim);
+    let group = h / kvh;
+    let scale = 1.0 / (d as f64).sqrt();
+    let mut out = vec![0f32; s.rows * h * d];
+    for (r, &(start, len)) in ranges.iter().enumerate() {
+        let (start, len) = (start as usize, len as usize);
+        for hh in 0..h {
+            let kh = hh / group;
+            let qv = &q[(r * h + hh) * d..][..d];
+            let scores: Vec<f64> = (0..len)
+                .map(|j| {
+                    let kr = &k[((start + j) * kvh + kh) * d..][..d];
+                    qv.iter()
+                        .zip(kr)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum::<f64>()
+                        * scale
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = scores.iter().map(|x| (x - max).exp()).collect();
+            let sum: f64 = e.iter().sum();
+            for c in 0..d {
+                let acc: f64 = (0..len)
+                    .map(|j| e[j] * f64::from(v[((start + j) * kvh + kh) * d + c]))
+                    .sum();
+                out[(r * h + hh) * d + c] = (acc / sum) as f32;
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FullAttnShape {
     pub tokens: usize,
@@ -1565,6 +1771,144 @@ pub trait Backend {
             }
         }
         Ok(())
+    }
+    /// Stores row `r` of `k` and `v` (`[rows, kv_heads, head_dim]` f32) at row `dst[r]` of the F32
+    /// pools; other pool rows are untouched. The default runs on the host (CPU backend).
+    fn kv_scatter(
+        &self,
+        k: &Self::Buffer,
+        v: &Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        dst: &[u32],
+        shape: PoolShape,
+    ) -> Result<()> {
+        crate::check::kv_scatter(
+            self.len(k),
+            self.len(v),
+            self.len(k_pool),
+            self.len(v_pool),
+            dst,
+            &shape,
+        )?;
+        let row = shape.kv_heads * shape.head_dim;
+        for (r, &d) in dst.iter().enumerate() {
+            self.copy(k, r * row, k_pool, d as usize * row, row)?;
+            self.copy(v, r * row, v_pool, d as usize * row, row)?;
+        }
+        Ok(())
+    }
+    /// [`rope_cos_sin_host`] of `positions` into `table` (`[positions.len(), head_dim]`): one
+    /// table per decode step serves every layer's [`Self::qk_norm_rope_kv`]. The default runs on
+    /// the host.
+    fn rope_cos_sin(
+        &self,
+        positions: &[u32],
+        head_dim: usize,
+        theta: f32,
+        table: &mut Self::Buffer,
+    ) -> Result<()> {
+        crate::check::rope_cos_sin(self.len(table), positions.len(), head_dim)?;
+        let t = rope_cos_sin_host(positions, head_dim, theta);
+        let tmp = self.upload(&t)?;
+        self.copy(&tmp, 0, table, 0, t.len())
+    }
+    /// A fused `q | k | v` projection's post-processing for pooled decode: per-head RMS norm and
+    /// rotary embedding of q (into `q_out`, `[rows, heads, head_dim]`) and k, then k and v stored
+    /// at pool row `dst[r]` (see [`qk_norm_rope_kv_host`]; `table` from [`Self::rope_cos_sin`]).
+    /// Replaces a split, two `rms_norm_groups`, two `rope_positions` and `kv_scatter`. The default
+    /// runs on the host.
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv(
+        &self,
+        qkv: &Self::Buffer,
+        q_norm: &Self::Buffer,
+        k_norm: &Self::Buffer,
+        table: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        k_pool: &mut Self::Buffer,
+        v_pool: &mut Self::Buffer,
+        dst: &[u32],
+        shape: QkvRopeShape,
+    ) -> Result<()> {
+        crate::check::qk_norm_rope_kv(
+            [
+                self.len(qkv),
+                self.len(q_norm),
+                self.len(k_norm),
+                self.len(table),
+                self.len(q_out),
+                self.len(k_pool),
+                self.len(v_pool),
+            ],
+            dst,
+            &shape,
+        )?;
+        let fetch = |b: &Self::Buffer| -> Result<Vec<f32>> {
+            let mut h = vec![0f32; self.len(b)];
+            self.download(b, &mut h)?;
+            Ok(h)
+        };
+        self.synchronize()?;
+        let (x, qn, kn, t) = (fetch(qkv)?, fetch(q_norm)?, fetch(k_norm)?, fetch(table)?);
+        let (q, k, v) = qk_norm_rope_kv_host(&x, &qn, &kn, &t, shape);
+        let tmp = self.upload(&q)?;
+        self.copy(&tmp, 0, q_out, 0, q.len())?;
+        let (kt, vt) = (self.upload(&k)?, self.upload(&v)?);
+        let row = shape.kv_heads * shape.head_dim;
+        for (r, &d) in dst.iter().enumerate() {
+            self.copy(&kt, r * row, k_pool, d as usize * row, row)?;
+            self.copy(&vt, r * row, v_pool, d as usize * row, row)?;
+        }
+        Ok(())
+    }
+    /// Decode attention of many sequences over one F32 KV pool: query row `r` attends to pool rows
+    /// `ranges[r].0 .. ranges[r].0 + ranges[r].1` (see [`attention_ranges_host`], the default, which
+    /// runs on the host).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_ranges(
+        &self,
+        q: &Self::Buffer,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        out: &mut Self::Buffer,
+        ranges: &[(u32, u32)],
+        shape: PoolShape,
+    ) -> Result<()> {
+        crate::check::attention_ranges(
+            self.len(q),
+            self.len(k_pool),
+            self.len(v_pool),
+            self.len(out),
+            ranges,
+            &shape,
+        )?;
+        let fetch = |b: &Self::Buffer| -> Result<Vec<f32>> {
+            let mut h = vec![0f32; self.len(b)];
+            self.download(b, &mut h)?;
+            Ok(h)
+        };
+        self.synchronize()?;
+        let (qh, kh, vh) = (fetch(q)?, fetch(k_pool)?, fetch(v_pool)?);
+        let o = attention_ranges_host(&qh, &kh, &vh, ranges, shape);
+        let tmp = self.upload(&o)?;
+        self.copy(&tmp, 0, out, 0, o.len())
+    }
+    /// Convolution patches; see [`Im2colShape`]. The default runs on the host through a download
+    /// and an upload (the CPU backend's implementation); device backends override it.
+    fn im2col_3x3s2(
+        &self,
+        x: &Self::Buffer,
+        y: &mut Self::Buffer,
+        shape: Im2colShape,
+    ) -> Result<()> {
+        crate::check::im2col_3x3s2(self.len(x), self.len(y), &shape)?;
+        let mut host = vec![0f32; self.len(x)];
+        self.synchronize()?;
+        self.download(x, &mut host)?;
+        let out = im2col_3x3s2_host(&host[..shape.in_len()], shape);
+        let tmp = self.upload(&out)?;
+        self.copy(&tmp, 0, y, 0, out.len())
     }
     /// Strided 2-D copy between (or within non-overlapping parts of) buffers; see [`Copy2dShape`].
     fn copy2d(&self, src: &Self::Buffer, dst: &mut Self::Buffer, shape: Copy2dShape) -> Result<()>;

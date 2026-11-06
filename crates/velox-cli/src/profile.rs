@@ -687,6 +687,80 @@ impl<B: Backend> Backend for Profiled<B> {
             self.inner.add_bias_rope(x, bias, p, table, s)
         })
     }
+    fn transpose_heads(
+        &self,
+        x: &B::Buffer,
+        y: &mut B::Buffer,
+        rows: usize,
+        a: usize,
+        b: usize,
+        dim: usize,
+    ) -> Result<()> {
+        self.time("transpose_heads", || {
+            self.inner.transpose_heads(x, y, rows, a, b, dim)
+        })
+    }
+    fn kv_scatter(
+        &self,
+        k: &B::Buffer,
+        v: &B::Buffer,
+        kp: &mut B::Buffer,
+        vp: &mut B::Buffer,
+        dst: &[u32],
+        s: velox_core::PoolShape,
+    ) -> Result<()> {
+        self.time("kv_scatter", || self.inner.kv_scatter(k, v, kp, vp, dst, s))
+    }
+    fn rope_cos_sin(
+        &self,
+        positions: &[u32],
+        head_dim: usize,
+        theta: f32,
+        table: &mut B::Buffer,
+    ) -> Result<()> {
+        self.time("rope_cos_sin", || {
+            self.inner.rope_cos_sin(positions, head_dim, theta, table)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv(
+        &self,
+        qkv: &B::Buffer,
+        qn: &B::Buffer,
+        kn: &B::Buffer,
+        table: &B::Buffer,
+        q_out: &mut B::Buffer,
+        kp: &mut B::Buffer,
+        vp: &mut B::Buffer,
+        dst: &[u32],
+        s: velox_core::QkvRopeShape,
+    ) -> Result<()> {
+        self.time("qk_norm_rope_kv", || {
+            self.inner
+                .qk_norm_rope_kv(qkv, qn, kn, table, q_out, kp, vp, dst, s)
+        })
+    }
+    fn attention_ranges(
+        &self,
+        q: &B::Buffer,
+        kp: &B::Buffer,
+        vp: &B::Buffer,
+        out: &mut B::Buffer,
+        ranges: &[(u32, u32)],
+        s: velox_core::PoolShape,
+    ) -> Result<()> {
+        self.time("attention_ranges", || {
+            self.inner.attention_ranges(q, kp, vp, out, ranges, s)
+        })
+    }
+    fn im2col_3x3s2(
+        &self,
+        x: &B::Buffer,
+        y: &mut B::Buffer,
+        s: velox_core::Im2colShape,
+    ) -> Result<()> {
+        self.time("im2col_3x3s2", || self.inner.im2col_3x3s2(x, y, s))
+    }
     fn add_bias_gelu(
         &self,
         x: &mut B::Buffer,

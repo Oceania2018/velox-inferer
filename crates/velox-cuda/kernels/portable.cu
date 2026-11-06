@@ -1207,6 +1207,202 @@ __global__ void transpose_heads_kernel(const float* __restrict__ x, float* __res
 }
 }  // namespace
 
+namespace {
+// Patches of a 3x3, stride 2, pad 1 convolution over NHWC images (velox_core::Im2colShape): one
+// thread per output value, zero outside the image.
+__global__ void im2col_3x3s2_kernel(const float* __restrict__ x, float* __restrict__ y, int images, int h, int w,
+                                    int c) {
+    const int ho = (h + 1) / 2, wo = (w + 1) / 2, k = 9 * c;
+    const long long n = static_cast<long long>(images) * ho * wo * k;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long row = i / k;
+        const int col = static_cast<int>(i % k), tap = col / c, ci = col % c;
+        const int ox = static_cast<int>(row % wo), oy = static_cast<int>((row / wo) % ho);
+        const long long img = row / (static_cast<long long>(wo) * ho);
+        const int iy = 2 * oy + tap / 3 - 1, ix = 2 * ox + tap % 3 - 1;
+        y[i] = (iy >= 0 && iy < h && ix >= 0 && ix < w) ? x[((img * h + iy) * w + ix) * c + ci] : 0.0f;
+    }
+}
+}  // namespace
+
+namespace {
+// Row r of k / v ([rows, row] f32) to pool row dst[r] (velox_core::Backend::kv_scatter).
+__global__ void kv_scatter_kernel(const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ kp,
+                                  float* __restrict__ vp, const uint32_t* __restrict__ dst, int rows, int row) {
+    const long long n = static_cast<long long>(rows) * row;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const int r = static_cast<int>(i / row), j = static_cast<int>(i % row);
+        const long long o = static_cast<long long>(dst[r]) * row + j;
+        kp[o] = k[i];
+        vp[o] = v[i];
+    }
+}
+
+constexpr int kRaWarps = 4, kRaMaxGroup = 8, kRaMaxPer = 8;  // head_dim <= 256, heads / kv_heads <= 8
+
+// Decode attention over pool ranges (velox_core::attention_ranges_host): block (row, kv head), the
+// group's query heads together so each K / V row is read once. Warps split the keys with an
+// online softmax (lane holds head_dim / 32 dims), then combine through shared memory.
+__global__ void __launch_bounds__(kRaWarps * 32)
+attention_ranges_kernel(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                        float* __restrict__ out, const uint32_t* __restrict__ ranges, int heads, int kv_heads, int d,
+                        float scale) {
+    const int r = blockIdx.x, kh = blockIdx.y, g = heads / kv_heads;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, per = d / 32;
+    const long long start = ranges[2 * r], len = ranges[2 * r + 1];
+    __shared__ float sm_m[kRaWarps][kRaMaxGroup], sm_l[kRaWarps][kRaMaxGroup];
+    __shared__ float sm_acc[kRaWarps][kRaMaxGroup][kRaMaxPer * 32];
+    float qv[kRaMaxGroup][kRaMaxPer], acc[kRaMaxGroup][kRaMaxPer], m[kRaMaxGroup], l[kRaMaxGroup];
+#pragma unroll
+    for (int hg = 0; hg < kRaMaxGroup; ++hg) {
+        m[hg] = -INFINITY, l[hg] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < kRaMaxPer; ++e) {
+            acc[hg][e] = 0.0f;
+            qv[hg][e] = (hg < g && e < per)
+                            ? q[(static_cast<long long>(r) * heads + kh * g + hg) * d + lane + 32 * e] * scale
+                            : 0.0f;
+        }
+    }
+    for (long long j = warp; j < len; j += kRaWarps) {
+        const long long base = ((start + j) * kv_heads + kh) * d;
+        float kk[kRaMaxPer], vv[kRaMaxPer];
+#pragma unroll
+        for (int e = 0; e < kRaMaxPer; ++e) {
+            kk[e] = e < per ? k[base + lane + 32 * e] : 0.0f;
+            vv[e] = e < per ? v[base + lane + 32 * e] : 0.0f;
+        }
+#pragma unroll
+        for (int hg = 0; hg < kRaMaxGroup; ++hg) {
+            if (hg >= g) break;
+            float sc = 0.0f;
+#pragma unroll
+            for (int e = 0; e < kRaMaxPer; ++e) sc += qv[hg][e] * kk[e];
+            sc = velox_warp_sum(sc);
+            const float mn = fmaxf(m[hg], sc), c = __expf(m[hg] - mn), p = __expf(sc - mn);
+            l[hg] = l[hg] * c + p;
+#pragma unroll
+            for (int e = 0; e < kRaMaxPer; ++e) acc[hg][e] = acc[hg][e] * c + p * vv[e];
+            m[hg] = mn;
+        }
+    }
+    for (int hg = 0; hg < g; ++hg) {
+        if (lane == 0) sm_m[warp][hg] = m[hg], sm_l[warp][hg] = l[hg];
+        for (int e = 0; e < per; ++e) sm_acc[warp][hg][lane + 32 * e] = acc[hg][e];
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < g * d; idx += blockDim.x) {
+        const int hg = idx / d, c = idx % d;
+        float mx = -INFINITY;
+        for (int w = 0; w < kRaWarps; ++w) mx = fmaxf(mx, sm_m[w][hg]);
+        float lsum = 0.0f, a = 0.0f;
+        for (int w = 0; w < kRaWarps; ++w) {
+            const float f = sm_m[w][hg] == -INFINITY ? 0.0f : __expf(sm_m[w][hg] - mx);
+            lsum += sm_l[w][hg] * f;
+            a += sm_acc[w][hg][c] * f;
+        }
+        out[(static_cast<long long>(r) * heads + kh * g + hg) * d + c] = a / lsum;
+    }
+}
+
+// Row r: [half] cos, then [half] sin of pos[r] * theta^(-2i / head_dim), in double
+// (velox_core::rope_cos_sin_host; rope_positions_kernel's angles).
+__global__ void rope_cos_sin_kernel(const uint32_t* __restrict__ pos, int head_dim, float theta,
+                                    float* __restrict__ table) {
+    const int half = head_dim / 2, r = blockIdx.x;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const double freq = pow(static_cast<double>(theta), -2.0 * i / head_dim);
+        double s, c;
+        sincos(static_cast<double>(pos[r]) * freq, &s, &c);
+        table[static_cast<size_t>(r) * head_dim + i] = static_cast<float>(c);
+        table[static_cast<size_t>(r) * head_dim + half + i] = static_cast<float>(s);
+    }
+}
+
+// One block per (row, head of q | k | v): q / k heads RMS-normed (rms_norm_groups_kernel's
+// arithmetic) and rotated with the row's table entry (rope_positions_kernel's), q into q_out, k
+// into pool row dst[r]; v heads copied there (velox_core::Backend::qk_norm_rope_kv).
+__global__ void qk_norm_rope_kv_kernel(const float* __restrict__ qkv, const float* __restrict__ qn,
+                                       const float* __restrict__ kn, const float* __restrict__ table,
+                                       float* __restrict__ q_out, float* __restrict__ kp, float* __restrict__ vp,
+                                       const uint32_t* __restrict__ dst, int heads, int kv_heads, int d, float eps) {
+    extern __shared__ float y[];  // d normed values
+    __shared__ float scratch[VELOX_WARP];
+    const int r = blockIdx.x, g = blockIdx.y;
+    const size_t row = static_cast<size_t>(heads + 2 * kv_heads) * d;
+    const float* x = qkv + r * row + static_cast<size_t>(g) * d;
+    const size_t prow = static_cast<size_t>(dst[r]) * kv_heads * d;
+    if (g >= heads + kv_heads) {
+        float* out = vp + prow + static_cast<size_t>(g - heads - kv_heads) * d;
+        for (int c = threadIdx.x; c < d; c += blockDim.x) out[c] = x[c];
+        return;
+    }
+    const bool is_q = g < heads;
+    const float* w = is_q ? qn + static_cast<size_t>(g) * d : kn + static_cast<size_t>(g - heads) * d;
+    float ss = 0.0f;
+    for (int c = threadIdx.x; c < d; c += blockDim.x) ss += x[c] * x[c];
+    ss = velox_block_sum(ss, scratch);
+    const float inv = rsqrtf(ss / static_cast<float>(d) + eps);
+    for (int c = threadIdx.x; c < d; c += blockDim.x) y[c] = x[c] * inv * w[c];
+    __syncthreads();
+    float* out = is_q ? q_out + (static_cast<size_t>(r) * heads + g) * d
+                      : kp + prow + static_cast<size_t>(g - heads) * d;
+    const float* cs = table + static_cast<size_t>(r) * d;
+    const int half = d / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const float a = y[i], b = y[i + half], c = cs[i], s = cs[half + i];
+        out[i] = a * c - b * s;
+        out[i + half] = a * s + b * c;
+    }
+}
+}  // namespace
+
+VELOX_API int velox_portable_rope_cos_sin(const uint32_t* pos, int rows, int head_dim, float theta, float* table) {
+    if (rows == 0) return 0;
+    if (head_dim <= 0 || head_dim % 2 != 0) return VELOX_ERR_UNSUPPORTED;
+    rope_cos_sin_kernel<<<rows, 64>>>(pos, head_dim, theta, table);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_qk_norm_rope_kv(const float* qkv, const float* qn, const float* kn, const float* table,
+                                             float* q_out, float* kp, float* vp, const uint32_t* dst, int rows,
+                                             int heads, int kv_heads, int d, float eps) {
+    if (rows == 0) return 0;
+    if (d <= 0 || d % 2 != 0 || d > 1024 || rows > 65535 * 32) return VELOX_ERR_UNSUPPORTED;
+    const int threads = d >= 256 ? 256 : (d + VELOX_WARP - 1) / VELOX_WARP * VELOX_WARP;
+    qk_norm_rope_kv_kernel<<<dim3(rows, heads + 2 * kv_heads), threads, d * sizeof(float)>>>(
+        qkv, qn, kn, table, q_out, kp, vp, dst, heads, kv_heads, d, eps);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_kv_scatter(const float* k, const float* v, float* kp, float* vp, const uint32_t* dst,
+                                        int rows, int row) {
+    const long long n = static_cast<long long>(rows) * row;
+    if (n == 0) return 0;
+    kv_scatter_kernel<<<velox_grid_1d(n, 256), 256>>>(k, v, kp, vp, dst, rows, row);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_attention_ranges(const float* q, const float* k, const float* v, float* out,
+                                              const uint32_t* ranges, int rows, int heads, int kv_heads, int d) {
+    if (rows == 0) return 0;
+    if (d % 32 != 0 || d > kRaMaxPer * 32 || kv_heads <= 0 || heads % kv_heads != 0 ||
+        heads / kv_heads > kRaMaxGroup)
+        return VELOX_ERR_UNSUPPORTED;
+    attention_ranges_kernel<<<dim3(rows, kv_heads), kRaWarps * 32>>>(q, k, v, out, ranges, heads, kv_heads, d,
+                                                                    rsqrtf(static_cast<float>(d)));
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_im2col_3x3s2(const float* x, float* y, int images, int h, int w, int c) {
+    const long long n = static_cast<long long>(images) * ((h + 1) / 2) * ((w + 1) / 2) * 9 * c;
+    if (n == 0) return 0;
+    im2col_3x3s2_kernel<<<velox_grid_1d(n, 256), 256>>>(x, y, images, h, w, c);
+    return velox_launch_status();
+}
+
 VELOX_API int velox_portable_transpose_heads(const float* x, float* y, long long rows, int a, int b, int dim) {
     const long long n = rows * a * b * dim;
     if (n == 0) return 0;
