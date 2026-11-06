@@ -2,6 +2,7 @@
 //! stop tokens and Qwen XML tool-call parsing. Resources come from the artifact.
 
 pub mod image;
+pub mod plain;
 pub mod template;
 pub mod tool_calls;
 
@@ -13,6 +14,7 @@ use tokenizers::Tokenizer;
 use velox_core::{Error, Result};
 use velox_weights::Artifact;
 
+pub use plain::PlainTokenizer;
 pub use template::ChatTemplate;
 pub use tool_calls::{parse_output, ParsedOutput};
 
