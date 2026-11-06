@@ -6,7 +6,9 @@ root="$(git rev-parse --show-toplevel)"
 branch="$(git rev-parse --abbrev-ref HEAD)"
 # A merge commit from main legitimately brings main's files; only check ordinary commits.
 if [ -f "$(git rev-parse --git-dir)/MERGE_HEAD" ]; then exit 0; fi
-if [ "$branch" = "main" ]; then
-  exec bash "$root/scripts/check-main-scope.sh" --staged
+# Hardware branches are named after the card (rtx-*, docs/branching.md); every other branch is
+# feature work headed for main and keeps main's scope (same rule as .github/workflows/scope.yml).
+if [[ "$branch" =~ ^rtx- ]]; then
+  exec bash "$root/scripts/check-branch-scope.sh" --staged
 fi
-exec bash "$root/scripts/check-branch-scope.sh" --staged
+exec bash "$root/scripts/check-main-scope.sh" --staged
