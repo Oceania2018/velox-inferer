@@ -22,8 +22,8 @@
 //!   and a second adoption makes one a branch, kept under the general rules.
 //!
 //! An optional NVMe tier ([`DiskTier`]) keeps copies of the hot entries (see [`Entry::hot`]):
-//! written while they are still resident ([`ContextStore::persist`]) or when they are evicted,
-//! for a cold start and for hot prefixes system RAM cannot keep.
+//! roots written while they are still resident ([`ContextStore::persist`]), any hot entry when it
+//! is evicted, for a cold start and for hot prefixes system RAM cannot keep.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -44,7 +44,7 @@ use velox_models::qwen3_5::{
     Checkpoint, DFlashModel, DFlashState, DraftContext, KvSegment, Session, KV_PAGE_ROWS,
 };
 
-use crate::disk::{DiskStats, DiskTier};
+use crate::disk::{DiskStats, DiskTier, Payload};
 
 pub(crate) struct Entry<B: Backend> {
     pub id: u64,
@@ -229,8 +229,10 @@ impl<B: Backend> ContextStore<B> {
     }
 
     /// Write-through of a persistent disk tier: queues a background copy of every resident hot
-    /// entry the disk does not hold yet, so a restarted server finds it. Cheap when there is
-    /// nothing new (a scan of the entries); call once per request and when idle.
+    /// root the disk does not hold yet, so a restarted server finds it. Branch points go to disk
+    /// only when evicted ([`Self::spill`]): while resident they are served from system RAM, and
+    /// writing every one through cost more NVMe wear than restarts of one build gain. Cheap when
+    /// there is nothing new (a scan of the entries); call once per request and when idle.
     pub fn persist(&mut self, b: &B) -> Result<(), CoreError> {
         self.reap();
         let Some(disk) = self.disk.as_ref().filter(|d| d.persistent()) else {
@@ -239,7 +241,8 @@ impl<B: Backend> ContextStore<B> {
         let new: Vec<usize> = (0..self.entries.len())
             .filter(|&i| {
                 let e = &self.entries[i];
-                e.hot()
+                e.root
+                    && e.hot()
                     && e.pos() >= self.disk_min
                     && !e.written
                     && e.writing.is_none()
@@ -979,27 +982,27 @@ impl<B: Backend> ContextStore<B> {
     }
 }
 
-/// Queues a disk copy of entry `e` (state, KV pages, drafter context, in that order); its
-/// storage must be in system RAM and stay unchanged until the copy completes.
+/// Queues a disk copy of entry `e` (state, KV pages, drafter context); its storage must be in
+/// system RAM and stay unchanged until the copy completes.
 fn write<B: Backend>(b: &B, disk: &mut DiskTier, e: &Entry<B>, now: u64) -> Option<u64> {
-    let parts: Option<Vec<(*const u8, usize)>> = e
-        .state
-        .buffers()
-        .chain(e.kv.iter().flat_map(|s| s.buffers()))
-        .chain(e.draft.iter().flat_map(|d| d.buffers()))
-        .map(|buf| b.host_bytes(buf).map(|x| (x.as_ptr(), x.len())))
-        .collect();
-    let segs = e.kv.iter().map(|s| (s.lo, s.hi)).collect();
-    let draft = e.draft.as_ref().map(|d| (d.lo, d.hi));
-    disk.write(
-        &e.keys,
-        e.state.rope_delta,
-        segs,
+    let host = |bufs: &mut dyn Iterator<Item = &B::Buffer>| -> Option<Vec<(*const u8, usize)>> {
+        bufs.map(|buf| b.host_bytes(buf).map(|x| (x.as_ptr(), x.len())))
+            .collect()
+    };
+    let kv =
+        e.kv.iter()
+            .map(|s| Some(((s.lo, s.hi), host(&mut s.buffers())?)))
+            .collect::<Option<_>>()?;
+    let draft = match &e.draft {
+        Some(d) => Some(((d.lo, d.hi), host(&mut d.buffers())?)),
+        None => None,
+    };
+    let payload = Payload {
+        state: host(&mut e.state.buffers())?,
+        kv,
         draft,
-        e.root,
-        parts?,
-        now,
-    )
+    };
+    disk.write(&e.keys, e.state.rope_delta, e.root, payload, now)
 }
 
 /// Hash of the keys of every full KV page's whole prefix: entry `i` covers keys
