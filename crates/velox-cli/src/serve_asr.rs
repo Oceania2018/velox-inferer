@@ -36,6 +36,10 @@ struct Job {
     mel: Vec<f32>,
     frames: usize,
     max_new: usize,
+    /// Scheduling class from the request's `priority` (0 = most urgent, the default). The qwen3-asr
+    /// sidecar sends 0 for a realtime final, 1 for batch files and 2 for partials (provisional text
+    /// the next partial or the final replaces). See `admissible`.
+    priority: u8,
     received: Instant,
     reply: Sender<std::result::Result<Done, String>>,
 }
@@ -194,6 +198,7 @@ fn engine<B: Backend>(
                 mel: mel.clone(),
                 frames,
                 max_new: i + 2,
+                priority: 0,
                 received: Instant::now(),
                 reply: warm_tx.clone(),
             });
@@ -228,13 +233,19 @@ fn engine<B: Backend>(
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        // Admit in arrival order while the batch and the pool have room: one encoder pass and one
-        // prefill pass for a group (prompts within PREFILL_ROWS, every clip at least a second
-        // long); a prompt longer than that, or a shorter clip, goes alone on the chunked path.
+        // Admit by priority, then arrival, while the batch and the pool have room: one encoder pass
+        // and one prefill pass for a group (prompts within PREFILL_ROWS, every clip at least a
+        // second long, one priority); a prompt longer than that, or a shorter clip, goes alone on
+        // the chunked path.
+        waiting.make_contiguous().sort_by_key(|j| j.priority);
+        let urgent = active.iter().map(|a| a.job.priority).min();
         let mut group: Vec<(PoolSeq, Job)> = Vec::new();
         let mut rows = 0;
         while active.len() + group.len() < max_batch && group.len() < ADMIT_MAX {
             let Some(job) = waiting.front() else { break };
+            if !admissible(job.priority, urgent, group.first().map(|g| g.1.priority)) {
+                break;
+            }
             let prompt_rows = job.prompt.len() - 1 + m.cfg.enc.tokens(job.frames);
             let need = prompt_rows + output_reserve(job.frames, job.max_new) + 2;
             if need > pool.rows() {
@@ -396,6 +407,16 @@ impl Phases {
 
 /// Requests admitted per round at most.
 const ADMIT_MAX: usize = 8;
+
+/// Whether a waiting request of `priority` may be admitted now. Not while a more urgent request
+/// is decoding: admission (encode + prefill) runs between decode steps, so admitting partials
+/// stretched every step of a final that was decoding (10 realtime streams on an RTX 5060 Ti:
+/// final p99 3-7 s, most of it partial admissions, against 1.8 s for one-at-a-time llama.cpp).
+/// A final decodes in ~0.2 s, so the partials wait about that long. A group holds one priority,
+/// so a final does not pay for encoding partials alongside it.
+fn admissible(priority: u8, decoding: Option<u8>, group: Option<u8>) -> bool {
+    decoding.is_none_or(|d| priority <= d) && group.is_none_or(|g| priority == g)
+}
 
 /// Encodes and prefills a group of requests (one pass each when several; the chunked path for a
 /// single one) and returns those still decoding. On error every sequence goes back to the pool.
@@ -664,12 +685,16 @@ fn chat(
         .or_else(|| req["max_completion_tokens"].as_u64())
         .map_or(default_max_new, |v| v as usize)
         .clamp(1, 4096);
+    let priority = req["priority"]
+        .as_u64()
+        .map_or(0, |p| p.min(u8::MAX as u64) as u8);
     let (reply, wait) = mpsc::channel();
     tx.send(Job {
         prompt,
         mel: features,
         frames,
         max_new,
+        priority,
         received: Instant::now(),
         reply,
     })
@@ -793,6 +818,21 @@ fn wav_to_pcm16k(b: &[u8]) -> std::result::Result<Vec<i16>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_by_priority() {
+        // Idle engine, empty group: anything goes.
+        assert!(admissible(2, None, None));
+        // A final decoding holds back partials and batch, not other finals.
+        assert!(admissible(0, Some(0), None));
+        assert!(!admissible(2, Some(0), None));
+        assert!(!admissible(1, Some(0), None));
+        // Partials decoding never hold back a final.
+        assert!(admissible(0, Some(2), None));
+        // One priority per group.
+        assert!(admissible(0, None, Some(0)));
+        assert!(!admissible(2, None, Some(0)));
+    }
 
     #[test]
     fn base64_round_trip() {
