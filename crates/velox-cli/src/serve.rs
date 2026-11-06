@@ -152,7 +152,9 @@ where
         // --disk-context-mib N (default 16384; 0: off) and --disk-context-dir DIR: NVMe tier below
         // RAM for reused roots (system prompt, task) and branch points, kept across restarts so a
         // cold start resumes them instead of prefilling (CUA: 15.5 s -> 1.4 s on the RTX 5060 Ti).
-        // Writes once per new prefix; mount DIR on a volume to keep it across container rebuilds.
+        // Roots are written while resident, branch points when RAM evicts them; KV pages a record
+        // shares with one already on disk are not written again. Mount DIR on a volume to keep it
+        // across container rebuilds.
         disk_context_bytes: a.parse::<u64>("disk-context-mib", 16384)? << 20,
         disk_context_dir: match a.get("disk-context-dir") {
             Some(d) => d.into(),
