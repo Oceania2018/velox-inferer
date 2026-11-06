@@ -470,6 +470,152 @@ pub fn copy2d(src: usize, dst: usize, s: &Copy2dShape) -> Result<()> {
     need("copy2d dst", dst, end(s.dst_offset, s.dst_stride)?)
 }
 
+fn pool_geometry(op: &str, s: &crate::backend::PoolShape, n: usize) -> Result<()> {
+    if s.rows == 0 || s.kv_heads == 0 || s.head_dim == 0 || s.heads % s.kv_heads != 0 {
+        return Err(Error::Shape(format!("{op}: shape {s:?}")));
+    }
+    if n != s.rows {
+        return Err(Error::Shape(format!(
+            "{op}: {n} indices for {} rows",
+            s.rows
+        )));
+    }
+    Ok(())
+}
+
+/// `kv_scatter`: rows fit, every destination is inside the pools.
+pub fn kv_scatter(
+    k: usize,
+    v: usize,
+    k_pool: usize,
+    v_pool: usize,
+    dst: &[u32],
+    s: &crate::backend::PoolShape,
+) -> Result<()> {
+    pool_geometry("kv_scatter", s, dst.len())?;
+    let row = product(&[s.kv_heads, s.head_dim])?;
+    need("kv_scatter k", k, product(&[s.rows, row])?)?;
+    need("kv_scatter v", v, product(&[s.rows, row])?)?;
+    need("kv_scatter k_pool", k_pool, product(&[s.pool_rows, row])?)?;
+    need("kv_scatter v_pool", v_pool, product(&[s.pool_rows, row])?)?;
+    if let Some(d) = dst.iter().find(|&&d| d as usize >= s.pool_rows) {
+        return Err(Error::Shape(format!(
+            "kv_scatter: row {d} past pool of {}",
+            s.pool_rows
+        )));
+    }
+    Ok(())
+}
+
+/// `rope_cos_sin`: an even head dim and a table of a row per position.
+pub fn rope_cos_sin(table: usize, rows: usize, head_dim: usize) -> Result<()> {
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return Err(Error::Shape(format!("rope_cos_sin: head_dim {head_dim}")));
+    }
+    need("rope_cos_sin table", table, product(&[rows, head_dim])?)
+}
+
+/// `qk_norm_rope_kv`: buffers `[qkv, q_norm, k_norm, table, q_out, k_pool, v_pool]` fit, one
+/// destination per row, each inside the pools.
+pub fn qk_norm_rope_kv(
+    lens: [usize; 7],
+    dst: &[u32],
+    s: &crate::backend::QkvRopeShape,
+) -> Result<()> {
+    let [qkv, q_norm, k_norm, table, q_out, k_pool, v_pool] = lens;
+    if s.rows == 0 || s.heads == 0 || s.kv_heads == 0 || s.head_dim == 0 || s.head_dim % 2 != 0 {
+        return Err(Error::Shape(format!("qk_norm_rope_kv: {s:?}")));
+    }
+    if dst.len() != s.rows {
+        return Err(Error::Shape(format!(
+            "qk_norm_rope_kv: {} destinations for {} rows",
+            dst.len(),
+            s.rows
+        )));
+    }
+    let kv = product(&[s.kv_heads, s.head_dim])?;
+    need("qk_norm_rope_kv qkv", qkv, product(&[s.rows, s.row()])?)?;
+    need(
+        "qk_norm_rope_kv q_norm",
+        q_norm,
+        product(&[s.heads, s.head_dim])?,
+    )?;
+    need("qk_norm_rope_kv k_norm", k_norm, kv)?;
+    need(
+        "qk_norm_rope_kv table",
+        table,
+        product(&[s.rows, s.head_dim])?,
+    )?;
+    need(
+        "qk_norm_rope_kv q_out",
+        q_out,
+        product(&[s.rows, s.heads, s.head_dim])?,
+    )?;
+    need(
+        "qk_norm_rope_kv k_pool",
+        k_pool,
+        product(&[s.pool_rows, kv])?,
+    )?;
+    need(
+        "qk_norm_rope_kv v_pool",
+        v_pool,
+        product(&[s.pool_rows, kv])?,
+    )?;
+    if let Some(d) = dst.iter().find(|&&d| d as usize >= s.pool_rows) {
+        return Err(Error::Shape(format!(
+            "qk_norm_rope_kv: row {d} past pool of {}",
+            s.pool_rows
+        )));
+    }
+    Ok(())
+}
+
+/// `attention_ranges`: buffers fit and every range is non-empty and inside the pools.
+pub fn attention_ranges(
+    q: usize,
+    k_pool: usize,
+    v_pool: usize,
+    out: usize,
+    ranges: &[(u32, u32)],
+    s: &crate::backend::PoolShape,
+) -> Result<()> {
+    pool_geometry("attention_ranges", s, ranges.len())?;
+    let qn = product(&[s.rows, s.heads, s.head_dim])?;
+    let row = product(&[s.kv_heads, s.head_dim])?;
+    need("attention_ranges q", q, qn)?;
+    need("attention_ranges out", out, qn)?;
+    need(
+        "attention_ranges k_pool",
+        k_pool,
+        product(&[s.pool_rows, row])?,
+    )?;
+    need(
+        "attention_ranges v_pool",
+        v_pool,
+        product(&[s.pool_rows, row])?,
+    )?;
+    for &(start, len) in ranges {
+        if len == 0 || start as usize + len as usize > s.pool_rows {
+            return Err(Error::Shape(format!(
+                "attention_ranges: range {start}+{len} in a pool of {}",
+                s.pool_rows
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `im2col_3x3s2`: the NHWC input and the patch matrix fit their buffers.
+pub fn im2col_3x3s2(x: usize, y: usize, s: &crate::backend::Im2colShape) -> Result<()> {
+    if s.images == 0 || s.h == 0 || s.w == 0 || s.c == 0 {
+        return Err(Error::Shape(format!("im2col_3x3s2: empty shape {s:?}")));
+    }
+    let n_in = product(&[s.images, s.h, s.w, s.c])?;
+    let n_out = product(&[s.images, s.out_h(), s.out_w(), 9, s.c])?;
+    need("im2col_3x3s2 x", x, n_in)?;
+    need("im2col_3x3s2 y", y, n_out)
+}
+
 /// `transpose_heads`: `rows` rows of `a * b` heads of `dim` values in both buffers.
 pub fn transpose_heads(
     x: usize,

@@ -8,12 +8,14 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::{Arc, Mutex};
 
+use velox_core::backend::PoolShape;
+use velox_core::backend::QkvRopeShape;
 use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, CopySpec, DilatedConvShape, DynConvShape, ExpertBank, FullAttnShape,
-    GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape, LinearDst, MoeRouteShape,
-    NormKind, QsaPoolShape, QsaSelectShape, RopePosShape, RopeShape, RowGateShape, WeightView,
-    GRAPH_STATIC,
+    GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, Im2colShape, KvStoreShape, LinearDst,
+    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopePosShape, RopeShape, RowGateShape,
+    WeightView, GRAPH_STATIC,
 };
 use velox_core::{
     check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, StateFormat, VariantInfo,
@@ -83,6 +85,13 @@ mod ffi {
 /// Launcher return codes below zero (see velox_common.cuh).
 const VELOX_ERR_UNSUPPORTED: i32 = -1;
 
+/// CUDA runtime errors that corrupt the context: once one is returned, every later call fails
+/// too and only a new process recovers (illegal address, launch timeout, context destroyed,
+/// device assert, the 714-719 kernel faults, unknown).
+fn is_sticky(code: i32) -> bool {
+    matches!(code, 700 | 702 | 709 | 710 | 714..=719 | 999)
+}
+
 /// Converts a CUDA/launcher return code into a Result. Public for variant launchers.
 pub fn status(code: i32, what: &str) -> Result<()> {
     match code {
@@ -93,10 +102,11 @@ pub fn status(code: i32, what: &str) -> Result<()> {
         c => {
             // SAFETY: cudaGetErrorString returns a static NUL-terminated string for any code.
             let msg = unsafe { CStr::from_ptr(ffi::velox_cuda_error_string(c)) };
-            Err(Error::Backend(format!(
-                "{what}: CUDA error {c}: {}",
-                msg.to_string_lossy()
-            )))
+            let m = format!("{what}: CUDA error {c}: {}", msg.to_string_lossy());
+            if is_sticky(c) {
+                velox_core::mark_device_lost(&m);
+            }
+            Err(Error::Backend(m))
         }
     }
 }
@@ -1088,6 +1098,60 @@ pub trait CudaKernels: Send + Sync {
         portable::transpose_heads(x, y, rows, a, b, dim)
     }
 
+    fn im2col_3x3s2(&self, x: &CudaBuffer, y: &mut CudaBuffer, shape: Im2colShape) -> Result<()> {
+        portable::im2col_3x3s2(x, y, shape)
+    }
+
+    fn kv_scatter(
+        &self,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        kp: &mut CudaBuffer,
+        vp: &mut CudaBuffer,
+        dst: &[u32],
+        shape: PoolShape,
+    ) -> Result<()> {
+        portable::kv_scatter(k, v, kp, vp, dst, shape)
+    }
+
+    fn rope_cos_sin(
+        &self,
+        positions: &[u32],
+        head_dim: usize,
+        theta: f32,
+        table: &mut CudaBuffer,
+    ) -> Result<()> {
+        portable::rope_cos_sin(positions, head_dim, theta, table)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv(
+        &self,
+        qkv: &CudaBuffer,
+        qn: &CudaBuffer,
+        kn: &CudaBuffer,
+        table: &CudaBuffer,
+        q_out: &mut CudaBuffer,
+        kp: &mut CudaBuffer,
+        vp: &mut CudaBuffer,
+        dst: &[u32],
+        shape: QkvRopeShape,
+    ) -> Result<()> {
+        portable::qk_norm_rope_kv(qkv, qn, kn, table, q_out, kp, vp, dst, shape)
+    }
+
+    fn attention_ranges(
+        &self,
+        q: &CudaBuffer,
+        kp: &CudaBuffer,
+        vp: &CudaBuffer,
+        out: &mut CudaBuffer,
+        ranges: &[(u32, u32)],
+        shape: PoolShape,
+    ) -> Result<()> {
+        portable::attention_ranges(q, kp, vp, out, ranges, shape)
+    }
+
     fn dyn_conv(
         &self,
         x: &CudaBuffer,
@@ -2053,6 +2117,80 @@ impl Backend for CudaBackend {
         check::transpose_heads(x.len, y.len, rows, a, b, dim)?;
         self.staged("transpose_heads", || {
             self.kernels.transpose_heads(x, y, rows, a, b, dim)
+        })
+    }
+
+    fn im2col_3x3s2(&self, x: &CudaBuffer, y: &mut CudaBuffer, shape: Im2colShape) -> Result<()> {
+        check::im2col_3x3s2(x.len, y.len, &shape)?;
+        self.staged("im2col_3x3s2", || self.kernels.im2col_3x3s2(x, y, shape))
+    }
+
+    fn kv_scatter(
+        &self,
+        k: &CudaBuffer,
+        v: &CudaBuffer,
+        kp: &mut CudaBuffer,
+        vp: &mut CudaBuffer,
+        dst: &[u32],
+        shape: PoolShape,
+    ) -> Result<()> {
+        check::kv_scatter(k.len, v.len, kp.len, vp.len, dst, &shape)?;
+        self.staged("kv_scatter", || {
+            self.kernels.kv_scatter(k, v, kp, vp, dst, shape)
+        })
+    }
+
+    fn rope_cos_sin(
+        &self,
+        positions: &[u32],
+        head_dim: usize,
+        theta: f32,
+        table: &mut CudaBuffer,
+    ) -> Result<()> {
+        check::rope_cos_sin(table.len, positions.len(), head_dim)?;
+        self.staged("rope_cos_sin", || {
+            self.kernels.rope_cos_sin(positions, head_dim, theta, table)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_kv(
+        &self,
+        qkv: &CudaBuffer,
+        qn: &CudaBuffer,
+        kn: &CudaBuffer,
+        table: &CudaBuffer,
+        q_out: &mut CudaBuffer,
+        kp: &mut CudaBuffer,
+        vp: &mut CudaBuffer,
+        dst: &[u32],
+        shape: QkvRopeShape,
+    ) -> Result<()> {
+        check::qk_norm_rope_kv(
+            [
+                qkv.len, qn.len, kn.len, table.len, q_out.len, kp.len, vp.len,
+            ],
+            dst,
+            &shape,
+        )?;
+        self.staged("qk_norm_rope_kv", || {
+            self.kernels
+                .qk_norm_rope_kv(qkv, qn, kn, table, q_out, kp, vp, dst, shape)
+        })
+    }
+
+    fn attention_ranges(
+        &self,
+        q: &CudaBuffer,
+        kp: &CudaBuffer,
+        vp: &CudaBuffer,
+        out: &mut CudaBuffer,
+        ranges: &[(u32, u32)],
+        shape: PoolShape,
+    ) -> Result<()> {
+        check::attention_ranges(q.len, kp.len, vp.len, out.len, ranges, &shape)?;
+        self.staged("attention_ranges", || {
+            self.kernels.attention_ranges(q, kp, vp, out, ranges, shape)
         })
     }
 

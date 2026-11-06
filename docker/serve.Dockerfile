@@ -18,9 +18,19 @@ WORKDIR /src
 COPY . .
 # Registry and target caches survive between builds, so a rebuild after a small change takes about
 # a minute instead of a full compile.
+#
+# Cargo (and build.rs rerun-if-changed) decides freshness by mtime, and a git-URL build context
+# stamps every file with its commit time. Building a ref committed before the cached artifacts were
+# made would otherwise reuse them and ship another ref's binary. So the cache keeps the sha256 of
+# every source file of the last build, and files whose content differs from it are touched first.
+# The list is written before compiling, so a failed build cannot leave artifacts it does not cover.
 RUN --mount=type=cache,target=/opt/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p velox-cli --features velox-cli/cuda \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    find . -path ./target -prune -o -type f -print0 | xargs -0 sha256sum | LC_ALL=C sort > /tmp/new.sha256 \
+    && touch target/.src.sha256 && LC_ALL=C sort target/.src.sha256 > /tmp/old.sha256 \
+    && LC_ALL=C comm -13 /tmp/old.sha256 /tmp/new.sha256 | cut -c67- | tr '\n' '\0' | xargs -0 -r touch -- \
+    && cp /tmp/new.sha256 target/.src.sha256 \
+    && cargo build --release --locked -p velox-cli --features velox-cli/cuda \
     && cp target/release/velox /usr/local/bin/velox
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
