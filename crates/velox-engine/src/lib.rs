@@ -85,9 +85,11 @@ pub struct EngineConfig {
     /// bf16 halves their device memory (157 -> 81 MB each for Qwen3.8-27B) at the rounding the
     /// context store's bf16 entries already apply on restore.
     pub device_state_format: StateFormat,
-    /// NVMe tier below the context store (see `disk`): roots and branch points several requests
-    /// resumed from; 0 disables it.
+    /// NVMe tier below the context store for a cold start (see `disk`): its most common roots;
+    /// 0 disables it.
     pub disk_context_bytes: u64,
+    /// Common roots kept on the NVMe tier at most (see `ContextStore::persist`).
+    pub disk_context_roots: usize,
     /// Directory of the NVMe tier's files.
     pub disk_context_dir: std::path::PathBuf,
     /// Identity of the loaded model (weights and kernels): records are kept across restarts in a
@@ -723,7 +725,10 @@ where
             vision_start: single_token(&fe, "<|vision_start|>"),
             image_pad: single_token(&fe, "<|image_pad|>"),
         };
-        let disk = if cfg.disk_context_bytes > 0 && cfg.host_context_bytes > 0 {
+        let disk = if cfg.disk_context_bytes > 0
+            && cfg.disk_context_roots > 0
+            && cfg.host_context_bytes > 0
+        {
             // Records hold raw storage: they only fit sessions of the same shapes and formats.
             let session = &lanes[0].session;
             let layout = format!(
@@ -739,6 +744,7 @@ where
                 DiskTier::new(
                     cfg.disk_context_dir.clone(),
                     cfg.disk_context_bytes,
+                    cfg.disk_context_roots,
                     cfg.disk_context_tag.as_deref(),
                     disk::executable_id(),
                     disk::fnv64(disk::FNV_OFFSET, layout.as_bytes()),
@@ -753,6 +759,7 @@ where
             cfg.lrfu_lambda,
             disk,
             DISK_GAIN,
+            cfg.disk_context_roots,
             cfg.host_state_format,
         );
         // Pin the store's memory before serving: until the store fills, every capture would

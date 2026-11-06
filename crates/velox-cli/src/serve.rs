@@ -149,13 +149,14 @@ where
         // --device-state-dtype f32|bf16|nvfp4 (default f32): storage of the device checkpoints
         // (lane heads and spares); bf16 halves them at the context store's rounding.
         device_state_format: StateFormat::parse(a.get("device-state-dtype").unwrap_or("f32"))?,
-        // --disk-context-mib N (default 16384; 0: off) and --disk-context-dir DIR: NVMe tier below
-        // RAM for reused roots (system prompt, task) and branch points, kept across restarts so a
-        // cold start resumes them instead of prefilling (CUA: 15.5 s -> 1.4 s on the RTX 5060 Ti).
-        // Roots are written while resident, branch points when RAM evicts them; KV pages a record
-        // shares with one already on disk are not written again. Mount DIR on a volume to keep it
-        // across container rebuilds.
-        disk_context_bytes: a.parse::<u64>("disk-context-mib", 16384)? << 20,
+        // --disk-context-mib N (default 4096; 0: off), --disk-context-roots N (default 10) and
+        // --disk-context-dir DIR: NVMe copies of at most N common roots (system prompts at least
+        // three conversations used, the most used first; fewer when fewer are), kept across
+        // restarts so a cold start resumes them instead of prefilling (CUA: 15.5 s -> 1.4 s on the
+        // RTX 5060 Ti). Nothing else is written. Mount DIR on a volume to keep it across container
+        // rebuilds.
+        disk_context_bytes: a.parse::<u64>("disk-context-mib", 4096)? << 20,
+        disk_context_roots: a.parse::<usize>("disk-context-roots", 10)?,
         disk_context_dir: match a.get("disk-context-dir") {
             Some(d) => d.into(),
             None => std::env::var_os("XDG_CACHE_HOME")
