@@ -12,7 +12,21 @@ jobs:
       - name: check
         run: |
           git fetch origin main:main 2>/dev/null || true
-          branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          # A pull request is checked against the branch it merges INTO: a PR into main keeps main's
+          # scope, a PR into a hardware branch the branch's. The source branch's name says nothing
+          # (a feature branch carries main work). A push is checked as the branch pushed to; a push
+          # to a branch that is neither main nor a hardware branch is left to its pull request.
+          # Hardware branches are named after the card (docs/branching.md); add a prefix here when a
+          # new vendor's branch appears.
+          if [ -n "${GITHUB_BASE_REF:-}" ]; then
+            branch="$GITHUB_BASE_REF"
+          else
+            branch="$GITHUB_REF_NAME"
+            if [ "$branch" != "main" ] && ! [[ "$branch" =~ ^rtx- ]]; then
+              echo "$branch is not main or a hardware branch: checked by its pull request"
+              exit 0
+            fi
+          fi
           if [ "$branch" = "main" ]; then
             bash scripts/check-main-scope.sh
           else

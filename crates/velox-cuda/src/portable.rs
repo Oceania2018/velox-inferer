@@ -1,11 +1,13 @@
 //! Safe wrappers over the portable kernels. Variants call these as the fallback for shapes their
 //! tuned kernels do not cover. Each wrapper re-validates, so it is safe to call directly.
 
+use velox_core::backend::PoolShape;
+use velox_core::backend::QkvRopeShape;
 use velox_core::backend::{
     AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank,
-    ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape,
-    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
-    RowGateShape, WeightView,
+    ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, Im2colShape,
+    KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape,
+    RopeShape, RowGateShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
 use velox_core::kv::{hadamard_norm, KvFormat};
@@ -1669,6 +1671,56 @@ extern "C" {
         accumulate: i32,
         block: i32,
     ) -> i32;
+    fn velox_portable_rope_cos_sin(
+        pos: *const u32,
+        rows: i32,
+        head_dim: i32,
+        theta: f32,
+        table: *mut f32,
+    ) -> i32;
+    fn velox_portable_qk_norm_rope_kv(
+        qkv: *const f32,
+        qn: *const f32,
+        kn: *const f32,
+        table: *const f32,
+        q_out: *mut f32,
+        kp: *mut f32,
+        vp: *mut f32,
+        dst: *const u32,
+        rows: i32,
+        heads: i32,
+        kv_heads: i32,
+        d: i32,
+        eps: f32,
+    ) -> i32;
+    fn velox_portable_kv_scatter(
+        k: *const f32,
+        v: *const f32,
+        kp: *mut f32,
+        vp: *mut f32,
+        dst: *const u32,
+        rows: i32,
+        row: i32,
+    ) -> i32;
+    fn velox_portable_attention_ranges(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        out: *mut f32,
+        ranges: *const u32,
+        rows: i32,
+        heads: i32,
+        kv_heads: i32,
+        d: i32,
+    ) -> i32;
+    fn velox_portable_im2col_3x3s2(
+        x: *const f32,
+        y: *mut f32,
+        images: i32,
+        h: i32,
+        w: i32,
+        c: i32,
+    ) -> i32;
     fn velox_portable_transpose_heads(
         x: *const f32,
         y: *mut f32,
@@ -1784,6 +1836,171 @@ pub fn dyn_conv(
             )
         },
         "portable dyn_conv",
+    )
+}
+
+pub fn rope_cos_sin(
+    positions: &[u32],
+    head_dim: usize,
+    theta: f32,
+    table: &mut CudaBuffer,
+) -> Result<()> {
+    check::rope_cos_sin(table.len(), positions.len(), head_dim)?;
+    let bytes: Vec<u8> = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let pos = stage(&bytes)?;
+    if graph_mode() == GraphMode::Replay {
+        return Ok(());
+    }
+    // SAFETY: the table holds positions.len() * head_dim values (checked); pos holds the positions.
+    status(
+        unsafe {
+            velox_portable_rope_cos_sin(
+                pos.cast(),
+                to_i32("rows", positions.len())?,
+                to_i32("head_dim", head_dim)?,
+                theta,
+                table.as_mut_ptr(),
+            )
+        },
+        "portable rope_cos_sin",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_rope_kv(
+    qkv: &CudaBuffer,
+    qn: &CudaBuffer,
+    kn: &CudaBuffer,
+    table: &CudaBuffer,
+    q_out: &mut CudaBuffer,
+    kp: &mut CudaBuffer,
+    vp: &mut CudaBuffer,
+    dst: &[u32],
+    s: QkvRopeShape,
+) -> Result<()> {
+    check::qk_norm_rope_kv(
+        [
+            qkv.len(),
+            qn.len(),
+            kn.len(),
+            table.len(),
+            q_out.len(),
+            kp.len(),
+            vp.len(),
+        ],
+        dst,
+        &s,
+    )?;
+    let bytes: Vec<u8> = dst.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let d = stage(&bytes)?;
+    if graph_mode() == GraphMode::Replay {
+        return Ok(());
+    }
+    // SAFETY: extents validated above; d holds rows u32 destinations inside the pools.
+    status(
+        unsafe {
+            velox_portable_qk_norm_rope_kv(
+                qkv.as_ptr(),
+                qn.as_ptr(),
+                kn.as_ptr(),
+                table.as_ptr(),
+                q_out.as_mut_ptr(),
+                kp.as_mut_ptr(),
+                vp.as_mut_ptr(),
+                d.cast(),
+                to_i32("rows", s.rows)?,
+                to_i32("heads", s.heads)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+                s.eps,
+            )
+        },
+        "portable qk_norm_rope_kv",
+    )
+}
+
+pub fn kv_scatter(
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    kp: &mut CudaBuffer,
+    vp: &mut CudaBuffer,
+    dst: &[u32],
+    s: PoolShape,
+) -> Result<()> {
+    check::kv_scatter(k.len(), v.len(), kp.len(), vp.len(), dst, &s)?;
+    let bytes: Vec<u8> = dst.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let d = stage(&bytes)?;
+    if graph_mode() == GraphMode::Replay {
+        return Ok(());
+    }
+    // SAFETY: extents validated above; d holds rows u32 destinations inside the pools.
+    status(
+        unsafe {
+            velox_portable_kv_scatter(
+                k.as_ptr(),
+                v.as_ptr(),
+                kp.as_mut_ptr(),
+                vp.as_mut_ptr(),
+                d.cast(),
+                to_i32("rows", s.rows)?,
+                to_i32("row", s.kv_heads * s.head_dim)?,
+            )
+        },
+        "portable kv_scatter",
+    )
+}
+
+pub fn attention_ranges(
+    q: &CudaBuffer,
+    kp: &CudaBuffer,
+    vp: &CudaBuffer,
+    out: &mut CudaBuffer,
+    ranges: &[(u32, u32)],
+    s: PoolShape,
+) -> Result<()> {
+    check::attention_ranges(q.len(), kp.len(), vp.len(), out.len(), ranges, &s)?;
+    let bytes: Vec<u8> = ranges
+        .iter()
+        .flat_map(|&(a, b)| a.to_le_bytes().into_iter().chain(b.to_le_bytes()))
+        .collect();
+    let r = stage(&bytes)?;
+    if graph_mode() == GraphMode::Replay {
+        return Ok(());
+    }
+    // SAFETY: extents and ranges validated above; r holds rows (start, len) pairs.
+    status(
+        unsafe {
+            velox_portable_attention_ranges(
+                q.as_ptr(),
+                kp.as_ptr(),
+                vp.as_ptr(),
+                out.as_mut_ptr(),
+                r.cast(),
+                to_i32("rows", s.rows)?,
+                to_i32("heads", s.heads)?,
+                to_i32("kv_heads", s.kv_heads)?,
+                to_i32("head_dim", s.head_dim)?,
+            )
+        },
+        "portable attention_ranges",
+    )
+}
+
+pub fn im2col_3x3s2(x: &CudaBuffer, y: &mut CudaBuffer, s: Im2colShape) -> Result<()> {
+    check::im2col_3x3s2(x.len(), y.len(), &s)?;
+    // SAFETY: both buffers hold the shape's values (checked).
+    status(
+        unsafe {
+            velox_portable_im2col_3x3s2(
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                to_i32("images", s.images)?,
+                to_i32("h", s.h)?,
+                to_i32("w", s.w)?,
+                to_i32("c", s.c)?,
+            )
+        },
+        "portable im2col_3x3s2",
     )
 }
 
