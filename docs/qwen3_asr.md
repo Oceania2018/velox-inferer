@@ -122,6 +122,12 @@ above: the system turn is written even when empty. llama-server drops it without
   ~250 rows on 1024- and 2048-row weights); slices sum in order, so results stay deterministic.
   Grids that cover the card run the unsplit kernel as before. The 27B (its vision tower and
   drafter use this kernel) was gated on `velox replay` against the previous build.
+- Requests carry a `priority` (JSON field, 0 = most urgent and the default; llama-server ignores
+  it). The qwen3-asr sidecar sends 0 for a realtime final, 1 for batch files, 2 for partials.
+  Waiting requests are admitted by priority, then arrival; a group holds one priority; and while a
+  more urgent request is decoding, less urgent ones are not admitted, because admission runs
+  between decode steps and stretches every step of the requests decoding. A final decodes in
+  ~0.2 s, so partials wait about that long. See the RTX 5060 Ti results below.
 - `VELOX_ASR_PHASES=1` prints, whenever the engine goes idle, wall time admitting (encode +
   prefill) vs decoding by batch size. At 16 requests admission was 75% of the time before the
   split-K and encoder changes.
@@ -152,6 +158,26 @@ identical, 0.12% of words differ (int8 and exact activations alike); llama.cpp 2
 Segments that flip between velox builds or batch compositions (18, 23, 27, 36 of the set) are
 near-ties: top-2 logit gaps of 0.001-0.04 at the deciding step (36: "." vs "," after "ten", 0.001),
 below f32 noise; the f64 golden check is unchanged across builds (enc 4-5e-3, logits ~3e-3).
+
+### Realtime streams (RTX 5060 Ti 16 GB alone, 2026-11-05)
+
+10 realtime streams of ~3 minutes each (one LibriSpeech test-clean speaker per stream, 0.8 s
+between utterances, starts staggered over 5 s) through the qwen3-asr sidecar
+(`ASR_DECODE_CONCURRENCY=16`); final latency counts from the end of the segment's audio, so it
+includes the sidecar's 500 ms VAD silence. 288 finals per run, every run 10 / 10 streams clean,
+WER 1.57% (llama.cpp 1.46%):
+
+| | final p50 | p90 | p99 | max | partials / stream |
+|---|---|---|---|---|---|
+| llama.cpp b11347, sidecar one at a time | 0.87 s | 1.21 s | 1.84 s | 2.09 s | - |
+| velox, arrival order (5 runs) | 0.84-1.04 s | 1.3-2.5 s | 3.0-6.8 s | 3.3-7.1 s | 144 |
+| velox, by priority (2 runs) | 0.67 / 0.69 s | 0.93 / 0.95 s | 1.30 / 1.39 s | 1.75 / 1.55 s | 173 |
+
+In arrival order every partial went straight in (the sidecar's priority gate never queues at 16
+in flight) and the busiest stretches spent 3.6 s admitting against 0.7 s decoding. Capping partials
+in flight at the sidecar instead (2 at a time, on top of priorities) was worse: p99 2.3-3.7 s and
+fewer partials. Direct to the decoder on this card (two short clips) velox is 27.6 / 58 / 102 /
+111x realtime at 1 / 4 / 16 / 32 concurrent requests, llama.cpp ~34 / 39 / 37x.
 
 Deployment note (Windows / WDDM): the 27B sizes itself device-wide at startup, so start
 serve-asr first; started after the 27B it oversubscribes VRAM, the driver pages to system RAM and
