@@ -1,10 +1,8 @@
-//! NVMe tier below the context store (off by default): roots (system prompt, task) a request
-//! resumed from are copied to disk by a background thread while they are still in system RAM,
-//! branch points several requests resumed from when system RAM evicts them, and a request whose
-//! deepest match is only on disk reads it back when that covers enough more than every resident
-//! source. That serves a cold start (a restarted server finds its prompts on disk instead of
-//! prefilling them) and hot prefixes that system RAM cannot keep; one-off history points never go
-//! to disk.
+//! NVMe tier below the context store (off by default) for a cold start: the context store copies
+//! its most common roots (system prompts) to disk on a background thread while they are still in
+//! system RAM, and a request whose deepest match is only on disk reads it back when that covers
+//! enough more than every resident source, so a restarted server finds its prompts on disk instead
+//! of prefilling them. It holds at most `max_records` records.
 //!
 //! A record is two kinds of file. Its own (`.ctx`) holds a header describing it (keys, KV ranges)
 //! then the recurrent state and drafter context. Its attention KV lives in page files (`.kvp`),
@@ -116,6 +114,8 @@ pub(crate) struct DiskTier {
     persistent: bool,
     layout: u64,
     budget: u64,
+    /// Records kept at most (least recently used ones go first).
+    max_records: usize,
     records: Vec<Record>,
     pages: HashMap<u128, Page>,
     jobs: Option<Sender<Job>>,
@@ -243,7 +243,7 @@ fn fill(
 }
 
 impl DiskTier {
-    /// A tier of at most `budget` bytes under `root`: in `<tag>-b<build>-<layout>` when `tag` (the
+    /// A tier of at most `budget` bytes and `max_records` records under `root`: in `<tag>-b<build>-<layout>` when `tag` (the
     /// model's identity) is given, holding the records an earlier process of the same build left
     /// there, else in a new private directory. `build` identifies the code and kernels that
     /// computed the records; a persistent tier deletes the directories other builds left under
@@ -252,6 +252,7 @@ impl DiskTier {
     pub fn new(
         root: PathBuf,
         budget: u64,
+        max_records: usize,
         tag: Option<&str>,
         build: u64,
         layout: u64,
@@ -285,6 +286,7 @@ impl DiskTier {
             persistent: tag.is_some(),
             layout,
             budget,
+            max_records,
             records: Vec::new(),
             pages: HashMap::new(),
             jobs: Some(jobs),
@@ -362,7 +364,7 @@ impl DiskTier {
             p.refs > 0
         });
         // The budget may be smaller than last time.
-        self.make_room(0);
+        self.make_room(0, false);
         if !self.records.is_empty() {
             eprintln!(
                 "disk context: {} records, {} KV pages ({:.2} GB) in {}",
@@ -614,7 +616,7 @@ impl DiskTier {
         for id in &shared {
             self.pages.get_mut(id).expect("checked").refs += 1;
         }
-        if !self.make_room(need) {
+        if !self.make_room(need, true) {
             for id in &shared {
                 self.pages.get_mut(id).expect("held").refs -= 1;
             }
@@ -682,10 +684,12 @@ impl DiskTier {
         Some(id)
     }
 
-    /// Evicts ready records, least recently used first, until `bytes` more fit.
-    fn make_room(&mut self, bytes: u64) -> bool {
+    /// Evicts ready records, least recently used first, until `bytes` more fit, and one more
+    /// record when `adding`.
+    fn make_room(&mut self, bytes: u64, adding: bool) -> bool {
         loop {
-            if self.used(false) + bytes <= self.budget {
+            let records = self.records.len() + adding as usize;
+            if self.used(false) + bytes <= self.budget && records <= self.max_records {
                 return true;
             }
             let Some(i) = self
@@ -922,7 +926,7 @@ mod tests {
     use super::*;
 
     fn tier(dir: &Path, budget: u64) -> DiskTier {
-        DiskTier::new(dir.to_path_buf(), budget, Some("test"), 7, 42).unwrap()
+        DiskTier::new(dir.to_path_buf(), budget, 100, Some("test"), 7, 42).unwrap()
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -994,7 +998,7 @@ mod tests {
         // Its pages went with it.
         assert_eq!(files(&dir, "kvp"), 0);
         // Another layout never sees the first one's directory.
-        let other = DiskTier::new(dir.clone(), 1 << 20, Some("test"), 7, 43).unwrap();
+        let other = DiskTier::new(dir.clone(), 1 << 20, 100, Some("test"), 7, 43).unwrap();
         assert_eq!(other.len(), 0);
         drop(other);
         let _ = fs::remove_dir_all(&dir);
@@ -1111,11 +1115,11 @@ mod tests {
             wait(&mut t);
         }
         // Another model of the same build, the old unversioned naming and a live private tier.
-        drop(DiskTier::new(dir.clone(), 1 << 20, Some("other"), 7, 42).unwrap());
+        drop(DiskTier::new(dir.clone(), 1 << 20, 100, Some("other"), 7, 42).unwrap());
         fs::create_dir_all(dir.join("test-000000000000002a")).unwrap();
         fs::create_dir_all(dir.join("velox-12345")).unwrap();
         assert_eq!(tier(&dir, 1 << 20).len(), 1, "same build keeps its records");
-        let next = DiskTier::new(dir.clone(), 1 << 20, Some("test"), 8, 42).unwrap();
+        let next = DiskTier::new(dir.clone(), 1 << 20, 100, Some("test"), 8, 42).unwrap();
         assert_eq!(next.len(), 0);
         drop(next);
         let mut left: Vec<String> = fs::read_dir(&dir)
@@ -1181,6 +1185,27 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert!(!t.holds(&[0]) && t.holds(&[1]) && t.holds(&[2]));
         drop(t);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tier_keeps_at_most_max_records() {
+        let dir = scratch("max");
+        let data = [1u8; 100];
+        {
+            let mut t = DiskTier::new(dir.clone(), 1 << 20, 2, Some("test"), 7, 42).unwrap();
+            for i in 0..3u32 {
+                t.write(&[i], 0, true, payload(&data, &[]), i as u64);
+                wait(&mut t);
+            }
+            // The least recently used one made room.
+            assert!(!t.holds(&[0]) && t.holds(&[1]) && t.holds(&[2]));
+        }
+        // A smaller limit at startup drops the oldest files.
+        let t = DiskTier::new(dir.clone(), 1 << 20, 1, Some("test"), 7, 42).unwrap();
+        assert_eq!(t.len(), 1);
+        drop(t);
+        assert_eq!(files(&dir, "ctx"), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
