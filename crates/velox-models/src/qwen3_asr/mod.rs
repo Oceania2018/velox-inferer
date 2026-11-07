@@ -58,6 +58,26 @@ impl<B: Backend> Grow<B> {
         }
         Ok(&mut self.0.as_mut().expect("allocated above").0)
     }
+
+    /// The buffer itself, at least `len` long, for a caller that keeps it past this call;
+    /// [`Grow::give`] hands it back.
+    fn take(&mut self, b: &B, len: usize) -> Result<(B::Buffer, usize)> {
+        match self.0.take() {
+            Some((buf, cap)) if cap >= len => Ok((buf, cap)),
+            old => {
+                drop(old);
+                let cap = len + len / 4;
+                Ok((b.alloc(cap)?, cap))
+            }
+        }
+    }
+
+    /// Keeps `buf` (of `cap` slots) for the next [`Grow::take`] unless a larger one is held.
+    fn give(&mut self, buf: B::Buffer, cap: usize) {
+        if self.0.as_ref().is_none_or(|(_, have)| *have < cap) {
+            self.0 = Some((buf, cap));
+        }
+    }
 }
 
 /// Encoder scratch reused across encodes. Measured on an RTX 5060 Ti (Windows / WDDM) with 20
@@ -79,6 +99,13 @@ pub struct EncWorkspace<B: Backend> {
     attn: Grow<B>,
     o: Grow<B>,
     f: Grow<B>,
+    /// The returned embeddings: a server hands them back with [`Qwen3Asr::recycle_audio`] once
+    /// prefilled. Allocating them per call was the last allocation on the request path, and the
+    /// one that hurt: past ~1 MB (8 s of audio) a WDDM `cudaMalloc` took 127 ms on average and up
+    /// to 0.5 s on a near-full RTX 5060 Ti, so a 16 s clip took 211 ms against 45 ms for 8 s.
+    out: Grow<B>,
+    /// Capacity of the embeddings last handed out (what [`Qwen3Asr::recycle_audio`] gives back).
+    out_cap: usize,
 }
 
 impl<B: Backend> Default for EncWorkspace<B> {
@@ -98,6 +125,8 @@ impl<B: Backend> Default for EncWorkspace<B> {
             attn: Grow::default(),
             o: Grow::default(),
             f: Grow::default(),
+            out: Grow::default(),
+            out_cap: 0,
         }
     }
 }
@@ -331,6 +360,15 @@ impl<B: Backend> Qwen3Asr<B> {
         Ok((out, counts[0]))
     }
 
+    /// Hands back embeddings from [`Self::encode_many`] once nothing still reads them (after the
+    /// prefill that consumed them), so the next encode reuses the buffer instead of allocating.
+    pub fn recycle_audio(&self, audio: B::Buffer) {
+        if let Ok(mut ws) = self.enc_ws.lock() {
+            let cap = ws.out_cap;
+            ws.out.give(audio, cap);
+        }
+    }
+
     /// Audio embeddings of several clips in one pass, `[sum tokens, hidden]` in clip order, and
     /// each clip's token count. Clips shorter than one second (one conv chunk) must come alone.
     /// Attention windows never cross clips, so the rows equal each clip encoded on its own.
@@ -438,7 +476,8 @@ impl<B: Backend> Qwen3Asr<B> {
         b.layer_norm(x, lw, lb, hbuf, n, d, e.ln_eps)?;
         Self::linear(b, hbuf, &self.enc.proj1, o, n)?;
         b.gelu(o, n * d, GeluKind::Erf)?;
-        let mut out = b.alloc(n * self.cfg.dec.hidden)?;
+        let (mut out, cap) = ws.out.take(b, n * self.cfg.dec.hidden)?;
+        ws.out_cap = cap;
         Self::linear(b, o, &self.enc.proj2, &mut out, n)?;
         Ok((out, counts, tr))
     }
