@@ -9,6 +9,14 @@
 // Block: 128 tokens x 64 weight rows, 8 warps (4 along tokens x 2 along rows, 32 x 32 each);
 // K advances 64 values per step: activations by cp.async, weights decoded by the block into
 // shared memory. Rows are 72 bf16 (9 chunks of 16 bytes, odd), so ldmatrix is conflict-free.
+//
+// Split K: a block is about as fast as its SM's bf16 MMAs allow, so a grid of fewer blocks than
+// SMs leaves the card idle (Qwen3-ASR prefill on [2048, 2048] at m = 64 or 128: 32 blocks for
+// 82 SMs, ~63 us at either m). Short grids then split K over gridDim.z: each slice writes its
+// partial sums to scratch (in L2 at these sizes) and a second kernel adds the slices in slice
+// order, so results do not depend on scheduling. Grids that already cover the card 1.5 times run
+// the unsplit instance, compiled as the kernel was before. (rtx-5090-32g targets 2x its 170 SMs;
+// on 82 SMs that also split 128-block grids such as [4096, 1024] at m = 256, 18% slower.)
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -58,7 +66,8 @@ struct RsArgs {
     int rows, m, kp;
     int bits, group, high;   // high-plane bytes per group (q5: 8, q6: 16)
     long long gpr, high_off, scale_off;
-    float* y;                // [m, rows]
+    float* y;                // [m, rows], or [splits, m, rows] partials when split
+    int steps_per_split;     // K steps (kBK values) per gridDim.z slice
 };
 
 struct RsSmem {
@@ -115,10 +124,14 @@ __device__ __forceinline__ void decode_step(RsSmem& s, const RsArgs& p, int n0, 
             __floats2bfloat162_rn(static_cast<float>(q[i]), static_cast<float>(q[i + 1]));
 }
 
+// kSplit false: the original kernel (one slice over all of K, straight into y), compiled as before.
+template <bool kSplit>
 __global__ void __launch_bounds__(kThreads) rowsplit_bf16_kernel(RsArgs p) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
     RsSmem& s = *reinterpret_cast<RsSmem*>(smem_raw);
     const int n0 = blockIdx.x * kBN, m0 = blockIdx.y * kBM;
+    const int k_begin = kSplit ? blockIdx.z * p.steps_per_split * kBK : 0;
+    const int k_end = kSplit ? min(p.kp, k_begin + p.steps_per_split * kBK) : p.kp;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int wm = warp >> 1, wn = warp & 1;
     const int g = lane >> 2, q4 = lane & 3;
@@ -134,7 +147,7 @@ __global__ void __launch_bounds__(kThreads) rowsplit_bf16_kernel(RsArgs p) {
     const int a_row = (lane & 7) + (((lane >> 3) & 1) << 3), a_col = (lane >> 4) << 3;
     const int b_row = (lane & 7) + ((lane >> 4) << 3), b_col = ((lane >> 3) & 1) << 3;
 
-    for (int k0 = 0; k0 < p.kp; k0 += kBK) {
+    for (int k0 = k_begin; k0 < k_end; k0 += kBK) {
         for (int idx = threadIdx.x; idx < kBM * (kBK / 8); idx += kThreads) {
             const int r = idx >> 3, c = idx & 7;
             cp_async16(s.a + r * kSA + c * 8, p.x + static_cast<long long>(m0 + r) * p.kp + k0 + c * 8);
@@ -190,11 +203,33 @@ __global__ void __launch_bounds__(kThreads) rowsplit_bf16_kernel(RsArgs p) {
             for (int h = 0; h < 2; ++h) {
                 const int t = m0 + wm * 32 + mt * 16 + g + 8 * h;
                 if (t >= p.m) continue;
-                float* out = p.y + static_cast<long long>(t) * p.rows + n;
+                float* out = p.y + ((kSplit ? static_cast<long long>(blockIdx.z) * p.m : 0LL) + t) * p.rows + n;
                 if (n < p.rows) out[0] = acc[mt][nt][2 * h];
                 if (n + 1 < p.rows) out[1] = acc[mt][nt][2 * h + 1];
             }
         }
+}
+
+// y = sum over slices of part[slice] (slice order: deterministic).
+__global__ void sum_splits(const float* __restrict__ part, int splits, long long n, float* __restrict__ y) {
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        float v = part[i];
+        for (int z = 1; z < splits; ++z) v += part[z * n + i];
+        y[i] = v;
+    }
+}
+
+int sm_count() {
+    static int n = 0;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || n <= 0)
+            n = 1;
+    });
+    return n;
 }
 
 // Grow-only and never freed (VeloxScratch): recorded CUDA graphs may still reference old buffers.
@@ -202,9 +237,10 @@ struct Scratch {
     VeloxScratch s;
     uint8_t* get(size_t need) { return static_cast<uint8_t*>(s.get(need)); }
 };
-Scratch g_rs;
+Scratch g_rs, g_part;
 
 long long align256(long long x) { return (x + 255) / 256 * 256; }
+
 
 }  // namespace
 
@@ -224,11 +260,36 @@ VELOX_API int velox_5090_linear_rowsplit(const float* x, int m, const uint8_t* w
         x, m, static_cast<int>(k), m_pad, static_cast<int>(kp), xb);
     static bool configured = false;
     if (!configured) {
-        cudaFuncSetAttribute(rowsplit_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(RsSmem));
+        cudaFuncSetAttribute(rowsplit_bf16_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(RsSmem));
+        cudaFuncSetAttribute(rowsplit_bf16_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(RsSmem));
         configured = true;
     }
+    // Split K until the grid covers the card 1.5 times, keeping at least kMinSteps steps per slice.
+    const int bx = (rows + kBN - 1) / kBN, by = m_pad / kBM, steps = static_cast<int>(kp / kBK);
+    constexpr int kMinSteps = 4, kMaxSplits = 16;
+    int splits = 1;
+    {
+        const int blocks = bx * by, target = sm_count() * 3 / 2;
+        if (blocks < target) splits = (target + blocks - 1) / blocks;
+        splits = max(1, min(splits, min(kMaxSplits, steps / kMinSteps)));
+    }
+    const int per = (steps + splits - 1) / splits;
+    splits = (steps + per - 1) / per;  // no empty slices
+    float* out = y;
+    if (splits > 1) {
+        out = reinterpret_cast<float*>(g_part.get(static_cast<size_t>(splits) * m * rows * sizeof(float)));
+        if (!out) return static_cast<int>(cudaErrorMemoryAllocation);
+    }
     const RsArgs a{xb, w, parent_rows, row_begin, rows, m, static_cast<int>(kp), bits, group, high, gpr, high_off,
-                   scale_off, y};
-    rowsplit_bf16_kernel<<<dim3((rows + kBN - 1) / kBN, m_pad / kBM), kThreads, sizeof(RsSmem)>>>(a);
+                   scale_off, out, per};
+    if (splits == 1) {
+        rowsplit_bf16_kernel<false><<<dim3(bx, by), kThreads, sizeof(RsSmem)>>>(a);
+        return velox_launch_status();
+    }
+    rowsplit_bf16_kernel<true><<<dim3(bx, by, splits), kThreads, sizeof(RsSmem)>>>(a);
+    {
+        const long long n = static_cast<long long>(m) * rows;
+        sum_splits<<<velox_grid_1d(n, 256), 256>>>(out, splits, n, y);
+    }
     return velox_launch_status();
 }
