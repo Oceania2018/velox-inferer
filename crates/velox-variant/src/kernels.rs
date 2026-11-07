@@ -537,6 +537,10 @@ const ROWSPLIT_MIN_M: usize = 64;
 /// weight-streaming bf16 tensor-core kernel.
 const SKINNY16_MAX_M: usize = 16;
 
+/// q8_g32 on the skinny kernel takes up to this many rows in one pass over the weights (Qwen3-ASR
+/// decodes batches of up to 32 sequences; in 16-row blocks a batch of 17 read the weights twice).
+const SKINNY_RS_Q8_MAX_M: usize = 64;
+
 /// Batched drafting (up to 6 sequences x 8-row blocks, or their 7 proposal rows each) runs the
 /// skinny kernel in blocks of 16 rows up to this many rows, rather than the exact portable path.
 /// Groupwise-integer weights hand over to the row-split kernel at `ROWSPLIT_MIN_M`.
@@ -2478,10 +2482,11 @@ impl CudaKernels for Rtx5090Kernels {
                     return Ok(());
                 }
                 if let Some(f) = skinny16_format(w, m) {
-                    // The kernel takes up to 16 rows; larger m runs in blocks (activations [m, k],
-                    // outputs [m, rows]).
-                    for r0 in (0..m).step_by(SKINNY16_MAX_M) {
-                        let mb = to_i32("m", (m - r0).min(SKINNY16_MAX_M))?;
+                    // The kernels take up to 16 rows (q8: 64); larger m runs in blocks (activations
+                    // [m, k], outputs [m, rows]).
+                    let block = if f == 8 { SKINNY_RS_Q8_MAX_M } else { SKINNY16_MAX_M };
+                    for r0 in (0..m).step_by(block) {
+                        let mb = to_i32("m", (m - r0).min(block))?;
                         // SAFETY: rows r0.. of x and y lie inside the buffers check::linear validated.
                         let (xp, yp) =
                             unsafe { (x.as_ptr().add(r0 * w.k), y.as_mut_ptr().add(r0 * w.rows)) };
