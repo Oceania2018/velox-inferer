@@ -128,8 +128,22 @@ above: the system turn is written even when empty. llama-server drops it without
   more urgent request is decoding, less urgent ones are not admitted, because admission runs
   between decode steps and stretches every step of the requests decoding. A final decodes in
   ~0.2 s, so partials wait about that long. See the RTX 5060 Ti results below.
+- Requests may carry a `draft` (JSON string, the text expected after the prompt; llama-server
+  ignores it). The sidecar sends a final the raw output of the last partial of the same speech,
+  which the final mostly repeats. Each decode step feeds a drafted sequence's next draft tokens
+  (up to 24) after its last token in the same pass and keeps the greedy predictions up to the first
+  draft token the model would not have produced (`Qwen3Asr::step_batch_draft`), so the output is
+  what one-token steps give; after a mismatch the draft re-anchors on the output's last 1-3 tokens.
+  A step feeds 64 rows at most; rows beyond one per sequence go to the most urgent requests first.
+  The verify rows run the projections at a wider batch than a one-token step would, a numeric
+  difference of the same kind as batch composition (below): on the 84 segments of two calls, alone
+  on the device, output was identical with no draft, the exact output as draft, and a draft with a
+  word changed and one dropped (engine time 6.2 / 2.3 / 3.2 s). RTX 5090 Laptop (24 GB), 24
+  realtime call streams x 10 min through the sidecar: 78% of fed draft tokens accepted, final p50
+  0.60 -> 0.56 s, p90 0.72 -> 0.62 s, p99 0.92 -> 0.74 s, max 1.15 -> 0.87 s (500 ms VAD silence
+  included), same 2772 finals.
 - `VELOX_ASR_PHASES=1` prints, whenever the engine goes idle, wall time admitting (encode +
-  prefill) vs decoding by batch size. At 16 requests admission was 75% of the time before the
+  prefill) vs decoding by rows fed (sequences plus draft tokens), and draft tokens fed / accepted. At 16 requests admission was 75% of the time before the
   split-K and encoder changes.
 - The encoder's scratch (im2col columns, conv activations, the residual stream, q / k / v, FFN)
   lives in a grow-only workspace, and the mel image and multi-clip positions are written into it
