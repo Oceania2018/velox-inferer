@@ -442,26 +442,32 @@ fn admit_group<B: Backend>(
             g.1.mel = Vec::new();
         }
         let mut ws = m.decoder_workspace()?;
-        if let [(seq, job)] = &mut group[..] {
-            if job.prompt.len() > PREFILL_ROWS {
-                return Ok(vec![m.start_pooled(
-                    b,
-                    pool,
-                    seq,
-                    &mut ws,
-                    bw,
-                    &job.prompt,
-                    &audio,
-                )?]);
+        let firsts = (|| {
+            if let [(seq, job)] = &mut group[..] {
+                if job.prompt.len() > PREFILL_ROWS {
+                    return Ok(vec![m.start_pooled(
+                        b,
+                        pool,
+                        seq,
+                        &mut ws,
+                        bw,
+                        &job.prompt,
+                        &audio,
+                    )?]);
+                }
             }
-        }
-        let mut at = 0;
-        let mut reqs: Vec<(&mut PoolSeq, &[u32], usize)> = Vec::with_capacity(group.len());
-        for ((seq, job), &n) in group.iter_mut().zip(&counts) {
-            reqs.push((seq, &job.prompt[..], at));
-            at += n;
-        }
-        m.prefill_many(b, pool, &mut reqs, &audio, &mut ws, bw)
+            let mut at = 0;
+            let mut reqs: Vec<(&mut PoolSeq, &[u32], usize)> = Vec::with_capacity(group.len());
+            for ((seq, job), &n) in group.iter_mut().zip(&counts) {
+                reqs.push((seq, &job.prompt[..], at));
+                at += n;
+            }
+            m.prefill_many(b, pool, &mut reqs, &audio, &mut ws, bw)
+        })();
+        // Both prefills end in a host readback of the first ids, so nothing reads the embeddings
+        // any more (and the next encode is queued after them on the same stream anyway).
+        m.recycle_audio(audio);
+        firsts
     })();
     let firsts = match r {
         Ok(f) => f,
