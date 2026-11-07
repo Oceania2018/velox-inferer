@@ -30,7 +30,76 @@ pub struct Qwen3Asr<B: Backend> {
     pos_rows: usize,
     /// The decoder workspace every request uses: static decode graphs replay on its buffers.
     dec_ws: std::sync::Mutex<DecWorkspace<B>>,
+    /// The encoder's scratch, reused by every encode (see [`EncWorkspace`]).
+    enc_ws: std::sync::Mutex<EncWorkspace<B>>,
     pub bytes: u64,
+}
+
+/// A device buffer that grows on demand and is otherwise kept: `cudaFree` synchronizes the
+/// device and `cudaMalloc` + memset are not cheap either, so per-call scratch costs far more
+/// than the kernels it serves on short clips.
+struct Grow<B: Backend>(Option<(B::Buffer, usize)>);
+
+impl<B: Backend> Default for Grow<B> {
+    fn default() -> Self {
+        Grow(None)
+    }
+}
+
+impl<B: Backend> Grow<B> {
+    /// The buffer, at least `len` long. Contents are whatever the last user left: every caller
+    /// writes the range it reads.
+    fn get(&mut self, b: &B, len: usize) -> Result<&mut B::Buffer> {
+        if self.0.as_ref().is_none_or(|(_, cap)| *cap < len) {
+            // A quarter of headroom, so a slowly growing clip length does not reallocate every time.
+            let cap = len + len / 4;
+            self.0 = None; // free the old one first: the new one may need its memory
+            self.0 = Some((b.alloc(cap)?, cap));
+        }
+        Ok(&mut self.0.as_mut().expect("allocated above").0)
+    }
+}
+
+/// Encoder scratch reused across encodes. Measured on an RTX 5060 Ti (Windows / WDDM) with 20
+/// realtime call streams: admission (encode + prefill) took 195 ms per group of ~90 rows while
+/// the GPU was busy about a third of the time; the rest was the ~16 allocations, frees and
+/// uploads per encode. The returned embeddings are still allocated per call (the caller keeps them).
+pub struct EncWorkspace<B: Backend> {
+    img: Grow<B>,
+    cols: Grow<B>,
+    acts: [Grow<B>; 3],
+    tr: Grow<B>,
+    rows: Grow<B>,
+    x: Grow<B>,
+    pos: Grow<B>,
+    hbuf: Grow<B>,
+    q: Grow<B>,
+    k: Grow<B>,
+    v: Grow<B>,
+    attn: Grow<B>,
+    o: Grow<B>,
+    f: Grow<B>,
+}
+
+impl<B: Backend> Default for EncWorkspace<B> {
+    fn default() -> Self {
+        EncWorkspace {
+            img: Grow::default(),
+            cols: Grow::default(),
+            acts: Default::default(),
+            tr: Grow::default(),
+            rows: Grow::default(),
+            x: Grow::default(),
+            pos: Grow::default(),
+            hbuf: Grow::default(),
+            q: Grow::default(),
+            k: Grow::default(),
+            v: Grow::default(),
+            attn: Grow::default(),
+            o: Grow::default(),
+            f: Grow::default(),
+        }
+    }
 }
 
 /// Intermediate results of [`Qwen3Asr::encode_traced`], for verification.
@@ -82,6 +151,7 @@ impl<B: Backend> Qwen3Asr<B> {
         let dec_ws = std::sync::Mutex::new(DecWorkspace::new(b, &cfg)?);
         Ok(Qwen3Asr {
             dec_ws,
+            enc_ws: std::sync::Mutex::new(EncWorkspace::default()),
             pos,
             pos_rows: POS_CHUNKS * per,
             cfg,
@@ -105,7 +175,12 @@ impl<B: Backend> Qwen3Asr<B> {
     /// to the same width (docs: tail chunks), so clips batch when all have at least one full
     /// chunk; a shorter clip must come alone. Everything after the host-built mel image runs on the
     /// device, `CONV_GROUP` chunks per pass.
-    fn conv_stack(&self, b: &B, clips: &[(&[f32], usize)]) -> Result<(B::Buffer, Vec<usize>)> {
+    fn conv_stack(
+        &self,
+        b: &B,
+        clips: &[(&[f32], usize)],
+        ws: &mut EncWorkspace<B>,
+    ) -> Result<Vec<usize>> {
         let e = &self.cfg.enc;
         let chunk = e.chunk_frames;
         let pad_to = match clips {
@@ -159,54 +234,52 @@ impl<B: Backend> Qwen3Asr<B> {
         let full = shapes(group);
         let act = |s: &Im2colShape| s.images * s.out_h() * s.out_w() * ch;
         let cols_len = full.iter().map(Im2colShape::out_len).max().unwrap_or(0);
-        let mut cols = b.alloc(cols_len)?;
-        let mut acts = [
-            b.alloc(act(&full[0]))?,
-            b.alloc(act(&full[1]))?,
-            b.alloc(act(&full[2]))?,
+        let cols = ws.cols.get(b, cols_len)?;
+        let [a0, a1, a2] = &mut ws.acts;
+        let acts = [
+            a0.get(b, act(&full[0]))?,
+            a1.get(b, act(&full[1]))?,
+            a2.get(b, act(&full[2]))?,
         ];
-        let mut tr = b.alloc(act(&full[2]))?;
+        let tr = ws.tr.get(b, act(&full[2]))?;
         let (fq, t) = (full[2].out_h(), full[2].out_w());
         debug_assert_eq!(fq, e.conv_freq());
         let feat = ch * fq;
         let tokens: usize = valid.iter().sum();
-        let mut rows = b.alloc(tokens * feat)?;
+        let rows = ws.rows.get(b, tokens * feat)?;
         let mut at = 0;
         let image = e.mels * pad_to;
+        // Each group's images go into the same scratch: write_at is stream-ordered (work queued
+        // before it reads the old values) and does not allocate.
+        let x0 = ws.img.get(b, group * image)?;
         for g0 in (0..chunks).step_by(group) {
             let gn = group.min(chunks - g0);
             let sh = shapes(gn);
-            let x0 = b.upload(&img[g0 * image..(g0 + gn) * image])?;
+            b.write_at(x0, 0, &img[g0 * image..(g0 + gn) * image])?;
             for (stage, s) in sh.iter().enumerate() {
-                let src = if stage == 0 { &x0 } else { &acts[stage - 1] };
-                b.im2col_3x3s2(src, &mut cols, *s)?;
+                let src: &B::Buffer = if stage == 0 { x0 } else { acts[stage - 1] };
+                b.im2col_3x3s2(src, cols, *s)?;
                 let (wm, bias) = &self.enc.conv[stage];
                 let m = s.images * s.out_h() * s.out_w();
-                b.linear(&cols, &wm.view(), &mut acts[stage], m)?;
-                b.add_bias_gelu(&mut acts[stage], bias, m, ch, GeluKind::Erf)?;
+                b.linear(cols, &wm.view(), acts[stage], m)?;
+                b.add_bias_gelu(acts[stage], bias, m, ch, GeluKind::Erf)?;
             }
             // [gn, fq, t, ch] -> [gn, t, fq, ch]: each time step's features f * ch + c.
-            b.transpose_heads(&acts[2], &mut tr, gn, fq, t, ch)?;
+            b.transpose_heads(acts[2], tr, gn, fq, t, ch)?;
             for c in g0..g0 + gn {
-                b.copy(
-                    &tr,
-                    (c - g0) * t * feat,
-                    &mut rows,
-                    at * feat,
-                    valid[c] * feat,
-                )?;
+                b.copy(tr, (c - g0) * t * feat, rows, at * feat, valid[c] * feat)?;
                 at += valid[c];
             }
         }
         debug_assert_eq!(at, tokens);
-        let mut out = b.alloc(tokens * e.d)?;
-        b.linear(&rows, &self.enc.conv_out.view(), &mut out, tokens)?;
+        let out = ws.x.get(b, tokens * e.d)?;
+        b.linear(rows, &self.enc.conv_out.view(), out, tokens)?;
         // Positions restart in every chunk: each clip's are a prefix of the repeated table.
         let counts: Vec<usize> = clips.iter().map(|c| e.tokens(c.1)).collect();
         if let [n] = counts[..] {
             if n <= self.pos_rows {
-                b.add(&mut out, &self.pos, n * e.d)?;
-                return Ok((out, counts));
+                b.add(out, &self.pos, n * e.d)?;
+                return Ok(counts);
             }
         }
         let per = EncConfig::chunk_tokens(chunk);
@@ -219,8 +292,10 @@ impl<B: Backend> Qwen3Asr<B> {
                     .take(n * e.d)
             })
             .collect();
-        b.add(&mut out, &b.upload(&pos)?, tokens * e.d)?;
-        Ok((out, counts))
+        let pb = ws.pos.get(b, pos.len())?;
+        b.write_at(pb, 0, &pos)?;
+        b.add(out, pb, tokens * e.d)?;
+        Ok(counts)
     }
 
     /// Audio embeddings `[tokens, hidden]` for 16 kHz mono PCM.
@@ -282,12 +357,19 @@ impl<B: Backend> Qwen3Asr<B> {
                 )));
             }
         }
-        let (mut x, counts) = self.conv_stack(b, clips)?;
+        let mut guard = self
+            .enc_ws
+            .lock()
+            .map_err(|_| Error::Backend("encoder workspace poisoned".into()))?;
+        let ws = &mut *guard;
+        let counts = self.conv_stack(b, clips, ws)?;
         let n: usize = counts.iter().sum();
+        let (d, hd) = (e.d, e.head_dim());
+        let x = ws.x.get(b, n * d)?;
         let mut tr = if trace {
             let mut conv = vec![0f32; n * e.d];
             b.synchronize()?;
-            b.download(&x, &mut conv)?;
+            b.download(x, &mut conv)?;
             Some(EncodeTrace {
                 mel: Vec::new(),
                 frames: 0,
@@ -310,12 +392,15 @@ impl<B: Backend> Qwen3Asr<B> {
             }
             at += cn;
         }
-        let (d, hd) = (e.d, e.head_dim());
-        let mut hbuf = b.alloc(n * d)?;
-        let (mut q, mut k, mut v) = (b.alloc(n * d)?, b.alloc(n * d)?, b.alloc(n * d)?);
-        let mut attn = b.alloc(n * d)?;
-        let mut o = b.alloc(n * d)?;
-        let mut f = b.alloc(n * e.ffn)?;
+        let hbuf = ws.hbuf.get(b, n * d)?;
+        let (q, k, v) = (
+            ws.q.get(b, n * d)?,
+            ws.k.get(b, n * d)?,
+            ws.v.get(b, n * d)?,
+        );
+        let attn = ws.attn.get(b, n * d)?;
+        let o = ws.o.get(b, n * d)?;
+        let f = ws.f.get(b, n * e.ffn)?;
         // Every token attends to its whole window: one ranges call per layer instead of five
         // launches (three copies in, attention, one copy out) per window.
         let ranges: Vec<(u32, u32)> = windows
@@ -330,31 +415,31 @@ impl<B: Backend> Qwen3Asr<B> {
             pool_rows: n,
         };
         for l in &self.enc.layers {
-            b.layer_norm(&x, &l.ln1.0, &l.ln1.1, &mut hbuf, n, d, e.ln_eps)?;
-            Self::linear(b, &hbuf, &l.q, &mut q, n)?;
-            Self::linear(b, &hbuf, &l.k, &mut k, n)?;
-            Self::linear(b, &hbuf, &l.v, &mut v, n)?;
-            b.attention_ranges(&q, &k, &v, &mut attn, &ranges, shape)?;
-            Self::linear(b, &attn, &l.out, &mut o, n)?;
-            b.add(&mut x, &o, n * d)?;
-            b.layer_norm(&x, &l.ln2.0, &l.ln2.1, &mut hbuf, n, d, e.ln_eps)?;
-            Self::linear(b, &hbuf, &l.fc1, &mut f, n)?;
-            b.gelu(&mut f, n * e.ffn, GeluKind::Erf)?;
-            Self::linear(b, &f, &l.fc2, &mut o, n)?;
-            b.add(&mut x, &o, n * d)?;
+            b.layer_norm(x, &l.ln1.0, &l.ln1.1, hbuf, n, d, e.ln_eps)?;
+            Self::linear(b, hbuf, &l.q, q, n)?;
+            Self::linear(b, hbuf, &l.k, k, n)?;
+            Self::linear(b, hbuf, &l.v, v, n)?;
+            b.attention_ranges(q, k, v, attn, &ranges, shape)?;
+            Self::linear(b, attn, &l.out, o, n)?;
+            b.add(x, o, n * d)?;
+            b.layer_norm(x, &l.ln2.0, &l.ln2.1, hbuf, n, d, e.ln_eps)?;
+            Self::linear(b, hbuf, &l.fc1, f, n)?;
+            b.gelu(f, n * e.ffn, GeluKind::Erf)?;
+            Self::linear(b, f, &l.fc2, o, n)?;
+            b.add(x, o, n * d)?;
             if let Some(t) = tr.as_mut() {
                 let mut host = vec![0f32; n * d];
                 b.synchronize()?;
-                b.download(&x, &mut host)?;
+                b.download(x, &mut host)?;
                 t.layers.push(host);
             }
         }
         let (lw, lb) = &self.enc.ln_post;
-        b.layer_norm(&x, lw, lb, &mut hbuf, n, d, e.ln_eps)?;
-        Self::linear(b, &hbuf, &self.enc.proj1, &mut o, n)?;
-        b.gelu(&mut o, n * d, GeluKind::Erf)?;
+        b.layer_norm(x, lw, lb, hbuf, n, d, e.ln_eps)?;
+        Self::linear(b, hbuf, &self.enc.proj1, o, n)?;
+        b.gelu(o, n * d, GeluKind::Erf)?;
         let mut out = b.alloc(n * self.cfg.dec.hidden)?;
-        Self::linear(b, &o, &self.enc.proj2, &mut out, n)?;
+        Self::linear(b, o, &self.enc.proj2, &mut out, n)?;
         Ok((out, counts, tr))
     }
 
