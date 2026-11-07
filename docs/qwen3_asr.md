@@ -131,6 +131,13 @@ above: the system turn is written even when empty. llama-server drops it without
 - `VELOX_ASR_PHASES=1` prints, whenever the engine goes idle, wall time admitting (encode +
   prefill) vs decoding by batch size. At 16 requests admission was 75% of the time before the
   split-K and encoder changes.
+- The encoder's scratch (im2col columns, conv activations, the residual stream, q / k / v, FFN)
+  lives in a grow-only workspace, and the mel image and multi-clip positions are written into it
+  with `write_at`: allocating and freeing ~16 buffers per encode cost more than the kernels on short
+  clips (`cudaFree` synchronizes the device; WDDM makes both slow). 20 realtime call streams on the
+  RTX 5060 Ti, 3 minutes: 195 -> 108 ms per admission, 2.15 -> 1.14 ms per encoder row, 67% more
+  requests served in the same time (partials 14 -> 51 per stream), final p50 1.27 -> 0.86 s, p90
+  3.12 -> 2.22 s; transcripts unchanged (LibriSpeech streams: same 72 / 4590 word errors).
 - Tried and dropped: an int8 (dp4a, Int8G32) kernel for q8_g32 at 2-16 tokens. End to end it was
   ~10% slower at 16 requests than the variant's bf16 skinny kernel and moved 3-6 of 52 segments
   off the reference.
