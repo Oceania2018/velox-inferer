@@ -841,7 +841,7 @@ pub const PREFILL_CAP: usize = 1024;
 
 /// Rows one batched decode step may feed in all: a token per sequence plus the draft tokens it
 /// verifies (see [`Qwen3Asr::step_batch_draft`]).
-pub const VERIFY_ROWS: usize = 64;
+pub const VERIFY_ROWS: usize = 32;
 
 const GRAPH_DECODE_BATCH: u64 = 2 << 16;
 

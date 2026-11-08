@@ -134,7 +134,10 @@ above: the system turn is written even when empty. llama-server drops it without
   (up to 24) after its last token in the same pass and keeps the greedy predictions up to the first
   draft token the model would not have produced (`Qwen3Asr::step_batch_draft`), so the output is
   what one-token steps give; after a mismatch the draft re-anchors on the output's last 1-3 tokens.
-  A step feeds 64 rows at most; rows beyond one per sequence go to the most urgent requests first.
+  A step feeds 32 rows at most; rows beyond one per sequence go to the most urgent requests first.
+  (64 was tried: steps of 33-64 rows cost 8-17 ms against 3-6 ms up to 20, and every sequence in
+  the batch pays for them; 24 streams x 10 min, 32 against 64 rows: final p99 0.70 vs 0.72 s, max
+  0.84 vs 0.97 s, engine p99 145 vs 157 ms.)
   The verify rows run the projections at a wider batch than a one-token step would, a numeric
   difference of the same kind as batch composition (below): on the 84 segments of two calls, alone
   on the device, output was identical with no draft, the exact output as draft, and a draft with a
