@@ -22,6 +22,7 @@ use velox_frontend::PlainTokenizer;
 use velox_models::qwen3_asr::mel::{MelFrontend, SAMPLE_RATE};
 use velox_models::qwen3_asr::{
     BatchWorkspace, KvPool, PoolSeq, Qwen3Asr, AUDIO_PAD, IM_END, MAX_BATCH, PREFILL_ROWS,
+    VERIFY_ROWS,
 };
 
 use crate::args::Args;
@@ -40,6 +41,10 @@ struct Job {
     /// sidecar sends 0 for a realtime final, 1 for batch files and 2 for partials (provisional text
     /// the next partial or the final replaces). See `admissible`.
     priority: u8,
+    /// Tokens the request expects to produce, from its `draft` field (the sidecar sends a final the
+    /// last partial of the same speech): verified in the decode steps, never trusted (see
+    /// `Qwen3Asr::step_batch_draft`), so they change how fast the output comes, not what it is.
+    draft: Vec<u32>,
     received: Instant,
     reply: Sender<std::result::Result<Done, String>>,
 }
@@ -148,6 +153,76 @@ struct Active {
     last: u32,
     /// Output tokens this sequence may still produce in its KV range.
     room: usize,
+    /// Where the job's draft continues after `ids` (`None` while the output has left it), and
+    /// where to search for it again (see `anchor`).
+    draft_at: Option<usize>,
+    draft_from: usize,
+}
+
+impl Active {
+    /// Re-aligns the draft with the output after new ids.
+    fn follow_draft(&mut self) {
+        if self.job.draft.is_empty() {
+            return;
+        }
+        self.draft_at = anchor(&self.job.draft, &self.ids, self.draft_from);
+        if let Some(at) = self.draft_at {
+            self.draft_from = at;
+        }
+    }
+
+    /// Records one produced id; true when the sequence is done (`truncated` set when cut short).
+    fn push(&mut self, id: u32, truncated: &mut bool) -> bool {
+        if id == IM_END {
+            return true;
+        }
+        self.ids.push(id);
+        self.last = id;
+        self.room -= 1;
+        *truncated = self.ids.len() >= self.job.max_new || self.room == 0;
+        *truncated
+    }
+}
+
+/// Draft tokens fed per sequence per step at most.
+const DRAFT_MAX: usize = 24;
+
+/// Draft tokens each active sequence feeds this step: the rows a step has beyond one per
+/// sequence go to the most urgent sequences first (a final before the partials decoding next to
+/// it), each within its draft, its KV range and its token limit.
+fn draft_lens(active: &[Active]) -> Vec<usize> {
+    let mut lens = vec![0; active.len()];
+    let mut budget = VERIFY_ROWS.saturating_sub(active.len());
+    let mut order: Vec<usize> = (0..active.len()).collect();
+    order.sort_by_key(|&i| active[i].job.priority);
+    for i in order {
+        let a = &active[i];
+        let Some(at) = a.draft_at else { continue };
+        let k = DRAFT_MAX
+            .min(budget)
+            .min(a.job.draft.len() - at)
+            .min(a.seq.capacity() - a.seq.pos - 1)
+            .min(a.job.max_new.saturating_sub(a.ids.len() + 1));
+        lens[i] = k;
+        budget -= k;
+    }
+    lens
+}
+
+/// Where `draft` continues after the output `ids`: just past the first place, at or after
+/// `from` (less a little slack, as the output may repeat a word the draft already passed), where
+/// it holds the output's last 3 tokens, else its last 2, else its last one. A transcription of
+/// the same speech mostly agrees with the output, with words changed here and there; after each
+/// change this finds where they agree again.
+fn anchor(draft: &[u32], ids: &[u32], from: usize) -> Option<usize> {
+    for n in (1..=ids.len().min(3)).rev() {
+        let tail = &ids[ids.len() - n..];
+        let start = from.saturating_sub(n + 2);
+        if let Some(j) = draft.get(start..)?.windows(n).position(|w| w == tail) {
+            return Some(start + j + n);
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,6 +274,7 @@ fn engine<B: Backend>(
                 frames,
                 max_new: i + 2,
                 priority: 0,
+                draft: Vec::new(),
                 received: Instant::now(),
                 reply: warm_tx.clone(),
             });
@@ -306,34 +382,46 @@ fn engine<B: Backend>(
             continue;
         }
         let ids: Vec<u32> = active.iter().map(|a| a.last).collect();
+        let lens = draft_lens(&active);
+        let drafted: usize = lens.iter().sum();
         let t_step = Instant::now();
         let next = {
             let mut ws = m.decoder_workspace()?;
+            // Copied out (VERIFY_ROWS tokens at most) so the sequences can be borrowed mutably.
+            let drafts: Vec<Vec<u32>> = active
+                .iter()
+                .zip(&lens)
+                .map(|(a, &k)| match a.draft_at {
+                    Some(at) => a.job.draft[at..at + k].to_vec(),
+                    None => Vec::new(),
+                })
+                .collect();
+            let drafts: Vec<&[u32]> = drafts.iter().map(Vec::as_slice).collect();
             let mut seqs: Vec<&mut PoolSeq> = active.iter_mut().map(|a| &mut a.seq).collect();
-            m.step_batch(b, &mut pool, &mut seqs, &ids, &mut ws, &mut bw)?
+            m.step_batch_draft(b, &mut pool, &mut seqs, &ids, &drafts, &mut ws, &mut bw)?
         };
         if serving {
-            ph.step(t_step.elapsed().as_secs_f64(), active.len());
+            let accepted: usize = next.iter().map(|v| v.len() - 1).sum();
+            ph.step(
+                t_step.elapsed().as_secs_f64(),
+                active.len(),
+                drafted,
+                accepted,
+            );
         }
         steps += 1;
         let mut i = 0;
         let mut next = next.into_iter();
         while i < active.len() {
-            let id = next.next().unwrap_or(IM_END);
+            let produced = next.next().unwrap_or_else(|| vec![IM_END]);
             let a = &mut active[i];
-            if id == IM_END {
+            let mut truncated = false;
+            if produced.into_iter().any(|id| a.push(id, &mut truncated)) {
                 let a = active.remove(i);
-                finish(&mut pool, a, false);
+                finish(&mut pool, a, truncated);
                 continue;
             }
-            a.ids.push(id);
-            a.last = id;
-            a.room -= 1;
-            if a.ids.len() >= a.job.max_new || a.room == 0 {
-                let a = active.remove(i);
-                finish(&mut pool, a, true);
-                continue;
-            }
+            a.follow_draft();
             i += 1;
         }
         while warm_rx.try_recv().is_ok() {
@@ -363,8 +451,11 @@ struct Phases {
     admits: usize,
     admitted: usize,
     admit_rows: usize,
-    /// Decode time and steps by batch size.
+    /// Decode time and steps by rows fed (sequences plus draft tokens).
     steps: std::collections::BTreeMap<usize, (f64, usize)>,
+    /// Draft tokens fed and accepted.
+    drafted: usize,
+    accepted: usize,
 }
 
 impl Phases {
@@ -374,8 +465,10 @@ impl Phases {
         self.admitted += n;
         self.admit_rows += rows;
     }
-    fn step(&mut self, s: f64, batch: usize) {
-        let e = self.steps.entry(batch).or_default();
+    fn step(&mut self, s: f64, batch: usize, drafted: usize, accepted: usize) {
+        self.drafted += drafted;
+        self.accepted += accepted;
+        let e = self.steps.entry(batch + drafted).or_default();
         e.0 += s;
         e.1 += 1;
     }
@@ -386,7 +479,7 @@ impl Phases {
             return;
         }
         eprintln!(
-            "[phases] admit {:.3}s enc {:.3}s ({} groups, {} requests, {} rows, {:.1} us/row)  decode {:.3}s ({n} steps)",
+            "[phases] admit {:.3}s enc {:.3}s ({} groups, {} requests, {} rows, {:.1} us/row)  decode {:.3}s ({n} steps; {} draft tokens fed, {} accepted)",
             self.admit_s,
             self.enc_s,
             self.admits,
@@ -394,13 +487,15 @@ impl Phases {
             self.admit_rows,
             1e6 * self.admit_s / self.admit_rows.max(1) as f64,
             dec
+            , self.drafted,
+            self.accepted
         );
         let line: Vec<String> = self
             .steps
             .iter()
             .map(|(b, (s, n))| format!("{b}:{n}x{:.2}ms", 1e3 * s / *n as f64))
             .collect();
-        eprintln!("[phases] decode by batch {}", line.join(" "));
+        eprintln!("[phases] decode by rows {}", line.join(" "));
         *self = Phases::default();
     }
 }
@@ -442,26 +537,32 @@ fn admit_group<B: Backend>(
             g.1.mel = Vec::new();
         }
         let mut ws = m.decoder_workspace()?;
-        if let [(seq, job)] = &mut group[..] {
-            if job.prompt.len() > PREFILL_ROWS {
-                return Ok(vec![m.start_pooled(
-                    b,
-                    pool,
-                    seq,
-                    &mut ws,
-                    bw,
-                    &job.prompt,
-                    &audio,
-                )?]);
+        let firsts = (|| {
+            if let [(seq, job)] = &mut group[..] {
+                if job.prompt.len() > PREFILL_ROWS {
+                    return Ok(vec![m.start_pooled(
+                        b,
+                        pool,
+                        seq,
+                        &mut ws,
+                        bw,
+                        &job.prompt,
+                        &audio,
+                    )?]);
+                }
             }
-        }
-        let mut at = 0;
-        let mut reqs: Vec<(&mut PoolSeq, &[u32], usize)> = Vec::with_capacity(group.len());
-        for ((seq, job), &n) in group.iter_mut().zip(&counts) {
-            reqs.push((seq, &job.prompt[..], at));
-            at += n;
-        }
-        m.prefill_many(b, pool, &mut reqs, &audio, &mut ws, bw)
+            let mut at = 0;
+            let mut reqs: Vec<(&mut PoolSeq, &[u32], usize)> = Vec::with_capacity(group.len());
+            for ((seq, job), &n) in group.iter_mut().zip(&counts) {
+                reqs.push((seq, &job.prompt[..], at));
+                at += n;
+            }
+            m.prefill_many(b, pool, &mut reqs, &audio, &mut ws, bw)
+        })();
+        // Both prefills end in a host readback of the first ids, so nothing reads the embeddings
+        // any more (and the next encode is queued after them on the same stream anyway).
+        m.recycle_audio(audio);
+        firsts
     })();
     let firsts = match r {
         Ok(f) => f,
@@ -481,6 +582,8 @@ fn admit_group<B: Backend>(
             ids: Vec::new(),
             last: first,
             room,
+            draft_at: None,
+            draft_from: 0,
         };
         if first == IM_END {
             finish(pool, a, false);
@@ -491,6 +594,7 @@ fn admit_group<B: Backend>(
             finish(pool, a, true);
             continue;
         }
+        a.follow_draft();
         out.push(a);
     }
     Ok(out)
@@ -688,6 +792,11 @@ fn chat(
     let priority = req["priority"]
         .as_u64()
         .map_or(0, |p| p.min(u8::MAX as u64) as u8);
+    // The text expected after the prompt (after the assistant prefix, when one is sent).
+    let draft = match req["draft"].as_str() {
+        Some(d) if !d.is_empty() => tok.encode(d).map_err(|e| bad(e.to_string()))?,
+        _ => Vec::new(),
+    };
     let (reply, wait) = mpsc::channel();
     tx.send(Job {
         prompt,
@@ -695,6 +804,7 @@ fn chat(
         frames,
         max_new,
         priority,
+        draft,
         received: Instant::now(),
         reply,
     })
@@ -838,6 +948,24 @@ mod tests {
     fn base64_round_trip() {
         assert_eq!(base64_decode("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
         assert_eq!(base64_decode("AAEC/w==").unwrap(), vec![0, 1, 2, 255]);
+    }
+
+    #[test]
+    fn draft_anchors_after_the_output() {
+        let draft = [1, 2, 3, 4, 5, 6, 7];
+        // In step: continues after the last token.
+        assert_eq!(anchor(&draft, &[1], 0), Some(1));
+        assert_eq!(anchor(&draft, &[1, 2, 3], 2), Some(3));
+        // A changed word: lost until the output meets the draft again.
+        assert_eq!(anchor(&draft, &[1, 2, 9], 2), None);
+        assert_eq!(anchor(&draft, &[1, 2, 9, 5], 2), Some(5));
+        // An inserted word, then back in step.
+        assert_eq!(anchor(&draft, &[1, 2, 9, 3, 4], 2), Some(4));
+        // The longest matching tail wins over an earlier single-token match.
+        assert_eq!(anchor(&[5, 1, 5, 6], &[4, 5, 6], 0), Some(4));
+        // Never before `from` (less slack for the tail).
+        assert_eq!(anchor(&[1, 9, 9, 9, 9, 9, 9, 1, 2], &[1], 8), Some(8));
+        assert_eq!(anchor(&draft, &[1], 7), None);
     }
 
     #[test]
