@@ -1626,6 +1626,157 @@ impl<B: Backend> Suite<'_, B> {
         Ok(())
     }
 
+    fn pool_ops(&mut self, lens: &[u32], heads: usize, kv_heads: usize, d: usize) -> Result<()> {
+        let rows = lens.len();
+        let row = kv_heads * d;
+        // Ranges laid out with gaps; each sequence's new row goes right after its range.
+        let mut ranges = Vec::new();
+        let mut at = 3u32;
+        for &l in lens {
+            ranges.push((at, l));
+            at += l + 5;
+        }
+        let pool_rows = at as usize;
+        let dst: Vec<u32> = ranges.iter().map(|&(a, l)| a + l - 1).collect();
+        let shape = velox_core::PoolShape {
+            rows,
+            heads,
+            kv_heads,
+            head_dim: d,
+            pool_rows,
+        };
+        let (k, v) = (self.rng.vec(rows * row, 1.0), self.rng.vec(rows * row, 1.0));
+        let (kp0, vp0) = (
+            self.rng.vec(pool_rows * row, 1.0),
+            self.rng.vec(pool_rows * row, 1.0),
+        );
+        let q = self.rng.vec(rows * heads * d, 1.0);
+        let (mut kw, mut vw) = (kp0.clone(), vp0.clone());
+        CpuBackend.kv_scatter(&k, &v, &mut kw, &mut vw, &dst, shape)?;
+        let mut want = vec![0.0; rows * heads * d];
+        CpuBackend.attention_ranges(&q, &kw, &vw, &mut want, &ranges, shape)?;
+        let (kd, vd) = (self.b.upload(&k)?, self.b.upload(&v)?);
+        let (mut kpd, mut vpd) = (self.b.upload(&kp0)?, self.b.upload(&vp0)?);
+        self.b
+            .kv_scatter(&kd, &vd, &mut kpd, &mut vpd, &dst, shape)?;
+        let got_k = fetch(self.b, &kpd, pool_rows * row)?;
+        self.record(
+            format!("kv_scatter {rows} rows of {row}"),
+            None,
+            &got_k,
+            &kw,
+            0.0,
+        );
+        let qd = self.b.upload(&q)?;
+        let mut od = self.b.alloc(rows * heads * d)?;
+        self.b
+            .attention_ranges(&qd, &kpd, &vpd, &mut od, &ranges, shape)?;
+        let got = fetch(self.b, &od, rows * heads * d)?;
+        self.record(
+            format!("attention_ranges lens {lens:?} heads {heads}/{kv_heads} x {d}"),
+            None,
+            &got,
+            &want,
+            1e-4,
+        );
+        Ok(())
+    }
+
+    /// `rope_cos_sin` then `qk_norm_rope_kv` (fused q | k | v rows into scattered pool rows) against
+    /// the CPU oracle; untouched pool rows must stay as they were.
+    fn qkv_rope_pool(
+        &mut self,
+        positions: &[u32],
+        heads: usize,
+        kv_heads: usize,
+        d: usize,
+    ) -> Result<()> {
+        let rows = positions.len();
+        let pool_rows = 4 * rows + 3;
+        let dst: Vec<u32> = (0..rows).map(|r| (4 * r + 1) as u32).collect();
+        let shape = velox_core::QkvRopeShape {
+            rows,
+            heads,
+            kv_heads,
+            head_dim: d,
+            pool_rows,
+            eps: 1e-6,
+        };
+        let row = kv_heads * d;
+        let qkv = self.rng.vec(rows * shape.row(), 2.0);
+        let (qn, kn) = (
+            self.rng.vec(heads * d, 1.0),
+            self.rng.vec(kv_heads * d, 1.0),
+        );
+        let (kp0, vp0) = (
+            self.rng.vec(pool_rows * row, 1.0),
+            self.rng.vec(pool_rows * row, 1.0),
+        );
+        let theta = 1_000_000.0;
+        let mut table = vec![0.0; rows * d];
+        CpuBackend.rope_cos_sin(positions, d, theta, &mut table)?;
+        let (mut q_want, mut kw, mut vw) = (vec![0.0; rows * heads * d], kp0.clone(), vp0.clone());
+        CpuBackend.qk_norm_rope_kv(
+            &qkv,
+            &qn,
+            &kn,
+            &table,
+            &mut q_want,
+            &mut kw,
+            &mut vw,
+            &dst,
+            shape,
+        )?;
+        let mut td = self.b.alloc(rows * d)?;
+        self.b.rope_cos_sin(positions, d, theta, &mut td)?;
+        let got_t = fetch(self.b, &td, rows * d)?;
+        self.record(
+            format!("rope_cos_sin {rows} positions x {d}"),
+            None,
+            &got_t,
+            &table,
+            1e-6,
+        );
+        let (xd, qnd, knd) = (
+            self.b.upload(&qkv)?,
+            self.b.upload(&qn)?,
+            self.b.upload(&kn)?,
+        );
+        let (mut kpd, mut vpd) = (self.b.upload(&kp0)?, self.b.upload(&vp0)?);
+        let mut qd = self.b.alloc(rows * heads * d)?;
+        // The device table (rounded once, like the oracle's) so the case checks this op alone.
+        self.b.qk_norm_rope_kv(
+            &xd, &qnd, &knd, &td, &mut qd, &mut kpd, &mut vpd, &dst, shape,
+        )?;
+        let name = format!("qk_norm_rope_kv {rows} rows heads {heads}/{kv_heads} x {d}");
+        let got_q = fetch(self.b, &qd, rows * heads * d)?;
+        self.record(format!("{name} q"), None, &got_q, &q_want, 1e-5);
+        let got_k = fetch(self.b, &kpd, pool_rows * row)?;
+        self.record(format!("{name} k pool"), None, &got_k, &kw, 1e-5);
+        let got_v = fetch(self.b, &vpd, pool_rows * row)?;
+        self.record(format!("{name} v pool"), None, &got_v, &vw, 0.0);
+        Ok(())
+    }
+
+    fn im2col_3x3s2(&mut self, images: usize, h: usize, w: usize, c: usize) -> Result<()> {
+        let shape = velox_core::Im2colShape { images, h, w, c };
+        let x = self.rng.vec(shape.in_len(), 1.0);
+        let mut want = vec![0.0; shape.out_len()];
+        CpuBackend.im2col_3x3s2(&x, &mut want, shape)?;
+        let xd = self.b.upload(&x)?;
+        let mut yd = self.b.alloc(shape.out_len())?;
+        self.b.im2col_3x3s2(&xd, &mut yd, shape)?;
+        let got = fetch(self.b, &yd, shape.out_len())?;
+        self.record(
+            format!("im2col_3x3s2 {images}x[{h}x{w}x{c}]"),
+            None,
+            &got,
+            &want,
+            0.0,
+        );
+        Ok(())
+    }
+
     fn transpose_heads(&mut self, rows: usize, a: usize, b: usize, dim: usize) -> Result<()> {
         let n = rows * a * b * dim;
         let x = self.rng.vec(n, 1.0);
@@ -3625,6 +3776,8 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         1,
     )?;
     // Gated DeltaNet outputs into llama.cpp's tiled value-head order (16 key heads x 3).
+    // Qwen3-ASR conv stack (docs/qwen3_asr.md): the mel image, the 480-channel layers, a short
+    // single chunk and odd sizes that exercise the zero border.
     s.transpose_heads(1, 16, 3, 128)?;
     s.transpose_heads(37, 16, 3, 128)?;
     s.transpose_heads(5, 2, 3, 7)?;
@@ -3821,6 +3974,21 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
         },
         false,
     )?;
+    // Qwen3-ASR (docs/qwen3_asr.md), last so the cases above keep their random inputs: batched
+    // decode over one KV pool (sequences of one key, a block boundary and long; GQA 16 / 8 x 128;
+    // a narrow odd case) and the conv stack's patches (the mel image, the 480-channel layers, a
+    // short single chunk, odd sizes for the zero border).
+    s.pool_ops(&[1, 4, 129, 300], 16, 8, 128)?;
+    s.pool_ops(&[2, 7], 4, 1, 64)?;
+    s.im2col_3x3s2(2, 128, 100, 1)?;
+    s.im2col_3x3s2(3, 64, 50, 480)?;
+    s.im2col_3x3s2(1, 32, 13, 480)?;
+    s.im2col_3x3s2(2, 7, 5, 3)?;
+    // The fused q | k | v decode post-processing: decode positions (one row, a batch with long
+    // positions) and a narrow odd case.
+    s.qkv_rope_pool(&[0], 16, 8, 128)?;
+    s.qkv_rope_pool(&[5, 130, 999, 4095, 17], 16, 8, 128)?;
+    s.qkv_rope_pool(&[3, 1], 4, 1, 64)?;
     // Its own seed: the synthetic model must not change when cases are added before it.
     let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);

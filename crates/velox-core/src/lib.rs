@@ -23,11 +23,11 @@ pub mod variant;
 pub use backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, ConvShape, CopySpec,
     DilatedConvShape, ExpertBank, ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind,
-    HcCombineShape, KvStoreShape, LinearDst, LinearPart, MoeRouteShape, NormKind, QsaPoolShape,
-    QsaSelectShape, RopeLayout, RopePosShape, RopeShape, RowGateShape, WeightView, GRAPH_KV_BUCKET,
-    GRAPH_STATIC,
+    HcCombineShape, Im2colShape, KvStoreShape, LinearDst, LinearPart, MoeRouteShape, NormKind,
+    PoolShape, QkvRopeShape, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
+    RowGateShape, WeightView, GRAPH_KV_BUCKET, GRAPH_STATIC,
 };
-pub use error::{Error, Result};
+pub use error::{device_lost, mark_device_lost, Error, Result};
 pub use format::WeightFormat;
 pub use kv::KvFormat;
 pub use op::Op;
