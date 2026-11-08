@@ -292,19 +292,24 @@ int launch(Args p) {
     return velox_launch_status();
 }
 
+// One pass over the weights serves every token: up to 64 (8 n-tiles). q4 / q5 callers stay at 16; q8
+// (Qwen3-ASR decode, batches of up to 32 sequences) used to re-read its weights per 16-token block.
 template <int F>
 int launch_fmt(Args p) {
-    return p.m <= 8 ? launch<F, 1>(p) : launch<F, 2>(p);
+    if (p.m <= 8) return launch<F, 1>(p);
+    if (p.m <= 16) return launch<F, 2>(p);
+    if constexpr (F == kQ8) return p.m <= 32 ? launch<F, 4>(p) : launch<F, 8>(p);
+    else return VELOX_ERR_UNSUPPORTED;
 }
 
 }  // namespace
 
 // y[m, rows] = bf16(x) . W[row_begin.., :]^T for a row_split_k128_v1 parent [parent_rows, k] in
-// format 4 (q4_g64), 5 (q5_g64) or 8 (q8_g32), 1 <= m <= 16. Returns VELOX_ERR_UNSUPPORTED for
+// format 4 (q4_g64), 5 (q5_g64) or 8 (q8_g32), 1 <= m <= 16 (q8: 64). Returns VELOX_ERR_UNSUPPORTED for
 // anything else.
 VELOX_API int velox_5060_linear_skinny_rs(const float* x, int m, const uint8_t* w, long long parent_rows, long long k,
                                           long long row_begin, int rows, int format, float* y) {
-    if (m < 1 || m > 16 || rows <= 0 || reinterpret_cast<uintptr_t>(w) % 16 != 0) return VELOX_ERR_UNSUPPORTED;
+    if (m < 1 || m > (format == kQ8 ? 64 : 16) || rows <= 0 || reinterpret_cast<uintptr_t>(w) % 16 != 0) return VELOX_ERR_UNSUPPORTED;
     if (format != kQ4 && format != kQ5 && format != kQ8) return VELOX_ERR_UNSUPPORTED;
     Args p{};
     p.w = w;
