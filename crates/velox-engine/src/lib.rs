@@ -77,6 +77,9 @@ pub struct EngineConfig {
     pub host_context_bytes: usize,
     /// LRFU decay per request of the context store (0: least recently used).
     pub lrfu_lambda: f64,
+    /// Common roots the context store evicts only after everything else (see
+    /// `ContextStore::pinned`); 0: plain LRFU.
+    pub ctx_pin_roots: usize,
     /// Storage format of the recurrent states the context store keeps (ninfer
     /// `--host-state-dtype`): bf16 holds twice as many prefixes as f32 in the same RAM, nvfp4
     /// about 5.5 times; lanes always run on f32 state.
@@ -757,6 +760,7 @@ where
         let mut store = ContextStore::new(
             cfg.host_context_bytes,
             cfg.lrfu_lambda,
+            cfg.ctx_pin_roots,
             disk,
             DISK_GAIN,
             cfg.disk_context_roots,

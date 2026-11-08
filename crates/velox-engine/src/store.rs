@@ -84,6 +84,11 @@ const FORK_KEYS: usize = 64;
 const MIN_FORKS: usize = 3;
 /// Conversations counted per root: enough to rank the common ones.
 const MAX_FORKS: usize = 64;
+/// Requests since its last reference after which a common root is no longer kept resident (see
+/// [`ContextStore::evict`]): long enough to span the gaps of an agent type that comes back every
+/// 10-20 minutes on a busy server (~60 requests a minute), short enough that a retired system
+/// prompt gives its memory back.
+const PIN_IDLE: u64 = 4096;
 
 impl<B: Backend> Entry<B> {
     pub fn pos(&self) -> usize {
@@ -121,6 +126,8 @@ pub(crate) struct ContextStore<B: Backend> {
     disk_min: usize,
     /// Most common roots kept on disk (see [`Self::persist`]).
     disk_roots: usize,
+    /// Most common roots evicted only after everything else (see [`Self::evict`]).
+    pin_roots: usize,
     /// Entries no longer resident whose disk copy is still being written, by record id (their
     /// memory must stay put).
     inflight: Vec<(u64, Entry<B>)>,
@@ -199,11 +206,13 @@ where
 
 impl<B: Backend> ContextStore<B> {
     /// A store of at most `budget` bytes ranking entries by LRFU with decay `lambda` per request,
-    /// keeping recurrent states in `format`, and the `disk_roots` most common roots of at least
-    /// `disk_min` tokens on `disk`.
+    /// keeping recurrent states in `format`, the `pin_roots` most common roots resident over
+    /// everything else, and the `disk_roots` most common roots of at least `disk_min` tokens on
+    /// `disk`.
     pub fn new(
         budget: usize,
         lambda: f64,
+        pin_roots: usize,
         disk: Option<DiskTier>,
         disk_min: usize,
         disk_roots: usize,
@@ -214,6 +223,7 @@ impl<B: Backend> ContextStore<B> {
             disk,
             disk_min,
             disk_roots,
+            pin_roots,
             inflight: Vec::new(),
             entries: Vec::new(),
             spare: Vec::new(),
@@ -263,16 +273,7 @@ impl<B: Backend> ContextStore<B> {
         let Some(disk) = self.disk.as_ref().filter(|d| d.persistent()) else {
             return Ok(());
         };
-        let mut common: Vec<usize> = (0..self.entries.len())
-            .filter(|&i| self.entries[i].common() && self.entries[i].pos() >= self.disk_min)
-            .collect();
-        common.sort_by(|&x, &y| {
-            let (x, y) = (&self.entries[x], &self.entries[y]);
-            (y.forks.len(), self.demand(y))
-                .partial_cmp(&(x.forks.len(), self.demand(x)))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        common.truncate(self.disk_roots);
+        let common = self.most_common(self.disk_roots, |e| e.pos() >= self.disk_min);
         let new: Vec<usize> = common
             .into_iter()
             .filter(|&i| {
@@ -588,6 +589,38 @@ impl<B: Backend> ContextStore<B> {
             .chain(self.inflight.iter().map(|(_, e)| e))
             .filter(|e| e.pos() <= limit && e.prefix_of(keys))
             .max_by_key(|e| e.pos())
+    }
+
+    /// Indices of the `n` most common roots (see [`Entry::common`]) passing `keep`: most
+    /// conversations served first, then the highest demand.
+    fn most_common(&self, n: usize, keep: impl Fn(&Entry<B>) -> bool) -> Vec<usize> {
+        let roots = (0..self.entries.len())
+            .filter(|&i| self.entries[i].common() && keep(&self.entries[i]))
+            .map(|i| {
+                (
+                    i,
+                    self.entries[i].forks.len(),
+                    self.demand(&self.entries[i]),
+                )
+            })
+            .collect();
+        rank_common(roots, n)
+    }
+
+    /// Ids of the roots [`Self::evict`] takes only after everything else: the `pin_roots` most
+    /// common ones referenced within the last [`PIN_IDLE`] requests. LRFU alone ranks by recency
+    /// (at λ = 0.1 a root used every few requests for an hour leads a one-off entry by at most
+    /// ~40 requests), so a system prompt whose agent type comes back every 10-20 minutes was
+    /// evicted in between and then read back from disk or prefilled again.
+    fn pinned(&self) -> HashSet<u64> {
+        if self.pin_roots == 0 {
+            return HashSet::new();
+        }
+        let now = self.now;
+        self.most_common(self.pin_roots, |e| now - e.last <= PIN_IDLE)
+            .into_iter()
+            .map(|i| self.entries[i].id)
+            .collect()
     }
 
     fn demand(&self, e: &Entry<B>) -> f64 {
@@ -928,19 +961,23 @@ impl<B: Backend> ContextStore<B> {
         self.entries.len()
     }
 
-    /// Evicts superseded entries first, then the lowest demand, until the store fits its budget.
-    /// `keep` (the entry just stored) is never evicted.
+    /// Evicts superseded entries first, then the lowest demand, and the pinned common roots (see
+    /// [`Self::pinned`]) only when nothing else is left, until the store fits its budget. `keep`
+    /// (the entry just stored) is never evicted.
     fn evict(&mut self, b: &B, keep: u64) -> Result<(), CoreError> {
         let mut synced = false;
+        let mut pinned: Option<HashSet<u64>> = None;
         while self.bytes(b) > self.budget {
+            let pinned = pinned.get_or_insert_with(|| self.pinned());
             let victim = self
                 .entries
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| e.id != keep)
                 .min_by(|(_, x), (_, y)| {
-                    (!x.superseded, self.demand(x))
-                        .partial_cmp(&(!y.superseded, self.demand(y)))
+                    let (px, py) = (pinned.contains(&x.id), pinned.contains(&y.id));
+                    (!x.superseded, px, self.demand(x))
+                        .partial_cmp(&(!y.superseded, py, self.demand(y)))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(i, _)| i);
@@ -1044,8 +1081,27 @@ fn page_hashes(keys: &[u32]) -> Vec<u64> {
         .collect()
 }
 
+/// The `n` most common of `roots` (`(index, conversations served, demand)`): most conversations
+/// first, then the highest demand.
+fn rank_common(mut roots: Vec<(usize, usize, f64)>, n: usize) -> Vec<usize> {
+    roots.sort_by(|x, y| {
+        (y.1, y.2)
+            .partial_cmp(&(x.1, x.2))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    roots.into_iter().take(n).map(|(i, _, _)| i).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn common_roots_rank_by_conversations_then_demand() {
+        // Conversations served outrank recency; demand breaks ties; at most n.
+        let roots = vec![(0, 3, 900.0), (1, 64, 10.0), (2, 64, 50.0), (3, 5, 1000.0)];
+        assert_eq!(super::rank_common(roots.clone(), 3), vec![2, 1, 3]);
+        assert_eq!(super::rank_common(roots, 0), Vec::<usize>::new());
+    }
+
     #[test]
     fn page_hashes_chain_the_prefix() {
         let a: Vec<u32> = (0..3 * super::KV_PAGE_ROWS as u32 + 5).collect();

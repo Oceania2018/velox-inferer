@@ -30,7 +30,105 @@ pub struct Qwen3Asr<B: Backend> {
     pos_rows: usize,
     /// The decoder workspace every request uses: static decode graphs replay on its buffers.
     dec_ws: std::sync::Mutex<DecWorkspace<B>>,
+    /// The encoder's scratch, reused by every encode (see [`EncWorkspace`]).
+    enc_ws: std::sync::Mutex<EncWorkspace<B>>,
     pub bytes: u64,
+}
+
+/// A device buffer that grows on demand and is otherwise kept: `cudaFree` synchronizes the
+/// device and `cudaMalloc` + memset are not cheap either, so per-call scratch costs far more
+/// than the kernels it serves on short clips.
+struct Grow<B: Backend>(Option<(B::Buffer, usize)>);
+
+impl<B: Backend> Default for Grow<B> {
+    fn default() -> Self {
+        Grow(None)
+    }
+}
+
+impl<B: Backend> Grow<B> {
+    /// The buffer, at least `len` long. Contents are whatever the last user left: every caller
+    /// writes the range it reads.
+    fn get(&mut self, b: &B, len: usize) -> Result<&mut B::Buffer> {
+        if self.0.as_ref().is_none_or(|(_, cap)| *cap < len) {
+            // A quarter of headroom, so a slowly growing clip length does not reallocate every time.
+            let cap = len + len / 4;
+            self.0 = None; // free the old one first: the new one may need its memory
+            self.0 = Some((b.alloc(cap)?, cap));
+        }
+        Ok(&mut self.0.as_mut().expect("allocated above").0)
+    }
+
+    /// The buffer itself, at least `len` long, for a caller that keeps it past this call;
+    /// [`Grow::give`] hands it back.
+    fn take(&mut self, b: &B, len: usize) -> Result<(B::Buffer, usize)> {
+        match self.0.take() {
+            Some((buf, cap)) if cap >= len => Ok((buf, cap)),
+            old => {
+                drop(old);
+                let cap = len + len / 4;
+                Ok((b.alloc(cap)?, cap))
+            }
+        }
+    }
+
+    /// Keeps `buf` (of `cap` slots) for the next [`Grow::take`] unless a larger one is held.
+    fn give(&mut self, buf: B::Buffer, cap: usize) {
+        if self.0.as_ref().is_none_or(|(_, have)| *have < cap) {
+            self.0 = Some((buf, cap));
+        }
+    }
+}
+
+/// Encoder scratch reused across encodes. Measured on an RTX 5060 Ti (Windows / WDDM) with 20
+/// realtime call streams: admission (encode + prefill) took 195 ms per group of ~90 rows while
+/// the GPU was busy about a third of the time; the rest was the ~16 allocations, frees and
+/// uploads per encode. The returned embeddings are still allocated per call (the caller keeps them).
+pub struct EncWorkspace<B: Backend> {
+    img: Grow<B>,
+    cols: Grow<B>,
+    acts: [Grow<B>; 3],
+    tr: Grow<B>,
+    rows: Grow<B>,
+    x: Grow<B>,
+    pos: Grow<B>,
+    hbuf: Grow<B>,
+    q: Grow<B>,
+    k: Grow<B>,
+    v: Grow<B>,
+    attn: Grow<B>,
+    o: Grow<B>,
+    f: Grow<B>,
+    /// The returned embeddings: a server hands them back with [`Qwen3Asr::recycle_audio`] once
+    /// prefilled. Allocating them per call was the last allocation on the request path, and the
+    /// one that hurt: past ~1 MB (8 s of audio) a WDDM `cudaMalloc` took 127 ms on average and up
+    /// to 0.5 s on a near-full RTX 5060 Ti, so a 16 s clip took 211 ms against 45 ms for 8 s.
+    out: Grow<B>,
+    /// Capacity of the embeddings last handed out (what [`Qwen3Asr::recycle_audio`] gives back).
+    out_cap: usize,
+}
+
+impl<B: Backend> Default for EncWorkspace<B> {
+    fn default() -> Self {
+        EncWorkspace {
+            img: Grow::default(),
+            cols: Grow::default(),
+            acts: Default::default(),
+            tr: Grow::default(),
+            rows: Grow::default(),
+            x: Grow::default(),
+            pos: Grow::default(),
+            hbuf: Grow::default(),
+            q: Grow::default(),
+            k: Grow::default(),
+            v: Grow::default(),
+            attn: Grow::default(),
+            o: Grow::default(),
+            f: Grow::default(),
+            out: Grow::default(),
+            out_cap: 0,
+        }
+    }
 }
 
 /// Intermediate results of [`Qwen3Asr::encode_traced`], for verification.
@@ -82,6 +180,7 @@ impl<B: Backend> Qwen3Asr<B> {
         let dec_ws = std::sync::Mutex::new(DecWorkspace::new(b, &cfg)?);
         Ok(Qwen3Asr {
             dec_ws,
+            enc_ws: std::sync::Mutex::new(EncWorkspace::default()),
             pos,
             pos_rows: POS_CHUNKS * per,
             cfg,
@@ -105,7 +204,12 @@ impl<B: Backend> Qwen3Asr<B> {
     /// to the same width (docs: tail chunks), so clips batch when all have at least one full
     /// chunk; a shorter clip must come alone. Everything after the host-built mel image runs on the
     /// device, `CONV_GROUP` chunks per pass.
-    fn conv_stack(&self, b: &B, clips: &[(&[f32], usize)]) -> Result<(B::Buffer, Vec<usize>)> {
+    fn conv_stack(
+        &self,
+        b: &B,
+        clips: &[(&[f32], usize)],
+        ws: &mut EncWorkspace<B>,
+    ) -> Result<Vec<usize>> {
         let e = &self.cfg.enc;
         let chunk = e.chunk_frames;
         let pad_to = match clips {
@@ -159,54 +263,52 @@ impl<B: Backend> Qwen3Asr<B> {
         let full = shapes(group);
         let act = |s: &Im2colShape| s.images * s.out_h() * s.out_w() * ch;
         let cols_len = full.iter().map(Im2colShape::out_len).max().unwrap_or(0);
-        let mut cols = b.alloc(cols_len)?;
-        let mut acts = [
-            b.alloc(act(&full[0]))?,
-            b.alloc(act(&full[1]))?,
-            b.alloc(act(&full[2]))?,
+        let cols = ws.cols.get(b, cols_len)?;
+        let [a0, a1, a2] = &mut ws.acts;
+        let acts = [
+            a0.get(b, act(&full[0]))?,
+            a1.get(b, act(&full[1]))?,
+            a2.get(b, act(&full[2]))?,
         ];
-        let mut tr = b.alloc(act(&full[2]))?;
+        let tr = ws.tr.get(b, act(&full[2]))?;
         let (fq, t) = (full[2].out_h(), full[2].out_w());
         debug_assert_eq!(fq, e.conv_freq());
         let feat = ch * fq;
         let tokens: usize = valid.iter().sum();
-        let mut rows = b.alloc(tokens * feat)?;
+        let rows = ws.rows.get(b, tokens * feat)?;
         let mut at = 0;
         let image = e.mels * pad_to;
+        // Each group's images go into the same scratch: write_at is stream-ordered (work queued
+        // before it reads the old values) and does not allocate.
+        let x0 = ws.img.get(b, group * image)?;
         for g0 in (0..chunks).step_by(group) {
             let gn = group.min(chunks - g0);
             let sh = shapes(gn);
-            let x0 = b.upload(&img[g0 * image..(g0 + gn) * image])?;
+            b.write_at(x0, 0, &img[g0 * image..(g0 + gn) * image])?;
             for (stage, s) in sh.iter().enumerate() {
-                let src = if stage == 0 { &x0 } else { &acts[stage - 1] };
-                b.im2col_3x3s2(src, &mut cols, *s)?;
+                let src: &B::Buffer = if stage == 0 { x0 } else { acts[stage - 1] };
+                b.im2col_3x3s2(src, cols, *s)?;
                 let (wm, bias) = &self.enc.conv[stage];
                 let m = s.images * s.out_h() * s.out_w();
-                b.linear(&cols, &wm.view(), &mut acts[stage], m)?;
-                b.add_bias_gelu(&mut acts[stage], bias, m, ch, GeluKind::Erf)?;
+                b.linear(cols, &wm.view(), acts[stage], m)?;
+                b.add_bias_gelu(acts[stage], bias, m, ch, GeluKind::Erf)?;
             }
             // [gn, fq, t, ch] -> [gn, t, fq, ch]: each time step's features f * ch + c.
-            b.transpose_heads(&acts[2], &mut tr, gn, fq, t, ch)?;
+            b.transpose_heads(acts[2], tr, gn, fq, t, ch)?;
             for c in g0..g0 + gn {
-                b.copy(
-                    &tr,
-                    (c - g0) * t * feat,
-                    &mut rows,
-                    at * feat,
-                    valid[c] * feat,
-                )?;
+                b.copy(tr, (c - g0) * t * feat, rows, at * feat, valid[c] * feat)?;
                 at += valid[c];
             }
         }
         debug_assert_eq!(at, tokens);
-        let mut out = b.alloc(tokens * e.d)?;
-        b.linear(&rows, &self.enc.conv_out.view(), &mut out, tokens)?;
+        let out = ws.x.get(b, tokens * e.d)?;
+        b.linear(rows, &self.enc.conv_out.view(), out, tokens)?;
         // Positions restart in every chunk: each clip's are a prefix of the repeated table.
         let counts: Vec<usize> = clips.iter().map(|c| e.tokens(c.1)).collect();
         if let [n] = counts[..] {
             if n <= self.pos_rows {
-                b.add(&mut out, &self.pos, n * e.d)?;
-                return Ok((out, counts));
+                b.add(out, &self.pos, n * e.d)?;
+                return Ok(counts);
             }
         }
         let per = EncConfig::chunk_tokens(chunk);
@@ -219,8 +321,10 @@ impl<B: Backend> Qwen3Asr<B> {
                     .take(n * e.d)
             })
             .collect();
-        b.add(&mut out, &b.upload(&pos)?, tokens * e.d)?;
-        Ok((out, counts))
+        let pb = ws.pos.get(b, pos.len())?;
+        b.write_at(pb, 0, &pos)?;
+        b.add(out, pb, tokens * e.d)?;
+        Ok(counts)
     }
 
     /// Audio embeddings `[tokens, hidden]` for 16 kHz mono PCM.
@@ -256,6 +360,15 @@ impl<B: Backend> Qwen3Asr<B> {
         Ok((out, counts[0]))
     }
 
+    /// Hands back embeddings from [`Self::encode_many`] once nothing still reads them (after the
+    /// prefill that consumed them), so the next encode reuses the buffer instead of allocating.
+    pub fn recycle_audio(&self, audio: B::Buffer) {
+        if let Ok(mut ws) = self.enc_ws.lock() {
+            let cap = ws.out_cap;
+            ws.out.give(audio, cap);
+        }
+    }
+
     /// Audio embeddings of several clips in one pass, `[sum tokens, hidden]` in clip order, and
     /// each clip's token count. Clips shorter than one second (one conv chunk) must come alone.
     /// Attention windows never cross clips, so the rows equal each clip encoded on its own.
@@ -282,12 +395,19 @@ impl<B: Backend> Qwen3Asr<B> {
                 )));
             }
         }
-        let (mut x, counts) = self.conv_stack(b, clips)?;
+        let mut guard = self
+            .enc_ws
+            .lock()
+            .map_err(|_| Error::Backend("encoder workspace poisoned".into()))?;
+        let ws = &mut *guard;
+        let counts = self.conv_stack(b, clips, ws)?;
         let n: usize = counts.iter().sum();
+        let (d, hd) = (e.d, e.head_dim());
+        let x = ws.x.get(b, n * d)?;
         let mut tr = if trace {
             let mut conv = vec![0f32; n * e.d];
             b.synchronize()?;
-            b.download(&x, &mut conv)?;
+            b.download(x, &mut conv)?;
             Some(EncodeTrace {
                 mel: Vec::new(),
                 frames: 0,
@@ -310,12 +430,15 @@ impl<B: Backend> Qwen3Asr<B> {
             }
             at += cn;
         }
-        let (d, hd) = (e.d, e.head_dim());
-        let mut hbuf = b.alloc(n * d)?;
-        let (mut q, mut k, mut v) = (b.alloc(n * d)?, b.alloc(n * d)?, b.alloc(n * d)?);
-        let mut attn = b.alloc(n * d)?;
-        let mut o = b.alloc(n * d)?;
-        let mut f = b.alloc(n * e.ffn)?;
+        let hbuf = ws.hbuf.get(b, n * d)?;
+        let (q, k, v) = (
+            ws.q.get(b, n * d)?,
+            ws.k.get(b, n * d)?,
+            ws.v.get(b, n * d)?,
+        );
+        let attn = ws.attn.get(b, n * d)?;
+        let o = ws.o.get(b, n * d)?;
+        let f = ws.f.get(b, n * e.ffn)?;
         // Every token attends to its whole window: one ranges call per layer instead of five
         // launches (three copies in, attention, one copy out) per window.
         let ranges: Vec<(u32, u32)> = windows
@@ -330,31 +453,32 @@ impl<B: Backend> Qwen3Asr<B> {
             pool_rows: n,
         };
         for l in &self.enc.layers {
-            b.layer_norm(&x, &l.ln1.0, &l.ln1.1, &mut hbuf, n, d, e.ln_eps)?;
-            Self::linear(b, &hbuf, &l.q, &mut q, n)?;
-            Self::linear(b, &hbuf, &l.k, &mut k, n)?;
-            Self::linear(b, &hbuf, &l.v, &mut v, n)?;
-            b.attention_ranges(&q, &k, &v, &mut attn, &ranges, shape)?;
-            Self::linear(b, &attn, &l.out, &mut o, n)?;
-            b.add(&mut x, &o, n * d)?;
-            b.layer_norm(&x, &l.ln2.0, &l.ln2.1, &mut hbuf, n, d, e.ln_eps)?;
-            Self::linear(b, &hbuf, &l.fc1, &mut f, n)?;
-            b.gelu(&mut f, n * e.ffn, GeluKind::Erf)?;
-            Self::linear(b, &f, &l.fc2, &mut o, n)?;
-            b.add(&mut x, &o, n * d)?;
+            b.layer_norm(x, &l.ln1.0, &l.ln1.1, hbuf, n, d, e.ln_eps)?;
+            Self::linear(b, hbuf, &l.q, q, n)?;
+            Self::linear(b, hbuf, &l.k, k, n)?;
+            Self::linear(b, hbuf, &l.v, v, n)?;
+            b.attention_ranges(q, k, v, attn, &ranges, shape)?;
+            Self::linear(b, attn, &l.out, o, n)?;
+            b.add(x, o, n * d)?;
+            b.layer_norm(x, &l.ln2.0, &l.ln2.1, hbuf, n, d, e.ln_eps)?;
+            Self::linear(b, hbuf, &l.fc1, f, n)?;
+            b.gelu(f, n * e.ffn, GeluKind::Erf)?;
+            Self::linear(b, f, &l.fc2, o, n)?;
+            b.add(x, o, n * d)?;
             if let Some(t) = tr.as_mut() {
                 let mut host = vec![0f32; n * d];
                 b.synchronize()?;
-                b.download(&x, &mut host)?;
+                b.download(x, &mut host)?;
                 t.layers.push(host);
             }
         }
         let (lw, lb) = &self.enc.ln_post;
-        b.layer_norm(&x, lw, lb, &mut hbuf, n, d, e.ln_eps)?;
-        Self::linear(b, &hbuf, &self.enc.proj1, &mut o, n)?;
-        b.gelu(&mut o, n * d, GeluKind::Erf)?;
-        let mut out = b.alloc(n * self.cfg.dec.hidden)?;
-        Self::linear(b, &o, &self.enc.proj2, &mut out, n)?;
+        b.layer_norm(x, lw, lb, hbuf, n, d, e.ln_eps)?;
+        Self::linear(b, hbuf, &self.enc.proj1, o, n)?;
+        b.gelu(o, n * d, GeluKind::Erf)?;
+        let (mut out, cap) = ws.out.take(b, n * self.cfg.dec.hidden)?;
+        ws.out_cap = cap;
+        Self::linear(b, o, &self.enc.proj2, &mut out, n)?;
         Ok((out, counts, tr))
     }
 
@@ -715,6 +839,10 @@ pub const MAX_BATCH: usize = 32;
 /// per position.
 pub const PREFILL_CAP: usize = 1024;
 
+/// Rows one batched decode step may feed in all: a token per sequence plus the draft tokens it
+/// verifies (see [`Qwen3Asr::step_batch_draft`]).
+pub const VERIFY_ROWS: usize = 32;
+
 const GRAPH_DECODE_BATCH: u64 = 2 << 16;
 
 /// One F32 KV pool for all serving sequences: per layer `[rows, kv_heads, head_dim]` K and V, and
@@ -800,7 +928,7 @@ impl<B: Backend> KvPool<B> {
 
 /// Buffers of [`Qwen3Asr::step_batch`] beyond the decoder workspace's.
 pub struct BatchWorkspace<B: Backend> {
-    /// `[MAX_BATCH, hidden]` final-norm rows, `[MAX_BATCH, vocab]` logits, one logits row, ids.
+    /// `[VERIFY_ROWS, hidden]` final-norm rows, `[VERIFY_ROWS, vocab]` logits, one logits row, ids.
     normed: B::Buffer,
     logits: B::Buffer,
     row: B::Buffer,
@@ -812,11 +940,12 @@ pub struct BatchWorkspace<B: Backend> {
 impl<B: Backend> BatchWorkspace<B> {
     pub fn new(b: &B, m: &Qwen3Asr<B>) -> Result<Self> {
         let t = &m.cfg.dec;
+        let rows = VERIFY_ROWS.max(MAX_BATCH);
         Ok(BatchWorkspace {
-            normed: b.alloc(MAX_BATCH * t.hidden)?,
-            logits: b.alloc(MAX_BATCH * t.vocab)?,
+            normed: b.alloc(rows * t.hidden)?,
+            logits: b.alloc(rows * t.vocab)?,
             row: b.alloc(t.vocab)?,
-            ids: b.alloc(MAX_BATCH)?,
+            ids: b.alloc(rows)?,
             prefill: m.session(b, PREFILL_CAP)?,
         })
     }
@@ -870,40 +999,101 @@ impl<B: Backend> Qwen3Asr<B> {
         ws: &mut DecWorkspace<B>,
         bw: &mut BatchWorkspace<B>,
     ) -> Result<Vec<u32>> {
+        let none = vec![&[][..]; seqs.len()];
+        let next = self.step_batch_draft(b, pool, seqs, ids, &none, ws, bw)?;
+        Ok(next.into_iter().map(|v| v[0]).collect())
+    }
+
+    /// [`Self::step_batch`] that also verifies drafts: sequence `i` feeds `drafts[i]` (tokens it
+    /// expects to produce next, e.g. an earlier transcription of the same audio) after `ids[i]`,
+    /// in the same pass. Every row predicts greedily, and a row's prediction counts only while
+    /// every draft token fed before it was the prediction of the row before that, so the result
+    /// is exactly what one-token steps produce: per sequence its next id, then one more id per
+    /// draft token accepted, up to the first draft token the model would not have produced (or
+    /// the end token). Positions advance over the verified rows only; KV written for rejected
+    /// rows lies past `pos` and is overwritten by later steps.
+    ///
+    /// All rows together must fit [`VERIFY_ROWS`]. The step is one static graph per total row
+    /// count, the same one a draft-free step of that many sequences records.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_batch_draft(
+        &self,
+        b: &B,
+        pool: &mut KvPool<B>,
+        seqs: &mut [&mut PoolSeq],
+        ids: &[u32],
+        drafts: &[&[u32]],
+        ws: &mut DecWorkspace<B>,
+        bw: &mut BatchWorkspace<B>,
+    ) -> Result<Vec<Vec<u32>>> {
         let n = seqs.len();
-        if n == 0 || n != ids.len() || n > MAX_BATCH || n > ws.rows {
+        let rows = n + drafts.iter().map(|d| d.len()).sum::<usize>();
+        if n == 0
+            || n != ids.len()
+            || n != drafts.len()
+            || n > MAX_BATCH
+            || rows > VERIFY_ROWS
+            || rows > ws.rows
+        {
             return Err(Error::Shape(format!(
-                "step_batch: {n} sequences, {} ids (max {MAX_BATCH})",
-                ids.len()
+                "step_batch: {n} sequences, {} ids, {} drafts, {rows} rows (max {MAX_BATCH} sequences, {VERIFY_ROWS} rows)",
+                ids.len(),
+                drafts.len()
             )));
         }
-        if let Some(s) = seqs.iter().find(|s| s.pos + 1 > s.cap) {
-            return Err(Error::Shape(format!(
-                "sequence at {} past capacity {}",
-                s.pos, s.cap
-            )));
-        }
-        let positions: Vec<u32> = seqs.iter().map(|s| s.pos as u32).collect();
-        let dst: Vec<u32> = seqs.iter().map(|s| (s.base + s.pos) as u32).collect();
-        let ranges: Vec<(u32, u32)> = seqs
+        if let Some((s, d)) = seqs
             .iter()
-            .map(|s| (s.base as u32, (s.pos + 1) as u32))
-            .collect();
-        let kv = seqs.iter().map(|s| s.pos + 1).max().unwrap_or(1);
+            .zip(drafts)
+            .find(|(s, d)| s.pos + 1 + d.len() > s.cap)
+        {
+            return Err(Error::Shape(format!(
+                "sequence at {} with {} draft tokens past capacity {}",
+                s.pos,
+                d.len(),
+                s.cap
+            )));
+        }
+        let (mut row_ids, mut positions, mut dst, mut ranges) = (
+            Vec::with_capacity(rows),
+            Vec::with_capacity(rows),
+            Vec::with_capacity(rows),
+            Vec::with_capacity(rows),
+        );
+        for ((s, &id), d) in seqs.iter().zip(ids).zip(drafts) {
+            for (j, &t) in std::iter::once(&id).chain(d.iter()).enumerate() {
+                let p = s.pos + j;
+                row_ids.push(t);
+                positions.push(p as u32);
+                dst.push((s.base + p) as u32);
+                ranges.push((s.base as u32, (p + 1) as u32));
+            }
+        }
+        let kv = ranges.iter().map(|r| r.1 as usize).max().unwrap_or(1);
         let key = GRAPH_DECODE_BATCH
             | GRAPH_STATIC
-            | (n as u64) << 8
+            | (rows as u64) << 8
             | ((kv.div_ceil(GRAPH_KV_BUCKET) as u64) & 0xffff) << 24;
         b.graph(key, &mut || {
-            self.batch_pass(b, pool, ids, &positions, &dst, &ranges, None, None, ws, bw)
+            self.batch_pass(
+                b, pool, &row_ids, &positions, &dst, &ranges, None, None, ws, bw,
+            )
         })?;
-        for s in seqs.iter_mut() {
-            s.pos += 1;
-        }
-        let mut host = vec![0f32; n];
+        let mut host = vec![0f32; rows];
         b.synchronize()?;
         b.download(&bw.ids, &mut host)?;
-        Ok(host[..n].iter().map(|v| v.to_bits()).collect())
+        let mut out = Vec::with_capacity(n);
+        let mut r = 0;
+        for (s, d) in seqs.iter_mut().zip(drafts) {
+            let pred: Vec<u32> = host[r..r + 1 + d.len()]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            r += 1 + d.len();
+            let k = accepted(d, &pred);
+            s.pos += 1 + k;
+            out.push(pred[..=k].to_vec());
+        }
+        Ok(out)
     }
 
     /// One decoder pass of `ids.len()` rows over the pool: row `r` is position `positions[r]` of a
@@ -1136,6 +1326,17 @@ impl<B: Backend> Qwen3Asr<B> {
     }
 }
 
+/// Draft tokens a verify pass accepts: `pred[j]` is the greedy id after feeding the row before
+/// draft token `j` (`pred[0]` after the sequence's last token), so draft token `j` holds while it
+/// equals `pred[j]`; nothing is accepted past the end token.
+fn accepted(draft: &[u32], pred: &[u32]) -> usize {
+    draft
+        .iter()
+        .zip(pred)
+        .take_while(|(d, p)| d == p && **p != IM_END)
+        .count()
+}
+
 /// Index of the largest value (lowest index on ties, NaN never chosen).
 pub fn argmax(x: &[f32]) -> u32 {
     let mut best = 0;
@@ -1150,6 +1351,17 @@ pub fn argmax(x: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drafts_accepted_up_to_the_first_miss() {
+        // pred[j] follows the row before draft[j]; pred has one more entry than draft.
+        assert_eq!(accepted(&[5, 6, 7], &[5, 6, 7, 8]), 3);
+        assert_eq!(accepted(&[5, 6, 7], &[5, 9, 7, 8]), 1);
+        assert_eq!(accepted(&[5, 6, 7], &[4, 6, 7, 8]), 0);
+        assert_eq!(accepted(&[], &[4]), 0);
+        // The end token stops the sequence even when the draft has it too.
+        assert_eq!(accepted(&[5, IM_END, 7], &[5, IM_END, 7, 8]), 1);
+    }
 
     #[test]
     fn chunk_positions_restart_every_chunk() {

@@ -143,6 +143,11 @@ where
         graph_budget: a.parse::<usize>("graph-mib", 256)? << 20,
         // --ctx-lrfu-lambda F: LRFU decay per request of that store (0: LRU).
         lrfu_lambda: a.parse("ctx-lrfu-lambda", 0.1)?,
+        // --ctx-pin-roots N (default 10; 0: off): the N most common roots (system prompts at
+        // least three conversations used, referenced within the last 4096 requests) are evicted
+        // from that store only after everything else, so an agent type that comes back every
+        // 10-20 minutes resumes its system prompt from RAM instead of disk or a prefill.
+        ctx_pin_roots: a.parse::<usize>("ctx-pin-roots", 10)?,
         // --host-state-dtype f32|bf16|nvfp4 (ninfer's name and default: bf16): storage of the
         // recurrent states the context store keeps; lanes always run on f32 state.
         host_state_format: StateFormat::parse(a.get("host-state-dtype").unwrap_or("bf16"))?,

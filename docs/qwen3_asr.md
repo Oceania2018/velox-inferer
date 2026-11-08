@@ -128,9 +128,44 @@ above: the system turn is written even when empty. llama-server drops it without
   more urgent request is decoding, less urgent ones are not admitted, because admission runs
   between decode steps and stretches every step of the requests decoding. A final decodes in
   ~0.2 s, so partials wait about that long. See the RTX 5060 Ti results below.
+- Requests may carry a `draft` (JSON string, the text expected after the prompt; llama-server
+  ignores it). The sidecar sends a final the raw output of the last partial of the same speech,
+  which the final mostly repeats. Each decode step feeds a drafted sequence's next draft tokens
+  (up to 24) after its last token in the same pass and keeps the greedy predictions up to the first
+  draft token the model would not have produced (`Qwen3Asr::step_batch_draft`), so the output is
+  what one-token steps give; after a mismatch the draft re-anchors on the output's last 1-3 tokens.
+  A step feeds 32 rows at most; rows beyond one per sequence go to the most urgent requests first.
+  (64 was tried: steps of 33-64 rows cost 8-17 ms against 3-6 ms up to 20, and every sequence in
+  the batch pays for them; 24 streams x 10 min, 32 against 64 rows: final p99 0.70 vs 0.72 s, max
+  0.84 vs 0.97 s, engine p99 145 vs 157 ms.)
+  The verify rows run the projections at a wider batch than a one-token step would, a numeric
+  difference of the same kind as batch composition (below): on the 84 segments of two calls, alone
+  on the device, output was identical with no draft, the exact output as draft, and a draft with a
+  word changed and one dropped (engine time 6.2 / 2.3 / 3.2 s). RTX 5090 Laptop (24 GB), 24
+  realtime call streams x 10 min through the sidecar: 78% of fed draft tokens accepted, final p50
+  0.60 -> 0.56 s, p90 0.72 -> 0.62 s, p99 0.92 -> 0.74 s, max 1.15 -> 0.87 s (500 ms VAD silence
+  included), same 2772 finals.
 - `VELOX_ASR_PHASES=1` prints, whenever the engine goes idle, wall time admitting (encode +
-  prefill) vs decoding by batch size. At 16 requests admission was 75% of the time before the
+  prefill) vs decoding by rows fed (sequences plus draft tokens), and draft tokens fed / accepted. At 16 requests admission was 75% of the time before the
   split-K and encoder changes.
+- The encoder's scratch (im2col columns, conv activations, the residual stream, q / k / v, FFN)
+  lives in a grow-only workspace, and the mel image and multi-clip positions are written into it
+  with `write_at`: allocating and freeing ~16 buffers per encode cost more than the kernels on short
+  clips (`cudaFree` synchronizes the device; WDDM makes both slow). 20 realtime call streams on the
+  RTX 5060 Ti, 3 minutes: 195 -> 108 ms per admission, 2.15 -> 1.14 ms per encoder row, 67% more
+  requests served in the same time (partials 14 -> 51 per stream), final p50 1.27 -> 0.86 s, p90
+  3.12 -> 2.22 s; transcripts unchanged (LibriSpeech streams: same 72 / 4590 word errors).
+- The returned embeddings are reused too (`Qwen3Asr::recycle_audio` after the prefill): that
+  per-call `cudaMalloc` was the last allocation on the request path and the expensive one. An
+  nsys trace of 16 s clips showed it at 127 ms on average and up to 547 ms (WDDM, RTX 5060 Ti
+  near full), against 45 ms for a whole 8 s request; past ~1 MB of embeddings (8 s of audio) the
+  allocation is that slow, so engine time jumped from 45 ms at 8 s to 211 ms at 16 s. After:
+  16 / 30 / 60 s clips 211 / 476 / 762 -> 77 / 145 / 298 ms. 20 realtime call streams x 3 min:
+  final p50 0.86 -> 0.63 s, p90 2.22 -> 0.96 s, 2677 requests served (partials 97 per stream);
+  LibriSpeech streams unchanged at 72 / 4590 word errors.
+  With the sidecar's decode concurrency at 32 instead of 16 (20 streams kept all 16 slots busy
+  with partials held behind finals, so new finals queued at the sidecar), p99 9.19 -> 1.03 s and
+  max 10.3 -> 1.14 s.
 - Tried and dropped: an int8 (dp4a, Int8G32) kernel for q8_g32 at 2-16 tokens. End to end it was
   ~10% slower at 16 requests than the variant's bf16 skinny kernel and moved 3-6 of 52 segments
   off the reference.
