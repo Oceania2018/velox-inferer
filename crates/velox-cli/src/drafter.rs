@@ -1,7 +1,8 @@
 //! The block drafter speculative decoding uses: `--drafter dflash2|dspine` (default dflash2),
 //! `--draft-artifact <.vi>` (where its component lives; default the model artifact) and
 //! `--draft-window <n>` (context rows it attends to, at most the trained window; fewer rows shrink
-//! every lane's drafter rings; 0: the trained window).
+//! every lane's drafter rings; 0: the trained window) and `--draft-vocab full|draft` (DSpine:
+//! propose over the target's full output head, the default, or its draft vocabulary head).
 
 use velox_core::{Backend, Error, Result};
 use velox_models::qwen3_5::{DFlashModel, DraftKind};
@@ -15,6 +16,7 @@ pub struct DraftSource {
     explicit: bool,
     art: Option<Artifact>,
     window: Option<usize>,
+    full_head: bool,
 }
 
 impl DraftSource {
@@ -28,11 +30,21 @@ impl DraftSource {
             0 => None,
             n => Some(n),
         };
+        let full_head = match a.get("draft-vocab").unwrap_or("full") {
+            "draft" => false,
+            "full" => true,
+            other => {
+                return Err(Error::Config(format!(
+                    "--draft-vocab must be full or draft, got '{other}'"
+                )))
+            }
+        };
         Ok(DraftSource {
             kind,
             explicit: kind == DraftKind::DSpine,
             art,
             window,
+            full_head,
         })
     }
 
@@ -63,6 +75,11 @@ impl DraftSource {
         main: &Artifact,
         hidden: usize,
     ) -> Result<Option<DFlashModel<B>>> {
-        DFlashModel::load_kind(b, self.artifact(main), hidden, self.kind, self.window)
+        let mut dm =
+            DFlashModel::load_kind(b, self.artifact(main), hidden, self.kind, self.window)?;
+        if let Some(d) = dm.as_mut() {
+            d.set_full_head(self.full_head);
+        }
+        Ok(dm)
     }
 }
