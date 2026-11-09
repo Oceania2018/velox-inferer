@@ -129,6 +129,8 @@ COMMANDS:
       --draft-artifact <.vi>    the drafter's artifact (e.g. from import-dspine; default --artifact)
       --draft-window <n>        drafter context rows (at most its trained window; fewer: less VRAM;
                                 0: the trained window)
+      --draft-vocab full|draft  DSpine proposal head: the target's full output head (full) or
+                                its draft vocabulary head (draft: cheaper, fewer drafts accepted)
       --score-branch-rows <n>  System One rank candidates per forward pass (100; 0 rejects rank)
       --max-vision-tokens <n>  merged vision tokens per image (32x32 px each) before it is
                             downscaled (1280: 1920x1080 -> 1504x832)

@@ -44,10 +44,6 @@ use velox_serve::{ApiError, ChatEngine, Delta, Outcome, ScoreOutcome, ScoreQuery
 pub use prompt::{build as build_prompt, ImageRun, Prompt};
 pub use sampling::{Sampler, CANDIDATES};
 
-/// Most drafts per sequence in a batched DFlash round: its windows (pending token plus drafts) stay
-/// below the 16 tokens a replayed graph step's attention takes.
-const BATCH_DRAFTS_MAX: usize = velox_models::qwen3_5::VERIFY_MAX - 2;
-
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Maximum tokens (prompt + completion) per request.
@@ -1982,9 +1978,8 @@ impl<B: Backend> Core<B> {
             let bw = bw.as_mut().expect("several lanes have a batch workspace");
             // Every sequence drafts the short block (ninfer's fixed 7 drafts): one shape, so one
             // recorded step, and two sequences fit the 16-row tiles a single long window would
-            // fill. Long blocks pay off only for a request decoding alone. Windows stay below 16
-            // rows: a replayed step cannot attend over 16+ tokens (`--dflash-short 15` drafts 14
-            // here).
+            // fill. Long blocks pay off only for a request decoding alone. Windows stay as wide as
+            // the backend can replay their attention (`Qwen35Text::batch_window_max`).
             let drafts = idx
                 .iter()
                 .filter_map(|&i| match &lanes[active[i].lane].drafter {
@@ -1993,7 +1988,12 @@ impl<B: Backend> Core<B> {
                 })
                 .min()
                 .unwrap_or(1)
-                .min(BATCH_DRAFTS_MAX);
+                .min(
+                    self.model
+                        .batch_window_max(&self.b, self.cfg.kv_format)
+                        .saturating_sub(1)
+                        .max(1),
+                );
             let room = idx.iter().all(|&i| {
                 lanes[active[i].lane].session.pos + drafts < lanes[active[i].lane].session.capacity
             });

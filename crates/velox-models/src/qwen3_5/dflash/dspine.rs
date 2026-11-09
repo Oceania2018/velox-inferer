@@ -19,6 +19,10 @@
 //!          refinement (`RefinementTail.greedy`), divided by rms(u_t) so it reads on a logit scale.
 //! ```
 //!
+//! Only the written rows go through the head (the draft vocabulary head unless
+//! `set_full_head`): x_t = u_t + rms(u_t) W_L m_t, so the pre-write score of a candidate follows
+//! from its logit, the two rows' rms and m_t . TG[c] on the host.
+//!
 //! Row 0's bridge state only feeds row 1 through `(s | v)_0 = TSV[anchor]`, so the codebook stays
 //! on the host: it builds TSV once, and TSV / TG live in system RAM as BF16.
 
@@ -29,7 +33,7 @@ use velox_core::backend::{
     Backend, BlockAttnShape, Copy2dShape, NormKind, PrevGateShape, RmsResidualShape, RopeShape,
 };
 use velox_core::format::{bf16_to_f32, f32_to_bf16, WeightFormat};
-use velox_core::{CopySpec, Error, Result, GRAPH_STATIC};
+use velox_core::{Error, Result, GRAPH_STATIC};
 use velox_weights::{Artifact, ObjectKind};
 
 use super::{
@@ -76,8 +80,10 @@ pub(crate) struct Scratch<B: Backend> {
     rms: B::Buffer,
     /// Each block's `(s | v)` for its anchor row.
     anchor_sv: B::Buffer,
-    /// Pre-write logits at the candidates, gathered for the host.
-    base_host: B::Buffer,
+    /// rms of the written rows that reach the head.
+    rms_post: B::Buffer,
+    /// Host-mapped `rms(u)` and last-layer messages of every block row, then `rms_post`.
+    aux_host: B::Buffer,
 }
 
 impl<B: Backend> Scratch<B> {
@@ -89,7 +95,8 @@ impl<B: Backend> Scratch<B> {
             msg: b.alloc(rows * c.rank)?,
             rms: b.alloc(rows)?,
             anchor_sv: b.alloc(rows * 2 * c.rank)?,
-            base_host: b.alloc_host(rows * c.top_k)?,
+            rms_post: b.alloc(rows)?,
+            aux_host: b.alloc_host(rows * (2 + c.rank))?,
         })
     }
 }
@@ -321,6 +328,7 @@ pub(super) fn load<B: Backend>(
         pred: Vec::new(),
         succ: Vec::new(),
         bridge: Some(bridge),
+        full_head: false,
         bytes,
     })
 }
@@ -438,8 +446,9 @@ impl<B: Backend> DFlashModel<B> {
             )));
         }
         let tw = &target.w;
-        let head = tw.view(&tw.head);
-        let vocab = tw.head.rows;
+        let (head, map) = self.proposal_head(target);
+        let nh = head.rows;
+        let head = tw.view(head);
         let mut ids = vec![c.mask_token; rows];
         let mut sv = Vec::with_capacity(n * 2 * r);
         for (i, &a) in anchors.iter().enumerate() {
@@ -607,9 +616,8 @@ impl<B: Backend> DFlashModel<B> {
                 )?;
                 b.linear(&sp.msg, &self.view(&br.write[li]), &mut dw.z, rows)?;
                 if li == last {
-                    // The pre-write rows (scored after the final norm) and each column's q.
+                    // Each column's q.
                     for i in 0..n {
-                        b.copy(&dw.x, (i * w + 1) * h, &mut dw.tail, (m + i * k) * h, k * h)?;
                         b.copy2d(
                             &sp.packed,
                             &mut dw.g,
@@ -638,48 +646,80 @@ impl<B: Backend> DFlashModel<B> {
             for i in 0..n {
                 b.copy(&dw.x, (i * w + 1) * h, &mut dw.tail, i * k * h, k * h)?;
             }
+            // rms of the written rows: with blocks of one row every row is a block's first, so
+            // `rms_residual_add` only measures.
+            b.rms_residual_add(
+                &mut dw.tail,
+                &dw.z,
+                &mut sp.rms_post,
+                RmsResidualShape {
+                    rows: m,
+                    cols: h,
+                    block: 1,
+                },
+            )?;
             b.rms_norm(
                 &dw.tail,
                 &self.params[self.final_norm],
                 &mut dw.hid,
-                2 * m,
+                m,
                 h,
                 c.eps,
                 NormKind::Plain,
             )?;
-            b.linear(&dw.hid, &head, &mut dw.logits, 2 * m)?;
-            b.copy(&dw.g, 0, &mut dw.g_host, 0, m * r)
+            b.linear(&dw.hid, &head, &mut dw.logits, m)?;
+            b.copy(&dw.g, 0, &mut dw.g_host, 0, m * r)?;
+            // What recovers the pre-write scores: rms(u) and the last layer's messages of every
+            // block row, the written rows' rms.
+            b.copy(&sp.rms, 0, &mut sp.aux_host, 0, rows)?;
+            b.copy(&sp.msg, 0, &mut sp.aux_host, rows, rows * r)?;
+            b.copy(&sp.rms_post, 0, &mut sp.aux_host, rows + rows * r, m)
         })?;
-        let top = b.top_k(&dw.logits, m, vocab, limit.min(vocab), c.top_k)?;
-        // The pre-write rows' logits at each column's candidates.
-        let ops: Vec<CopySpec<'_, B::Buffer>> = top
-            .iter()
-            .enumerate()
-            .flat_map(|(i, row)| {
-                let logits = &dw.logits;
-                row.iter().enumerate().map(move |(j, &(t, _))| CopySpec {
-                    src: logits,
-                    src_offset: (m + i) * vocab + t as usize,
-                    dst: 0,
-                    dst_offset: i * c.top_k + j,
-                    len: 1,
-                })
-            })
-            .collect();
-        b.copy_batch(&mut [&mut sp.base_host], &ops)?;
-        b.synchronize()?;
-        let base = host_rows(b, &sp.base_host, m * c.top_k)?;
+        let fetch = c.top_k + if map.is_some() { 8 } else { 0 };
+        let top = b.top_k(
+            &dw.logits,
+            m,
+            nh,
+            if map.is_some() { nh } else { limit.min(nh) },
+            fetch,
+        )?;
         let g = host_rows(b, &dw.g_host, m * r)?;
+        let aux = host_rows(b, &sp.aux_host, rows + rows * r + m)?;
+        let (rms_u, msg, rms_x) = (
+            &aux[..rows],
+            &aux[rows..rows + rows * r],
+            &aux[rows + rows * r..],
+        );
+        let eps = f64::from(c.eps);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let cands = (0..k)
                 .map(|t| {
-                    let row = i * k + t;
-                    top[row]
+                    let (row, j) = (i * w + 1 + t, i * k + t);
+                    // The head reads the final norm of x = u + rms(u) W m, so with
+                    // TG[c] = W^T (final_norm_w * head_c):
+                    //   head_c . final_norm(u) = (logit_c rms_eps(x) - rms(u) m . TG[c]) / rms_eps(u)
+                    // (the written row's logit, the parallel pass's message m).
+                    let ru = f64::from(rms_u[row]);
+                    let (sx, su) = (
+                        (f64::from(rms_x[j]).powi(2) + eps).sqrt(),
+                        (ru * ru + eps).sqrt(),
+                    );
+                    let mp = &msg[row * r..(row + 1) * r];
+                    top[j]
                         .iter()
-                        .enumerate()
-                        .map(|(j, &(id, _))| (id, base[row * c.top_k + j]))
+                        .map(|&(x, v)| (map.map_or(x, |ids| ids[x as usize]), v))
                         .filter(|&(id, _)| (id as usize) < limit)
+                        .take(c.top_k)
+                        .map(|(id, logit)| {
+                            let tg = &tables.tg[id as usize * r..][..r];
+                            let dot: f64 = mp
+                                .iter()
+                                .zip(tg)
+                                .map(|(&a, &b)| f64::from(a) * f64::from(bf16_to_f32(b)))
+                                .sum();
+                            (id, ((f64::from(logit) * sx - ru * dot) / su) as f32)
+                        })
                         .collect()
                 })
                 .collect();

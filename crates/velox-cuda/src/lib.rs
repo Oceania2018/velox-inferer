@@ -790,6 +790,14 @@ pub trait CudaKernels: Send + Sync {
         AttnPrecision::Exact
     }
 
+    /// Whether `attention` of this shape may run in a replayed graph step; see
+    /// [`Backend::attention_replays`]. The portable kernels stage their position and caches for
+    /// any shape, but a variant that routes some shapes to kernels taking them by value must
+    /// refuse those. The default keeps the windows below 16 tokens that every variant stages.
+    fn attention_replays(&self, s: AttnShape) -> bool {
+        s.tokens < 16
+    }
+
     /// Encodes K/V rows into caches; see [`KvStoreShape`]. Must be bit-exact with
     /// `velox_core::kv::encode_row`.
     fn kv_store(
@@ -2927,17 +2935,22 @@ impl Backend for CudaBackend {
             (2..=16, f) => format!("attention verify kv {f}"),
             (_, f) => format!("attention prefill kv {f}"),
         };
-        if graph_mode() == GraphMode::Replay && s.tokens >= 16 {
-            // Only the portable GQA paths stage their position; tuned prefill kernels do not.
-            return Err(Error::Backend(
-                "attention over 16+ tokens in a replayed graph step".into(),
-            ));
+        if graph_mode() == GraphMode::Replay && !self.kernels.attention_replays(s) {
+            // Tuned kernels that take the position by value would replay the recorded one.
+            return Err(Error::Backend(format!(
+                "attention over {} tokens in a replayed graph step",
+                s.tokens
+            )));
         }
         self.staged(&op, || self.kernels.attention(q, k, v, out, s))
     }
 
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
         self.kernels.attention_precision(s)
+    }
+
+    fn attention_replays(&self, s: AttnShape) -> bool {
+        self.kernels.attention_replays(s)
     }
 
     fn attention_windows_precision(&self, s: AttnShape) -> AttnPrecision {

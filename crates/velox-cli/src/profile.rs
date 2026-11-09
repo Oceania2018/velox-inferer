@@ -490,6 +490,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_precision(s)
     }
+    fn attention_replays(&self, s: AttnShape) -> bool {
+        self.inner.attention_replays(s)
+    }
     fn attention_windows_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_windows_precision(s)
     }

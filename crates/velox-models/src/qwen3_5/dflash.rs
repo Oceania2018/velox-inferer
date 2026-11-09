@@ -211,6 +211,9 @@ pub struct DFlashModel<B: Backend> {
     succ: Vec<u16>,
     /// DSpine's code bridge.
     bridge: Option<dspine::Bridge<B>>,
+    /// DSpine proposes over the target's full output head instead of its draft vocabulary head
+    /// (`proposal/`, the one DFlash2 uses), when the target has one.
+    full_head: bool,
     pub bytes: u64,
 }
 
@@ -464,6 +467,7 @@ impl<B: Backend> DFlashModel<B> {
             pred,
             succ,
             bridge: None,
+            full_head: false,
             bytes,
         }))
     }
@@ -506,19 +510,11 @@ impl<B: Backend> DFlashModel<B> {
         let c = &self.cfg;
         let stage = block;
         let (h, r, w) = (self.hidden, ctx_rows, block.max(batch_rows));
-        let tw = &target.w;
         let dspine = self.bridge.is_some();
-        // DSpine drafts over the full output head, which also scores its pre-write rows (twice
-        // the rows through the head).
-        let (head_rows, fold) = if dspine {
+        if dspine {
             self.dspine_tables(b, target)?;
-            (tw.head.rows, 2)
-        } else {
-            (
-                tw.proposal.as_ref().map_or(tw.head.rows, |p| p.head.rows),
-                1,
-            )
-        };
+        }
+        let head_rows = self.proposal_head(target).0.rows;
         Ok(DFlashWorkspace {
             id: NEXT_DRAFTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ctx_rows,
@@ -553,9 +549,9 @@ impl<B: Backend> DFlashModel<B> {
             gu: b.alloc(w * 2 * c.intermediate)?,
             mg: b.alloc(w * c.intermediate)?,
             mu: b.alloc(w * c.intermediate)?,
-            tail: b.alloc(fold * w * h)?,
-            hid: b.alloc(fold * w * h)?,
-            logits: b.alloc(fold * w * head_rows)?,
+            tail: b.alloc(w * h)?,
+            hid: b.alloc(w * h)?,
+            logits: b.alloc(w * head_rows)?,
             g: b.alloc(w * c.rank)?,
             g_host: b.alloc_host(w * c.rank)?,
             spine: if dspine {
@@ -564,6 +560,25 @@ impl<B: Backend> DFlashModel<B> {
                 None
             },
         })
+    }
+
+    /// DSpine: propose over the target's full output head (`true`) or its draft vocabulary head
+    /// (`false`, the loaded default; a draft outside it is never proposed, at a fraction of the
+    /// head's cost). DFlash2 always uses the draft vocabulary head.
+    pub fn set_full_head(&mut self, full: bool) {
+        self.full_head = full && self.bridge.is_some();
+    }
+
+    /// The head proposals score and, for a draft vocabulary head, its rows' token ids.
+    pub(super) fn proposal_head<'a>(
+        &self,
+        target: &'a Qwen35Text<B>,
+    ) -> (&'a WDesc, Option<&'a [u32]>) {
+        let tw = &target.w;
+        match &tw.proposal {
+            Some(p) if !self.full_head => (&p.head, Some(&p.token_ids[..])),
+            _ => (&tw.head, None),
+        }
     }
 
     /// f32 slots of one [`DraftContext`] page.
@@ -848,10 +863,8 @@ impl<B: Backend> DFlashModel<B> {
         let tw = &target.w;
         let mut ids = vec![c.mask_token; w];
         ids[0] = anchor;
-        let (head, map) = match &tw.proposal {
-            Some(p) => (tw.view(&p.head), Some(&p.token_ids)),
-            None => (tw.view(&tw.head), None),
-        };
+        let (head, map) = self.proposal_head(target);
+        let head = tw.view(head);
         let (qd, kvd) = (c.q_dim(), c.kv_dim());
         let k = drafts;
         // The block forward through the selector projection is one recorded step per width.
@@ -1021,10 +1034,8 @@ impl<B: Backend> DFlashModel<B> {
         for (i, &a) in anchors.iter().enumerate() {
             ids[i * w] = a;
         }
-        let (head, map) = match &tw.proposal {
-            Some(p) => (tw.view(&p.head), Some(&p.token_ids)),
-            None => (tw.view(&tw.head), None),
-        };
+        let (head, map) = self.proposal_head(target);
+        let head = tw.view(head);
         let (qd, kvd) = (c.q_dim(), c.kv_dim());
         let k = drafts;
         // The block forward is one recorded step per batch size and width. Static: positions and
