@@ -62,7 +62,8 @@ where
     // the drafter switches to a longer block while recent rounds accept nearly everything; in
     // production that proposed more drafts without accepting more (4.03 vs ninfer 4.06 per round).
     let dflash_drafts: usize = a.parse("dflash-drafts", 7)?;
-    let use_dflash = dflash_drafts > 0 && art.components().contains_key("dflash2");
+    let draft = crate::drafter::DraftSource::from_args(a)?;
+    let use_dflash = dflash_drafts > 0 && draft.available(art)?;
     let t0 = Instant::now();
     // With DFlash2 the MTP predictor is never used: skip its weights.
     // Matrices kept in system RAM (ninfer NINFER_HOST_MAPPED_WEIGHTS): the token embedding is
@@ -186,6 +187,9 @@ where
         lanes: a.parse("max-concurrency", 6)?,
         mtp_drafts: a.parse("mtp-drafts", 7)?,
         dflash_drafts,
+        // --dflash-short N (default 7): drafts of the short block requests start with; set to
+        // --dflash-drafts to draft that many every round (no adaptation).
+        dflash_short: a.parse("dflash-short", velox_engine::spec::ADAPT_LOW)?,
         kv_format: KvFormat::parse(a.get("kv-format").unwrap_or("f32"))?,
         // --score-branch-rows N (ninfer's name and default: 100; 0 rejects rank questions):
         // System One rank candidates scored per forward pass, at most 256.
@@ -216,12 +220,21 @@ where
     };
     let dflash = if use_dflash {
         let t2 = Instant::now();
-        let d = DFlashModel::load(&b, art, cfg.hidden)?;
+        let d: Option<DFlashModel<_>> = draft.load(&b, art, cfg.hidden)?;
         if let Some(d) = &d {
+            if dflash_drafts + 1 > d.cfg.max_block {
+                return Err(Error::Config(format!(
+                    "--dflash-drafts {dflash_drafts}: the {} drafter was trained on blocks of {}",
+                    draft.kind.component(),
+                    d.cfg.max_block
+                )));
+            }
             eprintln!(
-                "dflash2 drafter loaded ({:.2} GB, {} drafts per block) in {:.1}s{}",
+                "{} drafter loaded ({:.2} GB, {} drafts per block, window {}) in {:.1}s{}",
+                draft.kind.component(),
                 d.bytes as f64 / 1e9,
                 dflash_drafts,
+                d.context_window(),
                 t2.elapsed().as_secs_f64(),
                 in_use(&b)
             );

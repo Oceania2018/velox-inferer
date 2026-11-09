@@ -30,7 +30,7 @@ pub use config::{
 };
 pub use dflash::{
     BlockCandidates, DFlashConfig, DFlashModel, DFlashState, DFlashWorkspace, DraftContext,
-    DRAFT_PAGE_ROWS,
+    DraftKind, DRAFT_PAGE_ROWS,
 };
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use paging::{KvChunkSet, KvPool, KvShare};

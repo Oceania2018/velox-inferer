@@ -44,6 +44,10 @@ use velox_serve::{ApiError, ChatEngine, Delta, Outcome, ScoreOutcome, ScoreQuery
 pub use prompt::{build as build_prompt, ImageRun, Prompt};
 pub use sampling::{Sampler, CANDIDATES};
 
+/// Most drafts per sequence in a batched DFlash round: its windows (pending token plus drafts) stay
+/// below the 16 tokens a replayed graph step's attention takes.
+const BATCH_DRAFTS_MAX: usize = velox_models::qwen3_5::VERIFY_MAX - 2;
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Maximum tokens (prompt + completion) per request.
@@ -108,6 +112,9 @@ pub struct EngineConfig {
     /// DFlash2 drafts per block on the main lane when the engine has a DFlash2 model (0: use MTP
     /// instead).
     pub dflash_drafts: usize,
+    /// Drafts of the short block every request starts with ([`spec::ADAPT_LOW`] by default); at
+    /// least `dflash_drafts` turns adaptation off (every round drafts `dflash_drafts`).
+    pub dflash_short: usize,
     /// Storage format of the target model's attention KV caches.
     pub kv_format: KvFormat,
     /// Page the lanes' attention caches in virtual memory when the backend can: backed as each
@@ -676,10 +683,11 @@ where
             }
             let zero = session.checkpoint_in(&b, cfg.host_checkpoints)?;
             let drafter = match &dflash {
-                Some(dm) => Some(Drafter::DFlash(DFlashDrafter::new(
+                Some(dm) => Some(Drafter::DFlash(DFlashDrafter::with_short(
                     &b,
                     dm,
                     cfg.dflash_drafts,
+                    cfg.dflash_short,
                 )?)),
                 // MTP and plain decoding run one request at a time (see `Core::batchable`).
                 None if i == 0 && cfg.mtp_drafts > 0 && model.has_mtp() => Some(Drafter::Mtp(
@@ -701,12 +709,13 @@ where
             });
         }
         let dw = match &dflash {
-            Some(dm) => Some(DFlashDrafter::workspace(
+            Some(dm) => Some(DFlashDrafter::workspace_short(
                 &b,
                 dm,
                 &model,
                 cfg.chunk,
                 cfg.dflash_drafts,
+                cfg.dflash_short,
                 n_lanes,
             )?),
             None => None,
@@ -1973,7 +1982,9 @@ impl<B: Backend> Core<B> {
             let bw = bw.as_mut().expect("several lanes have a batch workspace");
             // Every sequence drafts the short block (ninfer's fixed 7 drafts): one shape, so one
             // recorded step, and two sequences fit the 16-row tiles a single long window would
-            // fill. Long blocks pay off only for a request decoding alone.
+            // fill. Long blocks pay off only for a request decoding alone. Windows stay below 16
+            // rows: a replayed step cannot attend over 16+ tokens (`--dflash-short 15` drafts 14
+            // here).
             let drafts = idx
                 .iter()
                 .filter_map(|&i| match &lanes[active[i].lane].drafter {
@@ -1981,7 +1992,8 @@ impl<B: Backend> Core<B> {
                     _ => None,
                 })
                 .min()
-                .unwrap_or(1);
+                .unwrap_or(1)
+                .min(BATCH_DRAFTS_MAX);
             let room = idx.iter().all(|&i| {
                 lanes[active[i].lane].session.pos + drafts < lanes[active[i].lane].session.capacity
             });

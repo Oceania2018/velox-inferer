@@ -14,8 +14,8 @@ use velox_core::backend::{
     ActQuant, AttnPrecision, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, CopySpec, DilatedConvShape, DynConvShape, ExpertBank, FullAttnShape,
     GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, Im2colShape, KvStoreShape, LinearDst,
-    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopePosShape, RopeShape, RowGateShape,
-    WeightView, GRAPH_STATIC,
+    MoeRouteShape, NormKind, PrevGateShape, QsaPoolShape, QsaSelectShape, RmsResidualShape,
+    RopePosShape, RopeShape, RowGateShape, WeightView, GRAPH_STATIC,
 };
 use velox_core::{
     check, profile, DeviceProfile, Error, GpuArch, KvFormat, Op, Result, StateFormat, VariantInfo,
@@ -1251,6 +1251,26 @@ pub trait CudaKernels: Send + Sync {
         portable::sigmoid_scale_rows(x, gate, shape)
     }
 
+    fn prev_gate(
+        &self,
+        packed: &CudaBuffer,
+        bias: &CudaBuffer,
+        out: &mut CudaBuffer,
+        shape: PrevGateShape,
+    ) -> Result<()> {
+        portable::prev_gate(packed, bias, out, shape)
+    }
+
+    fn rms_residual_add(
+        &self,
+        x: &mut CudaBuffer,
+        delta: &CudaBuffer,
+        rms: &mut CudaBuffer,
+        shape: RmsResidualShape,
+    ) -> Result<()> {
+        portable::rms_residual_add(x, delta, rms, shape)
+    }
+
     fn moe_route(
         &self,
         logits: &CudaBuffer,
@@ -2356,6 +2376,32 @@ impl Backend for CudaBackend {
         check::row_gate(x.len, gate.len, &shape)?;
         self.timed("sigmoid_scale_rows", || {
             self.kernels.sigmoid_scale_rows(x, gate, shape)
+        })
+    }
+
+    fn prev_gate(
+        &self,
+        packed: &CudaBuffer,
+        bias: &CudaBuffer,
+        out: &mut CudaBuffer,
+        shape: PrevGateShape,
+    ) -> Result<()> {
+        check::prev_gate(packed.len, bias.len, out.len, &shape)?;
+        self.timed("prev_gate", || {
+            self.kernels.prev_gate(packed, bias, out, shape)
+        })
+    }
+
+    fn rms_residual_add(
+        &self,
+        x: &mut CudaBuffer,
+        delta: &CudaBuffer,
+        rms: &mut CudaBuffer,
+        shape: RmsResidualShape,
+    ) -> Result<()> {
+        check::rms_residual(x.len, delta.len, rms.len, &shape)?;
+        self.timed("rms_residual_add", || {
+            self.kernels.rms_residual_add(x, delta, rms, shape)
         })
     }
 
