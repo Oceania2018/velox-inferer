@@ -15,6 +15,12 @@
 //!
 //! Context K/V live in per-layer rings of `window` rows (position `p` at row `p % window`); the
 //! drafter's live interval is `[lo, end)`. Rewinding (prefix reuse) only shrinks it.
+//!
+//! The same model runs DSpine drafters ([`DraftKind::DSpine`], `dspine/`; see [`dspine`]): no
+//! convolutions, block-causal attention, a code-bridge write after every layer and an exact
+//! last-write transition walk instead of the low-rank selector.
+
+mod dspine;
 
 use serde_json::Value;
 use velox_core::backend::{Backend, BlockAttnShape, DynConvShape, NormKind, RopeShape, WeightView};
@@ -40,8 +46,38 @@ fn graph_id<B: Backend>(dw: &DFlashWorkspace<B>, st: &DFlashState<B>) -> u64 {
 /// Context rows up to this many (decode commits) materialize as a recorded step.
 const GRAPH_ROWS: usize = 16;
 
+/// Which block drafter a [`DFlashModel`] runs (its artifact component).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftKind {
+    /// `dflash2/`: DFlash2 (bidirectional block, dynamic convolutions, low-rank selector).
+    DFlash2,
+    /// `dspine/`: DSpine (causal block, code bridge, exact last-write refinement).
+    DSpine,
+}
+
+impl DraftKind {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "dflash2" => Ok(DraftKind::DFlash2),
+            "dspine" => Ok(DraftKind::DSpine),
+            other => Err(Error::Config(format!(
+                "drafter must be dflash2 or dspine, got '{other}'"
+            ))),
+        }
+    }
+
+    /// The artifact component holding the drafter.
+    pub fn component(self) -> &'static str {
+        match self {
+            DraftKind::DFlash2 => "dflash2",
+            DraftKind::DSpine => "dspine",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DFlashConfig {
+    pub kind: DraftKind,
     pub layers: usize,
     pub heads: usize,
     pub kv_heads: usize,
@@ -53,9 +89,16 @@ pub struct DFlashConfig {
     /// Target blocks whose residual outputs form the conditioning features, in order.
     pub target_layers: Vec<usize>,
     pub mask_token: u32,
+    /// DFlash2: channels per convolution group (0 for DSpine).
     pub conv_group: usize,
+    /// DFlash2: selector rank. DSpine: the code bridge's message rank.
     pub rank: usize,
+    /// Candidates per mask column (DSpine: the refinement width).
     pub top_k: usize,
+    /// DSpine: code size of the bridge (0 for DFlash2).
+    pub code_size: usize,
+    /// Most rows of a draft block the drafter was trained on (anchor included).
+    pub max_block: usize,
 }
 
 fn field(v: &Value, key: &str) -> Result<usize> {
@@ -68,6 +111,13 @@ fn field(v: &Value, key: &str) -> Result<usize> {
 impl DFlashConfig {
     pub fn from_json(v: &Value) -> Result<Self> {
         let arch = v["architectures"][0].as_str().unwrap_or("");
+        if arch == "DFlashDraftModel"
+            && v["dflash_config"]
+                .get("selected_prefix_code_bridge")
+                .is_some()
+        {
+            return dspine::config(v);
+        }
         if arch != "DFlash2DraftModel" {
             return Err(Error::Unsupported(format!("draft architecture '{arch}'")));
         }
@@ -91,6 +141,7 @@ impl DFlashConfig {
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| Error::Config("dflash2: bad target_layer_ids".into()))?;
         Ok(DFlashConfig {
+            kind: DraftKind::DFlash2,
             layers,
             heads: field(v, "num_attention_heads")?,
             kv_heads: field(v, "num_key_value_heads")?,
@@ -104,6 +155,8 @@ impl DFlashConfig {
             conv_group: field(d, "conv_group_size")?,
             rank: field(d, "selector_rank")?,
             top_k: field(d, "selector_top_k")?,
+            code_size: 0,
+            max_block: super::VERIFY_MAX,
         })
     }
 
@@ -136,8 +189,9 @@ struct DLayer {
     up: WDesc,
     gate_up: Option<WDesc>,
     down: WDesc,
-    attn_conv: Conv,
-    mlp_conv: Conv,
+    /// DFlash2's dynamic convolutions (none for DSpine).
+    attn_conv: Option<Conv>,
+    mlp_conv: Option<Conv>,
 }
 
 /// DFlash2 weights (`dflash2/`); the token embedding and proposal head are the target's.
@@ -150,10 +204,16 @@ pub struct DFlashModel<B: Backend> {
     context_norm: usize,
     final_norm: usize,
     layers: Vec<DLayer>,
-    hidden_projection: WDesc,
-    /// Host BF16 codebooks `[vocab, rank]`.
+    /// DFlash2's selector projection (none for DSpine).
+    hidden_projection: Option<WDesc>,
+    /// Host BF16 codebooks `[vocab, rank]` (DFlash2).
     pred: Vec<u16>,
     succ: Vec<u16>,
+    /// DSpine's code bridge.
+    bridge: Option<dspine::Bridge<B>>,
+    /// DSpine proposes over the target's full output head instead of its draft vocabulary head
+    /// (`proposal/`, the one DFlash2 uses), when the target has one.
+    full_head: bool,
     pub bytes: u64,
 }
 
@@ -243,6 +303,18 @@ pub struct DFlashWorkspace<B: Backend> {
     g: B::Buffer,
     /// `g` copied to host-mapped memory ahead of the top-k, whose synchronization covers it.
     g_host: B::Buffer,
+    /// DSpine's bridge activations.
+    spine: Option<dspine::Scratch<B>>,
+}
+
+/// A DFlash2 layer's convolution (DSpine layers have none and never reach DFlash2 code).
+fn conv(c: &Option<Conv>) -> &Conv {
+    c.as_ref().expect("a DFlash2 layer has its convolutions")
+}
+
+/// DFlash2's selector projection.
+fn selector(d: &Option<WDesc>) -> &WDesc {
+    d.as_ref().expect("a DFlash2 drafter has its selector")
 }
 
 /// The first `n` values of `buf` (from [`Backend::alloc_host`]) once the device work writing it
@@ -271,10 +343,41 @@ pub struct BlockCandidates {
 impl<B: Backend> DFlashModel<B> {
     /// Loads `dflash2/` when the artifact has it.
     pub fn load(b: &B, art: &Artifact, hidden: usize) -> Result<Option<Self>> {
-        let Some(comp) = art.components().get("dflash2") else {
+        Self::load_kind(b, art, hidden, DraftKind::DFlash2, None)
+    }
+
+    /// Loads the `kind` drafter when the artifact has it; `window` (at most the trained one)
+    /// shortens the context it attends to, which shrinks every sequence's rings.
+    pub fn load_kind(
+        b: &B,
+        art: &Artifact,
+        hidden: usize,
+        kind: DraftKind,
+        window: Option<usize>,
+    ) -> Result<Option<Self>> {
+        let Some(comp) = art.components().get(kind.component()) else {
             return Ok(None);
         };
-        let cfg = DFlashConfig::from_json(&comp["config"])?;
+        let mut cfg = DFlashConfig::from_json(&comp["config"])?;
+        if cfg.kind != kind {
+            return Err(Error::Config(format!(
+                "the {} component holds a {:?} drafter",
+                kind.component(),
+                cfg.kind
+            )));
+        }
+        if let Some(w) = window {
+            if w == 0 || w > cfg.window {
+                return Err(Error::Config(format!(
+                    "draft window {w} must be in 1..={}",
+                    cfg.window
+                )));
+            }
+            cfg.window = w;
+        }
+        if kind == DraftKind::DSpine {
+            return dspine::load(b, art, hidden, cfg).map(Some);
+        }
         let mut l = Loader::new(b, art);
         let h = hidden;
         let feature_projection = l.matrix("dflash2/feature_projection")?;
@@ -297,8 +400,8 @@ impl<B: Backend> DFlashModel<B> {
                     proj,
                 })
             };
-            let attn_conv = conv("attention_conv")?;
-            let mlp_conv = conv("mlp_conv")?;
+            let attn_conv = Some(conv("attention_conv")?);
+            let mlp_conv = Some(conv("mlp_conv")?);
             let qkv = l.rows_of(&[
                 &p("attention/query"),
                 &p("attention/key"),
@@ -326,7 +429,7 @@ impl<B: Backend> DFlashModel<B> {
                 mlp_conv,
             });
         }
-        let hidden_projection = l.matrix("dflash2/candidate_selector/hidden_projection")?;
+        let hidden_projection = Some(l.matrix("dflash2/candidate_selector/hidden_projection")?);
         let codebook = |l: &Loader<'_, B>, name: &str| -> Result<Vec<u16>> {
             let (id, range) = l.binding(name)?;
             let obj = art
@@ -363,6 +466,8 @@ impl<B: Backend> DFlashModel<B> {
             hidden_projection,
             pred,
             succ,
+            bridge: None,
+            full_head: false,
             bytes,
         }))
     }
@@ -405,8 +510,11 @@ impl<B: Backend> DFlashModel<B> {
         let c = &self.cfg;
         let stage = block;
         let (h, r, w) = (self.hidden, ctx_rows, block.max(batch_rows));
-        let tw = &target.w;
-        let head_rows = tw.proposal.as_ref().map_or(tw.head.rows, |p| p.head.rows);
+        let dspine = self.bridge.is_some();
+        if dspine {
+            self.dspine_tables(b, target)?;
+        }
+        let head_rows = self.proposal_head(target).0.rows;
         Ok(DFlashWorkspace {
             id: NEXT_DRAFTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ctx_rows,
@@ -419,9 +527,13 @@ impl<B: Backend> DFlashModel<B> {
             vr: b.alloc(r * c.kv_dim())?,
             x: b.alloc(w * h)?,
             n: b.alloc(w * h)?,
-            prep: b.alloc(w * h)?,
+            prep: b.alloc(if dspine { 1 } else { w * h })?,
             z: b.alloc(w * h)?,
-            delta: b.alloc(w * 4 * (h / c.conv_group))?,
+            delta: b.alloc(if dspine {
+                1
+            } else {
+                w * 4 * (h / c.conv_group)
+            })?,
             qkv: b.alloc(w * (c.q_dim() + 2 * c.kv_dim()))?,
             q: b.alloc(w * c.q_dim())?,
             k: b.alloc(w * c.kv_dim())?,
@@ -442,7 +554,31 @@ impl<B: Backend> DFlashModel<B> {
             logits: b.alloc(w * head_rows)?,
             g: b.alloc(w * c.rank)?,
             g_host: b.alloc_host(w * c.rank)?,
+            spine: if dspine {
+                Some(dspine::Scratch::new(b, c, w)?)
+            } else {
+                None
+            },
         })
+    }
+
+    /// DSpine: propose over the target's full output head (`true`) or its draft vocabulary head
+    /// (`false`, the loaded default; a draft outside it is never proposed, at a fraction of the
+    /// head's cost). DFlash2 always uses the draft vocabulary head.
+    pub fn set_full_head(&mut self, full: bool) {
+        self.full_head = full && self.bridge.is_some();
+    }
+
+    /// The head proposals score and, for a draft vocabulary head, its rows' token ids.
+    pub(super) fn proposal_head<'a>(
+        &self,
+        target: &'a Qwen35Text<B>,
+    ) -> (&'a WDesc, Option<&'a [u32]>) {
+        let tw = &target.w;
+        match &tw.proposal {
+            Some(p) if !self.full_head => (&p.head, Some(&p.token_ids[..])),
+            _ => (&tw.head, None),
+        }
     }
 
     /// f32 slots of one [`DraftContext`] page.
@@ -715,6 +851,10 @@ impl<B: Backend> DFlashModel<B> {
         drafts: usize,
         limit: usize,
     ) -> Result<BlockCandidates> {
+        if self.cfg.kind == DraftKind::DSpine {
+            let mut out = self.dspine_propose(b, target, &[st], dw, &[anchor], drafts, limit)?;
+            return Ok(out.remove(0));
+        }
         let c = &self.cfg;
         let (h, w) = (self.hidden, drafts + 1);
         if drafts == 0 || w > dw.block || w > c.window {
@@ -723,10 +863,8 @@ impl<B: Backend> DFlashModel<B> {
         let tw = &target.w;
         let mut ids = vec![c.mask_token; w];
         ids[0] = anchor;
-        let (head, map) = match &tw.proposal {
-            Some(p) => (tw.view(&p.head), Some(&p.token_ids)),
-            None => (tw.view(&tw.head), None),
-        };
+        let (head, map) = self.proposal_head(target);
+        let head = tw.view(head);
         let (qd, kvd) = (c.q_dim(), c.kv_dim());
         let k = drafts;
         // The block forward through the selector projection is one recorded step per width.
@@ -736,7 +874,7 @@ impl<B: Backend> DFlashModel<B> {
             b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
             for (li, l) in self.layers.iter().enumerate() {
                 // Attention branch.
-                self.prepare(b, dw, l.input_norm, &l.attn_conv, w, w)?;
+                self.prepare(b, dw, l.input_norm, conv(&l.attn_conv), w, w)?;
                 b.linear(&dw.prep, &self.view(&l.qkv), &mut dw.qkv, w)?;
                 b.split_cols(
                     &dw.qkv,
@@ -792,12 +930,13 @@ impl<B: Backend> DFlashModel<B> {
                         ctx_lo: st.lo,
                         window: c.window,
                         ring: c.window,
+                        causal: false,
                     },
                 )?;
                 b.linear(&dw.attn, &self.view(&l.output), &mut dw.z, w)?;
-                self.finish(b, dw, &l.attn_conv, w, w)?;
+                self.finish(b, dw, conv(&l.attn_conv), w, w)?;
                 // MLP branch.
-                self.prepare(b, dw, l.post_norm, &l.mlp_conv, w, w)?;
+                self.prepare(b, dw, l.post_norm, conv(&l.mlp_conv), w, w)?;
                 match &l.gate_up {
                     Some(f) => {
                         b.linear(&dw.prep, &self.view(f), &mut dw.gu, w)?;
@@ -811,7 +950,7 @@ impl<B: Backend> DFlashModel<B> {
                     }
                 }
                 b.linear(&dw.mg, &self.view(&l.down), &mut dw.z, w)?;
-                self.finish(b, dw, &l.mlp_conv, w, w)?;
+                self.finish(b, dw, conv(&l.mlp_conv), w, w)?;
             }
             // Mask columns 1 .. w: final norm, proposal head, unary top-k, selector projection.
             b.copy(&dw.x, h, &mut dw.tail, 0, k * h)?;
@@ -825,7 +964,12 @@ impl<B: Backend> DFlashModel<B> {
                 NormKind::Plain,
             )?;
             b.linear(&dw.hid, &head, &mut dw.logits, k)?;
-            b.linear(&dw.hid, &self.view(&self.hidden_projection), &mut dw.g, k)?;
+            b.linear(
+                &dw.hid,
+                &self.view(selector(&self.hidden_projection)),
+                &mut dw.g,
+                k,
+            )?;
             b.copy(&dw.g, 0, &mut dw.g_host, 0, k * c.rank)
         })?;
         let n = head.rows;
@@ -866,6 +1010,9 @@ impl<B: Backend> DFlashModel<B> {
         drafts: usize,
         limit: usize,
     ) -> Result<Vec<BlockCandidates>> {
+        if self.cfg.kind == DraftKind::DSpine {
+            return self.dspine_propose(b, target, states, dw, anchors, drafts, limit);
+        }
         let c = &self.cfg;
         let n = states.len();
         let (h, w) = (self.hidden, drafts + 1);
@@ -887,10 +1034,8 @@ impl<B: Backend> DFlashModel<B> {
         for (i, &a) in anchors.iter().enumerate() {
             ids[i * w] = a;
         }
-        let (head, map) = match &tw.proposal {
-            Some(p) => (tw.view(&p.head), Some(&p.token_ids)),
-            None => (tw.view(&tw.head), None),
-        };
+        let (head, map) = self.proposal_head(target);
+        let head = tw.view(head);
         let (qd, kvd) = (c.q_dim(), c.kv_dim());
         let k = drafts;
         // The block forward is one recorded step per batch size and width. Static: positions and
@@ -905,7 +1050,7 @@ impl<B: Backend> DFlashModel<B> {
             b.embed(&ids, &tw.view(&tw.embed), &mut dw.x)?;
             for (li, l) in self.layers.iter().enumerate() {
                 // Attention branch.
-                self.prepare(b, dw, l.input_norm, &l.attn_conv, rows, w)?;
+                self.prepare(b, dw, l.input_norm, conv(&l.attn_conv), rows, w)?;
                 b.linear(&dw.prep, &self.view(&l.qkv), &mut dw.qkv, rows)?;
                 b.split_cols(
                     &dw.qkv,
@@ -967,14 +1112,15 @@ impl<B: Backend> DFlashModel<B> {
                             ctx_lo: st.lo,
                             window: c.window,
                             ring: c.window,
+                            causal: false,
                         },
                     )?;
                     b.copy(&dw.sattn, 0, &mut dw.attn, r * qd, w * qd)?;
                 }
                 b.linear(&dw.attn, &self.view(&l.output), &mut dw.z, rows)?;
-                self.finish(b, dw, &l.attn_conv, rows, w)?;
+                self.finish(b, dw, conv(&l.attn_conv), rows, w)?;
                 // MLP branch.
-                self.prepare(b, dw, l.post_norm, &l.mlp_conv, rows, w)?;
+                self.prepare(b, dw, l.post_norm, conv(&l.mlp_conv), rows, w)?;
                 match &l.gate_up {
                     Some(f) => {
                         b.linear(&dw.prep, &self.view(f), &mut dw.gu, rows)?;
@@ -988,7 +1134,7 @@ impl<B: Backend> DFlashModel<B> {
                     }
                 }
                 b.linear(&dw.mg, &self.view(&l.down), &mut dw.z, rows)?;
-                self.finish(b, dw, &l.mlp_conv, rows, w)?;
+                self.finish(b, dw, conv(&l.mlp_conv), rows, w)?;
             }
             // Mask columns 1 .. w of every block: final norm, proposal head, unary top-k, selector.
             for i in 0..n {
@@ -1005,7 +1151,12 @@ impl<B: Backend> DFlashModel<B> {
                 NormKind::Plain,
             )?;
             b.linear(&dw.hid, &head, &mut dw.logits, m)?;
-            b.linear(&dw.hid, &self.view(&self.hidden_projection), &mut dw.g, m)?;
+            b.linear(
+                &dw.hid,
+                &self.view(selector(&self.hidden_projection)),
+                &mut dw.g,
+                m,
+            )?;
             b.copy(&dw.g, 0, &mut dw.g_host, 0, m * c.rank)
         })?;
         let m = n * k;
@@ -1122,6 +1273,9 @@ impl<B: Backend> DFlashModel<B> {
         proposal: &mut dyn FnMut(&[(u32, f32)], &[u32]) -> Vec<(u32, f32)>,
         uniform: &mut dyn FnMut() -> f32,
     ) -> (Vec<u32>, Vec<Vec<(u32, f32)>>) {
+        if let Some(br) = &self.bridge {
+            return self.dspine_select(br, bc, anchor, proposal, uniform);
+        }
         let r = self.cfg.rank;
         let bf = |v: u16| f32::from_bits(u32::from(v) << 16);
         let mut prev = anchor;

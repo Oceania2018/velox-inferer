@@ -6,8 +6,8 @@ use velox_core::backend::QkvRopeShape;
 use velox_core::backend::{
     AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank,
     ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, Im2colShape,
-    KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape,
-    RopeShape, RowGateShape, WeightView,
+    KvStoreShape, MoeRouteShape, NormKind, PrevGateShape, QsaPoolShape, QsaSelectShape,
+    RmsResidualShape, RopeLayout, RopePosShape, RopeShape, RowGateShape, WeightView,
 };
 use velox_core::check::{self, to_i32};
 use velox_core::kv::{hadamard_norm, KvFormat};
@@ -1657,7 +1657,24 @@ extern "C" {
         ctx_lo: i64,
         window: i32,
         ring: i32,
+        causal: i32,
         params: *const i64,
+    ) -> i32;
+    fn velox_portable_prev_gate(
+        packed: *const f32,
+        bias: *const f32,
+        out: *mut f32,
+        rows: i64,
+        rank: i32,
+        block: i32,
+    ) -> i32;
+    fn velox_portable_rms_residual_add(
+        x: *mut f32,
+        delta: *const f32,
+        rms: *mut f32,
+        rows: i32,
+        cols: i32,
+        block: i32,
     ) -> i32;
     fn velox_portable_dyn_conv(
         x: *const f32,
@@ -1804,10 +1821,57 @@ pub fn attention_block(
                 s.ctx_lo as i64,
                 to_i32("window", s.window)?,
                 to_i32("ring", s.ring)?,
+                i32::from(s.causal),
                 params,
             )
         },
         "portable attention_block",
+    )
+}
+
+pub fn prev_gate(
+    packed: &CudaBuffer,
+    bias: &CudaBuffer,
+    out: &mut CudaBuffer,
+    s: PrevGateShape,
+) -> Result<()> {
+    check::prev_gate(packed.len(), bias.len(), out.len(), &s)?;
+    // SAFETY: extents validated above.
+    status(
+        unsafe {
+            velox_portable_prev_gate(
+                packed.as_ptr(),
+                bias.as_ptr(),
+                out.as_mut_ptr(),
+                s.rows as i64,
+                to_i32("rank", s.rank)?,
+                to_i32("block", s.block)?,
+            )
+        },
+        "portable prev_gate",
+    )
+}
+
+pub fn rms_residual_add(
+    x: &mut CudaBuffer,
+    delta: &CudaBuffer,
+    rms: &mut CudaBuffer,
+    s: RmsResidualShape,
+) -> Result<()> {
+    check::rms_residual(x.len(), delta.len(), rms.len(), &s)?;
+    // SAFETY: extents validated above.
+    status(
+        unsafe {
+            velox_portable_rms_residual_add(
+                x.as_mut_ptr(),
+                delta.as_ptr(),
+                rms.as_mut_ptr(),
+                to_i32("rows", s.rows)?,
+                to_i32("cols", s.cols)?,
+                to_i32("block", s.block)?,
+            )
+        },
+        "portable rms_residual_add",
     )
 }
 

@@ -820,14 +820,15 @@ __global__ void attention_block_partial_kernel(const float* __restrict__ q, cons
                                                const float* __restrict__ v_blk, float* __restrict__ part_acc,
                                                float* __restrict__ part_ml, int tokens, int heads, int kv_heads,
                                                int head_dim, long long pos0, long long ctx_lo, int window, int ring,
-                                               float scale, int splits, int split_keys) {
+                                               float scale, int splits, int split_keys, int causal) {
     const int h = blockIdx.x, t = blockIdx.y, sp = blockIdx.z, lane = threadIdx.x;
     const int kvh = h / (heads / kv_heads);
     const size_t q_off = (static_cast<size_t>(t) * heads + h) * head_dim;
     long long start = pos0 + t + 1 - window;
     if (start < ctx_lo) start = ctx_lo;
     const int n_ctx = static_cast<int>(pos0 - start);
-    const int total = n_ctx + tokens;
+    // Causal blocks: token t sees block rows 0 ..= t.
+    const int total = n_ctx + (causal ? t + 1 : tokens);
     const int j0 = sp * split_keys, j1 = min(j0 + split_keys, total);
     float qr[PER], acc[PER];
 #pragma unroll
@@ -903,7 +904,7 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
                                const float* __restrict__ v_blk, float* __restrict__ part_acc,
                                float* __restrict__ part_ml, int tokens, int heads, int kv_heads, int head_dim,
                                long long pos0, long long start0, int window, int ring, float scale, int splits,
-                               int split_keys,
+                               int split_keys, int causal,
                                const long long* __restrict__ params) {
     if (params != nullptr) {
         // Staged by a graph step: the block's position, context start (window-clamped here) and
@@ -926,6 +927,7 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
     const float* qrow[kGqaRowsPerWarp];
     float acc[kGqaRowsPerWarp][NV * 4], m[kGqaRowsPerWarp], l[kGqaRowsPerWarp];
     int first[kGqaRowsPerWarp];  // first visible key index; rows past `rows` see nothing
+    int last[kGqaRowsPerWarp];   // one past the last visible key index (causal blocks)
 #pragma unroll
     for (int i = 0; i < kGqaRowsPerWarp; ++i) {
         const int r = rg * kGqaRows + warp * kGqaRowsPerWarp + i;
@@ -933,6 +935,7 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
         long long start = pos0 + t + 1 - window;
         if (start < start0) start = start0;
         first[i] = r < rows ? static_cast<int>(start - start0) : 0x7fffffff;
+        last[i] = causal ? n_ctx + t + 1 : 0x7fffffff;
         qrow[i] = q + (r < rows ? (static_cast<size_t>(t) * heads + h) * head_dim : 0);
         m[i] = -INFINITY;
         l[i] = 0.0f;
@@ -976,7 +979,7 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
         float p[kGqaRowsPerWarp];
 #pragma unroll
         for (int i = 0; i < kGqaRowsPerWarp; ++i) {
-            const bool vis = lane < n && j >= first[i];
+            const bool vis = lane < n && j >= first[i] && j < last[i];
             s[i] = vis ? s[i] * scale : -INFINITY;
             const float mt = gqa_warp_max(s[i]);
             if (mt == -INFINITY) {  // warp-uniform: the row sees no key of this tile
@@ -1034,7 +1037,8 @@ __global__ void __launch_bounds__(kGqaWarps* VELOX_WARP)
 template <int PER>
 int attention_block_gqa(const float* q, const float* k_ctx, const float* v_ctx, const float* k_blk,
                         const float* v_blk, float* out, int tokens, int heads, int kv_heads, int head_dim,
-                        long long pos0, long long ctx_lo, int window, int ring, const long long* params) {
+                        long long pos0, long long ctx_lo, int window, int ring, int causal,
+                        const long long* params) {
     constexpr int TK = kGqaTile;
     long long start0 = pos0 + 1 - window;  // token 0 sees the most context
     if (start0 < ctx_lo) start0 = ctx_lo;
@@ -1065,7 +1069,7 @@ int attention_block_gqa(const float* q, const float* k_ctx, const float* v_ctx, 
     }
     attention_block_gqa_kernel<PER><<<dim3(kv_heads, splits, rgs), kGqaWarps * VELOX_WARP, smem>>>(
         q, k_ctx, v_ctx, k_blk, v_blk, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, start0, window,
-        ring, scale, splits, split_keys, params);
+        ring, scale, splits, split_keys, causal, params);
     attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
                                                                        splits);
     return velox_launch_status();
@@ -1074,7 +1078,7 @@ int attention_block_gqa(const float* q, const float* k_ctx, const float* v_ctx, 
 template <int PER>
 int attention_block_split(const float* q, const float* k_ctx, const float* v_ctx, const float* k_blk,
                           const float* v_blk, float* out, int tokens, int heads, int kv_heads, int head_dim,
-                          long long pos0, long long ctx_lo, int window, int ring) {
+                          long long pos0, long long ctx_lo, int window, int ring, int causal) {
     long long most = pos0 - ctx_lo;  // token 0 sees the most context
     if (most > window - 1) most = window - 1;
     const int kv = static_cast<int>(most) + tokens;
@@ -1090,7 +1094,7 @@ int attention_block_split(const float* q, const float* k_ctx, const float* v_ctx
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     attention_block_partial_kernel<PER><<<dim3(heads, tokens, splits), VELOX_WARP>>>(
         q, k_ctx, v_ctx, k_blk, v_blk, part_acc, part_ml, tokens, heads, kv_heads, head_dim, pos0, ctx_lo, window,
-        ring, scale, splits, split_keys);
+        ring, scale, splits, split_keys, causal);
     attention_combine_kernel<PER><<<dim3(heads, tokens), VELOX_WARP>>>(part_acc, part_ml, out, heads, head_dim,
                                                                        splits);
     return velox_launch_status();
@@ -1116,7 +1120,7 @@ __global__ void dyn_conv_kernel(const float* __restrict__ x, const float* __rest
 VELOX_API int velox_portable_attention_block(const float* q, const float* k_ctx, const float* v_ctx,
                                              const float* k_blk, const float* v_blk, float* out, int tokens,
                                              int heads, int kv_heads, int head_dim, long long pos0, long long ctx_lo,
-                                             int window, int ring, const long long* params) {
+                                             int window, int ring, int causal, const long long* params) {
     if (tokens > 65535 || head_dim > 256) return VELOX_ERR_UNSUPPORTED;
     const bool gqa = tokens <= 16 && head_dim % 32 == 0 && heads % kv_heads == 0 && heads / kv_heads > 1;
     // params: null, or device [pos0, ctx_lo, k_ctx, v_ctx] staged by a graph step (GQA path only).
@@ -1125,21 +1129,70 @@ VELOX_API int velox_portable_attention_block(const float* q, const float* k_ctx,
     if (gqa) {
         if (head_dim <= 64)
             return attention_block_gqa<2>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                          ctx_lo, window, ring, params);
+                                          ctx_lo, window, ring, causal, params);
         if (head_dim <= 128)
             return attention_block_gqa<4>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                          ctx_lo, window, ring, params);
+                                          ctx_lo, window, ring, causal, params);
         return attention_block_gqa<8>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                      ctx_lo, window, ring, params);
+                                      ctx_lo, window, ring, causal, params);
     }
     if (head_dim <= 64)
         return attention_block_split<2>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                        ctx_lo, window, ring);
+                                        ctx_lo, window, ring, causal);
     if (head_dim <= 128)
         return attention_block_split<4>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                        ctx_lo, window, ring);
+                                        ctx_lo, window, ring, causal);
     return attention_block_split<8>(q, k_ctx, v_ctx, k_blk, v_blk, out, tokens, heads, kv_heads, head_dim, pos0,
-                                    ctx_lo, window, ring);
+                                    ctx_lo, window, ring, causal);
+}
+
+namespace {
+// DSpine's adjacent message: one thread per (row, rank) element.
+__global__ void prev_gate_kernel(const float* __restrict__ packed, const float* __restrict__ bias,
+                                 float* __restrict__ out, long long rows, int rank, int block) {
+    const long long n = rows * rank;
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < n;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long r = i / rank;
+        const int j = static_cast<int>(i % rank);
+        if (r % block == 0) {
+            out[i] = 0.0f;
+            continue;
+        }
+        const float* cur = packed + r * 3 * rank;
+        const float* prev = cur - 3 * rank;
+        const float g = 1.0f / (1.0f + expf(-(cur[j] + prev[rank + j] + bias[j])));
+        out[i] = g * prev[2 * rank + j];
+    }
+}
+
+// DSpine's residual write: one block per row; the row's RMS before the update, then the update.
+__global__ void rms_residual_add_kernel(float* __restrict__ x, const float* __restrict__ delta,
+                                        float* __restrict__ rms, int cols, int block) {
+    __shared__ float scratch[VELOX_WARP];
+    const long long r = blockIdx.x;
+    float* xr = x + r * cols;
+    float ss = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) ss += xr[c] * xr[c];
+    const float scale = sqrtf(velox_block_sum(ss, scratch) / static_cast<float>(cols));
+    if (threadIdx.x == 0) rms[r] = scale;
+    if (r % block == 0) return;
+    const float* dr = delta + r * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) xr[c] += scale * dr[c];
+}
+}  // namespace
+
+VELOX_API int velox_portable_prev_gate(const float* packed, const float* bias, float* out, long long rows, int rank,
+                                       int block) {
+    if (block <= 0) return VELOX_ERR_UNSUPPORTED;
+    prev_gate_kernel<<<velox_grid_1d(rows * rank, 256), 256>>>(packed, bias, out, rows, rank, block);
+    return velox_launch_status();
+}
+
+VELOX_API int velox_portable_rms_residual_add(float* x, const float* delta, float* rms, int rows, int cols, int block) {
+    if (block <= 0 || rows <= 0) return VELOX_ERR_UNSUPPORTED;
+    rms_residual_add_kernel<<<rows, 256>>>(x, delta, rms, cols, block);
+    return velox_launch_status();
 }
 
 // block: rows per independent block (several sequences' draft blocks).
