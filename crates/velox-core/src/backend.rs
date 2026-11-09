@@ -166,8 +166,8 @@ pub const GRAPH_KV_BUCKET: usize = 1024;
 /// ring caches `[ring, kv_heads, head_dim]`, position `p` at row `p % ring`, valid for
 /// `ctx_lo <= p < pos0` (`pos0 - ctx_lo <= ring`). The block's own keys are `[tokens, kv_heads,
 /// head_dim]`. Token `i` attends to context positions `p` with `pos0 + i - p < window` and to every
-/// block row (`tokens <= window`). Query head `h` reads KV head `h / (heads / kv_heads)`; scores are
-/// scaled by `1 / sqrt(head_dim)`.
+/// block row (`tokens <= window`), or with `causal` to block rows `0 ..= i` only. Query head `h`
+/// reads KV head `h / (heads / kv_heads)`; scores are scaled by `1 / sqrt(head_dim)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockAttnShape {
     pub tokens: usize,
@@ -178,6 +178,28 @@ pub struct BlockAttnShape {
     pub ctx_lo: usize,
     pub window: usize,
     pub ring: usize,
+    pub causal: bool,
+}
+
+/// DSpine's adjacent message ([`Backend::prev_gate`]) over `rows` rows in blocks of `block` rows
+/// (one block per sequence's draft block). `packed` is `[rows, 3 rank]`, each row `(q | s | v)`;
+/// `bias` is `[rank]`. Row `r` past its block's first gets `out[r] = sigmoid(q[r] + s[r - 1] +
+/// bias) * v[r - 1]`; a block's first row (its anchor) gets zeros.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrevGateShape {
+    pub rows: usize,
+    pub rank: usize,
+    pub block: usize,
+}
+
+/// DSpine's residual write ([`Backend::rms_residual_add`]) over `x` (`[rows, cols]`) in blocks of
+/// `block` rows: `rms[r] = sqrt(mean_c x[r][c]^2)` of the row before the update, then `x[r] +=
+/// rms[r] * delta[r]` for every row past its block's first (a block's anchor row is unchanged).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RmsResidualShape {
+    pub rows: usize,
+    pub cols: usize,
+    pub block: usize,
 }
 
 impl BlockAttnShape {
@@ -1532,6 +1554,12 @@ pub trait Backend {
     fn attention_precision(&self, _shape: AttnShape) -> AttnPrecision {
         AttnPrecision::Exact
     }
+    /// Whether `attention` of this shape may run inside a replayed graph step (its kernel reads
+    /// the per-call position and caches from staged values). Batched speculative windows stay
+    /// within the widths this allows.
+    fn attention_replays(&self, _shape: AttnShape) -> bool {
+        true
+    }
     /// The operand precision `attention_windows` uses for this shape (its windows are read as
     /// distributions over a few candidates, so a backend may keep more precision than for
     /// `attention`).
@@ -2083,6 +2111,22 @@ pub trait Backend {
         v_blk: &Self::Buffer,
         out: &mut Self::Buffer,
         shape: BlockAttnShape,
+    ) -> Result<()>;
+    /// DSpine's gated message from each row's predecessor; see [`PrevGateShape`].
+    fn prev_gate(
+        &self,
+        packed: &Self::Buffer,
+        bias: &Self::Buffer,
+        out: &mut Self::Buffer,
+        shape: PrevGateShape,
+    ) -> Result<()>;
+    /// DSpine's RMS-scaled residual write; see [`RmsResidualShape`].
+    fn rms_residual_add(
+        &self,
+        x: &mut Self::Buffer,
+        delta: &Self::Buffer,
+        rms: &mut Self::Buffer,
+        shape: RmsResidualShape,
     ) -> Result<()>;
 }
 

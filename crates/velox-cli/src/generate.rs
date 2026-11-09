@@ -186,6 +186,7 @@ fn generate<B: Backend>(b: &B, a: &Args, on_phase: &mut dyn FnMut(&str)) -> Resu
                 .map_err(|_| Error::Config("--dflash takes a draft count".into()))?;
             dflash_generate(
                 b,
+                &crate::drafter::DraftSource::from_args(a)?,
                 &art,
                 &model,
                 &mut session,
@@ -612,6 +613,7 @@ fn mtp_generate<B: Backend>(
 #[allow(clippy::too_many_arguments)]
 fn dflash_generate<B: Backend>(
     b: &B,
+    draft: &crate::drafter::DraftSource,
     art: &Artifact,
     model: &Qwen35Text<B>,
     s: &mut velox_models::qwen3_5::Session<B>,
@@ -626,8 +628,12 @@ fn dflash_generate<B: Backend>(
     use velox_engine::spec::DFlashDrafter;
     use velox_models::qwen3_5::DFlashModel;
     let limit = fe.public_vocab;
-    let dm = DFlashModel::load(b, art, model.cfg.hidden)?
-        .ok_or_else(|| Error::Config("artifact has no dflash2 component".into()))?;
+    let dm: DFlashModel<B> = draft.load(b, art, model.cfg.hidden)?.ok_or_else(|| {
+        Error::Config(format!(
+            "artifact has no {} component",
+            draft.kind.component()
+        ))
+    })?;
     model.enable_capture(b, ws, &dm.cfg.target_layers)?;
     let mut dr = DFlashDrafter::new(b, &dm, drafts_per_block)?;
     let mut dw = DFlashDrafter::workspace(b, &dm, model, chunk, drafts_per_block, 1)?;

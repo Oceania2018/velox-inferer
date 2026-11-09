@@ -202,6 +202,28 @@ pub fn import_hf(a: &Args) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+pub fn import_dspine(a: &Args) -> Result<ExitCode> {
+    let dir = Path::new(required(a, "dir")?);
+    let output = Path::new(required(a, "output")?);
+    let quant = velox_models::qwen3_5::hf::DSpineQuant::parse(a.get("nvfp4").unwrap_or("mlp"))?;
+    let t0 = std::time::Instant::now();
+    let r = velox_models::qwen3_5::hf::import_dspine(dir, output, quant, &mut |line| {
+        eprintln!("[import] {line}")
+    })?;
+    for (format, objects, bytes) in &r.formats {
+        println!("  {format:<22} {objects:>6} objects {:>7.2} GB", gb(*bytes));
+    }
+    println!(
+        "wrote {} ({:.2} GB; {} objects, {} bindings) in {:.1}s; structure ok",
+        output.display(),
+        gb(r.payload_bytes),
+        r.objects,
+        r.bindings,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Whether `name` matches `pattern` as a whole, `*` standing for any run of characters.
 fn glob(pattern: &str, name: &str) -> bool {
     let mut parts = pattern.split('*');

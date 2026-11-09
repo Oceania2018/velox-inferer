@@ -1,0 +1,318 @@
+{
+ "load_runs": {
+  "45691e2-kv8192": {
+   "build": "rtx-5090-32g 45691e2, --kv-rows 8192",
+   "streams": 32,
+   "seconds": 600.0,
+   "channels": 2,
+   "completed": 32,
+   "errors": 0,
+   "finals": 3674,
+   "partials_per_stream": 391.0,
+   "p50": 0.572,
+   "p90": 0.62,
+   "p99": 0.703,
+   "p999": 0.896,
+   "max": 1.054
+  },
+  "45691e2-kv4096": {
+   "build": "rtx-5090-32g 45691e2, --kv-rows 4096",
+   "streams": 32,
+   "seconds": 600.0,
+   "channels": 2,
+   "completed": 32,
+   "errors": 0,
+   "finals": 3674,
+   "partials_per_stream": 390.625,
+   "p50": 0.573,
+   "p90": 0.62,
+   "p99": 0.701,
+   "p999": 0.982,
+   "max": 1.108
+  },
+  "45691e2-kv4096-phases": {
+   "build": "rtx-5090-32g 45691e2, --kv-rows 4096, VELOX_ASR_PHASES=1",
+   "streams": 32,
+   "seconds": 600.0,
+   "channels": 2,
+   "completed": 32,
+   "errors": 0,
+   "finals": 3674,
+   "partials_per_stream": 391.53125,
+   "p50": 0.573,
+   "p90": 0.619,
+   "p99": 0.703,
+   "p999": 0.901,
+   "max": 1.084
+  },
+  "328d024-kv4096-phases": {
+   "build": "rtx-5090-32g + q8 one-pass up to 64 rows (328d024), --kv-rows 4096, VELOX_ASR_PHASES=1",
+   "streams": 32,
+   "seconds": 600.0,
+   "channels": 2,
+   "completed": 32,
+   "errors": 0,
+   "finals": 3657,
+   "partials_per_stream": 404.78125,
+   "p50": 0.555,
+   "p90": 0.587,
+   "p99": 0.646,
+   "p999": 0.867,
+   "max": 1.013
+  }
+ },
+ "engine_phases": {
+  "45691e2 (first ~6 of 10 min)": {
+   "admit_s": 236.3,
+   "encode_s": 126.2,
+   "admit_us_per_row": 344,
+   "requests": 12321,
+   "decode_s": 113.0,
+   "decode_steps": 44092,
+   "draft_fed": 36742,
+   "draft_accepted": 29529,
+   "decode_by_rows": {
+    "1-1": {
+     "steps": 12914,
+     "ms_per_step": 2.15
+    },
+    "2-4": {
+     "steps": 16271,
+     "ms_per_step": 2.54
+    },
+    "5-8": {
+     "steps": 7978,
+     "ms_per_step": 2.71
+    },
+    "9-16": {
+     "steps": 5487,
+     "ms_per_step": 2.92
+    },
+    "17-23": {
+     "steps": 587,
+     "ms_per_step": 4.17
+    },
+    "24-27": {
+     "steps": 299,
+     "ms_per_step": 4.38
+    },
+    "28-32": {
+     "steps": 556,
+     "ms_per_step": 4.6
+    }
+   }
+  },
+  "328d024 (whole run)": {
+   "admit_s": 267.1,
+   "encode_s": 150.9,
+   "admit_us_per_row": 264,
+   "requests": 18008,
+   "decode_s": 210.5,
+   "decode_steps": 86028,
+   "draft_fed": 54568,
+   "draft_accepted": 44693,
+   "decode_by_rows": {
+    "1-1": {
+     "steps": 33974,
+     "ms_per_step": 2.12
+    },
+    "2-4": {
+     "steps": 32983,
+     "ms_per_step": 2.55
+    },
+    "5-8": {
+     "steps": 11916,
+     "ms_per_step": 2.75
+    },
+    "9-16": {
+     "steps": 5360,
+     "ms_per_step": 2.96
+    },
+    "17-23": {
+     "steps": 737,
+     "ms_per_step": 3.05
+    },
+    "24-27": {
+     "steps": 456,
+     "ms_per_step": 3.19
+    },
+    "28-32": {
+     "steps": 602,
+     "ms_per_step": 3.48
+    }
+   }
+  }
+ },
+ "bench_linear_q8_us_min_of_3": {
+  "[4096,2048]": {
+   "m=1": {
+    "before": 11.0,
+    "after": 11.6
+   },
+   "m=8": {
+    "before": 26.4,
+    "after": 32.8
+   },
+   "m=16": {
+    "before": 25.1,
+    "after": 24.6
+   },
+   "m=17": {
+    "before": 49.9,
+    "after": 26.4
+   },
+   "m=24": {
+    "before": 51.0,
+    "after": 25.8
+   },
+   "m=32": {
+    "before": 51.3,
+    "after": 23.7
+   },
+   "m=48": {
+    "before": 74.0,
+    "after": 23.5
+   },
+   "m=63": {
+    "before": 100.9,
+    "after": 24.4
+   }
+  },
+  "[2048,2048]": {
+   "m=1": {
+    "before": 8.0,
+    "after": 8.7
+   },
+   "m=8": {
+    "before": 29.8,
+    "after": 29.6
+   },
+   "m=16": {
+    "before": 26.0,
+    "after": 24.6
+   },
+   "m=17": {
+    "before": 62.2,
+    "after": 26.4
+   },
+   "m=24": {
+    "before": 47.3,
+    "after": 26.2
+   },
+   "m=32": {
+    "before": 54.9,
+    "after": 25.4
+   },
+   "m=48": {
+    "before": 94.8,
+    "after": 21.6
+   },
+   "m=63": {
+    "before": 94.5,
+    "after": 23.1
+   }
+  },
+  "[12288,2048]": {
+   "m=1": {
+    "before": 22.5,
+    "after": 22.3
+   },
+   "m=8": {
+    "before": 30.7,
+    "after": 34.0
+   },
+   "m=16": {
+    "before": 32.5,
+    "after": 32.3
+   },
+   "m=17": {
+    "before": 57.0,
+    "after": 35.1
+   },
+   "m=24": {
+    "before": 56.6,
+    "after": 36.3
+   },
+   "m=32": {
+    "before": 84.6,
+    "after": 36.0
+   },
+   "m=48": {
+    "before": 81.1,
+    "after": 45.1
+   },
+   "m=63": {
+    "before": 181.2,
+    "after": 48.8
+   }
+  },
+  "[2048,6144]": {
+   "m=1": {
+    "before": 13.4,
+    "after": 13.5
+   },
+   "m=8": {
+    "before": 23.6,
+    "after": 25.1
+   },
+   "m=16": {
+    "before": 23.0,
+    "after": 22.1
+   },
+   "m=17": {
+    "before": 55.7,
+    "after": 23.4
+   },
+   "m=24": {
+    "before": 48.2,
+    "after": 25.6
+   },
+   "m=32": {
+    "before": 48.0,
+    "after": 24.9
+   },
+   "m=48": {
+    "before": 82.7,
+    "after": 30.6
+   },
+   "m=63": {
+    "before": 98.7,
+    "after": 28.3
+   }
+  },
+  "[151936,2048]": {
+   "m=1": {
+    "before": 232.4,
+    "after": 251.0
+   },
+   "m=8": {
+    "before": 242.0,
+    "after": 243.7
+   },
+   "m=16": {
+    "before": 245.0,
+    "after": 243.6
+   },
+   "m=17": {
+    "before": 476.4,
+    "after": 246.8
+   },
+   "m=24": {
+    "before": 471.3,
+    "after": 236.6
+   },
+   "m=32": {
+    "before": 477.2,
+    "after": 256.6
+   },
+   "m=48": {
+    "before": 697.6,
+    "after": 290.8
+   },
+   "m=63": {
+    "before": 925.3,
+    "after": 303.4
+   }
+  }
+ }
+}

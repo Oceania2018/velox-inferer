@@ -123,3 +123,25 @@ one object per expert and projection (`text/layers/{i}/moe/experts/{e}/{gate,up,
 NVFP4 global scales differ per expert; the MTP head's fused BF16 `experts.gate_up_proj [E, 2I, H]`
 is split the same way (gate rows `[0, I)`, up rows `[I, 2I)`, as transformers' `chunk(2)` reads
 it).
+
+## DSpine drafter import
+
+A DSpine drafter checkpoint (HF `DFlashDraftModel` with a code bridge, e.g.
+`tencent/Qwen3.8-27B-DSpine-b16`) imports into a standalone `.vi` holding only the `dspine`
+component. It is served next to its target's artifact:
+
+```bash
+velox import-dspine --dir Qwen3.8-27B-DSpine-b16 --output dspine_b16_all.vi --nvfp4 all
+velox serve --artifact qwen3_8_27b_iq3_xss_nvfp4_hybrid_v3.vi --drafter dspine \
+  --draft-artifact dspine_b16_all.vi --dflash-drafts 15 --dflash-short 15 --draft-window 4096
+```
+
+`--nvfp4` picks the matrices encoded as NVFP4 (A16 activations): `mlp` (the MLPs), `all` (also the
+attention projections and the feature projection; 1.06 GB on the device instead of 1.62 GB, with
+no measurable loss of acceptance) or `none`. The code bridge (`dspine/bridge/*`: per-layer read
+and write projections, `gate | predecessor_gate | prev`, gate bias, codebook) always stays BF16;
+the codebook (0.5 GB) is read into system RAM only, where velox builds its transition tables.
+The import refuses checkpoints velox does not run: terminal-corrected bridges, convolutions,
+non-causal blocks, refinement other than the serial exact last write, or a draft vocabulary
+smaller than the target's. An artifact whose components are all drafters (`dflash2`, `dspine`)
+needs no `text` component.

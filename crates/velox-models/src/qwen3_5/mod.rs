@@ -30,7 +30,7 @@ pub use config::{
 };
 pub use dflash::{
     BlockCandidates, DFlashConfig, DFlashModel, DFlashState, DFlashWorkspace, DraftContext,
-    DRAFT_PAGE_ROWS,
+    DraftKind, DRAFT_PAGE_ROWS,
 };
 pub use mtp::{MtpNext, MtpRope, MtpSession, MtpWorkspace};
 pub use paging::{KvChunkSet, KvPool, KvShare};
@@ -220,6 +220,27 @@ fn linear_from<B: Backend>(
 
 /// Most tokens one `verify` call may feed (the anchor plus drafts).
 pub const VERIFY_MAX: usize = 16;
+
+impl<B: Backend> Qwen35Text<B> {
+    /// The widest window (anchor plus drafts, at most [`VERIFY_MAX`]) a recorded batched verify
+    /// can replay over a `kv` cache: its per-sequence attention must read staged positions.
+    pub fn batch_window_max(&self, b: &B, kv: KvFormat) -> usize {
+        let c = &self.cfg;
+        (1..=VERIFY_MAX)
+            .rev()
+            .find(|&tokens| {
+                b.attention_replays(AttnShape {
+                    tokens,
+                    heads: c.heads,
+                    kv_heads: c.kv_heads,
+                    head_dim: c.head_dim,
+                    pos0: 0,
+                    kv,
+                })
+            })
+            .unwrap_or(1)
+    }
+}
 
 /// Graph keys (`Backend::graph`) of the model's repeated steps: bits 0..16 carry the shape, 16..24
 /// the kind, 24..40 the KV bucket (static steps attend over a bucket-sized grid) and 40..56 the
