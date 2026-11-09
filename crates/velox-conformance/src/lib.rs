@@ -9,8 +9,8 @@ use velox_core::backend::{
     ActPolicy, ActQuant, AttnPrecision, AttnShape, Backend, BlockAttnShape, ConvShape, Copy2dShape,
     CopySpec, DilatedConvShape, DynConvShape, ExpertBank, ExpertMatrix, FullAttnShape,
     GdnReplayLayer, GdnShape, GeluKind, HcCombineShape, KvStoreShape, LinearDst, LinearPart,
-    MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopeLayout, RopePosShape, RopeShape,
-    RowGateShape, WeightView,
+    MoeRouteShape, NormKind, PrevGateShape, QsaPoolShape, QsaSelectShape, RmsResidualShape,
+    RopeLayout, RopePosShape, RopeShape, RowGateShape, WeightView,
 };
 use velox_core::format::{align256, decode_rows, f32_to_bf16, RowSplit, WeightFormat};
 use velox_core::kv::{decode_cache, encode_cache, KvFormat};
@@ -1459,10 +1459,57 @@ impl<B: Backend> Suite<'_, B> {
             .attention_block(&qd, &kcd, &vcd, &kbd, &vbd, &mut od, s)?;
         let got = fetch(self.b, &od, q_len)?;
         let name = format!(
-            "attention_block t={} h={}/{} d={} pos0={} lo={} window={} ring={}",
-            s.tokens, s.heads, s.kv_heads, s.head_dim, s.pos0, s.ctx_lo, s.window, s.ring
+            "attention_block t={} h={}/{} d={} pos0={} lo={} window={} ring={}{}",
+            s.tokens,
+            s.heads,
+            s.kv_heads,
+            s.head_dim,
+            s.pos0,
+            s.ctx_lo,
+            s.window,
+            s.ring,
+            if s.causal { " causal" } else { "" }
         );
         self.record(name, Some(Op::AttentionBlock), &got, &want, 2e-4);
+        Ok(())
+    }
+
+    /// DSpine's message and residual write over `blocks` draft blocks of `block` rows.
+    fn dspine_bridge(
+        &mut self,
+        blocks: usize,
+        block: usize,
+        rank: usize,
+        cols: usize,
+    ) -> Result<()> {
+        let rows = blocks * block;
+        let s = PrevGateShape { rows, rank, block };
+        let (packed, bias) = (self.rng.vec(rows * 3 * rank, 4.0), self.rng.vec(rank, 2.0));
+        let mut want = vec![0.0; rows * rank];
+        CpuBackend.prev_gate(&packed, &bias, &mut want, s)?;
+        let (pd, bd) = (self.b.upload(&packed)?, self.b.upload(&bias)?);
+        // Garbage in the output: anchor rows must be written as zeros.
+        let mut od = self.b.upload(&vec![7.0; rows * rank])?;
+        self.b.prev_gate(&pd, &bd, &mut od, s)?;
+        let got = fetch(self.b, &od, rows * rank)?;
+        let name = format!("prev_gate {blocks}x{block} rank={rank}");
+        self.record(name, Some(Op::PrevGate), &got, &want, 1e-6);
+
+        let s = RmsResidualShape { rows, cols, block };
+        let (x, d) = (
+            self.rng.vec(rows * cols, 3.0),
+            self.rng.vec(rows * cols, 0.5),
+        );
+        let (mut want_x, mut want_rms) = (x.clone(), vec![0.0; rows]);
+        CpuBackend.rms_residual_add(&mut want_x, &d, &mut want_rms, s)?;
+        let (mut xd, dd) = (self.b.upload(&x)?, self.b.upload(&d)?);
+        let mut rd = self.b.alloc(rows)?;
+        self.b.rms_residual_add(&mut xd, &dd, &mut rd, s)?;
+        let mut got = fetch(self.b, &xd, rows * cols)?;
+        got.extend(fetch(self.b, &rd, rows)?);
+        want_x.extend(want_rms);
+        let name = format!("rms_residual_add {blocks}x{block} cols={cols}");
+        self.record(name, Some(Op::RmsResidualAdd), &got, &want_x, 1e-5);
         Ok(())
     }
 
@@ -3213,8 +3260,30 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             ctx_lo,
             window,
             ring,
+            causal: false,
         })?;
     }
+    // Causal blocks (DSpine): the shared-tile kernel at a full 16-row block with a wrapped ring and
+    // a short context, and the per-row split kernel (tokens past 16, no GQA).
+    for (tokens, heads, kv_heads, head_dim, pos0, ctx_lo, window, ring) in [
+        (16, 32, 8, 128, 9000, 1000, 8192, 8192),
+        (16, 32, 8, 128, 3, 0, 8192, 8192),
+        (20, 8, 8, 64, 500, 300, 256, 256),
+    ] {
+        s.attention_block(BlockAttnShape {
+            tokens,
+            heads,
+            kv_heads,
+            head_dim,
+            pos0,
+            ctx_lo,
+            window,
+            ring,
+            causal: true,
+        })?;
+    }
+    s.dspine_bridge(1, 16, 512, 5120)?;
+    s.dspine_bridge(3, 8, 64, 300)?;
     // Other GQA geometries of the shared-tile kernel: d64 with a partial row group, d256 at 16 tokens.
     for (tokens, heads, kv_heads, head_dim, pos0, ctx_lo, window, ring) in [
         (5, 12, 4, 64, 300, 100, 128, 256),
@@ -3229,6 +3298,7 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             ctx_lo,
             window,
             ring,
+            causal: false,
         })?;
     }
     s.concat_cols(7, 13, 5)?;

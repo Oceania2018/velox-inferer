@@ -1240,6 +1240,72 @@ pub fn import_with(
         let id = b.push(format!("resource/text/{role}"), e, vec![Piece::Data(bytes)]);
         resources.insert(role, id.into());
     }
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mut components = Map::new();
+    components.insert(
+        "text".into(),
+        json!({ "config": cfg_json, "resources": resources }),
+    );
+    if let Some(v) = dflash_cfg {
+        components.insert("dflash2".into(), json!({ "config": v }));
+    }
+    if let Some(v) = vision {
+        components.insert("vision".into(), v);
+    }
+    let provenance = json!({
+        "converter": "velox import-hf",
+        "hf": {
+            "dir": name,
+            "architectures": hf_cfg.get("architectures"),
+            "quantization": hf_cfg
+                .get("quantization_config")
+                .map(|q| json!({ "quant_method": q.get("quant_method"), "format": q.get("format") })),
+        },
+    });
+
+    let w = write_artifact(
+        &st,
+        b,
+        components,
+        json!({ "name": name }),
+        provenance,
+        out,
+        progress,
+    )?;
+    Ok(ImportReport {
+        formats: w.formats,
+        objects: w.objects,
+        bindings: w.bindings,
+        uses: w.uses,
+        payload_bytes: w.payload,
+        mtp,
+    })
+}
+
+/// What [`write_artifact`] wrote.
+struct Written {
+    formats: Vec<(String, usize, u64)>,
+    objects: usize,
+    bindings: usize,
+    uses: usize,
+    payload: u64,
+}
+
+/// Lays `b`'s objects out back to back on 256-byte boundaries and writes them as a `.vi` with
+/// `components`, `metadata` and `provenance`; the result must pass the reader's structural checks.
+fn write_artifact(
+    st: &SafeTensors,
+    b: Builder<'_>,
+    components: Map<String, Value>,
+    metadata: Value,
+    provenance: Value,
+    out: &Path,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Written> {
     let Builder {
         mut outs,
         bindings,
@@ -1260,42 +1326,14 @@ pub fn import_with(
     }
     let payload = outs.last().map_or(0, |o| o.offset + o.bytes);
 
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string();
-    let mut components = Map::new();
-    components.insert(
-        "text".into(),
-        json!({ "config": cfg_json, "resources": resources }),
-    );
-    if let Some(v) = dflash_cfg {
-        components.insert("dflash2".into(), json!({ "config": v }));
-    }
-    if let Some(v) = vision {
-        components.insert("vision".into(), v);
-    }
     let report_counts = (objects.len(), bindings.len(), uses.len());
     let mut d = Map::new();
     d.insert("components".into(), Value::Object(components));
     d.insert("objects".into(), Value::Array(objects));
     d.insert("bindings".into(), Value::Object(bindings));
     d.insert("uses".into(), Value::Array(uses));
-    d.insert("metadata".into(), json!({ "name": name }));
-    d.insert(
-        "provenance".into(),
-        json!({
-            "converter": "velox import-hf",
-            "hf": {
-                "dir": name,
-                "architectures": hf_cfg.get("architectures"),
-                "quantization": hf_cfg
-                    .get("quantization_config")
-                    .map(|q| json!({ "quant_method": q.get("quant_method"), "format": q.get("format") })),
-            },
-        }),
-    );
+    d.insert("metadata".into(), metadata);
+    d.insert("provenance".into(), provenance);
     d.insert(
         "velox".into(),
         json!({ "format_version": 1, "source_container": "safetensors" }),
@@ -1337,7 +1375,7 @@ pub fn import_with(
                 if lo < hi {
                     let dst = &mut buf[(lo - at) as usize..(hi - at) as usize];
                     let rel = lo - p0;
-                    read_piece(&st, piece, oi, rel, dst, &mut plane)
+                    read_piece(st, piece, oi, rel, dst, &mut plane)
                         .map_err(|e| velox_weights::Error::Format(e.to_string()))?;
                 }
                 p0 += len;
@@ -1365,13 +1403,12 @@ pub fn import_with(
     .map_err(werr)?;
     // The written artifact must pass the reader's structural checks.
     Artifact::open(out).map_err(werr)?;
-    Ok(ImportReport {
+    Ok(Written {
         formats,
         objects: report_counts.0,
         bindings: report_counts.1,
         uses: report_counts.2,
-        payload_bytes: payload,
-        mtp,
+        payload,
     })
 }
 
@@ -1437,8 +1474,11 @@ fn read_piece(
     }
 }
 
+mod dspine;
 #[cfg(test)]
 mod tests;
+
+pub use dspine::{import_dspine, DSpineQuant};
 
 /// The DFlash2 drafter (`dflash2/`): HF `DFlash2DraftModel` names to velox's bindings. All BF16
 /// as stored; norms are plain multipliers (Qwen3 RMSNorm). The context key / value projections

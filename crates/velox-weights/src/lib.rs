@@ -116,6 +116,10 @@ pub struct FileEntry {
     pub logical_start: u64,
 }
 
+/// Components an artifact may hold without a `text` component: block drafters loaded next to
+/// their target's artifact.
+pub const DRAFTER_COMPONENTS: &[&str] = &["dflash2", "dspine"];
+
 pub struct Artifact {
     pub path: PathBuf,
     pub container: Container,
@@ -478,7 +482,12 @@ impl Artifact {
             .get("components")
             .and_then(Value::as_object)
             .ok_or_else(|| Error::Format("components must be an object".into()))?;
-        if !comps.contains_key("text") {
+        // A drafter-only artifact (e.g. `velox import-dspine`) is served next to its target's.
+        let drafter_only = !comps.is_empty()
+            && comps
+                .keys()
+                .all(|k| DRAFTER_COMPONENTS.contains(&k.as_str()));
+        if !comps.contains_key("text") && !drafter_only {
             return bad("components must include 'text'");
         }
         for (cid, c) in comps {

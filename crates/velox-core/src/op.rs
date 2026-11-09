@@ -57,6 +57,8 @@ pub enum Op {
     Conv1dSiluWindows,
     GatedDeltaNetWindows,
     AttentionWindows,
+    PrevGate,
+    RmsResidualAdd,
 }
 
 impl Op {
@@ -111,6 +113,8 @@ impl Op {
         Op::Conv1dSiluWindows,
         Op::GatedDeltaNetWindows,
         Op::AttentionWindows,
+        Op::PrevGate,
+        Op::RmsResidualAdd,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -165,6 +169,8 @@ impl Op {
             Op::Conv1dSiluWindows => "conv1d_silu_windows",
             Op::GatedDeltaNetWindows => "gated_delta_net_windows",
             Op::AttentionWindows => "attention_windows",
+            Op::PrevGate => "prev_gate",
+            Op::RmsResidualAdd => "rms_residual_add",
         }
     }
 }

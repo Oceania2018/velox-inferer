@@ -7,8 +7,8 @@
 use velox_core::backend::{
     log_softmax_gather_row, top_k_row, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape,
     Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank, ExpertMatrix, FullAttnShape, GdnShape,
-    GeluKind, HcCombineShape, KvStoreShape, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape,
-    RopePosShape, RopeShape, RowGateShape, WeightView,
+    GeluKind, HcCombineShape, KvStoreShape, MoeRouteShape, NormKind, PrevGateShape, QsaPoolShape,
+    QsaSelectShape, RmsResidualShape, RopePosShape, RopeShape, RowGateShape, WeightView,
 };
 use velox_core::format::decode_rows;
 use velox_core::kv::{decode_cache, decode_row, encode_row, KvFormat};
@@ -451,9 +451,10 @@ impl Backend for CpuBackend {
         let scale = 1.0 / (d as f64).sqrt();
         for t in 0..s.tokens {
             // Key rows: (buffer is context, row) for the visible context, then the block.
+            let blk = if s.causal { t + 1 } else { s.tokens };
             let keys: Vec<(bool, usize)> = (s.ctx_start(t)..s.pos0)
                 .map(|p| (true, p % s.ring))
-                .chain((0..s.tokens).map(|j| (false, j)))
+                .chain((0..blk).map(|j| (false, j)))
                 .collect();
             for h in 0..s.heads {
                 let kvh = h / group;
@@ -900,6 +901,54 @@ impl Backend for CpuBackend {
             }
         }
         state[..hist * c].copy_from_slice(&u[s.tokens * c..]);
+        Ok(())
+    }
+
+    fn prev_gate(
+        &self,
+        packed: &Vec<f32>,
+        bias: &Vec<f32>,
+        out: &mut Vec<f32>,
+        s: PrevGateShape,
+    ) -> Result<()> {
+        check::prev_gate(packed.len(), bias.len(), out.len(), &s)?;
+        let r = s.rank;
+        for row in 0..s.rows {
+            let o = &mut out[row * r..(row + 1) * r];
+            if row % s.block == 0 {
+                o.fill(0.0);
+                continue;
+            }
+            let (cur, prev) = (&packed[row * 3 * r..], &packed[(row - 1) * 3 * r..]);
+            for (j, oj) in o.iter_mut().enumerate() {
+                let g = sigmoid(f64::from(cur[j]) + f64::from(prev[r + j]) + f64::from(bias[j]));
+                *oj = (g * f64::from(prev[2 * r + j])) as f32;
+            }
+        }
+        Ok(())
+    }
+
+    fn rms_residual_add(
+        &self,
+        x: &mut Vec<f32>,
+        delta: &Vec<f32>,
+        rms: &mut Vec<f32>,
+        s: RmsResidualShape,
+    ) -> Result<()> {
+        check::rms_residual(x.len(), delta.len(), rms.len(), &s)?;
+        let c = s.cols;
+        for row in 0..s.rows {
+            let xr = &mut x[row * c..(row + 1) * c];
+            let ms = xr.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / c as f64;
+            let scale = ms.sqrt();
+            rms[row] = scale as f32;
+            if row % s.block == 0 {
+                continue;
+            }
+            for (v, &d) in xr.iter_mut().zip(&delta[row * c..(row + 1) * c]) {
+                *v = (f64::from(*v) + scale * f64::from(d)) as f32;
+            }
+        }
         Ok(())
     }
 
