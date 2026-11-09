@@ -5,6 +5,7 @@ method, results, notes) and the raw numbers. Newest first.
 
 | Run | What |
 |---|---|
+| [2026-11-08-rtx5090-32g-asr](2026-11-08-rtx5090-32g-asr/README.md) | Qwen3-ASR-1.7B Q8 at 32 live call streams on the desktop card: final latency p99 0.703 → 0.646 s with the Q8 one-pass kernel; 4096 KV rows suffice |
 | [2026-11-07-rtx5090-24g-asr](2026-11-07-rtx5090-24g-asr/README.md) | Qwen3-ASR-1.7B Q8 at 24 live call streams: final latency p99 0.934 → 0.700 s, transcripts unchanged |
 | [2026-11-01-rtx5090-32g-public](2026-11-01-rtx5090-32g-public/README.md) | Qwen3.8-27B NVFP4 vs hybrid v2/v3 on public data: ShareGPT, random 4K prefill, ScreenSpot-v2 accuracy |
 | [2026-10-21-rtx5090-32g](2026-10-21-rtx5090-32g/README.md) | Response speed at 1, 2, 4 and 6 concurrent requests, Qwen3.8-27B NVFP4 |
