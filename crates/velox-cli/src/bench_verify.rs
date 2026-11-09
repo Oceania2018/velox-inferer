@@ -9,9 +9,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use velox_core::{Backend, Error, KvFormat, Result};
-use velox_models::qwen3_5::{
-    DFlashModel, PrefillChunk, Qwen35Text, TextConfig, TextWeights, VERIFY_MAX,
-};
+use velox_models::qwen3_5::{PrefillChunk, Qwen35Text, TextConfig, TextWeights, VERIFY_MAX};
 use velox_weights::Artifact;
 
 use crate::args::Args;
@@ -51,7 +49,8 @@ fn bench<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
     let model = Qwen35Text::new(cfg, w);
     let mut ws = model.workspace(b, 2048)?;
     // Verify windows capture DFlash features when the artifact drafts with DFlash2.
-    if let Some(dm) = DFlashModel::load(b, &art, model.cfg.hidden)? {
+    let draft = crate::drafter::DraftSource::from_args(a)?;
+    if let Some(dm) = draft.load::<B>(b, &art, model.cfg.hidden)? {
         model.enable_capture(b, &mut ws, &dm.cfg.target_layers)?;
     }
     let capacity = context + 2 * rounds * m + 64;
