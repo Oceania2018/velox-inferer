@@ -1345,6 +1345,12 @@ impl CudaKernels for Rtx5090Kernels {
         })
     }
 
+    /// Only the f32-cache flash prefill kernel takes its position by value; the NVFP4 verify
+    /// kernel and the portable paths stage theirs.
+    fn attention_replays(&self, s: AttnShape) -> bool {
+        verify_nvfp4(&s) || self.attention_precision(s) == AttnPrecision::Exact
+    }
+
     fn attention_precision(&self, s: AttnShape) -> AttnPrecision {
         if verify_nvfp4(&s) {
             return AttnPrecision::F16;
