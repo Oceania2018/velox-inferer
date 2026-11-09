@@ -1554,6 +1554,12 @@ pub trait Backend {
     fn attention_precision(&self, _shape: AttnShape) -> AttnPrecision {
         AttnPrecision::Exact
     }
+    /// Whether `attention` of this shape may run inside a replayed graph step (its kernel reads
+    /// the per-call position and caches from staged values). Batched speculative windows stay
+    /// within the widths this allows.
+    fn attention_replays(&self, _shape: AttnShape) -> bool {
+        true
+    }
     /// The operand precision `attention_windows` uses for this shape (its windows are read as
     /// distributions over a few candidates, so a backend may keep more precision than for
     /// `attention`).
