@@ -3,8 +3,9 @@
 
 use crate::backend::{
     AttnShape, BlockAttnShape, ConvShape, Copy2dShape, DilatedConvShape, DynConvShape, ExpertBank,
-    FullAttnShape, GdnShape, HcCombineShape, KvStoreShape, MoeRouteShape, QsaPoolShape,
-    QsaSelectShape, RopePosShape, RopeShape, RowGateShape, WeightView,
+    FullAttnShape, GdnShape, HcCombineShape, KvStoreShape, MoeRouteShape, PrevGateShape,
+    QsaPoolShape, QsaSelectShape, RmsResidualShape, RopePosShape, RopeShape, RowGateShape,
+    WeightView,
 };
 use crate::error::{Error, Result};
 use crate::kv::KvFormat;
@@ -682,6 +683,25 @@ pub fn attention_block(
     need("attention_block k_blk", k_blk, blk)?;
     need("attention_block v_blk", v_blk, blk)?;
     need("attention_block out", out, q_len)
+}
+
+pub fn prev_gate(packed: usize, bias: usize, out: usize, s: &PrevGateShape) -> Result<()> {
+    if s.rows == 0 || s.rank == 0 || s.block == 0 || !s.rows.is_multiple_of(s.block) {
+        return Err(Error::Shape(format!("prev_gate: bad shape {s:?}")));
+    }
+    need("prev_gate packed", packed, product(&[s.rows, 3, s.rank])?)?;
+    need("prev_gate bias", bias, s.rank)?;
+    need("prev_gate out", out, product(&[s.rows, s.rank])?)
+}
+
+pub fn rms_residual(x: usize, delta: usize, rms: usize, s: &RmsResidualShape) -> Result<()> {
+    if s.rows == 0 || s.cols == 0 || s.block == 0 || !s.rows.is_multiple_of(s.block) {
+        return Err(Error::Shape(format!("rms_residual_add: bad shape {s:?}")));
+    }
+    let n = product(&[s.rows, s.cols])?;
+    need("rms_residual_add x", x, n)?;
+    need("rms_residual_add delta", delta, n)?;
+    need("rms_residual_add rms", rms, s.rows)
 }
 
 /// Converts a dimension for a C ABI that takes `int`.
