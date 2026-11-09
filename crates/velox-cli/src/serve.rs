@@ -299,12 +299,19 @@ pub fn run(a: &Args) -> Result<ExitCode> {
             ("branch".into(), velox_variant::INFO.branch.into()),
             ("profile".into(), profile.into()),
             ("container".into(), art.container.to_string()),
+            ("artifact".into(), file_name(&art.path)),
         ],
     };
     let listener = TcpListener::bind((host, port))
         .map_err(|e| Error::Config(format!("bind {host}:{port}: {e}")))?;
+    // The weights in use by file name (the container version alone says nothing about them).
+    let draft = a
+        .get("draft-artifact")
+        .map(|p| format!(" + {}", file_name(std::path::Path::new(p))))
+        .unwrap_or_default();
     eprintln!(
-        "listening on http://{host}:{port} | model {model_id} ({architecture}, {}) | variant {} | profile {profile}",
+        "listening on http://{host}:{port} | model {model_id} ({architecture}, {}{draft}, {}) | variant {} | profile {profile}",
+        file_name(&art.path),
         art.container,
         velox_variant::INFO.id
     );
@@ -312,4 +319,10 @@ pub fn run(a: &Args) -> Result<ExitCode> {
         .serve(listener)
         .map_err(|e| Error::Backend(e.to_string()))?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The last component of `path` (the whole path when it has none).
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
