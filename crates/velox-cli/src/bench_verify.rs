@@ -3,7 +3,9 @@
 //! at a time (`verify` + `commit`), on synthetic sessions at a fixed context length (timing does
 //! not depend on the cache contents). `--prefill N` makes every batched round a mixed step that also
 //! feeds N prompt tokens of one more sequence (the serving engine's round while a prompt prefills);
-//! `--only batched` skips the one-at-a-time rounds, e.g. for a `VELOX_GPU_TIMING=1` op breakdown.
+//! `--only batched` skips the one-at-a-time rounds, e.g. for a `VELOX_GPU_TIMING=1` op breakdown;
+//! `--dump <file>` writes the batched rounds' top candidates instead of timing (graphs vs
+//! `VELOX_NO_GRAPHS=1`).
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -114,6 +116,48 @@ fn bench<B: Backend>(b: &B, a: &Args) -> Result<ExitCode> {
         b.synchronize()?;
         Ok(t.elapsed().as_secs_f64() * 1e3 / rounds as f64)
     };
+    // --dump <file>: batched rounds only (a replayed step after the first one when graphs are
+    // on), every row's top candidates written to <file>. Sequences sit at different positions that
+    // advance every round, so a run with graphs and one with `VELOX_NO_GRAPHS=1` write the same
+    // file unless a replay reads a recorded position instead of the staged one.
+    if let Some(path) = a.get("dump") {
+        if n < 2 {
+            return Err(Error::Config("--dump needs --batch >= 2".into()));
+        }
+        // Real prompts, so every row attention reads was written (a fresh cache holds whatever
+        // its memory held).
+        for (i, s) in sessions.iter_mut().enumerate() {
+            s.pos = 0;
+            let prompt: Vec<u32> = (0..(context + 37 * i) as u32)
+                .map(|j| 1000 + j.wrapping_mul(7919) % 50000)
+                .collect();
+            model.advance(b, s, &mut ws, &prompt, None, &[])?;
+        }
+        let windows: Vec<Vec<u32>> = (0..n)
+            .map(|i| (0..m as u32).map(|j| 1000 + 97 * i as u32 + j).collect())
+            .collect();
+        let wins: Vec<&[u32]> = windows.iter().map(|w| &w[..]).collect();
+        let mut out = String::new();
+        for round in 0..rounds {
+            let mut refs: Vec<&mut _> = sessions.iter_mut().collect();
+            let batched = model.verify_batch(b, &mut refs, &mut ws, &mut bw, &wins, 8, limit)?;
+            for (i, rows) in batched.iter().enumerate() {
+                for (j, row) in rows.iter().enumerate() {
+                    out.push_str(&format!("{round} {i} {j}"));
+                    for (id, v) in row {
+                        out.push_str(&format!(" {id}:{:08x}", v.to_bits()));
+                    }
+                    out.push('\n');
+                }
+            }
+            for s in refs {
+                model.commit_batched(b, s, &bw, keep)?;
+            }
+        }
+        std::fs::write(path, out).map_err(|e| Error::Config(format!("{path}: {e}")))?;
+        println!("dump: {n} sequences x {m}-token windows, {rounds} rounds -> {path}");
+        return Ok(ExitCode::SUCCESS);
+    }
     // --bracket batched|solo: brackets two warm rounds of that mode for `ncu --profile-from-start off`.
     if let Some(mode) = a.get("bracket") {
         let mut f: Box<dyn FnMut() -> Result<()>> = match mode {

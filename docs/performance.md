@@ -93,13 +93,49 @@ advance in lockstep, so a harsher mix than production traffic):
 | DSpine `--nvfp4 all`, 15 drafts every round, window 4096 | 175 s | 229 | 7.72 | 90 | 1,465 / 2,845 ms | 40, 41, 41, 40 |
 | DSpine `--nvfp4 all`, `--dflash-short 7`, window 4096 | 174 s | 230 | 5.77 | 84 | 1,508 / 2,906 ms | 43, 43, 42, 45 |
 
-- Batched rounds draft at most 14 per sequence (`BATCH_DRAFTS_MAX`): a replayed step cannot attend
-  over 16+ tokens, which the 16-row windows of `--dflash-short 15` hit before that cap.
-- DSpine finishes the batch 10% sooner, but each request waits on larger batched rounds: its
-  proposal scores twice the rows over the full 248k-row head (DFlash2 uses the smaller draft
-  vocabulary head), so per-request latency is ~10% worse when 4 lanes decode at once. That cost is
-  the next thing to cut.
+- These runs drafted at most 14 per sequence in batched rounds: the backend refused any replayed
+  attention over 16+ tokens. See the follow-up below for 15.
+- DSpine finishes the batch 10% sooner, but each request waits on larger batched rounds, so
+  per-request latency is ~10% worse when 4 lanes decode at once.
 - All 380 tool calls are valid in every run. DFlash2 with the same 15-row batched windows keeps
   its hit rate, so the engine's batched verify is not the cause of the 15-draft DSpine run's lower
   point hits; the four lockstep replays produce near-identical outputs (one sample, not four), and
   the gap is within the spread single runs show.
+
+### DSpine head and 16-row batched windows (2026-11-09)
+
+Same machine, build, session and flags (`--nvfp4 all`, 15 drafts every round, window 4096).
+- **Head over the written rows only.** Each proposal sends only the written rows through the head.
+  A candidate's pre-write score comes back exactly on the host, from its logit, the two rows' rms
+  and `m . TG[c]`. Before, the head scored the pre-write rows as well, doubling its rows.
+- **15 drafts in batched rounds.** Kernels now report which attention shapes replay correctly
+  (`attention_replays`). On `rtx-5090-32g` everything except the f32-cache flash prefill kernel
+  replays, so batched rounds draft 15 instead of 14.
+- **Replay check.** `velox bench-verify --dump` with 4 prefilled sequences at staggered,
+  advancing positions writes bit-identical 16-row (and 15-row) batched rounds with graphs and
+  with `VELOX_NO_GRAPHS=1`, over 40 rounds. An f32 cache still refuses 16-row replay.
+
+One replay at a time, against the DFlash2 baseline above:
+
+| DSpine head | Tokens / round | Decode tok/s | Prefill |
+|---|---:|---:|---:|
+| Full head, pre-write rows through the head (before) | 8.03 | +27.4% | – |
+| **Full head, written rows only (`--draft-vocab full`, default)** | **8.02** | **+33.8%** | −0.8% |
+| Draft vocabulary head (`--draft-vocab draft`, DFlash2's 32k rows) | 7.17 | +20.3% | −1.3% |
+
+Four concurrent replays. The before and after rows were rerun back to back today: one replay at
+a time over a private Docker network, so none failed on `host.docker.internal`.
+
+| DSpine (4 lanes) | Wall | Aggregate tok/s | Tokens / round | Draft ms / round (3 / 4 seqs) | Decode p50 per request | End-to-end p50 / p90 | Points within 20 px |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Before (14 batched drafts, doubled head rows) | 174 s | 231 | 7.64 | 9.6 / 10.6 | 81 | 1,542 / 2,670 ms | 45, 41, 42, 41 |
+| **After, full head** | **171 s** | **233** | **7.79** | **8.1 / 9.2** | **86** | **1,511 / 2,767 ms** | 42, 43, 44, 40 |
+| After, draft vocabulary head | 177 s | 229 | 6.93 | 7.6 / 9.0 | 81 | 1,581 / 2,722 ms | 39, 41, 42, 43 |
+| After, full head, `VELOX_NO_GRAPHS=1` | 185 s | 217 | 7.78 | – | 80 | 1,614 / 3,011 ms | 42, 44, 45, 42 |
+
+- **Draft vocabulary.** Under concurrency the draft vocabulary saves only 0.2–0.5 ms per round,
+  but it loses 11% of tokens per round. The full head is the default.
+- **Draft cost.** With 4 sequences, the head is no longer what dominates the ~9 ms of drafting.
+  Verify takes ~31 ms per round.
+- **Spread.** The 4-lane gains (+1% aggregate, +6% decode p50) are within the spread of two runs of
+  one configuration: yesterday's "before" run gave 229 / 90 / 1,465 ms.
