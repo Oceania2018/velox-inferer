@@ -9,8 +9,8 @@ use std::time::Instant;
 use velox_core::backend::{
     ActQuant, AttnShape, Backend, BackendKind, BlockAttnShape, ConvShape, Copy2dShape,
     DilatedConvShape, DynConvShape, ExpertBank, FullAttnShape, GdnShape, GeluKind, HcCombineShape,
-    KvStoreShape, LinearDst, MoeRouteShape, NormKind, QsaPoolShape, QsaSelectShape, RopePosShape,
-    RopeShape, RowGateShape, WeightView,
+    KvStoreShape, LinearDst, MoeRouteShape, NormKind, PrevGateShape, QsaPoolShape, QsaSelectShape,
+    RmsResidualShape, RopePosShape, RopeShape, RowGateShape, WeightView,
 };
 use velox_core::{DeviceProfile, Op, Result, StateFormat};
 
@@ -490,6 +490,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn attention_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_precision(s)
     }
+    fn attention_replays(&self, s: AttnShape) -> bool {
+        self.inner.attention_replays(s)
+    }
     fn attention_windows_precision(&self, s: AttnShape) -> velox_core::AttnPrecision {
         self.inner.attention_windows_precision(s)
     }
@@ -891,6 +894,28 @@ impl<B: Backend> Backend for Profiled<B> {
             self.inner.conv1d_dilated_silu(x, weight, state, out, s)
         })
     }
+    fn prev_gate(
+        &self,
+        packed: &Self::Buffer,
+        bias: &Self::Buffer,
+        out: &mut Self::Buffer,
+        s: PrevGateShape,
+    ) -> Result<()> {
+        self.time("prev_gate", || self.inner.prev_gate(packed, bias, out, s))
+    }
+
+    fn rms_residual_add(
+        &self,
+        x: &mut Self::Buffer,
+        delta: &Self::Buffer,
+        rms: &mut Self::Buffer,
+        s: RmsResidualShape,
+    ) -> Result<()> {
+        self.time("rms_residual_add", || {
+            self.inner.rms_residual_add(x, delta, rms, s)
+        })
+    }
+
     fn sigmoid_scale_rows(
         &self,
         x: &mut B::Buffer,

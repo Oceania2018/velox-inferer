@@ -4,6 +4,7 @@ mod args;
 mod asr;
 mod bench;
 mod bench_verify;
+mod drafter;
 mod generate;
 mod profile;
 mod prompt_debug;
@@ -81,6 +82,9 @@ COMMANDS:
   import-hf               Qwen3.5/3.6 Hugging Face checkpoint (safetensors; BF16, compressed-tensors
                           FP8 / NVFP4) text stack, MTP head, tokenizer and chat template -> .vi
       --hf-dir <dir> --output <.vi>
+  import-dspine           DSpine drafter checkpoint (HF DFlashDraftModel with a code bridge) -> a
+                          standalone .vi with the dspine component (serve --draft-artifact)
+      --dir <dir> --output <.vi> [--nvfp4 none|mlp|all] (NVFP4 matrices; default mlp)
       --input <path> --output <path> [--to vi|ninfer] [--part-limit <bytes>]
   asr                     Qwen3-ASR on golden clips: stage timings and reference checks
       --gguf <Qwen3-ASR text .gguf> --mmproj <its mmproj .gguf> --golden <dir>
@@ -119,7 +123,14 @@ COMMANDS:
       --host-state-dtype <fmt>  context-store recurrent states: f32 | bf16 | nvfp4 (bf16)
       --device-state-dtype <fmt>  device checkpoints (lane heads, spares): f32 | bf16 | nvfp4 (f32)
       --mtp-drafts <n>      most MTP drafts per round, adapted to acceptance (7; 0 disables)
-      --dflash-drafts <n>   DFlash2 drafts per block when the artifact has dflash2 (7; 0: use MTP)
+      --dflash-drafts <n>   block-drafter drafts per block when it is there (7; 0: use MTP)
+      --dflash-short <n>    short block requests start with (7); = --dflash-drafts: no adaptation
+      --drafter dflash2|dspine  block drafter (dflash2); dspine needs a dspine component
+      --draft-artifact <.vi>    the drafter's artifact (e.g. from import-dspine; default --artifact)
+      --draft-window <n>        drafter context rows (at most its trained window; fewer: less VRAM;
+                                0: the trained window)
+      --draft-vocab full|draft  DSpine proposal head: the target's full output head (full) or
+                                its draft vocabulary head (draft: cheaper, fewer drafts accepted)
       --score-branch-rows <n>  System One rank candidates per forward pass (100; 0 rejects rank)
       --max-vision-tokens <n>  merged vision tokens per image (32x32 px each) before it is
                             downscaled (1280: 1920x1080 -> 1504x832)
@@ -173,6 +184,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("compose") => weights::compose(a),
         Some("import-gguf") => weights::import_gguf(a),
         Some("import-hf") => weights::import_hf(a),
+        Some("import-dspine") => weights::import_dspine(a),
         Some("generate") => generate::run(a),
         Some("asr") => asr::run(a),
         Some("serve-asr") => serve_asr::run(a),

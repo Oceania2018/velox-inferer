@@ -239,8 +239,9 @@ impl<B: Backend> MtpDrafter<B> {
 /// Speculative decoding with the DFlash2 block drafter: one masked-block forward proposes
 /// `drafts` tokens, each with the proposal distribution it was drawn from, so verification can
 /// use min(1, p / q) and the residual max(p - q, 0).
-/// The short DFlash block (drafts per round) every request starts with; see [`DFlashDrafter::observe`].
-const ADAPT_LOW: usize = 7;
+/// The short DFlash block (drafts per round) every request starts with unless configured; see
+/// [`DFlashDrafter::observe`].
+pub const ADAPT_LOW: usize = 7;
 
 pub struct DFlashDrafter<B: Backend> {
     /// Drafts in the next block (adapted by [`Self::observe`] between `low` and `max`).
@@ -257,8 +258,14 @@ impl<B: Backend> DFlashDrafter<B> {
     /// A drafter of up to `drafts` drafts per block. Its activations live in a workspace from
     /// [`Self::workspace`], which drafters of several sequences can share.
     pub fn new(b: &B, dm: &DFlashModel<B>, drafts: usize) -> Result<Self> {
+        Self::with_short(b, dm, drafts, ADAPT_LOW)
+    }
+
+    /// [`Self::new`] whose short block has `short` drafts (`short >= drafts`: no adaptation, every
+    /// round drafts `drafts`).
+    pub fn with_short(b: &B, dm: &DFlashModel<B>, drafts: usize, short: usize) -> Result<Self> {
         let max = Self::max_drafts(drafts);
-        let low = max.min(ADAPT_LOW);
+        let low = max.min(short.max(1));
         Ok(DFlashDrafter {
             drafts: low,
             max,
@@ -284,8 +291,21 @@ impl<B: Backend> DFlashDrafter<B> {
         drafts: usize,
         seqs: usize,
     ) -> Result<DFlashWorkspace<B>> {
+        Self::workspace_short(b, dm, target, ctx_rows, drafts, ADAPT_LOW, seqs)
+    }
+
+    /// [`Self::workspace`] for drafters made by [`Self::with_short`] with `short`.
+    pub fn workspace_short(
+        b: &B,
+        dm: &DFlashModel<B>,
+        target: &Qwen35Text<B>,
+        ctx_rows: usize,
+        drafts: usize,
+        short: usize,
+        seqs: usize,
+    ) -> Result<DFlashWorkspace<B>> {
         let max = Self::max_drafts(drafts);
-        let short = max.min(ADAPT_LOW);
+        let short = max.min(short.max(1));
         dm.workspace(b, target, ctx_rows, max + 1, seqs * (short + 1))
     }
 
