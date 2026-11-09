@@ -323,6 +323,8 @@ pub fn run(a: &Args) -> Result<ExitCode> {
 
 /// The last component of `path` (the whole path when it has none).
 fn file_name(path: &std::path::Path) -> String {
-    path.file_name()
-        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
