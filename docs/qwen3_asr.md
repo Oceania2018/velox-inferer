@@ -100,10 +100,15 @@ above: the system turn is written even when empty. llama-server drops it without
 - Q8_0 matrices are relaid as `q8_g32_fp16` (same codes and per-32 scales; lossless), which the
   5090 variant runs on its tuned kernels. Activations may be int8 / bf16 there (`AllowA8`);
   `VELOX_ASR_A16` keeps them exact, `VELOX_ASR_GGML` keeps the GGML blocks.
-- Decoding sequences share one F32 KV pool (`--kv-rows`, 229 KB per row for 1.7B): each request
+- Decoding sequences share one KV pool (`--kv-rows`; `--kv-format`, default `fp8`: 63 KB per row
+  for 1.7B, `f32` 224 KB). FP8 rows (K Hadamard-rotated, E4M3 with one scale per row; see
+  `velox_core::kv`) are written by `qk_norm_rope_kv` and read by `attention_ranges` directly.
+  On an RTX 5060 Ti, LibriSpeech test-clean WER was 1.91% (fp8) vs 1.89% (f32), and pooled
+  attention 1.8-2.5x faster; `nvfp4` (35 KB per row) raised WER to 7.28% (empty transcripts,
+  repetition loops) and is not recommended. Each request
   reserves its prompt plus `min(max_tokens, 6 x seconds + 32)` output rows, first fit; a request
   that does not fit yet waits. A request prefills in a reused scratch session (prefill KV kept
-  contiguous for the oracle-checked path), its rows are copied into its pool range, then it joins
+  contiguous for the oracle-checked path), its rows are copied (encoded, for a packed pool) into its pool range, then it joins
   the batch.
 - Every step advances all active requests at once (`step_batch`), recorded as a static graph per
   (batch size, KV bucket). q | k | v and gate | up are stacked by rows at load (row views keep the

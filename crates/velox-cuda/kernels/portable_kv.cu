@@ -1081,3 +1081,270 @@ VELOX_API int velox_portable_state_unpack(const unsigned char* src, float* dst, 
     }
     return velox_launch_status();
 }
+
+// ---- pooled decode over a quantized KV pool (velox_core::Backend::qk_norm_rope_kv /
+// attention_ranges with a non-F32 PoolShape::kv). Pool row p holds kv_heads encoded rows at
+// (p * kv_heads + head) * kv_row_bytes. F32 pools keep the kernels in portable.cu. ----
+
+namespace {
+
+// One block per (row, head of q | k | v), as qk_norm_rope_kv_kernel: q heads normed and rotated
+// into q_out; k heads normed, rotated, staged in shared memory and encoded by warp 0 into pool row
+// dst[r]; v heads encoded straight from the projection.
+template <int FMT, int PER>
+__global__ void qk_norm_rope_kvq_kernel(const float* __restrict__ qkv, const float* __restrict__ qn,
+                                        const float* __restrict__ kn, const float* __restrict__ table,
+                                        float* __restrict__ q_out, unsigned char* __restrict__ kp,
+                                        unsigned char* __restrict__ vp, const uint32_t* __restrict__ dst, int heads,
+                                        int kv_heads, int d, float eps, float norm) {
+    __shared__ float y[32 * PER];  // normed values
+    __shared__ float z[32 * PER];  // rotated k head
+    __shared__ float scratch[VELOX_WARP];
+    const int r = blockIdx.x, g = blockIdx.y, lane = threadIdx.x % VELOX_WARP;
+    const size_t row = static_cast<size_t>(heads + 2 * kv_heads) * d;
+    const float* x = qkv + r * row + static_cast<size_t>(g) * d;
+    const size_t rb = static_cast<size_t>(kv_row_bytes(FMT, d));
+    if (g >= heads + kv_heads) {
+        if (threadIdx.x < VELOX_WARP) {
+            const size_t prow = static_cast<size_t>(dst[r]) * kv_heads + (g - heads - kv_heads);
+            kv_store_row<FMT, PER>(x, vp + prow * rb, d, lane, norm, KvRot<FMT>::v);
+        }
+        return;
+    }
+    const bool is_q = g < heads;
+    const float* w = is_q ? qn + static_cast<size_t>(g) * d : kn + static_cast<size_t>(g - heads) * d;
+    float ss = 0.0f;
+    for (int c = threadIdx.x; c < d; c += blockDim.x) ss += x[c] * x[c];
+    ss = velox_block_sum(ss, scratch);
+    const float inv = rsqrtf(ss / static_cast<float>(d) + eps);
+    for (int c = threadIdx.x; c < d; c += blockDim.x) y[c] = x[c] * inv * w[c];
+    __syncthreads();
+    float* out = is_q ? q_out + (static_cast<size_t>(r) * heads + g) * d : z;
+    const float* cs = table + static_cast<size_t>(r) * d;
+    const int half = d / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const float a = y[i], b = y[i + half], c = cs[i], s = cs[half + i];
+        out[i] = a * c - b * s;
+        out[i + half] = a * s + b * c;
+    }
+    if (is_q) return;  // block-uniform
+    __syncthreads();
+    if (threadIdx.x < VELOX_WARP) {
+        const size_t prow = static_cast<size_t>(dst[r]) * kv_heads + (g - heads);
+        kv_store_row<FMT, PER>(z, kp + prow * rb, d, lane, norm, KvRot<FMT>::k);
+    }
+}
+
+template <int FMT>
+int qk_norm_rope_kvq_launch(const float* qkv, const float* qn, const float* kn, const float* table, float* q_out,
+                            unsigned char* kp, unsigned char* vp, const uint32_t* dst, int rows, int heads,
+                            int kv_heads, int d, float eps, float norm) {
+    const dim3 grid(rows, heads + 2 * kv_heads);
+    const int threads = d >= 128 ? 128 : d;  // d is a power of two >= 32
+    if (d <= 32)
+        qk_norm_rope_kvq_kernel<FMT, 1><<<grid, threads>>>(qkv, qn, kn, table, q_out, kp, vp, dst, heads, kv_heads, d, eps, norm);
+    else if (d <= 64)
+        qk_norm_rope_kvq_kernel<FMT, 2><<<grid, threads>>>(qkv, qn, kn, table, q_out, kp, vp, dst, heads, kv_heads, d, eps, norm);
+    else if (d <= 128)
+        qk_norm_rope_kvq_kernel<FMT, 4><<<grid, threads>>>(qkv, qn, kn, table, q_out, kp, vp, dst, heads, kv_heads, d, eps, norm);
+    else
+        qk_norm_rope_kvq_kernel<FMT, 8><<<grid, threads>>>(qkv, qn, kn, table, q_out, kp, vp, dst, heads, kv_heads, d, eps, norm);
+    return velox_launch_status();
+}
+
+constexpr int kRqWarps = 4, kRqMaxGroup = 8;
+
+// Lane `lane`'s elements x[e] = row[lane * PER + e] of a packed row (d == 32 * PER): one vector
+// load and branch-free conversion (the f16 exponent trick of kv_dequant_chunk; products of a code
+// and its scale are exact, so this equals the reference decode).
+template <int FMT, int PER>
+__device__ __forceinline__ void kv_load_contig(const unsigned char* __restrict__ row, int d, int lane,
+                                               float (&x)[PER]) {
+    const int e0 = lane * PER;
+    if (FMT == VELOX_KV_BF16) {
+        if (PER == 1) {
+            x[0] = kv_bf16_to_f32(reinterpret_cast<const unsigned short*>(row)[e0]);
+        } else {
+#pragma unroll
+            for (int j = 0; j < PER / 2; ++j) {
+                const unsigned w = reinterpret_cast<const unsigned*>(row)[e0 / 2 + j];
+                x[2 * j] = __uint_as_float(w << 16);
+                x[2 * j + 1] = __uint_as_float(w & 0xffff0000u);
+            }
+        }
+    } else if (FMT == VELOX_KV_FP8) {
+        const float s = *reinterpret_cast<const float*>(row + d) * 256.0f;
+        if (PER >= 4) {
+#pragma unroll
+            for (int j = 0; j < PER / 4; ++j) {
+                const unsigned w = reinterpret_cast<const unsigned*>(row)[e0 / 4 + j];
+                const float2 a = kv_e4m3x2_f16_scaled(w), b = kv_e4m3x2_f16_scaled(w >> 16);
+                x[4 * j] = a.x * s, x[4 * j + 1] = a.y * s, x[4 * j + 2] = b.x * s, x[4 * j + 3] = b.y * s;
+            }
+        } else {
+            const unsigned w = PER == 2 ? reinterpret_cast<const unsigned short*>(row)[lane] : row[lane];
+            const float2 a = kv_e4m3x2_f16_scaled(w);
+            x[0] = a.x * s;
+            if (PER == 2) x[PER - 1] = a.y * s;
+        }
+    } else {  // NVFP4: PER / 2 code bytes per lane, all in one group of 16 (PER <= 16)
+        const float s = kv_e4m3_to_f32(row[d / 2 + e0 / 16]) * 16384.0f;
+        if (PER == 1) {
+            const unsigned byte = row[lane >> 1];
+            x[0] = kv_e2m1_to_f32((lane & 1) ? byte >> 4 : byte & 15u) * (s * 0x1p-14f);
+        } else {
+            unsigned w;
+            if (PER == 2) w = row[lane];
+            else if (PER == 4) w = reinterpret_cast<const unsigned short*>(row)[lane];
+            else w = reinterpret_cast<const unsigned*>(row)[lane];
+#pragma unroll
+            for (int j = 0; j < PER / 2; ++j) {
+                const float2 a = kv_e2m1x2_f16_scaled(w >> (8 * j));
+                x[2 * j] = a.x * s, x[2 * j + 1] = a.y * s;
+            }
+        }
+    }
+}
+
+// attention_ranges_kernel over packed rows: block (row, kv head), the group's query heads together
+// (rotated when K is) so each K / V row is dequantized once per warp; warps split the keys with an
+// online softmax and combine through shared memory; with rotated V the result is un-rotated.
+template <int FMT, int PER>
+__global__ void __launch_bounds__(kRqWarps * 32)
+    attention_ranges_kvq_kernel(const float* __restrict__ q, const unsigned char* __restrict__ k,
+                                const unsigned char* __restrict__ v, float* __restrict__ out,
+                                const uint32_t* __restrict__ ranges, int heads, int kv_heads, int d, float scale,
+                                float norm) {
+    const int r = blockIdx.x, kh = blockIdx.y, g = heads / kv_heads;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const long long start = ranges[2 * r], len = ranges[2 * r + 1];
+    const size_t rb = static_cast<size_t>(kv_row_bytes(FMT, d));
+    __shared__ float sm_m[kRqWarps][kRqMaxGroup], sm_l[kRqWarps][kRqMaxGroup];
+    __shared__ float sm_acc[kRqWarps][kRqMaxGroup][PER * 32];
+    __shared__ float sm_q[kRqMaxGroup][PER * 32];
+    // Scaled (and rotated, when K is) query heads, computed in the Hadamard layout (element
+    // lane + 32p) by warp hg % kRqWarps, then read back contiguously (element lane * PER + e) to
+    // match kv_load_contig.
+    for (int hg = warp; hg < g; hg += kRqWarps) {
+        float t[PER];
+        kvq_load_query<FMT, PER>(q + (static_cast<long long>(r) * heads + kh * g + hg) * d, true, d, lane, scale,
+                                 norm, t);
+#pragma unroll
+        for (int p = 0; p < PER; ++p) sm_q[hg][lane + 32 * p] = t[p];
+    }
+    __syncthreads();
+    float qv[kRqMaxGroup][PER], acc[kRqMaxGroup][PER], m[kRqMaxGroup], l[kRqMaxGroup];
+#pragma unroll
+    for (int hg = 0; hg < kRqMaxGroup; ++hg) {
+        m[hg] = -INFINITY, l[hg] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < PER; ++e) {
+            acc[hg][e] = 0.0f;
+            qv[hg][e] = hg < g ? sm_q[hg][lane * PER + e] : 0.0f;
+        }
+    }
+    for (long long j = warp; j < len; j += kRqWarps) {
+        const size_t off = (static_cast<size_t>(start + j) * kv_heads + kh) * rb;
+        float kk[PER], vv[PER];
+        kv_load_contig<FMT, PER>(k + off, d, lane, kk);
+        kv_load_contig<FMT, PER>(v + off, d, lane, vv);
+#pragma unroll
+        for (int hg = 0; hg < kRqMaxGroup; ++hg) {
+            if (hg >= g) break;
+            float sc = 0.0f;
+#pragma unroll
+            for (int e = 0; e < PER; ++e) sc += qv[hg][e] * kk[e];
+            sc = velox_warp_sum(sc);
+            const float mn = fmaxf(m[hg], sc), c = __expf(m[hg] - mn), p = __expf(sc - mn);
+            l[hg] = l[hg] * c + p;
+#pragma unroll
+            for (int e = 0; e < PER; ++e) acc[hg][e] = acc[hg][e] * c + p * vv[e];
+            m[hg] = mn;
+        }
+    }
+#pragma unroll
+    for (int hg = 0; hg < kRqMaxGroup; ++hg) {
+        if (hg >= g) break;
+        if (lane == 0) sm_m[warp][hg] = m[hg], sm_l[warp][hg] = l[hg];
+#pragma unroll
+        for (int e = 0; e < PER; ++e) sm_acc[warp][hg][lane * PER + e] = acc[hg][e];  // by element index
+    }
+    __syncthreads();
+    // Warp w merges heads w, w + kRqWarps, ...: lane holds elements lane + 32p (the Hadamard layout).
+    for (int hg = warp; hg < g; hg += kRqWarps) {
+        float mx = -INFINITY;
+        for (int w = 0; w < kRqWarps; ++w) mx = fmaxf(mx, sm_m[w][hg]);
+        float f[kRqWarps], lsum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kRqWarps; ++w) {
+            f[w] = sm_m[w][hg] == -INFINITY ? 0.0f : __expf(sm_m[w][hg] - mx);
+            lsum += sm_l[w][hg] * f[w];
+        }
+        float o[PER];
+#pragma unroll
+        for (int e = 0; e < PER; ++e) {
+            float a = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kRqWarps; ++w) a += sm_acc[w][hg][lane + 32 * e] * f[w];
+            o[e] = a / lsum;
+        }
+        if (KvRot<FMT>::v) kv_hadamard<PER>(o, lane, norm);
+        const size_t o_off = (static_cast<size_t>(r) * heads + kh * g + hg) * d;
+#pragma unroll
+        for (int e = 0; e < PER; ++e) out[o_off + lane + 32 * e] = o[e];
+    }
+}
+
+template <int FMT>
+int attention_ranges_kvq_launch(const float* q, const unsigned char* k, const unsigned char* v, float* out,
+                                const uint32_t* ranges, int rows, int heads, int kv_heads, int d, float norm) {
+    const dim3 grid(rows, kv_heads);
+    const float scale = rsqrtf(static_cast<float>(d));
+    if (d == 32)
+        attention_ranges_kvq_kernel<FMT, 1><<<grid, kRqWarps * 32>>>(q, k, v, out, ranges, heads, kv_heads, d, scale, norm);
+    else if (d == 64)
+        attention_ranges_kvq_kernel<FMT, 2><<<grid, kRqWarps * 32>>>(q, k, v, out, ranges, heads, kv_heads, d, scale, norm);
+    else if (d == 128)
+        attention_ranges_kvq_kernel<FMT, 4><<<grid, kRqWarps * 32>>>(q, k, v, out, ranges, heads, kv_heads, d, scale, norm);
+    else
+        attention_ranges_kvq_kernel<FMT, 8><<<grid, kRqWarps * 32>>>(q, k, v, out, ranges, heads, kv_heads, d, scale, norm);
+    return velox_launch_status();
+}
+
+}  // namespace
+
+// Packed pools need head_dim a power of two in 32..256 (validated by velox_core::check).
+VELOX_API int velox_portable_qk_norm_rope_kvq(const float* qkv, const float* qn, const float* kn, const float* table,
+                                              float* q_out, unsigned char* kp, unsigned char* vp,
+                                              const uint32_t* dst, int rows, int heads, int kv_heads, int d, float eps,
+                                              int format, float norm) {
+    if (rows == 0) return 0;
+    if (d < 32 || d > 256 || (d & (d - 1)) != 0 || rows > 65535) return VELOX_ERR_UNSUPPORTED;
+    switch (format) {
+        case VELOX_KV_BF16:
+            return qk_norm_rope_kvq_launch<VELOX_KV_BF16>(qkv, qn, kn, table, q_out, kp, vp, dst, rows, heads, kv_heads, d, eps, norm);
+        case VELOX_KV_FP8:
+            return qk_norm_rope_kvq_launch<VELOX_KV_FP8>(qkv, qn, kn, table, q_out, kp, vp, dst, rows, heads, kv_heads, d, eps, norm);
+        case VELOX_KV_NVFP4:
+            return qk_norm_rope_kvq_launch<VELOX_KV_NVFP4>(qkv, qn, kn, table, q_out, kp, vp, dst, rows, heads, kv_heads, d, eps, norm);
+        default: return VELOX_ERR_UNSUPPORTED;
+    }
+}
+
+VELOX_API int velox_portable_attention_ranges_kvq(const float* q, const unsigned char* k, const unsigned char* v,
+                                                  float* out, const uint32_t* ranges, int rows, int heads,
+                                                  int kv_heads, int d, int format, float norm) {
+    if (rows == 0) return 0;
+    if (d < 32 || d > 256 || (d & (d - 1)) != 0 || kv_heads <= 0 || heads % kv_heads != 0 ||
+        heads / kv_heads > kRqMaxGroup || rows > 65535)
+        return VELOX_ERR_UNSUPPORTED;
+    switch (format) {
+        case VELOX_KV_BF16:
+            return attention_ranges_kvq_launch<VELOX_KV_BF16>(q, k, v, out, ranges, rows, heads, kv_heads, d, norm);
+        case VELOX_KV_FP8:
+            return attention_ranges_kvq_launch<VELOX_KV_FP8>(q, k, v, out, ranges, rows, heads, kv_heads, d, norm);
+        case VELOX_KV_NVFP4:
+            return attention_ranges_kvq_launch<VELOX_KV_NVFP4>(q, k, v, out, ranges, rows, heads, kv_heads, d, norm);
+        default: return VELOX_ERR_UNSUPPORTED;
+    }
+}

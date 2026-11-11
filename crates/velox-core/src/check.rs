@@ -494,6 +494,12 @@ pub fn kv_scatter(
     s: &crate::backend::PoolShape,
 ) -> Result<()> {
     pool_geometry("kv_scatter", s, dst.len())?;
+    if s.kv != crate::KvFormat::F32 {
+        return Err(Error::Shape(format!(
+            "kv_scatter: F32 pools only, not {}",
+            s.kv
+        )));
+    }
     let row = product(&[s.kv_heads, s.head_dim])?;
     need("kv_scatter k", k, product(&[s.rows, row])?)?;
     need("kv_scatter v", v, product(&[s.rows, row])?)?;
@@ -552,16 +558,12 @@ pub fn qk_norm_rope_kv(
         q_out,
         product(&[s.rows, s.heads, s.head_dim])?,
     )?;
-    need(
-        "qk_norm_rope_kv k_pool",
-        k_pool,
-        product(&[s.pool_rows, kv])?,
-    )?;
-    need(
-        "qk_norm_rope_kv v_pool",
-        v_pool,
-        product(&[s.pool_rows, kv])?,
-    )?;
+    s.kv.check_head_dim(s.head_dim)?;
+    let pool = s
+        .pool_slots()
+        .ok_or_else(|| Error::Shape(format!("qk_norm_rope_kv: pool overflows {s:?}")))?;
+    need("qk_norm_rope_kv k_pool", k_pool, pool)?;
+    need("qk_norm_rope_kv v_pool", v_pool, pool)?;
     if let Some(d) = dst.iter().find(|&&d| d as usize >= s.pool_rows) {
         return Err(Error::Shape(format!(
             "qk_norm_rope_kv: row {d} past pool of {}",
@@ -582,19 +584,14 @@ pub fn attention_ranges(
 ) -> Result<()> {
     pool_geometry("attention_ranges", s, ranges.len())?;
     let qn = product(&[s.rows, s.heads, s.head_dim])?;
-    let row = product(&[s.kv_heads, s.head_dim])?;
     need("attention_ranges q", q, qn)?;
     need("attention_ranges out", out, qn)?;
-    need(
-        "attention_ranges k_pool",
-        k_pool,
-        product(&[s.pool_rows, row])?,
-    )?;
-    need(
-        "attention_ranges v_pool",
-        v_pool,
-        product(&[s.pool_rows, row])?,
-    )?;
+    s.kv.check_head_dim(s.head_dim)?;
+    let pool = s
+        .pool_slots()
+        .ok_or_else(|| Error::Shape(format!("attention_ranges: pool overflows {s:?}")))?;
+    need("attention_ranges k_pool", k_pool, pool)?;
+    need("attention_ranges v_pool", v_pool, pool)?;
     for &(start, len) in ranges {
         if len == 0 || start as usize + len as usize > s.pool_rows {
             return Err(Error::Shape(format!(
