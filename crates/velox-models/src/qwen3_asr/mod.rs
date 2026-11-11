@@ -451,6 +451,7 @@ impl<B: Backend> Qwen3Asr<B> {
             kv_heads: e.heads,
             head_dim: hd,
             pool_rows: n,
+            kv: KvFormat::F32,
         };
         for l in &self.enc.layers {
             b.layer_norm(x, &l.ln1.0, &l.ln1.1, hbuf, n, d, e.ln_eps)?;
@@ -845,12 +846,13 @@ pub const VERIFY_ROWS: usize = 32;
 
 const GRAPH_DECODE_BATCH: u64 = 2 << 16;
 
-/// One F32 KV pool for all serving sequences: per layer `[rows, kv_heads, head_dim]` K and V, and
-/// first-fit ranges of rows handed to sequences.
+/// One KV pool for all serving sequences: per layer `[rows, kv_heads]` K and V rows in format
+/// `kv` (see [`velox_core::kv`]), and first-fit ranges of rows handed to sequences.
 pub struct KvPool<B: Backend> {
     k: Vec<B::Buffer>,
     v: Vec<B::Buffer>,
     rows: usize,
+    kv: KvFormat,
     /// Free ranges `(start, len)`, sorted by start, coalesced.
     free: Vec<(usize, usize)>,
 }
@@ -869,21 +871,35 @@ impl PoolSeq {
 }
 
 impl<B: Backend> KvPool<B> {
-    pub fn new(b: &B, cfg: &AsrConfig, rows: usize) -> Result<Self> {
+    pub fn new(b: &B, cfg: &AsrConfig, rows: usize, kv: KvFormat) -> Result<Self> {
         let t = &cfg.dec;
-        let row = t.kv_heads * t.head_dim;
+        kv.check_head_dim(t.head_dim)?;
+        let slots = kv
+            .cache_slots(rows, t.kv_heads, t.head_dim)
+            .ok_or_else(|| Error::Shape(format!("KV pool of {rows} rows overflows")))?;
         let mut k = Vec::with_capacity(t.layers);
         let mut v = Vec::with_capacity(t.layers);
         for _ in 0..t.layers {
-            k.push(b.alloc(rows * row)?);
-            v.push(b.alloc(rows * row)?);
+            k.push(b.alloc(slots)?);
+            v.push(b.alloc(slots)?);
         }
         Ok(KvPool {
             k,
             v,
             rows,
+            kv,
             free: vec![(0, rows)],
         })
+    }
+
+    pub fn format(&self) -> KvFormat {
+        self.kv
+    }
+
+    /// Device bytes of K and V over all layers.
+    pub fn bytes(&self, cfg: &AsrConfig) -> usize {
+        let t = &cfg.dec;
+        2 * t.layers * self.rows * t.kv_heads * self.kv.row_bytes(t.head_dim)
     }
 
     pub fn rows(&self) -> usize {
@@ -975,10 +991,28 @@ impl<B: Backend> Qwen3Asr<B> {
         let s = &mut bw.prefill;
         s.reset();
         self.prefill(b, s, ws, prompt, Some(audio))?;
-        let row = self.cfg.dec.kv_heads * self.cfg.dec.head_dim;
-        for li in 0..self.cfg.dec.layers {
-            b.copy(&s.k_cache[li], 0, &mut pool.k[li], seq.base * row, n * row)?;
-            b.copy(&s.v_cache[li], 0, &mut pool.v[li], seq.base * row, n * row)?;
+        let t = &self.cfg.dec;
+        let row = t.kv_heads * t.head_dim;
+        for li in 0..t.layers {
+            if pool.kv == KvFormat::F32 {
+                b.copy(&s.k_cache[li], 0, &mut pool.k[li], seq.base * row, n * row)?;
+                b.copy(&s.v_cache[li], 0, &mut pool.v[li], seq.base * row, n * row)?;
+            } else {
+                // The scratch session is F32: encode its rows into the pool's range.
+                b.kv_store(
+                    &s.k_cache[li],
+                    &s.v_cache[li],
+                    &mut pool.k[li],
+                    &mut pool.v[li],
+                    KvStoreShape {
+                        tokens: n,
+                        kv_heads: t.kv_heads,
+                        head_dim: t.head_dim,
+                        pos0: seq.base,
+                        format: pool.kv,
+                    },
+                )?;
+            }
         }
         seq.pos = n;
         b.fetch_u32_begin(&ws.next_id, 0, 0)?;
@@ -1124,6 +1158,7 @@ impl<B: Backend> Qwen3Asr<B> {
             kv_heads: t.kv_heads,
             head_dim: hd,
             pool_rows: pool.rows,
+            kv: pool.kv,
         };
         let qkv_shape = QkvRopeShape {
             rows: n,
@@ -1132,6 +1167,7 @@ impl<B: Backend> Qwen3Asr<B> {
             head_dim: hd,
             pool_rows: pool.rows,
             eps,
+            kv: pool.kv,
         };
         let (qkv_cols, gu_cols) = (qkv_shape.row(), 2 * t.ffn);
         b.embed(ids, &self.dec.embed.view(), &mut ws.x)?;

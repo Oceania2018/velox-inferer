@@ -64,6 +64,8 @@ COMMANDS:
       --heads <n> --kv-heads <n> --head-dim <n>  default 24/4, 256 (Qwen3.8)
       --pos0 <n> (16384) --tokens <list> (1,8,16) --kv-format <list> (f32,bf16,fp8,nvfp4) --iters <n> (50)
       --window <n>          time attention_windows (System One scoring windows, f32 K/V) instead
+  bench-pool-attn         Time attention_ranges over a KV pool per storage format (decode / prefill)
+      [--heads 16] [--kv-heads 8] [--head-dim 128] [--kv-format f32,bf16,fp8,nvfp4] [--iters 50]
   bench-verify            Time batched speculative verify rounds against one sequence at a time
       --artifact <path> --batch <n> (3) --window <n> (12) --context <n> (13000) --rounds <n> (40)
       [--keep <n>] [--kv-format nvfp4] [--prefill <n>] (mixed rounds) [--only batched]
@@ -91,7 +93,7 @@ COMMANDS:
       [--repeat 2] [--enc-tol 2e-2] [--logit-tol 2e-2] [--profile-ops] (docs/qwen3_asr.md)
   serve-asr               Qwen3-ASR behind llama-server's /v1/chat/completions (input_audio)
       --gguf <text .gguf> --mmproj <mmproj .gguf> --tokenizer <tokenizer.json>
-      [--host 0.0.0.0] [--port 8080] [--max-batch 32] [--max-tokens 512] [--kv-rows 8192]
+      [--host 0.0.0.0] [--port 8080] [--max-batch 32] [--max-tokens 512] [--kv-rows 8192] [--kv-format fp8|f32|bf16|nvfp4]
   generate                Greedy generation from token ids with a real artifact
       --artifact <path> (--prompt <text> | --ids <1,2,3>) [--chat-template <file>]
       [--max-tokens 64] [--chunk 256] [--capacity 4096] [--mtp N | --dflash N] (speculative)
@@ -178,6 +180,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         Some("bench-gdn") => bench_gdn(a),
         Some("bench-moe") => bench_moe(a),
         Some("bench-attn") => bench_attn(a),
+        Some("bench-pool-attn") => bench_pool_attn(a),
         Some("bench-verify") => bench_verify::run(a),
         Some("inspect") => weights::inspect(a),
         Some("convert") => weights::convert(a),
@@ -487,6 +490,31 @@ fn bench_gdn(a: &Args) -> Result<ExitCode> {
         Selected::Cpu(b) => bench::run_gdn(b, &cfg)?,
         #[cfg(feature = "cuda")]
         Selected::Cuda(b) => bench::run_gdn(b, &cfg)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `attention_ranges` over a pool (Qwen3-ASR decoder shape by default) per KV format: decode
+/// steps (one row per sequence) and prefills (a sequence's rows attend causally).
+fn bench_pool_attn(a: &Args) -> Result<ExitCode> {
+    let formats = a
+        .get("kv-format")
+        .unwrap_or("f32,bf16,fp8,nvfp4")
+        .split(',')
+        .map(|s| velox_core::KvFormat::parse(s.trim()))
+        .collect::<Result<Vec<_>>>()?;
+    let cfg = bench::PoolAttnConfig {
+        heads: a.parse("heads", 16)?,
+        kv_heads: a.parse("kv-heads", 8)?,
+        head_dim: a.parse("head-dim", 128)?,
+        formats,
+        iters: a.parse("iters", 50)?,
+    };
+    let sel = select::backend(a)?;
+    match &sel {
+        Selected::Cpu(b) => bench::run_pool_attn(b, &cfg)?,
+        #[cfg(feature = "cuda")]
+        Selected::Cuda(b) => bench::run_pool_attn(b, &cfg)?,
     }
     Ok(ExitCode::SUCCESS)
 }

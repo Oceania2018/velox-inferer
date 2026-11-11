@@ -309,9 +309,10 @@ pub fn im2col_3x3s2_host(x: &[f32], s: Im2colShape) -> Vec<f32> {
     y
 }
 
-/// Rows of a shared F32 KV pool (`[pool_rows, kv_heads, head_dim]` per cache) that several
-/// sequences live in, one contiguous range each: decode steps of many sequences then attend and
-/// store with one call per layer. See [`Backend::attention_ranges`] and [`Backend::kv_scatter`].
+/// Rows of a shared KV pool (`[pool_rows, kv_heads]` rows of `kv` per cache, each
+/// [`KvFormat::row_bytes`] as [`crate::kv`] lays them out) that several sequences live in, one
+/// contiguous range each: decode steps of many sequences then attend and store with one call per
+/// layer. See [`Backend::attention_ranges`] and [`Backend::kv_scatter`] (F32 only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolShape {
     /// Query / K / V rows of the call (one per sequence).
@@ -320,14 +321,23 @@ pub struct PoolShape {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub pool_rows: usize,
+    pub kv: KvFormat,
+}
+
+impl PoolShape {
+    /// f32 slots of one pool (K or V).
+    pub fn pool_slots(&self) -> Option<usize> {
+        self.kv
+            .cache_slots(self.pool_rows, self.kv_heads, self.head_dim)
+    }
 }
 
 /// Host reference of [`Backend::attention_ranges`]: query row `r` (`[rows, heads, head_dim]`)
 /// attends, causally complete, to pool rows `ranges[r].0 .. ranges[r].0 + ranges[r].1`; query head
 /// `h` reads kv head `h / (heads / kv_heads)`. Scale `1 / sqrt(head_dim)`.
 /// Shape of [`Backend::qk_norm_rope_kv`]: `rows` rows of a fused `q | k | v` projection
-/// (`[rows, (heads + 2 * kv_heads) * head_dim]`), stored into F32 pools of `pool_rows` rows of
-/// `[kv_heads, head_dim]`.
+/// (`[rows, (heads + 2 * kv_heads) * head_dim]`), stored into pools of `pool_rows` rows of
+/// `[kv_heads]` rows in format `kv` (encoded as [`crate::kv::encode_row`] specifies).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QkvRopeShape {
     pub rows: usize,
@@ -337,6 +347,7 @@ pub struct QkvRopeShape {
     pub pool_rows: usize,
     /// Of the per-head RMS norms.
     pub eps: f32,
+    pub kv: KvFormat,
 }
 
 impl QkvRopeShape {
@@ -344,6 +355,29 @@ impl QkvRopeShape {
     pub fn row(&self) -> usize {
         (self.heads + 2 * self.kv_heads) * self.head_dim
     }
+
+    /// f32 slots of one pool (K or V).
+    pub fn pool_slots(&self) -> Option<usize> {
+        self.kv
+            .cache_slots(self.pool_rows, self.kv_heads, self.head_dim)
+    }
+}
+
+/// The bytes of f32 slots (a packed KV buffer as the host sees it).
+pub fn slots_bytes(x: &[f32]) -> Vec<u8> {
+    x.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect()
+}
+
+/// f32 slots holding `bytes` (zero-padded to a slot).
+pub fn bytes_slots(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            f32::from_bits(u32::from_le_bytes(w))
+        })
+        .collect()
 }
 
 /// Host reference of [`Backend::rope_cos_sin`]: row `r` is `[head_dim / 2]` cos then sin of
@@ -428,6 +462,15 @@ pub fn attention_ranges_host(
     s: PoolShape,
 ) -> Vec<f32> {
     let (h, kvh, d) = (s.heads, s.kv_heads, s.head_dim);
+    // A quantized pool attends over the rows it represents.
+    let (kd, vd);
+    let (k, v) = if s.kv == KvFormat::F32 {
+        (k, v)
+    } else {
+        kd = crate::kv::decode_cache(s.kv, &slots_bytes(k), s.pool_rows * kvh, d, false);
+        vd = crate::kv::decode_cache(s.kv, &slots_bytes(v), s.pool_rows * kvh, d, true);
+        (&kd[..], &vd[..])
+    };
     let group = h / kvh;
     let scale = 1.0 / (d as f64).sqrt();
     let mut out = vec![0f32; s.rows * h * d];
@@ -1882,8 +1925,17 @@ pub trait Backend {
         let (q, k, v) = qk_norm_rope_kv_host(&x, &qn, &kn, &t, shape);
         let tmp = self.upload(&q)?;
         self.copy(&tmp, 0, q_out, 0, q.len())?;
+        // Pool rows hold kv_heads encoded rows each (the values themselves for F32).
+        let (k, v) = if shape.kv == KvFormat::F32 {
+            (k, v)
+        } else {
+            let enc = |x: &[f32], is_v| {
+                bytes_slots(&crate::kv::encode_cache(shape.kv, x, shape.head_dim, is_v))
+            };
+            (enc(&k, false), enc(&v, true))
+        };
         let (kt, vt) = (self.upload(&k)?, self.upload(&v)?);
-        let row = shape.kv_heads * shape.head_dim;
+        let row = shape.kv_heads * shape.kv.row_slots(shape.head_dim);
         for (r, &d) in dst.iter().enumerate() {
             self.copy(&kt, r * row, k_pool, d as usize * row, row)?;
             self.copy(&vt, r * row, v_pool, d as usize * row, row)?;
