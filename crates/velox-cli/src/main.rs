@@ -134,6 +134,8 @@ COMMANDS:
       --draft-vocab full|draft  DSpine proposal head: the target's full output head (full) or
                                 its draft vocabulary head (draft: cheaper, fewer drafts accepted)
       --score-branch-rows <n>  System One rank candidates per forward pass (100; 0 rejects rank)
+      --score-pass-rows <n>    System One tokens per scoring pass (0: score-branch-rows x 6; at
+                               most the prefill chunk; more rows = fewer passes for many questions)
       --max-vision-tokens <n>  merged vision tokens per image (32x32 px each) before it is
                             downscaled (1280: 1920x1080 -> 1504x832)
   replay                Replay a recorded agent session against an OpenAI-compatible server

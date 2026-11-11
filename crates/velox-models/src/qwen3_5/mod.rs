@@ -2703,7 +2703,11 @@ impl<B: Backend> Qwen35Text<B> {
             passes.push((len, &rest[..n]));
             rest = &rest[n..];
         }
-        let rows_max = passes.iter().map(|&(len, g)| len * g.len()).max().unwrap_or(0);
+        let rows_max = passes
+            .iter()
+            .map(|&(len, g)| len * g.len())
+            .max()
+            .unwrap_or(0);
         s.prepare_kv(b, s.pos, s.pos + rows_max)?;
         let mut out = vec![0f32; windows.len() * targets.len()];
         for (longest, group) in passes {
@@ -2741,13 +2745,8 @@ impl<B: Backend> Qwen35Text<B> {
                     NormKind::Offset,
                 )?;
                 b.linear(&ws.hidden, &w.view(&w.head), &mut ws.logits_rows, g)?;
-                let scores = b.log_softmax_gather(
-                    &ws.logits_rows,
-                    g,
-                    c.vocab,
-                    limit.min(c.vocab),
-                    targets,
-                )?;
+                let scores =
+                    b.log_softmax_gather(&ws.logits_rows, g, c.vocab, limit.min(c.vocab), targets)?;
                 // Back to request order: row j of this part is window group[k * head_rows + j].
                 let t = targets.len();
                 for (j, row) in scores.chunks(t).enumerate() {
