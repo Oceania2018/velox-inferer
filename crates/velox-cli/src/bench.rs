@@ -526,3 +526,81 @@ pub fn run_attn<B: Backend>(b: &B, c: &AttnConfig) -> Result<()> {
     }
     Ok(())
 }
+
+pub struct PoolAttnConfig {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub formats: Vec<velox_core::KvFormat>,
+    pub iters: usize,
+}
+
+/// Times `attention_ranges` per format over: decode steps of `seqs` sequences at `ctx` positions,
+/// and prefills of `seqs` sequences of `ctx` rows each (row j attends to rows 0..=j).
+pub fn run_pool_attn<B: Backend>(b: &B, c: &PoolAttnConfig) -> Result<()> {
+    let (h, kvh, d) = (c.heads, c.kv_heads, c.head_dim);
+    println!(
+        "attention_ranges heads {h}/{kvh} d {d}  on {}",
+        b.describe()
+    );
+    // (label, sequences, positions per sequence, prefill?)
+    let cases = [
+        ("decode", 16, 300, false),
+        ("decode", 16, 800, false),
+        ("decode", 32, 300, false),
+        ("prefill", 1, 400, true),
+        ("prefill", 4, 200, true),
+        ("prefill", 1, 1000, true),
+    ];
+    let mut rng = Rng::new(7);
+    for (label, seqs, ctx, prefill) in cases {
+        let pool_rows = seqs * ctx;
+        let mut ranges = Vec::new();
+        for s in 0..seqs {
+            let base = (s * ctx) as u32;
+            if prefill {
+                ranges.extend((1..=ctx as u32).map(|l| (base, l)));
+            } else {
+                ranges.push((base, ctx as u32));
+            }
+        }
+        let rows = ranges.len();
+        let k = rng.vec(pool_rows * kvh * d, 2.0);
+        let v = rng.vec(pool_rows * kvh * d, 1.0);
+        let q = b.upload(&rng.vec(rows * h * d, 2.0))?;
+        let mut out = b.alloc(rows * h * d)?;
+        let mut line = format!("  {label:>7} {seqs:>2} x {ctx:>4} ({rows:>4} rows)");
+        for &fmt in &c.formats {
+            let (kp, vp) = if fmt == velox_core::KvFormat::F32 {
+                (b.upload(&k)?, b.upload(&v)?)
+            } else {
+                (
+                    b.upload_bytes(&velox_core::kv::encode_cache(fmt, &k, d, false))?,
+                    b.upload_bytes(&velox_core::kv::encode_cache(fmt, &v, d, true))?,
+                )
+            };
+            let s = velox_core::PoolShape {
+                rows,
+                heads: h,
+                kv_heads: kvh,
+                head_dim: d,
+                pool_rows,
+                kv: fmt,
+            };
+            for _ in 0..3 {
+                b.attention_ranges(&q, &kp, &vp, &mut out, &ranges, s)?;
+            }
+            b.synchronize()?;
+            let mut samples = Vec::with_capacity(c.iters);
+            for _ in 0..c.iters {
+                let t0 = Instant::now();
+                b.attention_ranges(&q, &kp, &vp, &mut out, &ranges, s)?;
+                b.synchronize()?;
+                samples.push(t0.elapsed().as_secs_f64());
+            }
+            line += &format!("  {fmt}: {:>8.1} us", median(samples) * 1e6);
+        }
+        println!("{line}");
+    }
+    Ok(())
+}
