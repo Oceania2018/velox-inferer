@@ -294,6 +294,8 @@ struct Core<B: Backend> {
     fe: Frontend,
     cfg: EngineConfig,
     special: SpecialTokens,
+    /// Rows of one scoring pass: the longest window `score_plan` hands `score_windows`.
+    score_cap: usize,
     /// What `GET /metrics` reports of memory and the cache tiers, published by the worker.
     gauges: Gauges,
 }
@@ -728,6 +730,8 @@ where
         // Before warm-up and the memory budget, so the attention pool is sized without them.
         let sw =
             model.score_workspace(&b, cfg.score_rows.clamp(1, ws.max_tokens()), SCORE_WINDOW)?;
+        // What `Qwen35Text::score_windows` takes per pass, so per window.
+        let score_cap = (sw.max_seqs() * SCORE_WINDOW).min(ws.max_tokens());
         let special = SpecialTokens {
             im_start: single_token(&fe, "<|im_start|>"),
             vision_start: single_token(&fe, "<|vision_start|>"),
@@ -817,6 +821,7 @@ where
             fe,
             cfg,
             special,
+            score_cap,
             gauges: Gauges::default(),
         });
         let mut state = state;
@@ -2583,6 +2588,10 @@ impl<B: Backend> Core<B> {
         // The point the request's later questions resume from is the lane's head (kept on the
         // device), even past the media tail.
         if let Some(f) = fork.filter(|&f| f > start && f < p.ids.len()) {
+            // The fork must be the deepest point: only the deepest snapshot stays on the lane
+            // (the others need anchors, which scoring prompts do not place), and a checkpoint
+            // past the fork is of no use to the later questions, which part from this one there.
+            positions.retain(|&pos| pos < f);
             positions.push(f);
             positions.sort_unstable();
             positions.dedup();
@@ -2914,10 +2923,10 @@ impl<B: Backend> Core<B> {
             let text = plain
                 .iter()
                 .all(|&i| qs[i].p.runs.iter().all(|r| r.start + r.len <= fork));
-            if fork > 0
-                && text
-                && plain.len() * longest <= self.cfg.score_rows.max(1) * SCORE_WINDOW
-            {
+            // `score_windows` splits the windows into passes of its rows, so only each window has
+            // to fit in one pass: however many there are, they take far fewer weight reads than
+            // prefilling every question whole.
+            if fork > 0 && text && longest <= self.score_cap {
                 let mut candidates: Vec<u32> = Vec::new();
                 let mut answers = Vec::new();
                 for &i in &plain {

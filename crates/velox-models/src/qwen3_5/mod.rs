@@ -2649,11 +2649,12 @@ impl<B: Backend> Qwen35Text<B> {
     /// Scores continuations of `s`'s prompt without changing the session: each of `windows` (at
     /// most `sw`'s rows) is fed from `s.pos` as if it were the only one, and the log-probabilities
     /// (over the first `limit` ids) of `targets` after its last token are returned, window-major.
-    /// As many windows as `sw`'s rows hold (padded to the longest) share a forward pass, so every
-    /// weight is read once per pass rather than once per window, and each op takes every window of
-    /// the pass in one call. The GDN layers read the session's state and write scratch; window `i`'s
-    /// keys and values are written to the cache rows from `s.pos + i * longest` (rows past the
-    /// prompt hold nothing afterwards, as after a rejected verify). `ws`'s rows are overwritten.
+    /// As many windows as `sw`'s rows hold share a forward pass (longest first, each padded to the
+    /// longest of its pass), so every weight is read once per pass rather than once per window,
+    /// and each op takes every window of the pass in one call. The GDN layers read the session's
+    /// state and write scratch; the `i`th window of a pass `len` wide writes its keys and values
+    /// to the cache rows from `s.pos + i * len` (rows past the prompt hold nothing afterwards, as
+    /// after a rejected verify). `ws`'s rows are overwritten.
     #[allow(clippy::too_many_arguments)]
     pub fn score_windows(
         &self,
@@ -2688,18 +2689,32 @@ impl<B: Backend> Qwen35Text<B> {
                 s.pos, s.capacity
             )));
         }
-        // Window i's keys and values go to cache rows s.pos + i * longest.
-        let per_pass = (cap / longest).min((s.capacity - s.pos) / longest);
-        s.prepare_kv(b, s.pos, s.pos + per_pass.min(windows.len()) * longest)?;
-        let mut out = Vec::with_capacity(windows.len() * targets.len());
-        for group in windows.chunks(per_pass) {
-            // Every window is padded to the longest (repeating its last token), so the windows
-            // of a pass are one shape for the batched kernels: tokens after a window's last one
-            // do not change that row (attention and the recurrences are causal).
+        // Passes: the windows longest first, each pass padded to its own first (longest) window,
+        // so windows of very different lengths (System One questions) do not all pay for the
+        // longest one. Window i of a pass of width `len` takes cache rows s.pos + i * len.
+        let room = s.capacity - s.pos;
+        let mut order: Vec<usize> = (0..windows.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(windows[i].len()));
+        let mut passes: Vec<(usize, &[usize])> = Vec::new();
+        let mut rest = &order[..];
+        while let Some(&head) = rest.first() {
+            let len = windows[head].len();
+            let n = (cap / len).min(room / len).max(1).min(rest.len());
+            passes.push((len, &rest[..n]));
+            rest = &rest[n..];
+        }
+        let rows_max = passes.iter().map(|&(len, g)| len * g.len()).max().unwrap_or(0);
+        s.prepare_kv(b, s.pos, s.pos + rows_max)?;
+        let mut out = vec![0f32; windows.len() * targets.len()];
+        for (longest, group) in passes {
+            // Every window is padded to the pass's longest (repeating its last token), so the
+            // windows of a pass are one shape for the batched kernels: tokens after a window's
+            // last one do not change that row (attention and the recurrences are causal).
             let n = group.len();
             let mut ids = Vec::with_capacity(n * longest);
             let mut last = Vec::with_capacity(n);
-            for win in group {
+            for &wi in group {
+                let win = windows[wi];
                 last.push(ids.len() + win.len() - 1);
                 ids.extend_from_slice(win);
                 ids.resize(ids.len() + longest - win.len(), win[win.len() - 1]);
@@ -2710,7 +2725,8 @@ impl<B: Backend> Qwen35Text<B> {
             self.chunk_batch(b, None, &[], &mut [&mut *s], ws, sw, &ids, &rows)?;
             // Each window's last row, final-normed, through the output head; the head's rows hold
             // VERIFY_MAX at a time.
-            for part in last.chunks(VERIFY_MAX.min(ws.max_tokens)) {
+            let head_rows = VERIFY_MAX.min(ws.max_tokens);
+            for (k, part) in last.chunks(head_rows).enumerate() {
                 for (j, &row) in part.iter().enumerate() {
                     b.copy(&ws.x, row * c.hidden, &mut ws.h, j * c.hidden, c.hidden)?;
                 }
@@ -2725,13 +2741,19 @@ impl<B: Backend> Qwen35Text<B> {
                     NormKind::Offset,
                 )?;
                 b.linear(&ws.hidden, &w.view(&w.head), &mut ws.logits_rows, g)?;
-                out.extend(b.log_softmax_gather(
+                let scores = b.log_softmax_gather(
                     &ws.logits_rows,
                     g,
                     c.vocab,
                     limit.min(c.vocab),
                     targets,
-                )?);
+                )?;
+                // Back to request order: row j of this part is window group[k * head_rows + j].
+                let t = targets.len();
+                for (j, row) in scores.chunks(t).enumerate() {
+                    let wi = group[k * head_rows + j];
+                    out[wi * t..(wi + 1) * t].copy_from_slice(row);
+                }
             }
         }
         Ok(out)
