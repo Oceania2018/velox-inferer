@@ -68,8 +68,12 @@ pub fn run(a: &Args) -> Result<ExitCode> {
     let port: u16 = a.parse("port", 8080)?;
     let max_batch: usize = a.parse("max-batch", MAX_BATCH)?;
     let default_max_new: usize = a.parse("max-tokens", 512)?;
-    // F32 KV costs layers * 2 * kv_heads * head_dim * 4 bytes per row (229 KB for 1.7B).
+    // KV bytes per row are layers * 2 * kv_heads * KvFormat::row_bytes(head_dim): for 1.7B, fp8
+    // (K Hadamard-rotated, E4M3 with one scale per row) 63 KB, f32 224 KB. fp8 keeps accuracy
+    // (LibriSpeech test-clean WER 1.91% vs 1.89% f32) and its attention is faster; nvfp4 does not
+    // (7.3%, see docs/qwen3_asr.md).
     let kv_rows: usize = a.parse("kv-rows", 8192)?;
+    let kv_format = velox_core::KvFormat::parse(a.get("kv-format").unwrap_or("fp8"))?;
     let tok = Arc::new(PlainTokenizer::from_file(&tok_path)?);
     let warm_prompt = tok.encode(
         "<|im_start|>system
@@ -99,6 +103,7 @@ language English<asr_text>",
                     rx,
                     max_batch,
                     kv_rows,
+                    kv_format,
                     warm_prompt.clone(),
                     &ready_tx,
                 ),
@@ -110,6 +115,7 @@ language English<asr_text>",
                     rx,
                     max_batch,
                     kv_rows,
+                    kv_format,
                     warm_prompt.clone(),
                     &ready_tx,
                 ),
@@ -233,6 +239,7 @@ fn engine<B: Backend>(
     rx: Receiver<Job>,
     max_batch: usize,
     kv_rows: usize,
+    kv_format: velox_core::KvFormat,
     warm_prompt: Vec<u32>,
     ready: &Sender<Result<()>>,
 ) -> Result<()> {
@@ -240,12 +247,13 @@ fn engine<B: Backend>(
     let t0 = Instant::now();
     let m = Qwen3Asr::load(b, text, mmproj)?;
     let mut bw = BatchWorkspace::new(b, &m)?;
-    let mut pool = KvPool::new(b, &m.cfg, kv_rows)?;
+    let mut pool = KvPool::new(b, &m.cfg, kv_rows, kv_format)?;
     eprintln!(
-        "loaded {:.2} GB in {:.1?} on {}; KV pool {kv_rows} rows",
+        "loaded {:.2} GB in {:.1?} on {}; KV pool {kv_rows} rows {kv_format} ({:.0} MB)",
         m.bytes as f64 / 1e9,
         t0.elapsed(),
-        b.describe()
+        b.describe(),
+        pool.bytes(&m.cfg) as f64 / 1e6
     );
     let mut waiting: VecDeque<Job> = VecDeque::new();
     let mut active: Vec<Active> = Vec::new();

@@ -742,6 +742,36 @@ extern "C" {
         format: i32,
         norm: f32,
     ) -> i32;
+    fn velox_portable_qk_norm_rope_kvq(
+        qkv: *const f32,
+        qn: *const f32,
+        kn: *const f32,
+        table: *const f32,
+        q_out: *mut f32,
+        kp: *mut u8,
+        vp: *mut u8,
+        dst: *const u32,
+        rows: i32,
+        heads: i32,
+        kv_heads: i32,
+        d: i32,
+        eps: f32,
+        format: i32,
+        norm: f32,
+    ) -> i32;
+    fn velox_portable_attention_ranges_kvq(
+        q: *const f32,
+        k: *const u8,
+        v: *const u8,
+        out: *mut f32,
+        ranges: *const u32,
+        rows: i32,
+        heads: i32,
+        kv_heads: i32,
+        d: i32,
+        format: i32,
+        norm: f32,
+    ) -> i32;
     fn velox_portable_kv_store(
         k: *const f32,
         v: *const f32,
@@ -1960,6 +1990,31 @@ pub fn qk_norm_rope_kv(
     if graph_mode() == GraphMode::Replay {
         return Ok(());
     }
+    if s.kv != KvFormat::F32 {
+        // SAFETY: extents (in the pool format) validated above; d holds rows u32 destinations.
+        return status(
+            unsafe {
+                velox_portable_qk_norm_rope_kvq(
+                    qkv.as_ptr(),
+                    qn.as_ptr(),
+                    kn.as_ptr(),
+                    table.as_ptr(),
+                    q_out.as_mut_ptr(),
+                    kp.as_mut_ptr().cast(),
+                    vp.as_mut_ptr().cast(),
+                    d.cast(),
+                    to_i32("rows", s.rows)?,
+                    to_i32("heads", s.heads)?,
+                    to_i32("kv_heads", s.kv_heads)?,
+                    to_i32("head_dim", s.head_dim)?,
+                    s.eps,
+                    kv_format_code(s.kv),
+                    hadamard_norm(s.head_dim),
+                )
+            },
+            "portable qk_norm_rope_kvq",
+        );
+    }
     // SAFETY: extents validated above; d holds rows u32 destinations inside the pools.
     status(
         unsafe {
@@ -2030,6 +2085,27 @@ pub fn attention_ranges(
     let r = stage(&bytes)?;
     if graph_mode() == GraphMode::Replay {
         return Ok(());
+    }
+    if s.kv != KvFormat::F32 {
+        // SAFETY: extents (in the pool format) and ranges validated above.
+        return status(
+            unsafe {
+                velox_portable_attention_ranges_kvq(
+                    q.as_ptr(),
+                    kp.as_ptr().cast(),
+                    vp.as_ptr().cast(),
+                    out.as_mut_ptr(),
+                    r.cast(),
+                    to_i32("rows", s.rows)?,
+                    to_i32("heads", s.heads)?,
+                    to_i32("kv_heads", s.kv_heads)?,
+                    to_i32("head_dim", s.head_dim)?,
+                    kv_format_code(s.kv),
+                    hadamard_norm(s.head_dim),
+                )
+            },
+            "portable attention_ranges_kvq",
+        );
     }
     // SAFETY: extents and ranges validated above; r holds rows (start, len) pairs.
     status(

@@ -1691,6 +1691,7 @@ impl<B: Backend> Suite<'_, B> {
             kv_heads,
             head_dim: d,
             pool_rows,
+            kv: KvFormat::F32,
         };
         let (k, v) = (self.rng.vec(rows * row, 1.0), self.rng.vec(rows * row, 1.0));
         let (kp0, vp0) = (
@@ -1748,6 +1749,7 @@ impl<B: Backend> Suite<'_, B> {
             head_dim: d,
             pool_rows,
             eps: 1e-6,
+            kv: KvFormat::F32,
         };
         let row = kv_heads * d;
         let qkv = self.rng.vec(rows * shape.row(), 2.0);
@@ -1802,6 +1804,157 @@ impl<B: Backend> Suite<'_, B> {
         self.record(format!("{name} k pool"), None, &got_k, &kw, 1e-5);
         let got_v = fetch(self.b, &vpd, pool_rows * row)?;
         self.record(format!("{name} v pool"), None, &got_v, &vw, 0.0);
+        Ok(())
+    }
+
+    /// `attention_ranges` over a packed pool of `fmt` rows (random rows encoded on the host) against
+    /// the oracle, which attends over the rows the pool represents.
+    fn pool_attention_q(
+        &mut self,
+        fmt: KvFormat,
+        lens: &[u32],
+        heads: usize,
+        kv_heads: usize,
+        d: usize,
+    ) -> Result<()> {
+        let rows = lens.len();
+        let mut ranges = Vec::new();
+        let mut at = 3u32;
+        for &l in lens {
+            ranges.push((at, l));
+            at += l + 5;
+        }
+        let pool_rows = at as usize;
+        let shape = velox_core::PoolShape {
+            rows,
+            heads,
+            kv_heads,
+            head_dim: d,
+            pool_rows,
+            kv: fmt,
+        };
+        let enc = |x: &[f32], is_v| {
+            velox_core::backend::bytes_slots(&velox_core::kv::encode_cache(fmt, x, d, is_v))
+        };
+        let kp = enc(&self.rng.vec(pool_rows * kv_heads * d, 1.0), false);
+        let vp = enc(&self.rng.vec(pool_rows * kv_heads * d, 1.0), true);
+        let q = self.rng.vec(rows * heads * d, 1.0);
+        let mut want = vec![0.0; rows * heads * d];
+        CpuBackend.attention_ranges(&q, &kp, &vp, &mut want, &ranges, shape)?;
+        let (qd, kpd, vpd) = (self.b.upload(&q)?, self.b.upload(&kp)?, self.b.upload(&vp)?);
+        let mut od = self.b.alloc(rows * heads * d)?;
+        self.b
+            .attention_ranges(&qd, &kpd, &vpd, &mut od, &ranges, shape)?;
+        let got = fetch(self.b, &od, rows * heads * d)?;
+        self.record(
+            format!("attention_ranges {fmt} lens {lens:?} heads {heads}/{kv_heads} x {d}"),
+            None,
+            &got,
+            &want,
+            1e-4,
+        );
+        Ok(())
+    }
+
+    /// `qk_norm_rope_kv` into packed pools of `fmt`: q as the F32 case; V rows encode the
+    /// projection itself, so they match the oracle byte for byte; K rows are encoded from values
+    /// that differ from the oracle's by rounding, so at most 1% of their bytes may differ (a code
+    /// on a rounding boundary) and the rows they represent must agree to within one code step.
+    fn qkv_rope_pool_q(
+        &mut self,
+        fmt: KvFormat,
+        positions: &[u32],
+        heads: usize,
+        kv_heads: usize,
+        d: usize,
+    ) -> Result<()> {
+        let rows = positions.len();
+        let pool_rows = 4 * rows + 3;
+        let dst: Vec<u32> = (0..rows).map(|r| (4 * r + 1) as u32).collect();
+        let shape = velox_core::QkvRopeShape {
+            rows,
+            heads,
+            kv_heads,
+            head_dim: d,
+            pool_rows,
+            eps: 1e-6,
+            kv: fmt,
+        };
+        let slots = shape.pool_slots().expect("pool size");
+        let qkv = self.rng.vec(rows * shape.row(), 2.0);
+        let (qn, kn) = (
+            self.rng.vec(heads * d, 1.0),
+            self.rng.vec(kv_heads * d, 1.0),
+        );
+        let enc = |x: &[f32], is_v| {
+            velox_core::backend::bytes_slots(&velox_core::kv::encode_cache(fmt, x, d, is_v))
+        };
+        let kp0 = enc(&self.rng.vec(pool_rows * kv_heads * d, 1.0), false);
+        let vp0 = enc(&self.rng.vec(pool_rows * kv_heads * d, 1.0), true);
+        let mut table = vec![0.0; rows * d];
+        CpuBackend.rope_cos_sin(positions, d, 1_000_000.0, &mut table)?;
+        let (mut q_want, mut kw, mut vw) = (vec![0.0; rows * heads * d], kp0.clone(), vp0.clone());
+        CpuBackend.qk_norm_rope_kv(
+            &qkv,
+            &qn,
+            &kn,
+            &table,
+            &mut q_want,
+            &mut kw,
+            &mut vw,
+            &dst,
+            shape,
+        )?;
+        let (xd, qnd, knd, td) = (
+            self.b.upload(&qkv)?,
+            self.b.upload(&qn)?,
+            self.b.upload(&kn)?,
+            self.b.upload(&table)?,
+        );
+        let (mut kpd, mut vpd) = (self.b.upload(&kp0)?, self.b.upload(&vp0)?);
+        let mut qd = self.b.alloc(rows * heads * d)?;
+        self.b.qk_norm_rope_kv(
+            &xd, &qnd, &knd, &td, &mut qd, &mut kpd, &mut vpd, &dst, shape,
+        )?;
+        let name = format!("qk_norm_rope_kv {fmt} {rows} rows heads {heads}/{kv_heads} x {d}");
+        let got_q = fetch(self.b, &qd, rows * heads * d)?;
+        self.record(format!("{name} q"), None, &got_q, &q_want, 1e-5);
+        let got_v = fetch(self.b, &vpd, slots)?;
+        let (gb, wb) = (
+            velox_core::backend::slots_bytes(&got_v),
+            velox_core::backend::slots_bytes(&vw),
+        );
+        let diff = gb.iter().zip(&wb).filter(|(a, b)| a != b).count();
+        self.record(
+            format!("{name} v pool bytes"),
+            None,
+            &[diff as f32],
+            &[0.0],
+            0.0,
+        );
+        let got_k = fetch(self.b, &kpd, slots)?;
+        let (gb, wb) = (
+            velox_core::backend::slots_bytes(&got_k),
+            velox_core::backend::slots_bytes(&kw),
+        );
+        let diff = gb.iter().zip(&wb).filter(|(a, b)| a != b).count();
+        self.record(
+            format!("{name} k pool bytes differing (fraction)"),
+            None,
+            &[diff as f32 / gb.len() as f32],
+            &[0.0],
+            0.01,
+        );
+        let n = pool_rows * kv_heads;
+        let dg = velox_core::kv::decode_cache(fmt, &gb, n, d, false);
+        let dw = velox_core::kv::decode_cache(fmt, &wb, n, d, false);
+        // One E2M1 step at the top of a group is a third of its amax (|k| <= ~4 after the norm).
+        let step = match fmt {
+            KvFormat::Nvfp4 => 1.5,
+            KvFormat::Fp8 => 0.3,
+            _ => 0.05,
+        };
+        self.record(format!("{name} k pool rows"), None, &dg, &dw, step);
         Ok(())
     }
 
@@ -4059,6 +4212,13 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.qkv_rope_pool(&[0], 16, 8, 128)?;
     s.qkv_rope_pool(&[5, 130, 999, 4095, 17], 16, 8, 128)?;
     s.qkv_rope_pool(&[3, 1], 4, 1, 64)?;
+    for fmt in [KvFormat::Bf16, KvFormat::Fp8, KvFormat::Nvfp4] {
+        s.pool_attention_q(fmt, &[1, 4, 129, 300], 16, 8, 128)?;
+        s.pool_attention_q(fmt, &[2, 7], 4, 1, 64)?;
+        s.qkv_rope_pool_q(fmt, &[0], 16, 8, 128)?;
+        s.qkv_rope_pool_q(fmt, &[5, 130, 999, 4095, 17], 16, 8, 128)?;
+        s.qkv_rope_pool_q(fmt, &[3, 1], 4, 1, 64)?;
+    }
     // Its own seed: the synthetic model must not change when cases are added before it.
     let stack = qwen4::qwen4_stack(b, &mut velox_core::rng::Rng::new(0x5157_4e34))?;
     s.results.extend(stack);
