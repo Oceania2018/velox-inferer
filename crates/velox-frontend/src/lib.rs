@@ -155,6 +155,28 @@ impl Frontend {
         Ok(ids)
     }
 
+    /// Token ids of several rendered prompts that share a long start (System One questions over
+    /// one state): the shared start is tokenized once, then each text's rest. Same ids as
+    /// [`Self::encode`] of each text; the first text is also encoded whole to check, and on any
+    /// difference (or no usable cut) every text is encoded whole.
+    pub fn encode_shared(&self, texts: &[String]) -> Result<Vec<Vec<u32>>> {
+        let whole = |texts: &[String]| texts.iter().map(|t| self.encode(t)).collect();
+        let Some(cut) = shared_cut(texts) else {
+            return whole(texts);
+        };
+        let head = self.encode(&texts[0][..cut])?;
+        let mut out = Vec::with_capacity(texts.len());
+        for t in texts {
+            let mut ids = head.clone();
+            ids.extend(self.encode(&t[cut..])?);
+            out.push(ids);
+        }
+        if out[0] != self.encode(&texts[0])? {
+            return whole(texts);
+        }
+        Ok(out)
+    }
+
     fn encode_whole(&self, text: &str) -> Result<Vec<u32>> {
         let enc = self
             .tokenizer
@@ -196,4 +218,75 @@ fn vision_pixels(art: &Artifact) -> Result<Option<(u64, u64)>> {
             .ok_or_else(|| Error::Config(format!("preprocessor_config.json: size.{k} missing")))
     };
     Ok(Some((get("shortest_edge")?, get("longest_edge")?)))
+}
+
+/// Shared starts shorter than this are tokenized with each text (not worth the check).
+const MIN_SHARED_CUT: usize = 2048;
+
+/// Where texts that share a start can be tokenized apart: before the last newline inside the
+/// shared start that follows a letter or digit. The byte-level pre-tokenizer ends a letter or
+/// digit run before any newline, whatever comes after it, so the ids before and after the cut
+/// are those of the whole text. `None` for fewer than two texts or a short shared start.
+fn shared_cut(texts: &[String]) -> Option<usize> {
+    let (first, rest) = texts.split_first()?;
+    if rest.is_empty() {
+        return None;
+    }
+    let shared = rest.iter().fold(first.len(), |n, t| {
+        first
+            .bytes()
+            .zip(t.bytes())
+            .take(n)
+            .take_while(|(a, b)| a == b)
+            .count()
+    });
+    // The newline itself is shared, so the cut is inside every text, on a char boundary.
+    let head = &first.as_bytes()[..shared];
+    let cut = (1..shared)
+        .rev()
+        .find(|&i| head[i] == b'\n' && is_alnum_before(first, i))?;
+    (cut >= MIN_SHARED_CUT).then_some(cut)
+}
+
+/// Whether the char that ends at byte `i` of `s` is a letter or digit.
+fn is_alnum_before(s: &str, i: usize) -> bool {
+    s[..i]
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn shared_cut_is_before_a_newline_after_a_word() {
+        let state = "word ".repeat(500); // 2500 bytes
+        let a = format!("<|im_start|>user\n{state}tail\n\nQuestion: a?");
+        let b = format!("<|im_start|>user\n{state}tail\n\nQuestion: b?");
+        let cut = shared_cut(&texts(&[&a, &b])).unwrap();
+        assert_eq!(&a[cut - 4..cut + 2], "tail\n\n");
+        assert_eq!(a[..cut], b[..cut]);
+    }
+
+    #[test]
+    fn shared_cut_skips_punctuation_and_short_starts() {
+        let state = "word ".repeat(500);
+        // Only newlines after punctuation in the shared start past the prompt head: no cut there.
+        let a = format!("x\n{state}end.\n\nQ: a");
+        let b = format!("x\n{state}end.\n\nQ: b");
+        assert_eq!(shared_cut(&texts(&[&a, &b])), None);
+        assert_eq!(shared_cut(&texts(&["short\nA", "short\nB"])), None);
+        assert_eq!(shared_cut(&texts(&[&a])), None);
+        // Multi-byte letters before the newline.
+        let c = format!("{state}é\nQ: a");
+        let d = format!("{state}é\nQ: b");
+        let cut = shared_cut(&texts(&[&c, &d])).unwrap();
+        assert!(c.is_char_boundary(cut) && c[cut..].starts_with('\n'));
+    }
 }

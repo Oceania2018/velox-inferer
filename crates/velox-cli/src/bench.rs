@@ -352,9 +352,15 @@ pub struct GdnConfig {
     pub v_dim: usize,
     pub tokens: Vec<usize>,
     pub iters: usize,
+    /// Non-zero: time `gated_delta_net_windows` (System One scoring windows of `tokens` rows,
+    /// this many, all from one state) and `conv1d_silu_windows` before it, instead.
+    pub windows: usize,
 }
 
 pub fn run_gdn<B: Backend>(b: &B, c: &GdnConfig) -> Result<()> {
+    if c.windows > 0 {
+        return run_gdn_windows(b, c);
+    }
     let mut rng = Rng::new(13);
     let a_log = b.upload(&rng.vec(c.v_heads, 1.0))?;
     let dt_bias = b.upload(&rng.vec(c.v_heads, 1.0))?;
@@ -397,6 +403,85 @@ pub fn run_gdn<B: Backend>(b: &B, c: &GdnConfig) -> Result<()> {
             t * 1e6,
             best * 1e6,
             t * 1e6 / tokens as f64
+        );
+    }
+    Ok(())
+}
+
+/// Median and best seconds of `iters` synchronized runs of `f` (after 3 warm-ups).
+fn time_op<B: Backend>(b: &B, iters: usize, mut f: impl FnMut() -> Result<()>) -> Result<(f64, f64)> {
+    for _ in 0..3 {
+        f()?;
+    }
+    b.synchronize()?;
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        f()?;
+        b.synchronize()?;
+        samples.push(t0.elapsed().as_secs_f64());
+    }
+    let best = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    Ok((median(samples), best))
+}
+
+/// One layer's recurrent ops of a System One scoring pass: `windows` windows of each token count,
+/// against the same rows prefilled as one sequence (what a prefill pass costs per row).
+fn run_gdn_windows<B: Backend>(b: &B, c: &GdnConfig) -> Result<()> {
+    let mut rng = Rng::new(13);
+    let a_log = b.upload(&rng.vec(c.v_heads, 1.0))?;
+    let dt_bias = b.upload(&rng.vec(c.v_heads, 1.0))?;
+    let state_in = b.upload(&rng.vec(c.v_heads * c.v_dim * c.k_dim, 0.1))?;
+    let mut state = b.upload(&rng.vec(c.v_heads * c.v_dim * c.k_dim, 0.1))?;
+    println!(
+        "gated_delta_net_windows x{} heads {}/{} d {}/{}  on {}",
+        c.windows,
+        c.k_heads,
+        c.v_heads,
+        c.k_dim,
+        c.v_dim,
+        b.describe()
+    );
+    for &tokens in &c.tokens {
+        let s = velox_core::GdnShape {
+            tokens,
+            k_heads: c.k_heads,
+            v_heads: c.v_heads,
+            k_dim: c.k_dim,
+            v_dim: c.v_dim,
+            row0: 0,
+        };
+        let rows = tokens * c.windows;
+        let channels = s.qkv_width();
+        let qkv = b.upload(&rng.vec(rows * channels, 1.0))?;
+        let ab = b.upload(&rng.vec(rows * 2 * c.v_heads, 2.0))?;
+        let conv_w = b.upload(&rng.vec(channels * 4, 0.5))?;
+        let conv_in = b.upload(&rng.vec(channels * 3, 0.5))?;
+        let mut conv_out = b.alloc(rows * channels)?;
+        let mut out = b.alloc(rows * c.v_heads * c.v_dim)?;
+        let conv = velox_core::ConvShape {
+            tokens,
+            channels,
+            width: 4,
+            row0: 0,
+        };
+        let (cw, _) = time_op(b, c.iters, || {
+            b.conv1d_silu_windows(&qkv, &conv_w, &conv_in, &mut conv_out, conv, c.windows)
+        })?;
+        let (gw, gw_min) = time_op(b, c.iters, || {
+            b.gated_delta_net_windows(&qkv, &ab, &a_log, &dt_bias, &state_in, &mut out, s, c.windows)
+        })?;
+        let whole = velox_core::GdnShape { tokens: rows, ..s };
+        let (gp, _) = time_op(b, c.iters, || {
+            b.gated_delta_net(&qkv, &ab, &a_log, &dt_bias, &mut state, &mut out, whole)
+        })?;
+        println!(
+            "  tokens={tokens:<4} rows={rows:<6} gdn windows {:>9.1} us (min {:>9.1})  conv windows {:>8.1} us  | \
+             one {rows}-row prefill gdn {:>8.1} us",
+            gw * 1e6,
+            gw_min * 1e6,
+            cw * 1e6,
+            gp * 1e6
         );
     }
     Ok(())

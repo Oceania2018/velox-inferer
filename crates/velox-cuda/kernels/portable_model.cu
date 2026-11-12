@@ -977,6 +977,11 @@ __global__ void __launch_bounds__(kGdnThreads)
     const int kh = h / (v_heads / k_heads);
     const int n = tokens - t0 < C ? tokens - t0 : C;
     const size_t width = static_cast<size_t>(2 * k_heads * DK + v_heads * v_dim);
+    // blockIdx.z: scoring window (`tokens` rows each, its own prep); 0 for one sequence.
+    const size_t win = blockIdx.z;
+    qkv += win * tokens * width;
+    ab += win * tokens * 2 * v_heads;
+    prep += win * v_heads * gridDim.y * kGdnPrep;
     float* out = prep + (static_cast<size_t>(h) * gridDim.y + ci) * kGdnPrep;
 
     // Rows: 8 threads per chunk row, each 4-wide pieces at dc * 4 + 32 j.
@@ -1100,6 +1105,14 @@ __global__ void __launch_bounds__(kGdnThreads, R > 1 ? 2 : 3)
     const int chunks = (tokens + C - 1) / C;
     const size_t width = static_cast<size_t>(2 * k_heads * DK + v_heads * v_dim);
     const float inv_sqrt_dk = rsqrtf(static_cast<float>(DK));
+    // blockIdx.z: scoring window (`tokens` rows, its own prep and state copy); 0 for one sequence.
+    {
+        const size_t win = blockIdx.z;
+        qkv += win * tokens * width;
+        prep += win * v_heads * chunks * kGdnPrep;
+        state += win * v_heads * v_dim * DK;
+        out += win * tokens * v_heads * v_dim;
+    }
 
     // Thread (si, dc) owns state rows si + 16 r (and chunk row si for loads) over columns
     // dc * 4 + 32 * j + e; its 8-thread group is lane-aligned within the warp.
@@ -2092,13 +2105,68 @@ VELOX_API int velox_portable_conv1d_silu_windows(const float* x, const float* w,
     return velox_launch_status();
 }
 
+// dst[c * n + i] = src[i] for c < copies.
+__global__ void broadcast_rows_kernel(const float* __restrict__ src, float* __restrict__ dst, long long n,
+                                      int copies) {
+    const long long total = n * copies;
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < total;
+         i += static_cast<long long>(gridDim.x) * blockDim.x)
+        dst[i] = src[i % n];
+}
+
+// Windows the chunked scoring path takes per launch: each needs its own state copy (3 MB on
+// Qwen3.8) and prep, so the scratch stays bounded however many windows a pass holds.
+constexpr int kGdnWindowGroup = 8;
+
 // Scoring windows: `windows` windows of `tokens` rows each (window w at row w * tokens of qkv, ab
 // and out), every one from state_in; no state is written. pp: as velox_portable_gated_delta_net.
+// Windows longer than kGdnRowsMaxT take the chunked kernels (a copy of state_in each, in
+// groups of kGdnWindowGroup) as a prefill does; the per-row recurrence would run every token of
+// every window in order.
 VELOX_API int velox_portable_gated_delta_net_windows(const float* qkv, const float* ab, const float* a_log,
                                                      const float* dt_bias, const float* state_in, float* out,
                                                      int tokens, int windows, int k_heads, int v_heads, int k_dim,
                                                      int v_dim, const long long* pp) {
     if (windows > 65535) return VELOX_ERR_UNSUPPORTED;
+    if (pp == nullptr && tokens > kGdnRowsMaxT && (k_dim == 32 || k_dim == 64 || k_dim == 128)) {
+        const long long sn = static_cast<long long>(v_heads) * v_dim * k_dim;
+        const int chunks = (tokens + kGdnChunk - 1) / kGdnChunk;
+        const int group = windows < kGdnWindowGroup ? windows : kGdnWindowGroup;
+        static VeloxScratch state_scratch, prep_scratch;
+        float* states = static_cast<float*>(state_scratch.get(static_cast<size_t>(group) * sn * sizeof(float)));
+        float* prep = static_cast<float*>(
+            prep_scratch.get(static_cast<size_t>(group) * v_heads * chunks * kGdnPrep * sizeof(float)));
+        if (states == nullptr || prep == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+        const size_t width = static_cast<size_t>(2 * k_heads * k_dim + v_heads * v_dim);
+        const int r = v_dim >= 4 * kGdnVt ? 4 : v_dim >= 2 * kGdnVt ? 2 : 1;
+        const dim3 block(kGdnThreads);
+        for (int w0 = 0; w0 < windows; w0 += group) {
+            const int g = windows - w0 < group ? windows - w0 : group;
+            const float* q = qkv + static_cast<size_t>(w0) * tokens * width;
+            const float* a = ab + static_cast<size_t>(w0) * tokens * 2 * v_heads;
+            float* o = out + static_cast<size_t>(w0) * tokens * v_heads * v_dim;
+            broadcast_rows_kernel<<<velox_grid_1d(sn * g, 256), 256>>>(state_in, states, sn, g);
+            const dim3 pgrid(v_heads, chunks, g), grid(v_heads, (v_dim + kGdnVt * r - 1) / (kGdnVt * r), g);
+#define VELOX_GDN_WIN_R(DK, R) \
+    gated_delta_net_chunk_kernel<DK, R><<<grid, block>>>(q, prep, states, o, tokens, k_heads, v_heads, v_dim)
+#define VELOX_GDN_WIN(DK)                                                                                         \
+    gated_delta_net_prepare_kernel<DK><<<pgrid, block>>>(q, a, a_log, dt_bias, prep, tokens, k_heads, v_heads,    \
+                                                         v_dim);                                                  \
+    if (r == 4) VELOX_GDN_WIN_R(DK, 4);                                                                           \
+    else if (r == 2) VELOX_GDN_WIN_R(DK, 2);                                                                      \
+    else VELOX_GDN_WIN_R(DK, 1)
+            if (k_dim == 32) {
+                VELOX_GDN_WIN(32);
+            } else if (k_dim == 64) {
+                VELOX_GDN_WIN(64);
+            } else {
+                VELOX_GDN_WIN(128);
+            }
+#undef VELOX_GDN_WIN
+#undef VELOX_GDN_WIN_R
+        }
+        return velox_launch_status();
+    }
     constexpr int kWarps = kGdnRowsWarps;
     const int rows_per_block = tokens <= kGdnRowsMaxT ? kGdnRowsPerBlock : kWarps;
     const dim3 grid(v_heads, (v_dim + rows_per_block - 1) / rows_per_block, windows), block(kWarps * VELOX_WARP);
