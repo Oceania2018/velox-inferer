@@ -37,12 +37,18 @@ probe tells a build with the endpoint from one without (404).
 token each) and its branches (1-5 tokens). The engine renders and tokenizes them, then:
 
 1. **Exact repeats** (the same rendered prompt, image bytes, candidates and branches) are answered
-   from the last 256 answers without decoding the images or touching the GPU.
+   from the last 256 answers without decoding the images or touching the GPU. The questions are
+   tokenized together (`Frontend::encode_shared`): their shared text once, cut before a newline
+   that follows a letter or digit (a pre-tokenizer boundary whatever follows), then each rest,
+   checked against the first question encoded whole (50 questions over a 9.6K-token state: ~630
+   ms of tokenizing became ~30 ms).
 2. **Plans jobs** (`score_plan`), each admitted like a chat request (prefix reuse and the context
    store work as usual):
    - questions without branches that share the start of their prompts are one job: the shared
      prefix (system, state, images) is prefilled once, then each question's rest (text, ending in
-     its assistant prefill) is a *window* scored from that state;
+     its assistant prefill) is a *window* scored from that state, however many there are (each
+     rest must fit one scoring pass; otherwise every question is prefilled whole, the first one
+     keeping a checkpoint at the shared prefix for the others);
    - a single question without branches is prefilled whole, and its candidates are read off the
      prompt's last row (`Qwen35Text::last_logprobs`): no extra pass;
    - a `rank` question prefills its prompt but the last token, and every window is that token
@@ -53,13 +59,17 @@ token each) and its branches (1-5 tokens). The engine renders and tokenizes them
    the engine thread before the next request), and on lanes whose last request was a scoring one
    when nothing is reused, so chat lanes keep their device state.
 
-`Qwen35Text::score_windows` feeds the windows of a job, padded to the longest (tokens after a
-window's last one do not change its row), as many per forward pass as `--score-branch-rows` x 6
-rows hold (100 rank windows, as ninfer), so the weights are read once per pass. Each op takes all
-windows of a pass in one call, and the pass runs eagerly (about 15 launches per layer):
+`Qwen35Text::score_windows` feeds the windows of a job longest first, each pass padded to its own
+longest window (tokens after a window's last one do not change its row), as many per forward pass
+as its rows hold, so the weights are read once per pass. A pass holds `--score-pass-rows` rows
+(default 0 = `--score-branch-rows` x 6 = 600: 100 rank windows, as ninfer; at most the prefill
+chunk); multi-question requests want more (qwen-llm-inferencer sets 2048, ~170 MB). Each op takes
+all windows of a pass in one call, and the pass runs eagerly (about 15 launches per layer):
 
 - `conv1d_silu_windows` / `gated_delta_net_windows`: every window starts from the session's
-  recurrent state, which they only read (scratch outputs, no state written);
+  recurrent state, which they only read (scratch outputs, no state written). Windows longer than
+  16 tokens (question rests) take the prefill's chunked GDN kernels, each window on a copy of the
+  state (groups of 8, ~25 MB); shorter ones (rank branches) the per-row recurrence;
 - attention rotates every window at the positions after the prompt, stores window `i`'s keys and
   values at cache rows `pos + i * len` (past the prompt; left as after a rejected verify), decodes
   the cache rows to f32 (`kv_load`, as long prefill chunks do) and runs `attention_windows`: each
@@ -80,7 +90,9 @@ and that the session state is untouched; `velox selftest` covers the three windo
 - `velox selftest` covers `log_softmax_gather`, `conv1d_silu_windows`, `gated_delta_net_windows`
   and `attention_windows` against the oracle (on their own seeds, so the cases after them keep
   their data).
-- `velox bench-attn --window 5 --pos0 1440 --tokens 500` times `attention_windows`.
+- `velox bench-attn --window 5 --pos0 1440 --tokens 500` times `attention_windows`;
+  `velox bench-gdn --windows 50 --tokens 43,231` times the recurrent window ops against a prefill of
+  the same rows.
 - Parity with ninfer: compare the prompt token counts (`usage.input_tokens`) first; a difference
   means the template or tokenization diverged. Probabilities differ by engine numerics, and
   velox's own prefill varies between runs (GEMM reduction order, prefixes restored from bf16
@@ -120,3 +132,28 @@ identical, worst change TTFT +0.4% (baseline runs differ by 1.6%).
 
 Open: a scoring request still waits for the chat prefill chunk in flight; the rtx-5090 variant's
 `attention_windows` is the only tuned window kernel (others use the exact portable one).
+
+### Multi-question requests (2026-11-11)
+
+Measured on the RTX 5090 32 GB (rtx-5090-32g + this path, production flags, `--score-pass-rows
+2048`), 50 questions per request, synthetic maintenance tickets of ~300 tokens, p50 of 3, beside
+production chat traffic. Before: rtx-5090-32g at d9e5498.
+
+| Request | before | after |
+|---|---:|---:|
+| `choice` x 50, a ticket in each question (14.2K prompt tokens) | 2213 ms | 940 ms |
+| `choice` x 50 over a 9.6K-token state of tickets | 42161 ms | 1042 ms |
+| `noul` / `score` x 50, a ticket in each question | | 885 / 1015 ms |
+| `noul` / `score` x 50 over the state | | 926 / 1102 ms |
+| `choice` x 10, a ticket in each question | 743 ms | 239 ms |
+| `rank` 50 candidates (the same tickets, 9.9K tokens) | 853 ms | 850 ms |
+| one `choice` question | 61 ms | 62 ms |
+
+Before, a request whose rests did not fit one 600-row pass prefilled every question whole, one
+after another, and the checkpoint meant for the shared prefix was dropped whenever the prompt had
+a deeper one (scoring prompts place no anchors), so each question re-prefilled the state from 0;
+`gated_delta_net_windows` stepped through every token of a window (231-token windows, one layer:
+20.7 ms, now 2.2 ms). Answers: the same questions batched against each sent alone, on the same
+build, move by as much as changing one digit of the state does (choice max |dp| 0.23 vs 0.24,
+noul 0.18 vs 0.23, score 0.07 vs 0.10); an exact repeat of a question is answered from step 1,
+so such comparisons need distinct prompts.
