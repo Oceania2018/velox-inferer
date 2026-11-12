@@ -2,8 +2,11 @@
 
 ninfer's decision endpoint (Ollama's System One spec plus ninfer's `rank` extension), served by
 `velox serve` with the same contract, so llm-inference-daemon and its callers can use either
-engine. ninfer's implementation is the reference: `src/serve/systemone.cpp` (requests, prompts,
-answers), `systemone_http.cpp` (HTTP) and `ProgramImpl::score_branches` (rank).
+engine. ninfer's implementation is the reference for requests and answers: `src/serve/systemone.cpp`,
+`systemone_http.cpp` (HTTP) and `ProgramImpl::score_branches` (rank). The `choice`, `noul` and
+`score` prompts are velox's own (2026-11-11): the question comes last, after its options, scale or
+definitions and the answer format, so questions that share those differ only in their last line
+(see [Multi-question requests](#multi-question-requests-2026-11-11)); `rank` prompts are ninfer's.
 
 ## Contract
 
@@ -20,7 +23,8 @@ answers), `systemone_http.cpp` (HTTP) and `ProgramImpl::score_branches` (rank).
 | `rank` | object, 1-256 candidates; `threshold` (0.5), `limit`, `scale` (2-10 levels) | `[` | after each branch `"<id>] "`: the level digits | `similarities` (expected level / (L - 1), most similar first), `ranking`, `legend`, `threshold` |
 
 Candidate probabilities are renormalized among the scored tokens. Every question is one scoring
-request: system, user (images first, then the state and question), and the assistant prefill,
+request: system, user (images first, then the state, the criteria, the answer format and the
+question), and the assistant prefill,
 rendered as a continuation of that final assistant message with thinking off
 (`ChatTemplate::render_continuation`, the template's `continue_final_message`). Deploy with
 ninfer's `qwen3_8.jinja` (`--chat-template`): the artifact's embedded template drops the empty
@@ -161,3 +165,24 @@ a deeper one (scoring prompts place no anchors), so each question re-prefilled t
 build, move by as much as changing one digit of the state does (choice max |dp| 0.23 vs 0.24,
 noul 0.18 vs 0.23, score 0.07 vs 0.10); an exact repeat of a question is answered from step 1,
 so such comparisons need distinct prompts.
+
+Question last (velox PR after #20). With ninfer's order (`Question:` before `Options:`) every
+question's window held its options and answer format: 50 `choice` questions with 7 options over a
+5.3K-token state scored 50 windows of up to 71 tokens (330 ms of a 765 ms request). With the
+criteria before the question, the shared prefix runs through them and the windows hold
+`<rest of the question>` and the assistant prefill: up to 15 tokens, 79 ms. p50 of 3, same
+synthetic tickets, RTX 5090 32 GB:
+
+| Request | question first | question last |
+|---|---:|---:|
+| `choice` x50 over a 5.3K-token state | 765 ms | 510 ms |
+| `score` x50 over the state | 700 ms | 498 ms |
+| `noul` x50 over the state | 545 ms | 524 ms |
+| `choice` x50, a ticket in each question | 712 ms | 498 ms |
+| `rank` 50 candidates (unchanged prompt) | 489 ms | 463 ms |
+
+Answers, 4 states of 50 tickets x 6 question sets (trade and unit `choice` with 7 options; dog,
+child and repeat-report `noul`; urgency `score`), each format run twice: accuracy 99.5-100% in
+both orders (one more miss in 1,200 lookups); mean probability of the truth 0.985 -> 0.977 (trade),
+0.993 -> 0.978 (unit), noul within 0.006. Old vs new moves a distribution by 0.007-0.018 on average
+(run-to-run noise 0.006-0.011) and the urgency score by 0.15 (noise 0.10), mean 2.04 -> 1.97.
