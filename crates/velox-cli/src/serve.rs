@@ -202,6 +202,9 @@ where
                 )))
             }
         },
+        // --score-pass-rows N (default 0 = --score-branch-rows x 6): tokens of one scoring pass,
+        // capped at the prefill chunk. Raise it for requests with many questions.
+        score_pass_rows: a.parse("score-pass-rows", 0)?,
     };
     let vision = if art.components().contains_key("vision")
         && a.get("vision").is_none_or(|v| v != "false")

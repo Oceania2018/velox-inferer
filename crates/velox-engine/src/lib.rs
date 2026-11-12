@@ -131,6 +131,11 @@ pub struct EngineConfig {
     /// System One rank branches scored per forward pass (ninfer `--score-branch-rows`; 0
     /// rejects branch scoring). Each takes about 0.5 MB of scoring buffers on Qwen3.8-27B.
     pub score_rows: usize,
+    /// Rows (tokens) of one System One scoring pass, at most the prefill chunk; 0 means
+    /// `score_rows` rank branches' worth. Multi-question requests feed every question's rest as
+    /// a window, so more rows mean fewer passes (each re-reads the weights and decodes the
+    /// prompt's cache). About 80 KB of scoring buffers per row on Qwen3.8-27B.
+    pub score_pass_rows: usize,
 }
 
 /// Tokens of one scoring window, at most: the prompt's last token, then a rank branch
@@ -294,6 +299,8 @@ struct Core<B: Backend> {
     fe: Frontend,
     cfg: EngineConfig,
     special: SpecialTokens,
+    /// Rows of one scoring pass: the longest window `score_plan` hands `score_windows`.
+    score_cap: usize,
     /// What `GET /metrics` reports of memory and the cache tiers, published by the worker.
     gauges: Gauges,
 }
@@ -726,8 +733,14 @@ where
             _ => None,
         };
         // Before warm-up and the memory budget, so the attention pool is sized without them.
-        let sw =
-            model.score_workspace(&b, cfg.score_rows.clamp(1, ws.max_tokens()), SCORE_WINDOW)?;
+        let pass_rows = match cfg.score_pass_rows {
+            0 => cfg.score_rows.max(1) * SCORE_WINDOW,
+            n => n.max(SCORE_WINDOW),
+        }
+        .min(ws.max_tokens().max(SCORE_WINDOW));
+        let sw = model.score_workspace(&b, pass_rows / SCORE_WINDOW, SCORE_WINDOW)?;
+        // What `Qwen35Text::score_windows` takes per pass, so per window.
+        let score_cap = (sw.max_seqs() * SCORE_WINDOW).min(ws.max_tokens());
         let special = SpecialTokens {
             im_start: single_token(&fe, "<|im_start|>"),
             vision_start: single_token(&fe, "<|vision_start|>"),
@@ -817,6 +830,7 @@ where
             fe,
             cfg,
             special,
+            score_cap,
             gauges: Gauges::default(),
         });
         let mut state = state;
@@ -2583,6 +2597,10 @@ impl<B: Backend> Core<B> {
         // The point the request's later questions resume from is the lane's head (kept on the
         // device), even past the media tail.
         if let Some(f) = fork.filter(|&f| f > start && f < p.ids.len()) {
+            // The fork must be the deepest point: only the deepest snapshot stays on the lane
+            // (the others need anchors, which scoring prompts do not place), and a checkpoint
+            // past the fork is of no use to the later questions, which part from this one there.
+            positions.retain(|&pos| pos < f);
             positions.push(f);
             positions.sort_unstable();
             positions.dedup();
@@ -2754,16 +2772,18 @@ impl<B: Backend> Core<B> {
         }
     }
 
-    /// A scoring query (see `ChatEngine::score`), rendered and tokenized: the prompt renders as a
-    /// continuation of its final assistant message with thinking off, as ninfer's System One
-    /// requests do. Candidates must be one token each and branches 1 to 5 (ninfer's limits and
-    /// error codes). Its images are decoded later, by [`Self::expand_score`].
+    /// A scoring query (see `ChatEngine::score`), rendered: the prompt renders as a continuation
+    /// of its final assistant message with thinking off, as ninfer's System One requests do.
+    /// Candidates must be one token each and branches 1 to 5 (ninfer's limits and error codes).
+    /// Returns the draft without its prompt ids and the prompt text: a request's questions are
+    /// tokenized together (`Frontend::encode_shared`). Images are decoded later, by
+    /// [`Self::expand_score`].
     fn prepare_score(
         &self,
         req: &Value,
         candidates: &[String],
         branches: &[String],
-    ) -> Result<Draft, ApiError> {
+    ) -> Result<(Draft, String), ApiError> {
         use velox_serve::systemone::{MAX_BRANCH_TOKENS, MAX_RANK_CANDIDATES};
         let invalid = |code: &'static str, message: String| ApiError {
             code,
@@ -2797,7 +2817,6 @@ impl<B: Backend> Core<B> {
             .template
             .render_continuation(&messages, false)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
-        let ids = self.fe.encode(&text).map_err(core)?;
         let candidates = candidates
             .iter()
             .map(|c| {
@@ -2831,12 +2850,13 @@ impl<B: Backend> Core<B> {
                 Ok(ids)
             })
             .collect::<Result<Vec<Vec<u32>>, ApiError>>()?;
-        Ok(Draft {
-            ids,
+        let draft = Draft {
+            ids: Vec::new(),
             urls,
             candidates,
             branches,
-        })
+        };
+        Ok((draft, text))
     }
 
     /// A drafted scoring query with its images decoded (`decoded` holds those of the request's
@@ -2914,10 +2934,10 @@ impl<B: Backend> Core<B> {
             let text = plain
                 .iter()
                 .all(|&i| qs[i].p.runs.iter().all(|r| r.start + r.len <= fork));
-            if fork > 0
-                && text
-                && plain.len() * longest <= self.cfg.score_rows.max(1) * SCORE_WINDOW
-            {
+            // `score_windows` splits the windows into passes of its rows, so only each window has
+            // to fit in one pass: however many there are, they take far fewer weight reads than
+            // prefilling every question whole.
+            if fork > 0 && text && longest <= self.score_cap {
                 let mut candidates: Vec<u32> = Vec::new();
                 let mut answers = Vec::new();
                 for &i in &plain {
@@ -3320,10 +3340,19 @@ where
 
     fn score(&self, queries: &[ScoreQuery<'_>]) -> Result<Vec<ScoreOutcome>, ApiError> {
         let t0 = Instant::now();
-        let drafts = queries
+        let (mut drafts, texts): (Vec<Draft>, Vec<String>) = queries
             .iter()
             .map(|q| self.core.prepare_score(q.request, q.candidates, q.branches))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .unzip();
+        // Questions over one state share most of their text: tokenized once, not per question.
+        for (d, ids) in drafts
+            .iter_mut()
+            .zip(self.core.fe.encode_shared(&texts).map_err(core)?)
+        {
+            d.ids = ids;
+        }
         let keys: Vec<_> = drafts.iter().map(ScoreCache::key).collect();
         let mut out: Vec<Option<ScoreOutcome>> = keys
             .iter()

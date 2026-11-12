@@ -3722,6 +3722,11 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
     s.gdn_windows(16, 48, 128, 6, 40, 0)?;
     s.gdn_windows(2, 6, 64, 1, 3, 5)?;
     s.gdn_windows(2, 4, 128, 20, 3, 0)?;
+    // System One question rests: longer windows take the chunked kernels, in groups of 8 windows
+    // (partial chunks, a row offset, every chunked head width).
+    s.gdn_windows(16, 48, 128, 43, 11, 0)?;
+    s.gdn_windows(2, 6, 64, 37, 9, 5)?;
+    s.gdn_windows(2, 4, 32, 17, 3, 0)?;
     s.attention_windows(24, 4, 256, 300, 6, 20)?;
     s.attention_windows(24, 4, 256, 611, 5, 40)?;
     s.attention_windows(8, 2, 128, 37, 3, 7)?;
