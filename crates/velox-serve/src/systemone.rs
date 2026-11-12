@@ -225,15 +225,6 @@ fn option_line(label: &str, key: &str, description: &Value) -> String {
     line
 }
 
-/// The question closes the user turn, after its options, scale or definitions and the answer
-/// format. A request's questions usually share those (and the state), so everything before the
-/// question is one shared prefix, prefilled once, and each question's scoring window is only its
-/// own text and the assistant prefill. (ninfer puts the question first; 50 choice questions over
-/// one state then scored ~71-token windows instead of ~20.)
-fn question_line(instructions: &str) -> String {
-    format!("\n\nQuestion: {instructions}")
-}
-
 /// Builds a question's prompt and candidates: (item, param, state, instructions, system, out).
 type BuildFn = fn(&Value, &str, &str, &str, &str, &mut Question) -> Result<(), ApiError>;
 
@@ -260,7 +251,7 @@ fn parse_choice(
             "too_many_options",
         ));
     }
-    let mut user = format!("{state}\n\nOptions:");
+    let mut user = format!("{state}\n\nQuestion: {instructions}\n\nOptions:");
     for (i, (key, description)) in options.iter().enumerate() {
         if !description.is_null() && !description.is_string() {
             return Err(bad_request(format!(
@@ -274,7 +265,6 @@ fn parse_choice(
         q.keys.push(key.clone());
     }
     user.push_str("\n\nAnswer with the letter of the single best option.");
-    user.push_str(&question_line(instructions));
     q.request = scoring_request(system, user, "Answer:");
     Ok(())
 }
@@ -287,7 +277,7 @@ fn parse_noul(
     system: &str,
     q: &mut Question,
 ) -> Result<(), ApiError> {
-    let mut user = state.to_string();
+    let mut user = format!("{state}\n\nQuestion: {instructions}");
     if let Some(c) = criteria(item) {
         let Value::Object(map) = c else {
             return Err(bad_request(format!("{param}.criteria must be an object")));
@@ -297,8 +287,6 @@ fn parse_noul(
                 "{param}.criteria accepts only true and false"
             )));
         }
-        // A blank line after the state, then one line per definition.
-        user.push('\n');
         if let Some(text) = optional_text(c, "true", &format!("{param}.criteria.true"))? {
             user.push_str(&format!("\ntrue means: {text}"));
         }
@@ -307,7 +295,6 @@ fn parse_noul(
         }
     }
     user.push_str("\n\nAnswer true or false.");
-    user.push_str(&question_line(instructions));
     q.request = scoring_request(system, user, "Answer:");
     q.candidates = [" true", " True", " false", " False"]
         .map(String::from)
@@ -333,7 +320,7 @@ fn parse_score(
             "{param}.criteria must have 2 to 10 levels"
         )));
     }
-    let mut user = format!("{state}\n\nScale (lowest first):");
+    let mut user = format!("{state}\n\nQuestion: {instructions}\n\nScale (lowest first):");
     for (level, d) in levels.iter().enumerate() {
         let description = require_text(d, &format!("{param}.criteria[{level}]"))?;
         user.push_str(&format!("\n{level}: {description}"));
@@ -342,7 +329,6 @@ fn parse_score(
     }
     // Qwen encodes " 7" as two tokens, so the prefill ends at "(" and the bare digit is scored.
     user.push_str("\n\nAnswer with the number of the level that fits best, in parentheses.");
-    user.push_str(&question_line(instructions));
     q.request = scoring_request(system, user, "Answer: (");
     Ok(())
 }
@@ -828,8 +814,8 @@ mod tests {
         assert_eq!(
             user_text(pick),
             format!(
-                "{state}\n\nOptions:\nA. a\nB. b: second\n\n\
-                 Answer with the letter of the single best option.\n\nQuestion: Which one?"
+                "{state}\n\nQuestion: Which one?\n\nOptions:\nA. a\nB. b: second\n\n\
+                 Answer with the letter of the single best option."
             )
         );
         assert_eq!(pick.candidates, [" A", " B"]);
@@ -839,45 +825,20 @@ mod tests {
         assert_eq!(
             user_text(done),
             format!(
-                "{state}\n\ntrue means: finished\nfalse means: not yet\n\n\
-                 Answer true or false.\n\nQuestion: Done?"
+                "{state}\n\nQuestion: Done?\ntrue means: finished\nfalse means: not yet\n\n\
+                 Answer true or false."
             )
         );
         assert_eq!(done.candidates, [" true", " True", " false", " False"]);
         assert_eq!(
             user_text(level),
             format!(
-                "{state}\n\nScale (lowest first):\n0: low\n1: high\n\n\
-                 Answer with the number of the level that fits best, in parentheses.\n\n\
-                 Question: How bad?"
+                "{state}\n\nQuestion: How bad?\n\nScale (lowest first):\n0: low\n1: high\n\n\
+                 Answer with the number of the level that fits best, in parentheses."
             )
         );
         assert_eq!(level.request["messages"][2]["content"], "Answer: (");
         assert_eq!(level.candidates, ["0", "1"]);
-    }
-
-    #[test]
-    fn questions_with_the_same_criteria_differ_only_in_their_question() {
-        let body = json!({
-            "model": "m",
-            "state": "Ticket 1: sink leaks.",
-            "questions": {
-                "a": {"type": "choice", "instructions": "Trade for ticket 1?",
-                      "criteria": {"plumbing": null, "electrical": null}},
-                "b": {"type": "choice", "instructions": "Trade for ticket 2?",
-                      "criteria": {"plumbing": null, "electrical": null}},
-                "c": {"type": "noul", "instructions": "Urgent?"},
-            },
-        });
-        let r = parse(&body).unwrap();
-        let (a, b) = (user_text(&r.questions[0]), user_text(&r.questions[1]));
-        let shared = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
-        assert!(a[..shared].ends_with("Question: Trade for ticket "), "{a:?}");
-        // Without definitions a noul question is the state, the answer format and the question.
-        assert_eq!(
-            user_text(&r.questions[2]),
-            "Ticket 1: sink leaks.\n\nAnswer true or false.\n\nQuestion: Urgent?"
-        );
     }
 
     #[test]
