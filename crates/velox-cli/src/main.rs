@@ -60,6 +60,8 @@ COMMANDS:
       --k-heads <n> --v-heads <n> --k-dim <n> --v-dim <n>  default 16/48 heads, 128/128 (Qwen3.8)
       --tokens <list>       token counts, comma separated (default 1,8,64,512)
       --iters <n>           timed iterations (default 50)
+      --windows <n>         time gated_delta_net_windows + conv1d_silu_windows (System One
+                            scoring) over n windows of each token count instead
   bench-attn              Time causal attention over a KV cache in each storage format
       --heads <n> --kv-heads <n> --head-dim <n>  default 24/4, 256 (Qwen3.8)
       --pos0 <n> (16384) --tokens <list> (1,8,16) --kv-format <list> (f32,bf16,fp8,nvfp4) --iters <n> (50)
@@ -134,6 +136,8 @@ COMMANDS:
       --draft-vocab full|draft  DSpine proposal head: the target's full output head (full) or
                                 its draft vocabulary head (draft: cheaper, fewer drafts accepted)
       --score-branch-rows <n>  System One rank candidates per forward pass (100; 0 rejects rank)
+      --score-pass-rows <n>    System One tokens per scoring pass (0: score-branch-rows x 6; at
+                               most the prefill chunk; more rows = fewer passes for many questions)
       --max-vision-tokens <n>  merged vision tokens per image (32x32 px each) before it is
                             downscaled (1280: 1920x1080 -> 1504x832)
   replay                Replay a recorded agent session against an OpenAI-compatible server
@@ -484,6 +488,7 @@ fn bench_gdn(a: &Args) -> Result<ExitCode> {
         v_dim: a.parse("v-dim", 128)?,
         tokens,
         iters: a.parse("iters", 50)?,
+        windows: a.parse("windows", 0)?,
     };
     let sel = select::backend(a)?;
     match &sel {
