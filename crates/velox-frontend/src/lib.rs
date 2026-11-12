@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde_json::Value;
-use tokenizers::Tokenizer;
+use tokenizers::{
+    Normalizer, OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Tokenizer,
+};
 use velox_core::{Error, Result};
 use velox_weights::Artifact;
 
@@ -161,7 +163,8 @@ impl Frontend {
     /// difference (or no usable cut) every text is encoded whole.
     pub fn encode_shared(&self, texts: &[String]) -> Result<Vec<Vec<u32>>> {
         let whole = |texts: &[String]| texts.iter().map(|t| self.encode(t)).collect();
-        let Some(cut) = shared_cut(texts) else {
+        let Some(cut) = shared_len(texts).and_then(|shared| self.shared_cut(&texts[0], shared))
+        else {
             return whole(texts);
         };
         let head = self.encode(&texts[0][..cut])?;
@@ -175,6 +178,31 @@ impl Frontend {
             return whole(texts);
         }
         Ok(out)
+    }
+
+    /// Where texts whose first `shared` bytes are equal can be tokenized apart: a pre-token
+    /// boundary of `first` (the tokenizer's own normalizer and pre-tokenizer) followed by one
+    /// whole pre-token and a byte of lookahead inside the shared start. BPE never merges across
+    /// pre-tokens and the pre-tokenizer has no lookbehind, so whatever follows the shared start,
+    /// every text splits there and its ids before and after the cut are those of the whole text.
+    /// (The old rule, before a newline that follows a letter or digit, found no cut in a state
+    /// whose lines end in punctuation: `.` takes the newlines after it into its pre-token.)
+    /// `None` when the cut would be short of [`MIN_SHARED_CUT`].
+    fn shared_cut(&self, first: &str, shared: usize) -> Option<usize> {
+        if shared < MIN_SHARED_CUT {
+            return None;
+        }
+        let mut pre = PreTokenizedString::from(&first[..shared]);
+        if let Some(n) = self.tokenizer.get_normalizer() {
+            pre.normalize(|s| n.normalize(s)).ok()?;
+        }
+        if let Some(p) = self.tokenizer.get_pre_tokenizer() {
+            p.pre_tokenize(&mut pre).ok()?;
+        }
+        let splits = pre.get_splits(OffsetReferential::Original, OffsetType::Byte);
+        // The last pre-token that ends before the shared start's last byte: its start is the cut.
+        let (_, (cut, _), _) = splits.iter().rev().find(|(_, (_, end), _)| *end < shared)?;
+        (*cut >= MIN_SHARED_CUT && first.is_char_boundary(*cut)).then_some(*cut)
     }
 
     fn encode_whole(&self, text: &str) -> Result<Vec<u32>> {
@@ -223,16 +251,14 @@ fn vision_pixels(art: &Artifact) -> Result<Option<(u64, u64)>> {
 /// Shared starts shorter than this are tokenized with each text (not worth the check).
 const MIN_SHARED_CUT: usize = 2048;
 
-/// Where texts that share a start can be tokenized apart: before the last newline inside the
-/// shared start that follows a letter or digit. The byte-level pre-tokenizer ends a letter or
-/// digit run before any newline, whatever comes after it, so the ids before and after the cut
-/// are those of the whole text. `None` for fewer than two texts or a short shared start.
-fn shared_cut(texts: &[String]) -> Option<usize> {
+/// Bytes at the start of every text that are equal (on a char boundary of the first). `None` for
+/// fewer than two texts.
+fn shared_len(texts: &[String]) -> Option<usize> {
     let (first, rest) = texts.split_first()?;
     if rest.is_empty() {
         return None;
     }
-    let shared = rest.iter().fold(first.len(), |n, t| {
+    let mut shared = rest.iter().fold(first.len(), |n, t| {
         first
             .bytes()
             .zip(t.bytes())
@@ -240,20 +266,10 @@ fn shared_cut(texts: &[String]) -> Option<usize> {
             .take_while(|(a, b)| a == b)
             .count()
     });
-    // The newline itself is shared, so the cut is inside every text, on a char boundary.
-    let head = &first.as_bytes()[..shared];
-    let cut = (1..shared)
-        .rev()
-        .find(|&i| head[i] == b'\n' && is_alnum_before(first, i))?;
-    (cut >= MIN_SHARED_CUT).then_some(cut)
-}
-
-/// Whether the char that ends at byte `i` of `s` is a letter or digit.
-fn is_alnum_before(s: &str, i: usize) -> bool {
-    s[..i]
-        .chars()
-        .next_back()
-        .is_some_and(char::is_alphanumeric)
+    while !first.is_char_boundary(shared) {
+        shared -= 1;
+    }
+    Some(shared)
 }
 
 #[cfg(test)]
@@ -264,29 +280,194 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    #[test]
-    fn shared_cut_is_before_a_newline_after_a_word() {
-        let state = "word ".repeat(500); // 2500 bytes
-        let a = format!("<|im_start|>user\n{state}tail\n\nQuestion: a?");
-        let b = format!("<|im_start|>user\n{state}tail\n\nQuestion: b?");
-        let cut = shared_cut(&texts(&[&a, &b])).unwrap();
-        assert_eq!(&a[cut - 4..cut + 2], "tail\n\n");
-        assert_eq!(a[..cut], b[..cut]);
+    /// Qwen3.8's pre-tokenizer pattern (`tokenizer.json` `pre_tokenizer.pretokenizers[0]`).
+    const QWEN_PRE_TOKENIZER: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// Qwen3.8's normalizer and pre-tokenizer verbatim, a byte-level BPE whose merges reach
+    /// across the places a cut must not go (punctuation into the newlines after it, a space into
+    /// the word after it, a newline run) and `<|im_start|>` as a special token.
+    fn qwen_like() -> Frontend {
+        let mut bytes: Vec<u32> = (b'!'..=b'~')
+            .chain(0xa1..=0xac)
+            .chain(0xae..=0xff)
+            .map(u32::from)
+            .collect();
+        let mut chars = bytes.clone();
+        let mut extra = 0;
+        for b in 0..256u32 {
+            if !bytes.contains(&b) {
+                bytes.push(b);
+                chars.push(256 + extra);
+                extra += 1;
+            }
+        }
+        let byte = |b: u8| {
+            char::from_u32(chars[bytes.iter().position(|&x| x == u32::from(b)).unwrap()])
+                .unwrap()
+                .to_string()
+        };
+        let mut vocab = serde_json::Map::new();
+        for b in 0..=255u8 {
+            let n = vocab.len();
+            vocab.insert(byte(b), n.into());
+        }
+        let mut merges = Vec::new();
+        for (l, r) in [
+            (".", "\n"),
+            (".\n", "\n"),
+            ("\n", "\n"),
+            (" ", "t"),
+            (" t", "i"),
+            ("w", "o"),
+            ("wo", "r"),
+            ("1", "2"),
+        ] {
+            let enc = |s: &str| s.bytes().map(byte).collect::<String>();
+            let (l, r) = (enc(l), enc(r));
+            let n = vocab.len();
+            vocab.entry(format!("{l}{r}")).or_insert(n.into());
+            merges.push(format!("{l} {r}"));
+        }
+        let im_start = vocab.len();
+        let json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [{"id": im_start, "content": "<|im_start|>", "single_word": false,
+                "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": QWEN_PRE_TOKENIZER},
+                 "behavior": "Isolated", "invert": false},
+                {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}]},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "",
+                "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                "vocab": vocab, "merges": merges},
+        });
+        frontend(&serde_json::to_vec(&json).unwrap())
+    }
+
+    fn frontend(tokenizer: &[u8]) -> Frontend {
+        Frontend::from_parts(tokenizer, br#"{"eos_token_id": 0}"#, String::new(), None).unwrap()
+    }
+
+    /// Texts over one long state that differ after it, the way System One renders questions:
+    /// random lines of letters, digits, punctuation, spaces, accents and combining marks.
+    fn questions(seed: u64, state_end: &str) -> Vec<String> {
+        const PIECES: &[&str] = &[
+            "word", "two", " ", "  ", "\n", "\n\n", ".", ".\n\n", "#12", "é", "e\u{301}", "ti",
+            "!?", " \n", "'s", "\t", "12", "}",
+        ];
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut next = |n: usize| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 33) as usize) % n
+        };
+        let mut state = String::from("<|im_start|>user\n");
+        while state.len() < 3000 {
+            state.push_str(PIECES[next(PIECES.len())]);
+        }
+        state.push_str(state_end);
+        (0..6)
+            .map(|_| {
+                let mut q = state.clone();
+                for _ in 0..1 + next(12) {
+                    q.push_str(PIECES[next(PIECES.len())]);
+                }
+                q.push_str("\n<|im_start|>assistant\nAnswer:");
+                q
+            })
+            .collect()
+    }
+
+    fn check_shared(fe: &Frontend, cases: u64) -> usize {
+        let mut cut_found = 0;
+        for seed in 0..cases {
+            for end in [
+                "",
+                ".\n\n",
+                "end.",
+                "}\n",
+                "  ",
+                "Question: ticket #10",
+                "é",
+            ] {
+                let texts = questions(seed, end);
+                let shared = shared_len(&texts).unwrap();
+                if fe.shared_cut(&texts[0], shared).is_some() {
+                    cut_found += 1;
+                }
+                let got = fe.encode_shared(&texts).unwrap();
+                for (t, ids) in texts.iter().zip(&got) {
+                    assert_eq!(
+                        ids,
+                        &fe.encode_whole(t).unwrap(),
+                        "seed {seed}, end {end:?}: {t:?}"
+                    );
+                }
+            }
+        }
+        cut_found
     }
 
     #[test]
-    fn shared_cut_skips_punctuation_and_short_starts() {
-        let state = "word ".repeat(500);
-        // Only newlines after punctuation in the shared start past the prompt head: no cut there.
-        let a = format!("x\n{state}end.\n\nQ: a");
-        let b = format!("x\n{state}end.\n\nQ: b");
-        assert_eq!(shared_cut(&texts(&[&a, &b])), None);
-        assert_eq!(shared_cut(&texts(&["short\nA", "short\nB"])), None);
-        assert_eq!(shared_cut(&texts(&[&a])), None);
-        // Multi-byte letters before the newline.
-        let c = format!("{state}é\nQ: a");
-        let d = format!("{state}é\nQ: b");
-        let cut = shared_cut(&texts(&[&c, &d])).unwrap();
-        assert!(c.is_char_boundary(cut) && c[cut..].starts_with('\n'));
+    fn encode_shared_matches_whole_texts() {
+        let fe = qwen_like();
+        let cases = 40;
+        // Shared starts end anywhere (in a word, after punctuation, in a space run, before an
+        // accent), yet a cut is found for nearly every set and the ids never change.
+        assert!(check_shared(&fe, cases) as u64 >= cases * 7 * 9 / 10);
+    }
+
+    #[test]
+    fn shared_cut_after_punctuation_is_near_the_divergence() {
+        let fe = qwen_like();
+        let state = "A ticket line that ends in a full stop.\n\n".repeat(80);
+        let texts: Vec<String> = ["1000", "1001"]
+            .iter()
+            .map(|n| format!("<|im_start|>user\n{state}Question: Which trade handles ticket #{n}?"))
+            .collect();
+        let shared = shared_len(&texts).unwrap();
+        let cut = fe.shared_cut(&texts[0], shared).unwrap();
+        // The old rule found no cut here (every newline follows a '.'); this one is in the
+        // question, a few bytes before the texts differ.
+        assert!(shared - cut <= 8, "cut {cut}, shared {shared}");
+        // Digits are pre-tokens of their own, so the cut can sit inside the number.
+        assert!(
+            texts[0][..cut].ends_with("ticket #1"),
+            "{:?}",
+            &texts[0][cut - 20..cut]
+        );
+        assert_eq!(
+            fe.encode_shared(&texts).unwrap()[1],
+            fe.encode_whole(&texts[1]).unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_cut_needs_two_texts_and_a_long_start() {
+        let fe = qwen_like();
+        assert_eq!(shared_len(&texts(&["only one"])), None);
+        let short = texts(&["short\nA", "short\nB"]);
+        assert_eq!(fe.shared_cut(&short[0], shared_len(&short).unwrap()), None);
+        // A shared start that ends inside a multi-byte char is cut back to its boundary.
+        let a = format!("{}é", "word ".repeat(500));
+        let b = format!("{}è", "word ".repeat(500));
+        let n = shared_len(&texts(&[&a, &b])).unwrap();
+        assert!(a.is_char_boundary(n) && n == "word ".repeat(500).len());
+    }
+
+    /// The same property on the model's own tokenizer: `VELOX_TOKENIZER_JSON=<tokenizer.json>`.
+    #[test]
+    fn encode_shared_matches_whole_texts_on_a_real_tokenizer() {
+        let Some(path) = std::env::var_os("VELOX_TOKENIZER_JSON") else {
+            eprintln!("VELOX_TOKENIZER_JSON not set; skipped");
+            return;
+        };
+        let fe = frontend(&std::fs::read(path).unwrap());
+        let cases = 200;
+        assert!(check_shared(&fe, cases) as u64 >= cases * 7 * 9 / 10);
     }
 }

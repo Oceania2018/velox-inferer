@@ -38,10 +38,14 @@ token each) and its branches (1-5 tokens). The engine renders and tokenizes them
 
 1. **Exact repeats** (the same rendered prompt, image bytes, candidates and branches) are answered
    from the last 256 answers without decoding the images or touching the GPU. The questions are
-   tokenized together (`Frontend::encode_shared`): their shared text once, cut before a newline
-   that follows a letter or digit (a pre-tokenizer boundary whatever follows), then each rest,
-   checked against the first question encoded whole (50 questions over a 9.6K-token state: ~630
-   ms of tokenizing became ~30 ms).
+   tokenized together (`Frontend::encode_shared`): their shared text once, cut at the start of
+   the last whole pre-token inside it (the tokenizer's own normalizer and pre-tokenizer; BPE does
+   not merge across pre-tokens and the pattern has no lookbehind), then each rest, checked
+   against the first question encoded whole (50 questions over a 9.6K-token state: ~630 ms of
+   tokenizing became ~30 ms). The first rule, before a newline that follows a letter or digit,
+   found no cut in a state whose lines end in punctuation (`.` takes the newlines after it), and
+   such requests tokenized every question whole: 255-335 ms for 50 questions over 5.3K tokens,
+   17-21 ms now.
 2. **Plans jobs** (`score_plan`), each admitted like a chat request (prefix reuse and the context
    store work as usual):
    - questions without branches that share the start of their prompts are one job: the shared
