@@ -161,3 +161,12 @@ a deeper one (scoring prompts place no anchors), so each question re-prefilled t
 build, move by as much as changing one digit of the state does (choice max |dp| 0.23 vs 0.24,
 noul 0.18 vs 0.23, score 0.07 vs 0.10); an exact repeat of a question is answered from step 1,
 so such comparisons need distinct prompts.
+
+Question last (PR #21, reverted 2026-11-12): moving `Question:` after the options and the answer
+format shortened the windows (50 `choice` over a 5.3K-token state: score 270 -> 83 ms, request
+0.95 -> 0.53 s) and kept the ticket set at 99.5-100%, but it broke fact lookups in a long state:
+50 "What color is box N?" questions, each fact in a numbered log line, scored 50/50 (mean
+confidence 0.85) question first and 22-24/50 (0.53) question last; with filler without numbers,
+44/50 (0.70). Single and batched answers were identical, so the prompt order, not the window path,
+caused it, and repeating the answer format after the question did not help (24/50). The question
+stays before its criteria (ninfer's order); measure a lookup-heavy set before reordering again.
