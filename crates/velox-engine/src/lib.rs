@@ -56,6 +56,8 @@ pub struct EngineConfig {
     /// A request that offers tools answers with a tool call only: the prompt ends in the opening
     /// `<tool_call>` tag, so the model skips the sentence it would otherwise write first (ninfer's
     /// tool-call grammar constraint has the same effect; the agent reads the call's own `why`).
+    /// A request with `tool_preamble` writes its sentence anyway and is steered into the call
+    /// (see `Preamble`).
     pub force_tool_call: bool,
     /// Streaming requests receive their text as it is generated (ninfer does the same), up to the
     /// first `<tool_call>`; off: the whole answer at the end. Tool calls and reasoning always
@@ -336,6 +338,9 @@ struct SpecialTokens {
     im_start: Option<u32>,
     vision_start: Option<u32>,
     image_pad: Option<u32>,
+    /// `<tool_call>`: what a [`Preamble`] request commits in place of a stop or an overlong
+    /// sentence.
+    tool_call: Option<u32>,
 }
 
 fn core(e: CoreError) -> ApiError {
@@ -535,6 +540,44 @@ struct Job {
     queued: Instant,
     /// A scoring request: nothing is generated (see [`Scoring`]).
     score: Option<Scoring>,
+    /// A tool request that may write a sentence before its call (see [`Preamble`]).
+    preamble: Option<Preamble>,
+}
+
+/// Request field `tool_preamble`: a request offering tools may write a short text before its
+/// call (the agent shows it while the call is still being written), and still always calls.
+/// Until the call opens, a stop or the token past `max` is replaced by `open`; decoding goes on
+/// inside the call from there. `tool_preamble: 0` amounts to the forced call, `true` to
+/// [`DEFAULT_PREAMBLE_TOKENS`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Preamble {
+    /// The `<tool_call>` token.
+    open: u32,
+    /// Preamble tokens allowed before the call is forced.
+    max: usize,
+}
+
+/// `tool_preamble: true`: room for the one-sentence account an agent asks for (~25 words).
+const DEFAULT_PREAMBLE_TOKENS: usize = 64;
+
+impl Preamble {
+    /// The token a request commits in place of `t`, with `out` committed so far and the call
+    /// `opened` or not.
+    fn steer(&self, t: u32, eos: bool, out: usize, opened: bool) -> u32 {
+        if !opened && t != self.open && (eos || out >= self.max) {
+            self.open
+        } else {
+            t
+        }
+    }
+}
+
+/// The request's `tool_preamble` (see [`Preamble`]): `Some(max)` for a number or `true`.
+fn preamble_tokens(req: &Value) -> Option<usize> {
+    match req.get("tool_preamble")? {
+        Value::Bool(true) => Some(DEFAULT_PREAMBLE_TOKENS),
+        v => v.as_u64().map(|n| n as usize),
+    }
 }
 
 /// What a scoring request scores once its prompt is in the lane (see `Core::finish_prefill`).
@@ -631,9 +674,27 @@ struct Active<B: Backend> {
     pre: Option<Prefill<B>>,
     /// A scoring request's result (see `Done::scores`).
     scores: Vec<f32>,
+    /// A [`Preamble`] request has committed its `<tool_call>`.
+    opened: bool,
 }
 
 impl<B: Backend> Active<B> {
+    /// `t`, or what a [`Preamble`] request commits in its place.
+    fn steer(&self, t: u32, eos: bool) -> u32 {
+        self.job
+            .preamble
+            .map_or(t, |p| p.steer(t, eos, self.out.len(), self.opened))
+    }
+
+    /// Appends a committed output token.
+    fn push(&mut self, t: u32) {
+        self.out.push(t);
+        self.job.sampler.observe(t);
+        if self.job.preamble.is_some_and(|p| p.open == t) {
+            self.opened = true;
+        }
+    }
+
     /// Sends a streaming job the output it has not seen yet (`complete` sends the rest).
     fn send_new(&mut self) {
         if self.job.stream && self.out.len() > self.sent {
@@ -745,6 +806,7 @@ where
             im_start: single_token(&fe, "<|im_start|>"),
             vision_start: single_token(&fe, "<|vision_start|>"),
             image_pad: single_token(&fe, "<|image_pad|>"),
+            tool_call: single_token(&fe, TOOL_CALL_OPEN.trim_end()),
         };
         let disk = if cfg.disk_context_bytes > 0
             && cfg.disk_context_roots > 0
@@ -1540,6 +1602,7 @@ impl<B: Backend> Core<B> {
                 cands: Vec::new(),
                 pre: Some(pre),
                 scores: Vec::new(),
+                opened: false,
             }),
             Err(e) => {
                 lane.keys.clear();
@@ -1761,13 +1824,14 @@ impl<B: Backend> Core<B> {
     /// its next prompt chunk in the same forward pass, or its whole prompt when nothing decodes.
     fn round(&self, st: &mut Lanes<B>, active: &mut [Active<B>]) -> Result<(), ApiError> {
         for a in active.iter_mut().filter(|a| a.pre.is_none()) {
-            let c = a.c;
+            // Steered before this round's forward pass feeds it.
+            let c = a.steer(a.c, self.fe.is_eos(a.c));
+            a.c = c;
             if self.fe.is_eos(c) {
                 a.finish = Some("stop");
                 continue;
             }
-            a.out.push(c);
-            a.job.sampler.observe(c);
+            a.push(c);
             if a.out.len() >= a.job.max_tokens {
                 a.finish = Some("length");
             }
@@ -1844,14 +1908,20 @@ impl<B: Backend> Core<B> {
             };
             match verdict {
                 Ok(()) => {
-                    keep += 1;
                     let d = window[j + 1];
-                    if self.fe.is_eos(d) {
+                    let eos = self.fe.is_eos(d);
+                    let s = a.steer(d, eos);
+                    if s != d {
+                        // As if the target had rejected the draft and sampled `s`.
+                        next = Some(s);
+                        break;
+                    }
+                    keep += 1;
+                    if eos {
                         a.finish = Some("stop");
                         break;
                     }
-                    a.out.push(d);
-                    a.job.sampler.observe(d);
+                    a.push(d);
                     if a.out.len() >= a.job.max_tokens {
                         a.finish = Some("length");
                         break;
@@ -2698,6 +2768,7 @@ impl<B: Backend> Core<B> {
             usize,
             Option<Value>,
             bool,
+            Option<Preamble>,
         ),
         ApiError,
     > {
@@ -2713,13 +2784,20 @@ impl<B: Backend> Core<B> {
             .template
             .render(&messages, tools.as_ref(), thinking, true)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
+        let offers_tools = tools
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|t| !t.is_empty());
+        // A preamble request writes its text first and is steered into the call (see
+        // `Preamble`); it overrides the server's forced call. Not while thinking: the reasoning
+        // comes first and has no length of its own to cap.
+        let preamble = match (self.special.tool_call, preamble_tokens(req)) {
+            (Some(open), Some(max)) if offers_tools && !thinking => Some(Preamble { open, max }),
+            _ => None,
+        };
         // Forced tool call: the prompt ends in the opening tag, so the model continues inside
         // the call (`generate` puts the tag back before parsing the output).
-        let forced = self.cfg.force_tool_call
-            && tools
-                .as_ref()
-                .and_then(Value::as_array)
-                .is_some_and(|t| !t.is_empty());
+        let forced = self.cfg.force_tool_call && offers_tools && preamble.is_none();
         if forced {
             text.push_str(TOOL_CALL_OPEN);
         }
@@ -2758,7 +2836,7 @@ impl<B: Backend> Core<B> {
             });
         }
         let sampler = Sampler::from_request(req, thinking);
-        Ok((p, images, sampler, max_tokens, tools, forced))
+        Ok((p, images, sampler, max_tokens, tools, forced, preamble))
     }
 
     /// Rendered ids plus images as model input (image placeholders expanded, MRoPE positions).
@@ -3124,6 +3202,7 @@ fn score_job(
             windows,
             fork: None,
         }),
+        preamble: None,
     }
 }
 
@@ -3256,7 +3335,7 @@ where
 
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
         let core_ = &self.core;
-        let (p, images, sampler, max_tokens, tools, forced) = core_.prepare(req)?;
+        let (p, images, sampler, max_tokens, tools, forced, preamble) = core_.prepare(req)?;
         let prompt_tokens = p.ids.len() as u64;
         // A forced call has no text before it, reasoning arrives whole, and non-streaming answers
         // are assembled whole anyway.
@@ -3280,6 +3359,7 @@ where
                 reply: tx,
                 queued: Instant::now(),
                 score: None,
+                preamble,
             });
         }
         self.queue.cv.notify_one();
@@ -3545,5 +3625,42 @@ mod tests {
         assert_eq!(streamable_content("ok \u{FFFD}"), Some("ok"));
         assert_eq!(streamable_content("ok <tool_"), Some("ok"));
         assert_eq!(streamable_content("<think>\nplan"), None);
+    }
+
+    #[test]
+    fn preamble_steers_a_stop_or_an_overlong_sentence_into_the_call() {
+        let p = Preamble { open: 7, max: 3 };
+        // Text before the cap passes; a stop before the call becomes the call.
+        assert_eq!(p.steer(1, false, 0, false), 1);
+        assert_eq!(p.steer(2, true, 1, false), 7);
+        // The token past the cap becomes the call; the call itself passes.
+        assert_eq!(p.steer(1, false, 3, false), 7);
+        assert_eq!(p.steer(7, false, 0, false), 7);
+        // Inside the call nothing is steered: it ends with its own stop, at any length.
+        assert_eq!(p.steer(2, true, 40, true), 2);
+        assert_eq!(p.steer(1, false, 40, true), 1);
+        // 0 = the call comes first, as when forced.
+        assert_eq!(Preamble { open: 7, max: 0 }.steer(1, false, 0, false), 7);
+    }
+
+    #[test]
+    fn preamble_tokens_from_the_request() {
+        assert_eq!(preamble_tokens(&json!({})), None);
+        assert_eq!(preamble_tokens(&json!({"tool_preamble": false})), None);
+        assert_eq!(
+            preamble_tokens(&json!({"tool_preamble": true})),
+            Some(DEFAULT_PREAMBLE_TOKENS)
+        );
+        assert_eq!(preamble_tokens(&json!({"tool_preamble": 48})), Some(48));
+    }
+
+    #[test]
+    fn a_call_steered_in_mid_sentence_still_parses() {
+        // The cap cut the sentence: the tag follows the text with no newline.
+        let answer = "The Save button is enabled, so I<tool_call>\n<function=click>\n\
+                      <parameter=x>\n4\n</parameter>\n</function>\n</tool_call>";
+        let parsed = parse_output(answer, None);
+        assert_eq!(parsed.content, "The Save button is enabled, so I");
+        assert_eq!(parsed.tool_calls.len(), 1);
     }
 }
