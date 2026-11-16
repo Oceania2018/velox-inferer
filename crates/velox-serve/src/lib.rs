@@ -56,6 +56,9 @@ impl ApiError {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Delta {
     Content(String),
+    /// The answer's reasoning (its think block, without the tags): OpenAI-compatible
+    /// `reasoning_content`, sent before the content it led to.
+    Reasoning(String),
     /// One complete OpenAI `tool_calls[]` entry (`{"index","id","type","function":{...}}`).
     ToolCall(Value),
 }
@@ -632,6 +635,7 @@ impl Server {
         let _lane = self.lanes.acquire();
         let t0 = Instant::now();
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
         let mut headers_sent = false;
         let mut io_err = None;
@@ -641,6 +645,7 @@ impl Server {
             if !stream {
                 match d {
                     Delta::Content(t) => content.push_str(&t),
+                    Delta::Reasoning(t) => reasoning.push_str(&t),
                     Delta::ToolCall(c) => tool_calls.push(c),
                 }
                 return;
@@ -656,6 +661,9 @@ impl Server {
                 }
                 match d {
                     Delta::Content(t) => sse(w, &chunk(json!({"content": t}), Value::Null)),
+                    Delta::Reasoning(t) => {
+                        sse(w, &chunk(json!({"reasoning_content": t}), Value::Null))
+                    }
                     Delta::ToolCall(c) => sse(w, &chunk(json!({"tool_calls": [c]}), Value::Null)),
                 }
             })();
@@ -726,6 +734,9 @@ impl Server {
             return w.flush();
         }
         let mut message = json!({"role": "assistant", "content": if content.is_empty() && !tool_calls.is_empty() { Value::Null } else { content.into() }});
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = reasoning.into();
+        }
         if !tool_calls.is_empty() {
             message["tool_calls"] = Value::Array(tool_calls);
         }
