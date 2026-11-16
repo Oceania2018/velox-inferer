@@ -224,6 +224,17 @@ fn streamable_content(text: &str) -> Option<&str> {
     Some(text[..end].trim_end_matches('\u{FFFD}').trim())
 }
 
+/// The answer as `parse_output` should read it. A thinking answer opens inside its think block
+/// (the generation prompt ends with `<think>`), so one cut off before `</think>` (max_tokens)
+/// is all reasoning; read as is, that reasoning would come back as the content.
+fn closed_reasoning(text: &str, thinking: bool) -> std::borrow::Cow<'_, str> {
+    if thinking && !text.contains("</think>") {
+        format!("{text}</think>").into()
+    } else {
+        text.into()
+    }
+}
+
 /// Lanes whose chain head stays in device memory (the most recently admitted); other heads move
 /// to the context store, from where their next request restores them (~5 ms over PCIe).
 const DEVICE_HEADS: usize = 2;
@@ -3498,7 +3509,15 @@ where
         if forced {
             text.insert_str(0, TOOL_CALL_OPEN);
         }
-        let parsed = parse_output(&text, tools.as_ref());
+        let parsed = parse_output(
+            &closed_reasoning(&text, core_.thinking(req)),
+            tools.as_ref(),
+        );
+        // Whole, before the content: a thinking answer is never streamed (see `stream` above),
+        // so nothing of it has been emitted yet.
+        if let Some(r) = parsed.reasoning.filter(|r| !r.is_empty()) {
+            emit(Delta::Reasoning(r));
+        }
         match parsed.content.strip_prefix(streamed.as_str()) {
             Some(rest) if !rest.is_empty() => emit(Delta::Content(rest.to_string())),
             Some(_) => {}
@@ -3789,6 +3808,32 @@ mod tests {
         let with_preamble = Preamble { max: 3, ..p };
         assert_eq!(with_preamble.steer(1, false, 6, false, Some(4)), 1);
         assert_eq!(with_preamble.steer(1, false, 7, false, Some(4)), 7);
+    }
+
+    #[test]
+    fn a_thinking_answer_cut_off_inside_its_think_block_is_all_reasoning() {
+        let cut = parse_output(&closed_reasoning("Let me look at the screen", true), None);
+        assert_eq!(cut.reasoning.as_deref(), Some("Let me look at the screen"));
+        assert_eq!(cut.content, "");
+        // A closed block, or a request that is not thinking, reads as before.
+        let closed = parse_output(
+            &closed_reasoning(
+                "why</think>
+
+Click it.",
+                true,
+            ),
+            None,
+        );
+        assert_eq!(
+            (closed.reasoning.as_deref(), closed.content.as_str()),
+            (Some("why"), "Click it.")
+        );
+        let plain = parse_output(&closed_reasoning("Click it.", false), None);
+        assert_eq!(
+            (plain.reasoning, plain.content.as_str()),
+            (None, "Click it.")
+        );
     }
 
     fn special(tool_call: Option<u32>, think_close: Option<u32>) -> SpecialTokens {
