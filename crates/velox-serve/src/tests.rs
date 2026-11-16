@@ -26,6 +26,73 @@ impl ChatEngine for Scripted {
     }
 }
 
+/// Emits a thinking answer: its reasoning, then the content and a call.
+struct Thinking;
+
+impl ChatEngine for Thinking {
+    fn architecture(&self) -> &str {
+        "Thinking"
+    }
+
+    fn generate(&self, _: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
+        emit(Delta::Reasoning("The menu is open.".into()));
+        emit(Delta::Content("hi".into()));
+        emit(Delta::ToolCall(
+            json!({"index": 0, "id": "c1", "type": "function", "function": {"name": "click", "arguments": "{}"}}),
+        ));
+        Ok(Outcome {
+            finish_reason: "tool_calls".into(),
+            prompt_tokens: 100,
+            cached_tokens: 0,
+            completion_tokens: 20,
+            queue_ms: 0.0,
+            prompt_ms: 1.0,
+            predicted_ms: 1.0,
+            first_token: None,
+        })
+    }
+}
+
+#[test]
+fn reasoning_comes_back_as_reasoning_content() {
+    let port = start(Box::new(Thinking));
+    let chat = r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#;
+    let (status, body) = http(port, "POST", "/v1/chat/completions", chat);
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let m = &v["choices"][0]["message"];
+    assert_eq!(m["reasoning_content"], "The menu is open.");
+    assert_eq!(m["content"], "hi");
+    assert_eq!(m["tool_calls"][0]["function"]["name"], "click");
+
+    let streamed = r#"{"model":"m","messages":[{"role":"user","content":"x"}],"stream":true}"#;
+    let (_, body) = http(port, "POST", "/v1/chat/completions", streamed);
+    let deltas: Vec<Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str::<Value>(d).unwrap()["choices"][0]["delta"].clone())
+        .collect();
+    let first = |key: &str| deltas.iter().position(|d| d.get(key).is_some());
+    assert_eq!(
+        deltas[first("reasoning_content").unwrap()]["reasoning_content"],
+        "The menu is open."
+    );
+    assert!(first("reasoning_content") < first("tool_calls"));
+}
+
+/// A reply with no reasoning carries no `reasoning_content` field at all.
+#[test]
+fn an_answer_without_reasoning_has_no_reasoning_field() {
+    let port = start(Box::new(Scripted));
+    let chat = r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#;
+    let (_, body) = http(port, "POST", "/v1/chat/completions", chat);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
+}
+
 fn start(engine: Box<dyn ChatEngine>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
