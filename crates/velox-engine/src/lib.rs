@@ -341,6 +341,9 @@ struct SpecialTokens {
     /// `<tool_call>`: what a [`Preamble`] request commits in place of a stop or an overlong
     /// sentence.
     tool_call: Option<u32>,
+    /// `</think>`: what a thinking [`Preamble`] request commits in place of a stop or the token
+    /// past its reasoning budget.
+    think_close: Option<u32>,
 }
 
 fn core(e: CoreError) -> ApiError {
@@ -549,11 +552,28 @@ struct Job {
 /// Until the call opens, a stop or the token past `max` is replaced by `open`; decoding goes on
 /// inside the call from there. `tool_preamble: 0` amounts to the forced call, `true` to
 /// [`DEFAULT_PREAMBLE_TOKENS`].
+///
+/// A THINKING request offering tools is steered the same way, after its reasoning: the prompt
+/// ends in `<think>`, so a prompt ending in `<tool_call>` (the plain forced call) would put the
+/// call inside the think block and the model would never reason — every tool request with
+/// `reasoning_effort: low` came back as a bare call. With `think` set, the reasoning runs first
+/// (a stop or the token past its budget becomes `</think>`), and `max` then counts from there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Preamble {
     /// The `<tool_call>` token.
     open: u32,
-    /// Preamble tokens allowed before the call is forced.
+    /// Preamble tokens allowed before the call is forced (after the reasoning, when thinking).
+    max: usize,
+    /// A thinking request's reasoning phase, which comes before the preamble.
+    think: Option<Think>,
+}
+
+/// The reasoning phase of a thinking [`Preamble`] request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Think {
+    /// The `</think>` token.
+    close: u32,
+    /// Reasoning tokens allowed before `</think>` is forced (`thinking_budget_tokens`).
     max: usize,
 }
 
@@ -561,15 +581,93 @@ struct Preamble {
 const DEFAULT_PREAMBLE_TOKENS: usize = 64;
 
 impl Preamble {
-    /// The token a request commits in place of `t`, with `out` committed so far and the call
-    /// `opened` or not.
-    fn steer(&self, t: u32, eos: bool, out: usize, opened: bool) -> u32 {
-        if !opened && t != self.open && (eos || out >= self.max) {
+    /// The token a request commits in place of `t`, with `out` committed so far, the call
+    /// `opened` or not, and `thought`: how many of `out` the reasoning took up to and including
+    /// its `</think>`, once it has closed.
+    fn steer(&self, t: u32, eos: bool, out: usize, opened: bool, thought: Option<usize>) -> u32 {
+        if opened {
+            return t;
+        }
+        if let (Some(think), None) = (self.think, thought) {
+            // Still reasoning: only its own close or the call itself pass unchanged.
+            return if t != think.close && t != self.open && (eos || out >= think.max) {
+                think.close
+            } else {
+                t
+            };
+        }
+        let since = out - thought.unwrap_or(0);
+        if t != self.open && (eos || since >= self.max) {
             self.open
         } else {
             t
         }
     }
+}
+
+/// What decides how a request offering tools reaches its call (see [`tool_steering`]).
+#[derive(Clone, Copy, Debug)]
+struct ToolRequest {
+    offers_tools: bool,
+    /// The answer opens with reasoning (`chat_template_kwargs.enable_thinking`).
+    thinking: bool,
+    /// `--force-tool-call on`.
+    force: bool,
+    /// The request's `tool_preamble` (see [`preamble_tokens`]).
+    preamble: Option<usize>,
+    /// The request's `thinking_budget_tokens` (see [`thinking_budget`]).
+    budget: Option<usize>,
+}
+
+/// How a request offering tools is held to its call: the [`Preamble`] steering it, and whether
+/// the prompt ends in `<tool_call>` instead (the plain forced call).
+///
+/// - A `tool_preamble` request writes its text first and is steered into the call; it overrides
+///   the server's forced call.
+/// - A thinking request that would be held to a call (forced, or a preamble) reasons first and is
+///   steered after it — never forced at the prompt's end, which is inside the think block. Should
+///   the tokenizer lack `</think>` or `<tool_call>` as single tokens, it is left unsteered: a
+///   call it may skip beats reasoning it cannot do.
+/// - Otherwise the server's `--force-tool-call` ends the prompt in the tag.
+fn tool_steering(special: &SpecialTokens, r: ToolRequest) -> (Option<Preamble>, bool) {
+    if !r.offers_tools {
+        return (None, false);
+    }
+    if r.thinking {
+        if !(r.force || r.preamble.is_some()) {
+            return (None, false);
+        }
+        let steer = match (special.tool_call, special.think_close) {
+            (Some(open), Some(close)) => Some(Preamble {
+                open,
+                max: r.preamble.unwrap_or(0),
+                think: Some(Think {
+                    close,
+                    max: r.budget.unwrap_or(usize::MAX),
+                }),
+            }),
+            _ => None,
+        };
+        return (steer, false);
+    }
+    let steer = match (special.tool_call, r.preamble) {
+        (Some(open), Some(max)) => Some(Preamble {
+            open,
+            max,
+            think: None,
+        }),
+        _ => None,
+    };
+    let forced = r.force && steer.is_none();
+    (steer, forced)
+}
+
+/// The request's `thinking_budget_tokens` (set by llm-inference-daemon from `reasoning_effort`):
+/// the reasoning tokens a thinking tool request may spend before `</think>` is forced.
+fn thinking_budget(req: &Value) -> Option<usize> {
+    req.get("thinking_budget_tokens")?
+        .as_u64()
+        .map(|n| n as usize)
 }
 
 /// The request's `tool_preamble` (see [`Preamble`]): `Some(max)` for a number or `true`.
@@ -676,22 +774,29 @@ struct Active<B: Backend> {
     scores: Vec<f32>,
     /// A [`Preamble`] request has committed its `<tool_call>`.
     opened: bool,
+    /// A thinking [`Preamble`] request has committed its `</think>`: the output tokens up to
+    /// and including it.
+    thought: Option<usize>,
 }
 
 impl<B: Backend> Active<B> {
     /// `t`, or what a [`Preamble`] request commits in its place.
     fn steer(&self, t: u32, eos: bool) -> u32 {
-        self.job
-            .preamble
-            .map_or(t, |p| p.steer(t, eos, self.out.len(), self.opened))
+        self.job.preamble.map_or(t, |p| {
+            p.steer(t, eos, self.out.len(), self.opened, self.thought)
+        })
     }
 
     /// Appends a committed output token.
     fn push(&mut self, t: u32) {
         self.out.push(t);
         self.job.sampler.observe(t);
-        if self.job.preamble.is_some_and(|p| p.open == t) {
-            self.opened = true;
+        if let Some(p) = self.job.preamble {
+            if p.open == t {
+                self.opened = true;
+            } else if self.thought.is_none() && p.think.is_some_and(|k| k.close == t) {
+                self.thought = Some(self.out.len());
+            }
         }
     }
 
@@ -807,6 +912,7 @@ where
             vision_start: single_token(&fe, "<|vision_start|>"),
             image_pad: single_token(&fe, "<|image_pad|>"),
             tool_call: single_token(&fe, TOOL_CALL_OPEN.trim_end()),
+            think_close: single_token(&fe, "</think>"),
         };
         let disk = if cfg.disk_context_bytes > 0
             && cfg.disk_context_roots > 0
@@ -1603,6 +1709,7 @@ impl<B: Backend> Core<B> {
                 pre: Some(pre),
                 scores: Vec::new(),
                 opened: false,
+                thought: None,
             }),
             Err(e) => {
                 lane.keys.clear();
@@ -2779,25 +2886,30 @@ impl<B: Backend> Core<B> {
             images: urls,
         } = normalize_request(req)?;
         let thinking = self.thinking(req);
+        let effort = req
+            .pointer("/chat_template_kwargs/reasoning_effort")
+            .and_then(Value::as_str);
         let mut text = self
             .fe
             .template
-            .render(&messages, tools.as_ref(), thinking, true)
+            .render_effort(&messages, tools.as_ref(), thinking, true, effort)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
         let offers_tools = tools
             .as_ref()
             .and_then(Value::as_array)
             .is_some_and(|t| !t.is_empty());
-        // A preamble request writes its text first and is steered into the call (see
-        // `Preamble`); it overrides the server's forced call. Not while thinking: the reasoning
-        // comes first and has no length of its own to cap.
-        let preamble = match (self.special.tool_call, preamble_tokens(req)) {
-            (Some(open), Some(max)) if offers_tools && !thinking => Some(Preamble { open, max }),
-            _ => None,
-        };
+        let (preamble, forced) = tool_steering(
+            &self.special,
+            ToolRequest {
+                offers_tools,
+                thinking,
+                force: self.cfg.force_tool_call,
+                preamble: preamble_tokens(req),
+                budget: thinking_budget(req),
+            },
+        );
         // Forced tool call: the prompt ends in the opening tag, so the model continues inside
         // the call (`generate` puts the tag back before parsing the output).
-        let forced = self.cfg.force_tool_call && offers_tools && preamble.is_none();
         if forced {
             text.push_str(TOOL_CALL_OPEN);
         }
@@ -3629,18 +3741,139 @@ mod tests {
 
     #[test]
     fn preamble_steers_a_stop_or_an_overlong_sentence_into_the_call() {
-        let p = Preamble { open: 7, max: 3 };
+        let p = Preamble {
+            open: 7,
+            max: 3,
+            think: None,
+        };
         // Text before the cap passes; a stop before the call becomes the call.
-        assert_eq!(p.steer(1, false, 0, false), 1);
-        assert_eq!(p.steer(2, true, 1, false), 7);
+        assert_eq!(p.steer(1, false, 0, false, None), 1);
+        assert_eq!(p.steer(2, true, 1, false, None), 7);
         // The token past the cap becomes the call; the call itself passes.
-        assert_eq!(p.steer(1, false, 3, false), 7);
-        assert_eq!(p.steer(7, false, 0, false), 7);
+        assert_eq!(p.steer(1, false, 3, false, None), 7);
+        assert_eq!(p.steer(7, false, 0, false, None), 7);
         // Inside the call nothing is steered: it ends with its own stop, at any length.
-        assert_eq!(p.steer(2, true, 40, true), 2);
-        assert_eq!(p.steer(1, false, 40, true), 1);
+        assert_eq!(p.steer(2, true, 40, true, None), 2);
+        assert_eq!(p.steer(1, false, 40, true, None), 1);
         // 0 = the call comes first, as when forced.
-        assert_eq!(Preamble { open: 7, max: 0 }.steer(1, false, 0, false), 7);
+        let forced = Preamble {
+            open: 7,
+            max: 0,
+            think: None,
+        };
+        assert_eq!(forced.steer(1, false, 0, false, None), 7);
+    }
+
+    #[test]
+    fn a_thinking_request_reasons_first_then_is_steered_into_the_call() {
+        // open = 7 (`<tool_call>`), close = 9 (`</think>`), 5 reasoning tokens, no preamble.
+        let p = Preamble {
+            open: 7,
+            max: 0,
+            think: Some(Think { close: 9, max: 5 }),
+        };
+        // While reasoning, text passes — the forced call does NOT start inside the think block.
+        assert_eq!(p.steer(1, false, 0, false, None), 1);
+        assert_eq!(p.steer(1, false, 4, false, None), 1);
+        // A stop, or the token past the budget, closes the reasoning instead.
+        assert_eq!(p.steer(2, true, 2, false, None), 9);
+        assert_eq!(p.steer(1, false, 5, false, None), 9);
+        // The model's own close passes.
+        assert_eq!(p.steer(9, false, 3, false, None), 9);
+        // After `</think>` (4 tokens of output incl. it) the call is forced at once…
+        assert_eq!(p.steer(1, false, 4, false, Some(4)), 7);
+        assert_eq!(p.steer(2, true, 4, false, Some(4)), 7);
+        // …and inside the call nothing is steered.
+        assert_eq!(p.steer(2, true, 30, true, Some(4)), 2);
+        // With a preamble, its allowance counts from the close, not from the first token.
+        let with_preamble = Preamble { max: 3, ..p };
+        assert_eq!(with_preamble.steer(1, false, 6, false, Some(4)), 1);
+        assert_eq!(with_preamble.steer(1, false, 7, false, Some(4)), 7);
+    }
+
+    fn special(tool_call: Option<u32>, think_close: Option<u32>) -> SpecialTokens {
+        SpecialTokens {
+            im_start: None,
+            vision_start: None,
+            image_pad: None,
+            tool_call,
+            think_close,
+        }
+    }
+
+    fn tool_request(thinking: bool, force: bool, preamble: Option<usize>) -> ToolRequest {
+        ToolRequest {
+            offers_tools: true,
+            thinking,
+            force,
+            preamble,
+            budget: Some(4096),
+        }
+    }
+
+    #[test]
+    fn a_thinking_tool_request_is_never_forced_inside_its_think_block() {
+        let s = special(Some(7), Some(9));
+        // The bug: forced + thinking used to end the prompt in `<tool_call>` after `<think>`.
+        let (steer, forced) = tool_steering(&s, tool_request(true, true, None));
+        assert!(!forced);
+        assert_eq!(
+            steer,
+            Some(Preamble {
+                open: 7,
+                max: 0,
+                think: Some(Think {
+                    close: 9,
+                    max: 4096
+                })
+            })
+        );
+        // A thinking preamble request keeps its allowance, after the reasoning.
+        let (steer, forced) = tool_steering(&s, tool_request(true, true, Some(64)));
+        assert!(!forced);
+        assert_eq!(steer.map(|p| p.max), Some(64));
+        // Thinking, not held to a call: left alone.
+        assert_eq!(
+            tool_steering(&s, tool_request(true, false, None)),
+            (None, false)
+        );
+        // No `</think>` token: unsteered rather than forced into the think block.
+        assert_eq!(
+            tool_steering(&special(Some(7), None), tool_request(true, true, None)),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn a_non_thinking_tool_request_steers_as_before() {
+        let s = special(Some(7), Some(9));
+        // --force-tool-call: the prompt ends in the tag.
+        assert_eq!(
+            tool_steering(&s, tool_request(false, true, None)),
+            (None, true)
+        );
+        // tool_preamble overrides it.
+        let (steer, forced) = tool_steering(&s, tool_request(false, true, Some(64)));
+        assert!(!forced);
+        assert_eq!(
+            steer,
+            Some(Preamble {
+                open: 7,
+                max: 64,
+                think: None
+            })
+        );
+        // Neither: free.
+        assert_eq!(
+            tool_steering(&s, tool_request(false, false, None)),
+            (None, false)
+        );
+        // No tools: nothing to steer into.
+        let no_tools = ToolRequest {
+            offers_tools: false,
+            ..tool_request(true, true, Some(64))
+        };
+        assert_eq!(tool_steering(&s, no_tools), (None, false));
     }
 
     #[test]
