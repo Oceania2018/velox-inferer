@@ -102,6 +102,28 @@ impl ChatTemplate {
             enable_thinking,
             add_generation_prompt,
             false,
+            None,
+        )
+    }
+
+    /// [`Self::render`] with the request's `chat_template_kwargs.reasoning_effort`, the variable
+    /// Qwen3.8's template picks its reasoning instruction from (`low`: keep it brief). Absent, the
+    /// variable stays undefined and the template's own default applies (`xhigh` for Qwen3.8).
+    pub fn render_effort(
+        &self,
+        messages: &Value,
+        tools: Option<&Value>,
+        enable_thinking: bool,
+        add_generation_prompt: bool,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String> {
+        self.render_with(
+            messages,
+            tools,
+            enable_thinking,
+            add_generation_prompt,
+            false,
+            reasoning_effort,
         )
     }
 
@@ -116,7 +138,7 @@ impl ChatTemplate {
                 "assistant continuation requires a final assistant message".into(),
             ));
         }
-        self.render_with(messages, None, enable_thinking, false, true)
+        self.render_with(messages, None, enable_thinking, false, true, None)
     }
 
     fn render_with(
@@ -126,17 +148,23 @@ impl ChatTemplate {
         enable_thinking: bool,
         add_generation_prompt: bool,
         continue_final_message: bool,
+        reasoning_effort: Option<&str>,
     ) -> Result<String> {
         let tmpl = self
             .env
             .get_template("chat")
             .map_err(|e| Error::Config(e.to_string()))?;
-        let ctx = minijinja::context! {
+        let base = minijinja::context! {
             messages => JValue::from_serialize(messages),
             tools => tools.map(JValue::from_serialize),
             enable_thinking => enable_thinking,
             add_generation_prompt => add_generation_prompt,
             continue_final_message => continue_final_message,
+        };
+        // Only when given: a `none` value would defeat the template's `|default(...)`.
+        let ctx = match reasoning_effort {
+            Some(effort) => minijinja::context! { reasoning_effort => effort, ..base },
+            None => base,
         };
         tmpl.render(ctx)
             .map_err(|e| Error::Config(format!("chat template: {e:#}")))
@@ -195,6 +223,24 @@ mod tests {
         assert!(t
             .render_continuation(&json!([{"role": "user", "content": "q"}]), false)
             .is_err());
+    }
+
+    #[test]
+    fn reasoning_effort_reaches_the_template_only_when_given() {
+        // Qwen3.8's selection, reduced: the variable defaults to xhigh when undefined.
+        let src = "{%- if enable_thinking %}{{ reasoning_effort|default('xhigh') }}{% endif %}";
+        let t = ChatTemplate::new(src.into()).unwrap();
+        let msgs = json!([]);
+        assert_eq!(
+            t.render_effort(&msgs, None, true, false, Some("low"))
+                .unwrap(),
+            "low"
+        );
+        assert_eq!(
+            t.render_effort(&msgs, None, true, false, None).unwrap(),
+            "xhigh"
+        );
+        assert_eq!(t.render(&msgs, None, true, false).unwrap(), "xhigh");
     }
 
     #[test]
