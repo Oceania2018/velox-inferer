@@ -119,6 +119,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn device_allocs(&self) -> Option<(usize, usize, usize)> {
         self.inner.device_allocs()
     }
+    fn host_pinned(&self) -> Option<velox_core::backend::HostPinned> {
+        self.inner.host_pinned()
+    }
     fn upload_bytes_host(&self, data: &[u8]) -> Result<B::Buffer> {
         self.inner.upload_bytes_host(data)
     }

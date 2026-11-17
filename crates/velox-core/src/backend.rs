@@ -17,6 +17,20 @@ use crate::state::StateFormat;
 /// MiB), so a background thread can prepare it while the device works.
 pub type HostAlloc<T> = std::sync::Arc<dyn Fn(usize) -> Result<T> + Send + Sync>;
 
+/// Pinned system RAM of this process ([`Backend::host_pinned`]), in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostPinned {
+    /// Reserved ahead of use ([`Backend::reserve_host`]).
+    pub reserved: usize,
+    /// Of `reserved`, held by no buffer (returned or never handed out).
+    pub reserved_free: usize,
+    /// Pinned outside the reservation (when it had no room) and alive: unbounded, so worth
+    /// watching. Includes storage pinned before the reservation was made (weights kept in RAM).
+    pub outside: usize,
+    /// Buffers behind `outside`.
+    pub outside_buffers: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Cpu,
@@ -1801,6 +1815,10 @@ pub trait Backend {
     /// This process's device allocations: (buffer bytes live, buffer bytes at their peak since
     /// start, physical chunk bytes live), when the backend counts them.
     fn device_allocs(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+    /// This process's pinned system RAM ([`Self::alloc_host`]), when the backend has any.
+    fn host_pinned(&self) -> Option<HostPinned> {
         None
     }
     /// (free, total) device memory in bytes, when the backend can tell: what can still be
