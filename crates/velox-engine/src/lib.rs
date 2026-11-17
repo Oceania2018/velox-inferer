@@ -327,6 +327,8 @@ struct Gauges {
     host_used: AtomicU64,
     host_budget: AtomicU64,
     host_entries: AtomicU64,
+    host_pool: AtomicU64,
+    host_pinned_outside: AtomicU64,
     /// Whether there is a disk tier (the disk figures stay unrendered without one).
     disk: AtomicBool,
     disk_used: AtomicU64,
@@ -1200,9 +1202,31 @@ impl<B: Backend> Core<B> {
                     chunks as f64 / (1u64 << 30) as f64
                 )
             });
+        let gib = |x: usize| x as f64 / (1u64 << 30) as f64;
+        // Pinned system RAM: the context store against its budget, then the backend's view (what
+        // the reservation has free, and what was pinned outside it, which nothing bounds).
+        let store = if st.store.enabled() {
+            format!(
+                ", store {:.2} + pools {:.2} of {:.2} GiB",
+                gib(st.store.bytes(&self.b)),
+                gib(st.store.pool_bytes(&self.b)),
+                gib(st.store.budget())
+            )
+        } else {
+            String::new()
+        };
+        let pinned = self.b.host_pinned().map_or(String::new(), |h| {
+            format!(
+                ", pinned {:.2} GiB reserved ({:.2} free) + {:.2} GiB outside ({} buffers)",
+                gib(h.reserved),
+                gib(h.reserved_free),
+                gib(h.outside),
+                h.outside_buffers
+            )
+        });
         eprintln!(
-            "[mem] device in use {}{pool}{allocs}{snaps}, graphs {graphs} ({:.2} GB, {released} \
-             released)",
+            "[mem] device in use {}{pool}{allocs}{snaps}{store}{pinned}, graphs {graphs} ({:.2} \
+             GB, {released} released)",
             self.b.device_in_use().map_or("unknown".into(), |u| format!(
                 "{:.2} GiB",
                 u as f64 / (1u64 << 30) as f64
@@ -1224,6 +1248,10 @@ impl<B: Backend> Core<B> {
         set(&g.host_used, st.store.bytes(&self.b) as u64);
         set(&g.host_budget, st.store.budget() as u64);
         set(&g.host_entries, st.store.len() as u64);
+        set(&g.host_pool, st.store.pool_bytes(&self.b) as u64);
+        if let Some(h) = self.b.host_pinned() {
+            set(&g.host_pinned_outside, h.outside as u64);
+        }
         if let Some(d) = st.store.disk_stats() {
             set(&g.disk_used, d.used);
             set(&g.disk_budget, d.budget);
@@ -3384,6 +3412,19 @@ where
             "gauge",
             "Context store entries",
             &g.host_entries,
+        );
+        put(
+            "velox_host_context_pool_bytes",
+            "gauge",
+            "Context store reusable storage held beside its entries (within the budget)",
+            &g.host_pool,
+        );
+        put(
+            "velox_host_pinned_outside_bytes",
+            "gauge",
+            "Pinned system RAM outside the startup reservation (unbounded; includes weights kept \
+             in RAM)",
+            &g.host_pinned_outside,
         );
         if !g.disk.load(Ordering::Relaxed) {
             return;
