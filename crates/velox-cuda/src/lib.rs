@@ -277,58 +277,116 @@ static CHUNK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// Pinned system memory reserved ahead of use ([`Backend::reserve_host`]): pinning costs about
 /// 0.4 ms per MB under WSL, so a server pins its context-store budget at startup and host
 /// storage asked for on the request path afterwards is carved from a slab or reused.
-static HOST_ARENA: Mutex<HostArena> = Mutex::new(HostArena {
-    slabs: Vec::new(),
-    free: Vec::new(),
-});
+static HOST_ARENA: Mutex<HostArena> = Mutex::new(HostArena::new());
+
+/// Host buffers pinned outside the [`HOST_ARENA`] (it had no room for them) and alive, with their
+/// bytes: nothing bounds these, so the engine's memory log reports them.
+static HOST_OUTSIDE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HOST_OUTSIDE_BUFFERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Pieces are aligned like cudaHostAlloc's own allocations.
 const HOST_ALIGN: usize = 4096;
 /// Pinned per call while reserving: large single pins fail more readily under WSL.
 const HOST_SLAB: usize = 256 << 20;
 
+/// Address bookkeeping of the pinned slabs (no memory access, so it is testable without a
+/// device). Returned pieces coalesce with free neighbours in their slab and serve any size (best
+/// fit): storage returned as one kind of buffer (KV pages) can hold another (recurrent states).
+/// Reuse by exact size alone stranded it: when a workload moved from long prompts to many short
+/// ones, KV-page pieces sat free while every new state was pinned outside the arena, with no
+/// bound (RTX 5090 under WSL: 7.7 GiB outside a 25.5 GiB arena after a day, then swapping).
 struct HostArena {
     /// Pinned slabs as (base, bytes, bytes carved), never freed: the process keeps them until
-    /// it exits.
+    /// it exits. Bytes past the carved mark are still zero from pinning.
     slabs: Vec<(usize, usize, usize)>,
-    /// Pieces dropped buffers returned, by size: states, KV pages and drafter pages are each of
-    /// one size, so storage is asked for again at the sizes it was returned at.
-    free: Vec<(usize, Vec<usize>)>,
+    /// Free pieces by address (to their length), and the same pieces by (length, address) for
+    /// best fit.
+    free_by_addr: std::collections::BTreeMap<usize, usize>,
+    free_by_size: std::collections::BTreeSet<(usize, usize)>,
+    /// Sum of the free pieces' lengths.
+    free_bytes: usize,
 }
 
 impl HostArena {
-    /// A zeroed piece of `bytes` (a multiple of [`HOST_ALIGN`]) if the arena has room.
-    fn take(&mut self, bytes: usize) -> Option<*mut c_void> {
-        if let Some(ptr) = self
-            .free
-            .iter_mut()
-            .find(|(n, _)| *n == bytes)
-            .and_then(|(_, v)| v.pop())
-        {
-            // SAFETY: a piece of a live slab, `bytes` long, that no buffer owns.
-            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
-            return Some(ptr as *mut c_void);
+    const fn new() -> Self {
+        HostArena {
+            slabs: Vec::new(),
+            free_by_addr: std::collections::BTreeMap::new(),
+            free_by_size: std::collections::BTreeSet::new(),
+            free_bytes: 0,
         }
-        // Slabs are zeroed when pinned and each byte is carved once, so carves need no clearing.
+    }
+
+    /// The address of a piece of `bytes` (a multiple of [`HOST_ALIGN`]) and whether it needs
+    /// clearing (a reused piece) or is still zero (freshly carved), if the arena has room. Free
+    /// pieces go first (the smallest that fits, split), so the uncarved rest stays one block.
+    fn take(&mut self, bytes: usize) -> Option<(usize, bool)> {
+        if let Some(&(len, addr)) = self.free_by_size.range((bytes, 0)..).next() {
+            self.unlink(addr, len);
+            if len > bytes {
+                self.link(addr + bytes, len - bytes);
+            }
+            return Some((addr, true));
+        }
         let (base, _, used) = self
             .slabs
             .iter_mut()
             .find(|(_, cap, used)| *cap - *used >= bytes)?;
-        let ptr = *base + *used;
+        let addr = *base + *used;
         *used += bytes;
-        Some(ptr as *mut c_void)
+        Some((addr, false))
     }
 
-    fn give(&mut self, ptr: usize, bytes: usize) {
-        match self.free.iter_mut().find(|(n, _)| *n == bytes) {
-            Some((_, v)) => v.push(ptr),
-            None => self.free.push((bytes, vec![ptr])),
+    /// Returns a piece [`Self::take`] handed out, merging it with free neighbours in its slab
+    /// (never across slabs: a buffer must lie within one pinned allocation).
+    fn give(&mut self, addr: usize, bytes: usize) {
+        let Some(&(base, _, used)) = self
+            .slabs
+            .iter()
+            .find(|(base, cap, _)| (*base..*base + *cap).contains(&addr))
+        else {
+            debug_assert!(false, "piece {addr:#x} is not in a slab");
+            return;
+        };
+        let (mut start, mut len) = (addr, bytes);
+        if let Some((&p, &pl)) = self.free_by_addr.range(..addr).next_back() {
+            if p >= base && p + pl == addr {
+                self.unlink(p, pl);
+                start = p;
+                len += pl;
+            }
         }
+        let end = addr + bytes;
+        if end < base + used {
+            if let Some(&nl) = self.free_by_addr.get(&end) {
+                self.unlink(end, nl);
+                len += nl;
+            }
+        }
+        self.link(start, len);
+    }
+
+    fn link(&mut self, addr: usize, len: usize) {
+        self.free_by_addr.insert(addr, len);
+        self.free_by_size.insert((len, addr));
+        self.free_bytes += len;
+    }
+
+    fn unlink(&mut self, addr: usize, len: usize) {
+        self.free_by_addr.remove(&addr);
+        self.free_by_size.remove(&(len, addr));
+        self.free_bytes -= len;
     }
 
     /// Bytes pinned and not carved yet.
     fn room(&self) -> usize {
         self.slabs.iter().map(|(_, cap, used)| cap - used).sum()
+    }
+
+    /// Bytes pinned in slabs.
+    fn pinned(&self) -> usize {
+        self.slabs.iter().map(|(_, cap, _)| cap).sum()
     }
 }
 
@@ -399,6 +457,9 @@ impl Drop for CudaBuffer {
                     }
                 } else if self.host {
                     ffi::velox_cuda_free_host(self.ptr.cast());
+                    use std::sync::atomic::Ordering::Relaxed;
+                    HOST_OUTSIDE_BYTES.fetch_sub(self.len * 4, Relaxed);
+                    HOST_OUTSIDE_BUFFERS.fetch_sub(1, Relaxed);
                 } else {
                     ffi::velox_cuda_free(self.ptr.cast());
                     BUFFER_BYTES.fetch_sub(self.len * 4, std::sync::atomic::Ordering::Relaxed);
@@ -423,12 +484,23 @@ impl CudaBuffer {
                 .ok()
                 .and_then(|mut a| a.take(bytes.next_multiple_of(HOST_ALIGN)));
             match piece {
-                Some(p) => (ptr, pooled) = (p, true),
-                // SAFETY: out-pointer to a live local.
-                None => status(
-                    unsafe { ffi::velox_cuda_host_alloc(&mut ptr, bytes) },
-                    "cudaHostAlloc (mapped)",
-                )?,
+                Some((addr, dirty)) => {
+                    if dirty {
+                        // SAFETY: a piece of a live slab, at least `bytes` long, no buffer owns.
+                        unsafe { std::ptr::write_bytes(addr as *mut u8, 0, bytes) };
+                    }
+                    (ptr, pooled) = (addr as *mut c_void, true);
+                }
+                None => {
+                    // SAFETY: out-pointer to a live local.
+                    status(
+                        unsafe { ffi::velox_cuda_host_alloc(&mut ptr, bytes) },
+                        "cudaHostAlloc (mapped)",
+                    )?;
+                    use std::sync::atomic::Ordering::Relaxed;
+                    HOST_OUTSIDE_BYTES.fetch_add(bytes, Relaxed);
+                    HOST_OUTSIDE_BUFFERS.fetch_add(1, Relaxed);
+                }
             }
         }
         Ok(CudaBuffer {
@@ -2119,6 +2191,19 @@ impl Backend for CudaBackend {
         ))
     }
 
+    fn host_pinned(&self) -> Option<velox_core::backend::HostPinned> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (reserved, reserved_free) = HOST_ARENA
+            .lock()
+            .map_or((0, 0), |a| (a.pinned(), a.free_bytes + a.room()));
+        Some(velox_core::backend::HostPinned {
+            reserved,
+            reserved_free,
+            outside: HOST_OUTSIDE_BYTES.load(Relaxed),
+            outside_buffers: HOST_OUTSIDE_BUFFERS.load(Relaxed),
+        })
+    }
+
     fn device_in_use(&self) -> Option<usize> {
         let (mut used, mut total) = (0usize, 0usize);
         // SAFETY: out-pointers to live locals.
@@ -3304,4 +3389,81 @@ pub(crate) fn dtod(dst: *mut f32, src: *const f32, len: usize) -> Result<()> {
         unsafe { ffi::velox_cuda_dtod(dst.cast(), src.cast(), len * 4) },
         "copy",
     )
+}
+
+#[cfg(test)]
+mod host_arena_tests {
+    use super::HostArena;
+
+    const P: usize = 4096;
+
+    fn arena(slabs: &[(usize, usize)]) -> HostArena {
+        let mut a = HostArena::new();
+        a.slabs = slabs.iter().map(|&(b, n)| (b, n, 0)).collect();
+        a
+    }
+
+    #[test]
+    fn carves_clean_then_reuses_dirty() {
+        let mut a = arena(&[(0x10_0000, 8 * P)]);
+        assert_eq!(a.take(2 * P), Some((0x10_0000, false)));
+        a.give(0x10_0000, 2 * P);
+        assert_eq!(a.take(2 * P), Some((0x10_0000, true)));
+        assert_eq!(a.room(), 6 * P);
+    }
+
+    #[test]
+    fn returned_pieces_of_one_size_serve_another() {
+        // Three 2-page pieces (KV pages) come back; a 5-page piece (a state) fits in them once
+        // they coalesce, without carving or pinning.
+        let mut a = arena(&[(0x10_0000, 6 * P)]);
+        let ps: Vec<usize> = (0..3).map(|_| a.take(2 * P).unwrap().0).collect();
+        assert_eq!(a.take(P), None, "slab fully carved");
+        for &p in &ps {
+            a.give(p, 2 * P);
+        }
+        assert_eq!(a.free_by_addr.len(), 1, "neighbours merged");
+        assert_eq!(a.take(5 * P), Some((0x10_0000, true)));
+        assert_eq!(a.free_bytes, P);
+        assert_eq!(a.take(P), Some((0x10_0000 + 5 * P, true)));
+        assert_eq!(a.take(P), None);
+    }
+
+    #[test]
+    fn coalesces_in_any_order_and_picks_best_fit() {
+        let mut a = arena(&[(0x10_0000, 10 * P)]);
+        let p: Vec<usize> = [1, 3, 1, 4, 1]
+            .iter()
+            .map(|&n| a.take(n * P).unwrap().0)
+            .collect();
+        // Free the 3-page and 4-page pieces: two holes, not adjacent.
+        a.give(p[1], 3 * P);
+        a.give(p[3], 4 * P);
+        // Best fit: 3 pages go to the 3-page hole.
+        assert_eq!(a.take(3 * P), Some((p[1], true)));
+        a.give(p[1], 3 * P);
+        // Freeing the 1-page pieces between them joins everything into one block.
+        a.give(p[2], P);
+        a.give(p[0], P);
+        a.give(p[4], P);
+        assert_eq!(
+            a.free_by_addr.iter().collect::<Vec<_>>(),
+            vec![(&0x10_0000, &(10 * P))]
+        );
+        assert_eq!(a.free_by_size.len(), 1);
+        assert_eq!(a.free_bytes, 10 * P);
+    }
+
+    #[test]
+    fn never_merges_across_slabs() {
+        // Two slabs back to back in the address space stay separate allocations.
+        let mut a = arena(&[(0x10_0000, 2 * P), (0x10_0000 + 2 * P, 2 * P)]);
+        let x = a.take(2 * P).unwrap().0;
+        let y = a.take(2 * P).unwrap().0;
+        assert_eq!(y, x + 2 * P);
+        a.give(x, 2 * P);
+        a.give(y, 2 * P);
+        assert_eq!(a.free_by_addr.len(), 2);
+        assert_eq!(a.take(3 * P), None);
+    }
 }
