@@ -133,10 +133,14 @@ pub(crate) struct ContextStore<B: Backend> {
     inflight: Vec<(u64, Entry<B>)>,
     entries: Vec<Entry<B>>,
     /// Storage of evicted states and KV pages, reused for new ones: pinning memory costs about
-    /// 0.4 ms per MB, ten times the copy.
+    /// 0.4 ms per MB, ten times the copy. Counted in the budget with the entries (see
+    /// [`Self::evict`]); beyond [`MAX_SPARE`] states, [`RESERVE_PAGES`] KV pages and
+    /// `draft_reserve` drafter pages they are given back when the store is full.
     spare: Vec<Checkpoint<B>>,
     pages: Vec<B::Buffer>,
     draft_pages: Vec<B::Buffer>,
+    /// Drafter pages [`Self::top_up`] and [`Self::feed`] were last asked to keep ready.
+    draft_reserve: usize,
     /// Full KV pages by the hash of their whole prefix (see [`page_hashes`]).
     shared: HashMap<u64, Weak<KvSegment<B>>>,
     budget: usize,
@@ -229,6 +233,7 @@ impl<B: Backend> ContextStore<B> {
             spare: Vec::new(),
             pages: Vec::new(),
             draft_pages: Vec::new(),
+            draft_reserve: 0,
             shared: HashMap::new(),
             budget,
             lambda: lambda.max(0.0),
@@ -439,6 +444,7 @@ impl<B: Backend> ContextStore<B> {
         session: &Session<B>,
         draft: Option<(usize, usize)>,
     ) -> Result<bool, CoreError> {
+        self.draft_reserve = draft.map_or(0, |(n, _)| n);
         // A background pinner keeps the reserve instead.
         if !self.enabled() || self.pinner.is_some() {
             return Ok(false);
@@ -477,6 +483,7 @@ impl<B: Backend> ContextStore<B> {
     /// [`PINNED_STATES`] states, [`RESERVE_PAGES`] KV pages and `draft` drafter pages
     /// (`(count, page length)`) ready within the budget. Cheap: call once per scheduler step.
     pub fn feed(&mut self, b: &B, session: &Session<B>, draft: Option<(usize, usize)>) {
+        self.draft_reserve = draft.map_or(0, |(n, _)| n);
         let Some(p) = self.pinner.as_mut() else {
             return;
         };
@@ -964,10 +971,23 @@ impl<B: Backend> ContextStore<B> {
     /// Evicts superseded entries first, then the lowest demand, and the pinned common roots (see
     /// [`Self::pinned`]) only when nothing else is left, until the store fits its budget. `keep`
     /// (the entry just stored) is never evicted.
+    ///
+    /// The budget covers the entries and the pools of reusable storage together: counting the
+    /// entries alone let the pools grow without bound when the mix of entries changed (KV pages
+    /// of evicted long prompts kept while short prompts' states needed new memory: 9 GiB over a
+    /// 24 GiB budget after a day on an RTX 5090). Pool storage beyond its reserve goes first, then
+    /// entries, whose storage joins the pools and is trimmed in turn.
     fn evict(&mut self, b: &B, keep: u64) -> Result<(), CoreError> {
         let mut synced = false;
         let mut pinned: Option<HashSet<u64>> = None;
-        while self.bytes(b) > self.budget {
+        loop {
+            let held = self.bytes(b) + self.pool_bytes(b);
+            if held <= self.budget {
+                break;
+            }
+            if self.trim_pools(b, held - self.budget) > 0 {
+                continue;
+            }
             let pinned = pinned.get_or_insert_with(|| self.pinned());
             let victim = self
                 .entries
@@ -993,6 +1013,39 @@ impl<B: Backend> ContextStore<B> {
         }
         self.shared.retain(|_, w| w.strong_count() > 0);
         Ok(())
+    }
+
+    /// Bytes of reusable storage in the pools: spare states, KV pages and drafter pages.
+    pub fn pool_bytes(&self, b: &B) -> usize {
+        let each = |v: &[B::Buffer]| v.first().map_or(0, |x| b.len(x) * 4) * v.len();
+        self.spare.iter().map(|s| s.bytes(b)).sum::<usize>()
+            + each(&self.pages)
+            + each(&self.draft_pages)
+    }
+
+    /// Gives back pool storage beyond the pools' reserves until `want` bytes are freed or only
+    /// the reserves are left; returns the bytes freed. Dropped storage returns to the backend's
+    /// reservation (where any size can reuse it) or, pinned outside it, to the system.
+    fn trim_pools(&mut self, b: &B, want: usize) -> usize {
+        let each = |v: &[B::Buffer]| v.first().map_or(0, |x| b.len(x) * 4);
+        let pools = [
+            (
+                self.draft_pages.len(),
+                each(&self.draft_pages),
+                self.draft_reserve,
+            ),
+            (self.pages.len(), each(&self.pages), RESERVE_PAGES),
+            (
+                self.spare.len(),
+                self.spare.first().map_or(0, |s| s.bytes(b)),
+                MAX_SPARE,
+            ),
+        ];
+        let drop = trim_plan(&pools, want);
+        self.draft_pages.truncate(self.draft_pages.len() - drop[0]);
+        self.pages.truncate(self.pages.len() - drop[1]);
+        self.spare.truncate(self.spare.len() - drop[2]);
+        pools.iter().zip(&drop).map(|((_, n, _), d)| n * d).sum()
     }
 
     /// Returns an entry's storage to the pools (KV pages once no other entry shares them).
@@ -1092,8 +1145,42 @@ fn rank_common(mut roots: Vec<(usize, usize, f64)>, n: usize) -> Vec<usize> {
     roots.into_iter().take(n).map(|(i, _, _)| i).collect()
 }
 
+/// How many items to drop from each pool, given as (items, bytes each, items to keep), to free
+/// `want` bytes: from the first pool on, only items beyond what each keeps, no more than needed.
+fn trim_plan(pools: &[(usize, usize, usize)], want: usize) -> Vec<usize> {
+    let mut freed = 0;
+    pools
+        .iter()
+        .map(|&(len, each, keep)| {
+            if freed >= want || each == 0 {
+                return 0;
+            }
+            let n = len.saturating_sub(keep).min((want - freed).div_ceil(each));
+            freed += n * each;
+            n
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trim_drops_only_surplus_and_only_what_is_needed() {
+        use super::trim_plan;
+        // (items, bytes each, keep): drafter pages, KV pages, states.
+        let pools = [(20, 10, 16), (40, 4, 32), (6, 80, 4)];
+        // Nothing needed, nothing dropped.
+        assert_eq!(trim_plan(&pools, 0), vec![0, 0, 0]);
+        // 25 bytes: three drafter pages (the first pool) cover it.
+        assert_eq!(trim_plan(&pools, 25), vec![3, 0, 0]);
+        // 50 bytes: all 4 surplus drafter pages (40), then 3 KV pages (12).
+        assert_eq!(trim_plan(&pools, 50), vec![4, 3, 0]);
+        // More than every surplus: everything above the reserves, nothing below.
+        assert_eq!(trim_plan(&pools, 10_000), vec![4, 8, 2]);
+        // Pools at or under their reserve give nothing.
+        assert_eq!(trim_plan(&[(16, 10, 16), (0, 4, 32)], 100), vec![0, 0]);
+    }
+
     #[test]
     fn common_roots_rank_by_conversations_then_demand() {
         // Conversations served outrank recency; demand breaks ties; at most n.
