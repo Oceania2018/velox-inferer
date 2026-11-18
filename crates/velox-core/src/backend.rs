@@ -2397,7 +2397,10 @@ mod graph_kv_tests {
             if kv <= 8 * GRAPH_KV_BUCKET {
                 assert_eq!(keys, kv.div_ceil(GRAPH_KV_BUCKET) * GRAPH_KV_BUCKET);
             } else {
-                assert!((keys - kv) * 8 < kv, "{kv} -> {keys} overshoots by 1/8 or more");
+                assert!(
+                    (keys - kv) * 8 < kv,
+                    "{kv} -> {keys} overshoots by 1/8 or more"
+                );
             }
             assert_eq!(graph_kv_index(kv) as usize * GRAPH_KV_BUCKET, keys);
         }
