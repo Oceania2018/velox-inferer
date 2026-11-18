@@ -818,7 +818,8 @@ pub enum AttnPrecision {
     /// The score product as [`AttnPrecision::Fp8QkF16Pv`]; the value product in FP8: V rounded
     /// to E4M3 per channel (kv head x dim, `scale = amax / 448` over the `kv_len` rows) and the
     /// softmax weights to E4M3 (times 256, so weights down to ~2^-17 of the row maximum stay).
-    /// The oracle emulates the V rounding only; the E4M3 weights set the looser tolerance.
+    /// The oracle emulates the V rounding only; the E4M3 weights set the looser tolerance, so
+    /// kernels take it over long prefixes only (rows over a few keys move by percents).
     Fp8QkFp8Pv,
 }
 
