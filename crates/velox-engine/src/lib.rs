@@ -1153,11 +1153,22 @@ impl<B: Backend> Core<B> {
     /// idle lanes, least recently used first, give their chunks back (their conversations resume
     /// from the context store). False when that is not enough while other requests run: the
     /// request waits for them. Alone, it runs anyway (the pool lends past its size).
-    fn kv_room(&self, st: &mut Lanes<B>, li: usize, len: usize, busy: &[usize]) -> bool {
+    /// `reserved`: sets the running requests will still take (a prompt still prefilling backs its
+    /// chunks as it goes), so a request admitted beside one does not push the pool past its size
+    /// later (2 x 128K on a 24 GB card: lent sets overcommit the device, WDDM pages to system RAM
+    /// and both lanes decode ~50x slower).
+    fn kv_room(
+        &self,
+        st: &mut Lanes<B>,
+        li: usize,
+        len: usize,
+        busy: &[usize],
+        reserved: usize,
+    ) -> bool {
         let Some(pool) = st.pool.clone() else {
             return true;
         };
-        let need = st.lanes[li].session.kv_need(len + KV_TRIM_SLACK);
+        let need = st.lanes[li].session.kv_need(len + KV_TRIM_SLACK) + reserved;
         while pool.free_sets() < need {
             let Some(j) = (0..st.lanes.len())
                 .filter(|&j| j != li && !busy.contains(&j))
@@ -1499,7 +1510,16 @@ impl<B: Backend> Core<B> {
                 let Some(li) = Self::pick_lane(&st.lanes, &busy, &waiting[0].p.keys) else {
                     break;
                 };
-                if !self.kv_room(&mut st, li, waiting[0].p.keys.len(), &busy) {
+                // What the running requests still back up to their prompt (and output room).
+                let reserved: usize = active
+                    .iter()
+                    .map(|a| {
+                        st.lanes[a.lane]
+                            .session
+                            .kv_need(a.job.p.keys.len() + KV_TRIM_SLACK)
+                    })
+                    .sum();
+                if !self.kv_room(&mut st, li, waiting[0].p.keys.len(), &busy, reserved) {
                     break;
                 }
                 let job = waiting.pop_front().expect("checked");
