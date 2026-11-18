@@ -2031,12 +2031,21 @@ impl<B: Backend> Core<B> {
             .filter(|&i| matches!(st.lanes[active[i].lane].drafter, Some(Drafter::DFlash(_))))
             .collect();
         // Scoring prompts go first: their answer follows right after them, while a chat prompt
-        // is followed by its whole decode.
+        // is followed by its whole decode. Then the prompt with the fewest tokens left: one chunk
+        // per round, so taking the oldest made a short prompt admitted beside a 125K one wait for
+        // all of its ~60 chunks (52 s on the RTX 5090 Laptop); finished, the short request decodes
+        // and the long prompt's chunks ride with its windows (`batch_round`).
         let prefilling = |i: &usize| active[*i].pre.is_some();
+        let left = |i: usize| {
+            active[i]
+                .pre
+                .as_ref()
+                .map_or(usize::MAX, |p| active[i].job.p.ids.len().saturating_sub(p.start + p.done))
+        };
         let next = (0..active.len())
             .filter(prefilling)
             .find(|&i| active[i].job.score.is_some())
-            .or_else(|| (0..active.len()).find(prefilling));
+            .or_else(|| (0..active.len()).filter(prefilling).min_by_key(|&i| left(i)));
         if let Some(pi) = next {
             if !dflash.is_empty() && st.bw.is_some() {
                 // The next prompt chunk rides with every decoding request's window.
