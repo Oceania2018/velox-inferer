@@ -5,6 +5,7 @@
 // (scale = amax / 448) and the scores use block-scaled FP8 MMA with unit UE8M0 scales, which runs
 // at full rate with FP32 accumulation on sm_120a. V and the softmax weights are f16 for the value
 // product. The caches stay f32; each call converts the prefix it reads.
+// With fp8_pv (AttnPrecision::Fp8QkFp8Pv) the value product is FP8 as well; see below.
 //
 // Block: one query head x 64 query tokens, 4 warps of 16 rows. Key tiles of 32 stream through a
 // two-stage cp.async pipeline; K rows are 256 bytes and V rows 512 bytes in shared memory, with
@@ -157,15 +158,6 @@ __device__ __forceinline__ void load_tile(Smem& s, const AttnArgs& p, int stage,
     }
 }
 
-__device__ __forceinline__ void mma_f16_h(uint32_t (&c)[2], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                 : "+r"(c[0]), "+r"(c[1])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-// kTileH16: the value product accumulates each 32-key tile in f16 (full rate, 210 vs 105 TFLOPS
-// on this card) and adds the tile's sum to the f32 output; P and V stay f16.
-template <bool kTileH16>
 __global__ void __launch_bounds__(kThreads, 2) flash_prefill_kernel(AttnArgs p) {
     extern __shared__ __align__(128) uint8_t smem_raw[];
     Smem& s = *reinterpret_cast<Smem*>(smem_raw);
@@ -273,48 +265,18 @@ __global__ void __launch_bounds__(kThreads, 2) flash_prefill_kernel(AttnArgs p) 
         }
 
         // O += P V: two k-steps of 16 keys; P becomes the f16 A operand directly.
-        if constexpr (kTileH16) {
-            uint32_t a[2][4];
 #pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                a[j][0] = pack_h2(sc[2 * j][0], sc[2 * j][1]);
-                a[j][1] = pack_h2(sc[2 * j][2], sc[2 * j][3]);
-                a[j][2] = pack_h2(sc[2 * j + 1][0], sc[2 * j + 1][1]);
-                a[j][3] = pack_h2(sc[2 * j + 1][2], sc[2 * j + 1][3]);
-            }
+        for (int j = 0; j < 2; ++j) {
+            const uint32_t a[4] = {pack_h2(sc[2 * j][0], sc[2 * j][1]), pack_h2(sc[2 * j][2], sc[2 * j][3]),
+                                   pack_h2(sc[2 * j + 1][0], sc[2 * j + 1][1]),
+                                   pack_h2(sc[2 * j + 1][2], sc[2 * j + 1][3])};
+            const int vrow = j * 16 + (lane & 7) + (((lane >> 3) & 1) << 3);
 #pragma unroll
             for (int dn = 0; dn < 16; ++dn) {
-                uint32_t h0[2] = {0u, 0u}, h1[2] = {0u, 0u};
-#pragma unroll
-                for (int j = 0; j < 2; ++j) {
-                    uint32_t b[4];
-                    ldsm_x4_t(b, s.v[st] + v_off(j * 16 + (lane & 7) + (((lane >> 3) & 1) << 3),
-                                                 dn * 16 + ((lane >> 4) << 3)));
-                    mma_f16_h(h0, a[j], b[0], b[1]);
-                    mma_f16_h(h1, a[j], b[2], b[3]);
-                }
-                const float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(&h0[0]));
-                const float2 y0 = __half22float2(*reinterpret_cast<const __half2*>(&h0[1]));
-                const float2 x1 = __half22float2(*reinterpret_cast<const __half2*>(&h1[0]));
-                const float2 y1 = __half22float2(*reinterpret_cast<const __half2*>(&h1[1]));
-                o[2 * dn][0] += x0.x, o[2 * dn][1] += x0.y, o[2 * dn][2] += y0.x, o[2 * dn][3] += y0.y;
-                o[2 * dn + 1][0] += x1.x, o[2 * dn + 1][1] += x1.y;
-                o[2 * dn + 1][2] += y1.x, o[2 * dn + 1][3] += y1.y;
-            }
-        } else {
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                const uint32_t a[4] = {pack_h2(sc[2 * j][0], sc[2 * j][1]), pack_h2(sc[2 * j][2], sc[2 * j][3]),
-                                       pack_h2(sc[2 * j + 1][0], sc[2 * j + 1][1]),
-                                       pack_h2(sc[2 * j + 1][2], sc[2 * j + 1][3])};
-                const int vrow = j * 16 + (lane & 7) + (((lane >> 3) & 1) << 3);
-#pragma unroll
-                for (int dn = 0; dn < 16; ++dn) {
-                    uint32_t b[4];
-                    ldsm_x4_t(b, s.v[st] + v_off(vrow, dn * 16 + ((lane >> 4) << 3)));
-                    mma_f16(o[2 * dn], a, b[0], b[1]);
-                    mma_f16(o[2 * dn + 1], a, b[2], b[3]);
-                }
+                uint32_t b[4];
+                ldsm_x4_t(b, s.v[st] + v_off(vrow, dn * 16 + ((lane >> 4) << 3)));
+                mma_f16(o[2 * dn], a, b[0], b[1]);
+                mma_f16(o[2 * dn + 1], a, b[2], b[3]);
             }
         }
         __syncthreads();
@@ -338,7 +300,7 @@ __global__ void __launch_bounds__(kThreads, 2) flash_prefill_kernel(AttnArgs p) 
 }
 
 // ---------------------------------------------------------------------------------------------
-// FP8 value product (VELOX_ATTN_FP8PV=1). The value product above runs f16 x f16 -> f32, which is
+// FP8 value product (AttnPrecision::Fp8QkFp8Pv). The value product above runs f16 x f16 -> f32, which is
 // a quarter of the FP8 rate on this card (105 vs 417 TFLOPS, block-scaled e4m3 with f32
 // accumulation). Here it is FP8 too:
 //   P: exp2(s - m + 8), i.e. the softmax weights times 256 (max 256, so E4M3 keeps weights down
@@ -595,17 +557,6 @@ __global__ void __launch_bounds__(kThreads, 2) flash_prefill_fp8pv_kernel(Attn8A
     }
 }
 
-// VELOX_ATTN_FP8PV: unset or 0 = f16 x f16 -> f32 value product; 1 = FP8 (above); 2 = f16 with
-// per-tile f16 accumulation (flash_prefill_kernel<true>).
-int pv_mode() {
-    static const int mode = [] {
-        const char* e = getenv("VELOX_ATTN_FP8PV");
-        return e == nullptr || e[0] == '\0' ? 0 : atoi(e);
-    }();
-    return mode;
-}
-bool fp8_pv_enabled() { return pv_mode() == 1; }
-
 // Grow-only and never freed (VeloxScratch): recorded CUDA graphs may still reference old buffers.
 struct Scratch {
     VeloxScratch s;
@@ -619,9 +570,12 @@ size_t align_up(size_t x) { return (x + 255) / 256 * 256; }
 
 // Causal attention for head_dim 256 (see velox_core::backend::AttnShape). Returns
 // VELOX_ERR_UNSUPPORTED for other geometries.
+// fp8_pv != 0: the value product in FP8 (AttnPrecision::Fp8QkFp8Pv), for up to 8 kv heads.
 VELOX_API int velox_5090_attention_prefill(const float* q, const float* k, const float* v, float* out, int tokens,
-                                           int heads, int kv_heads, int head_dim, int pos0, float scale) {
+                                           int heads, int kv_heads, int head_dim, int pos0, float scale,
+                                           int fp8_pv) {
     if (head_dim != kD || tokens <= 0 || kv_heads <= 0 || heads % kv_heads != 0) return VELOX_ERR_UNSUPPORTED;
+    if (fp8_pv && kv_heads > 8) return VELOX_ERR_UNSUPPORTED;
     const long long kv_len = static_cast<long long>(pos0) + tokens;
     const long long q_rows = static_cast<long long>(tokens) * heads, k_rows = kv_len * kv_heads;
     const size_t qb = align_up(q_rows * kD), qsb = align_up(q_rows * 4), kb = align_up(k_rows * kD),
@@ -635,7 +589,7 @@ VELOX_API int velox_5090_attention_prefill(const float* q, const float* k, const
     __half* vh = reinterpret_cast<__half*>(base + qb + qsb + kb + ksb);
 
     constexpr float kLog2e = 1.4426950408889634f;
-    if (fp8_pv_enabled() && kv_heads <= 8) {
+    if (fp8_pv) {
         // q/k as below; V as transposed E4M3 tiles with per-channel scales (vb has room: 2 bytes
         // per value there, 1 here, plus the scales and channel maxima).
         const long long tiles = (kv_len + kBN - 1) / kBN;
@@ -674,16 +628,12 @@ VELOX_API int velox_5090_attention_prefill(const float* q, const float* k, const
 
     static bool configured = false;
     if (!configured) {
-        cudaFuncSetAttribute(flash_prefill_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem));
-        cudaFuncSetAttribute(flash_prefill_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem));
+        cudaFuncSetAttribute(flash_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem));
         configured = true;
     }
     AttnArgs p{qc, qs, kc, ks, vh, out, tokens, heads, kv_heads, pos0, static_cast<int>(kv_len)};
     const dim3 grid((tokens + kBM - 1) / kBM, heads);
-    if (pv_mode() == 2)
-        flash_prefill_kernel<true><<<grid, kThreads, sizeof(Smem)>>>(p);
-    else
-        flash_prefill_kernel<false><<<grid, kThreads, sizeof(Smem)>>>(p);
+    flash_prefill_kernel<<<grid, kThreads, sizeof(Smem)>>>(p);
     return velox_launch_status();
 }
 
