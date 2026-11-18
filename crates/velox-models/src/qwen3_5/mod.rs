@@ -19,7 +19,7 @@ use velox_core::backend::{
 };
 use velox_core::{
     CopySpec, Error, KvFormat, KvStoreShape, MoeRouteShape, Result, RowGateShape, StateFormat,
-    GRAPH_KV_BUCKET, GRAPH_STATIC,
+    GRAPH_STATIC,
 };
 
 use crate::experts::ExpertCache;
@@ -264,7 +264,7 @@ const GRAPH_SEGMENT_STARTS: [usize; 3] = [1, 4, 16];
 fn graph_key(kind: u64, shape: u64, s: &Session<impl Backend>, kv_len: Option<usize>) -> u64 {
     let mut key = kind | shape | (s.id & 0xffff) << 40;
     if let Some(kv) = kv_len {
-        key |= GRAPH_STATIC | (kv.div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
+        key |= GRAPH_STATIC | velox_core::graph_kv_index(kv) << 24;
     }
     key
 }
@@ -2521,7 +2521,7 @@ impl<B: Backend> Qwen35Text<B> {
                 | n as u64
                 | (m as u64) << 4
                 | u64::from(!ws.capture.is_empty()) << 9
-                | (kv.div_ceil(GRAPH_KV_BUCKET) as u64 & 0xffff) << 24;
+                | velox_core::graph_kv_index(kv) << 24;
             b.graph(key, &mut || run(sessions, ws, bw))?;
         } else {
             run(sessions, ws, bw)?;
