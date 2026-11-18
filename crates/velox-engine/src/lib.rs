@@ -1395,6 +1395,56 @@ impl<B: Backend> Core<B> {
                 model.commit_batched(b, s, bw, 1)?;
             }
         }
+        // Lanes drafting together propose in one batched block forward (`batch_round`), recorded
+        // once per batch size: warm every size here, so its recording, workspace growth and
+        // first-use kernel loading do not land on a request (the first 2-lane round on the RTX
+        // 5090 Laptop took 16.6 s in the draft). Best effort: a failure only costs that first
+        // round later, so it is logged, not fatal.
+        if let (Some(dm), Some(dw)) = (self.dflash.as_ref(), dw.as_mut()) {
+            if lanes.len() > 1 && !solo_draft() {
+                let drafts = lanes
+                    .iter()
+                    .filter_map(|l| match &l.drafter {
+                        Some(Drafter::DFlash(d)) => Some(d.short_block()),
+                        _ => None,
+                    })
+                    .min()
+                    .unwrap_or(1)
+                    .min(
+                        model
+                            .batch_window_max(b, self.cfg.kv_format)
+                            .saturating_sub(1)
+                            .max(1),
+                    );
+                for n in 2..=lanes.len() {
+                    for l in lanes.iter_mut().take(n) {
+                        if let Some(Drafter::DFlash(d)) = l.drafter.as_mut() {
+                            d.drafts = drafts;
+                            d.align(dm, l.session.pos);
+                        }
+                    }
+                    let states: Vec<&DFlashState<B>> = lanes
+                        .iter()
+                        .take(n)
+                        .filter_map(|l| match &l.drafter {
+                            Some(Drafter::DFlash(d)) => Some(d.context()),
+                            _ => None,
+                        })
+                        .collect();
+                    if states.len() < n {
+                        break;
+                    }
+                    let t = Instant::now();
+                    match dm.propose_batch(b, model, &states, dw, &vec![0u32; n], drafts, limit) {
+                        Ok(_) => eprintln!(
+                            "warm-up: batched draft of {n} lanes in {:.1} ms",
+                            t.elapsed().as_secs_f64() * 1e3
+                        ),
+                        Err(e) => eprintln!("warm-up: batched draft of {n} lanes failed: {e}"),
+                    }
+                }
+            }
+        }
         if let (Some(v), Some((min_px, max_px))) = (&self.vision, self.fe.vision_pixels) {
             // A square image at the pixel budget: the most patches the tower sees.
             let side = ((max_px.min(1 << 26)) as f64).sqrt() as usize;
