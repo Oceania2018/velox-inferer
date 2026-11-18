@@ -174,6 +174,29 @@ pub const GRAPH_STATIC: u64 = 1 << 63;
 /// backend sizes attention grids for the bucket and reads the actual length on the device.
 pub const GRAPH_KV_BUCKET: usize = 1024;
 
+/// Keys a static graph step's KV bucket covers for `kv` keys (always a multiple of
+/// [`GRAPH_KV_BUCKET`], at least `kv`): 1024-key buckets up to 8K keys, then the largest power of
+/// two at most `kv / 8`, so a grid sized for the bucket overshoots the actual length by under 1/8
+/// (kernels stop at the actual length) and 64K-128K keys take 8 buckets instead of 64. Every new
+/// bucket records a new graph, and instantiating one at long context under WSL/WDDM spent 2.5-46 s
+/// in the driver's allocation (RTX 5090 Laptop, 124K keys): with 1024-key buckets, every long
+/// prompt of a slightly different length paid that again.
+pub fn graph_kv_keys(kv: usize) -> usize {
+    let step = if kv <= 8 * GRAPH_KV_BUCKET {
+        GRAPH_KV_BUCKET
+    } else {
+        let eighth = kv / 8;
+        (1usize << (usize::BITS - 1 - eighth.leading_zeros())).max(GRAPH_KV_BUCKET)
+    };
+    kv.max(1).div_ceil(step) * step
+}
+
+/// The bucket index a static graph key carries in bits 24..40 for `kv` keys (see
+/// [`graph_kv_keys`]); the backend reads it back as index x [`GRAPH_KV_BUCKET`] keys.
+pub fn graph_kv_index(kv: usize) -> u64 {
+    (graph_kv_keys(kv) / GRAPH_KV_BUCKET) as u64 & 0xffff
+}
+
 /// Non-causal attention of a query block over a sliding-window context (DFlash drafting).
 ///
 /// `q` is `[tokens, heads, head_dim]` for positions `pos0 .. pos0 + tokens`. Context keys live in
@@ -2356,4 +2379,35 @@ pub fn log_softmax_gather_row(row: &[f32], ids: &[u32]) -> Vec<f32> {
             None => f32::NEG_INFINITY,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod graph_kv_tests {
+    use super::{graph_kv_index, graph_kv_keys, GRAPH_KV_BUCKET};
+
+    #[test]
+    fn buckets_cover_the_length_and_grow_coarser() {
+        let mut last = 0;
+        for kv in 1..=262_144usize {
+            let keys = graph_kv_keys(kv);
+            assert!(keys >= kv, "{kv} -> {keys}");
+            assert_eq!(keys % GRAPH_KV_BUCKET, 0, "{kv} -> {keys}");
+            assert!(keys >= last, "not monotone at {kv}");
+            last = keys;
+            if kv <= 8 * GRAPH_KV_BUCKET {
+                assert_eq!(keys, kv.div_ceil(GRAPH_KV_BUCKET) * GRAPH_KV_BUCKET);
+            } else {
+                assert!((keys - kv) * 8 < kv, "{kv} -> {keys} overshoots by 1/8 or more");
+            }
+            assert_eq!(graph_kv_index(kv) as usize * GRAPH_KV_BUCKET, keys);
+        }
+        // Long prompts a few hundred keys apart share one recording.
+        assert_eq!(graph_kv_keys(123_934), graph_kv_keys(124_839));
+        let distinct = |lo: usize, hi: usize| {
+            let mut v: Vec<usize> = (lo..hi).map(graph_kv_keys).collect();
+            v.dedup();
+            v.len()
+        };
+        assert_eq!(distinct(65_537, 131_073), 8);
+    }
 }

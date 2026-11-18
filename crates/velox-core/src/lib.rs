@@ -25,7 +25,8 @@ pub use backend::{
     DilatedConvShape, ExpertBank, ExpertMatrix, FullAttnShape, GdnReplayLayer, GdnShape, GeluKind,
     HcCombineShape, Im2colShape, KvStoreShape, LinearDst, LinearPart, MoeRouteShape, NormKind,
     PoolShape, PrevGateShape, QkvRopeShape, QsaPoolShape, QsaSelectShape, RmsResidualShape,
-    RopeLayout, RopePosShape, RopeShape, RowGateShape, WeightView, GRAPH_KV_BUCKET, GRAPH_STATIC,
+    RopeLayout, RopePosShape, RopeShape, RowGateShape, WeightView, graph_kv_index, graph_kv_keys,
+    GRAPH_KV_BUCKET, GRAPH_STATIC,
 };
 pub use error::{device_lost, mark_device_lost, Error, Result};
 pub use format::WeightFormat;
