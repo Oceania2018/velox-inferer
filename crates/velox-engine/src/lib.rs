@@ -1305,6 +1305,13 @@ impl<B: Backend> Core<B> {
             sw,
             ..
         } = st;
+        // Every lane warms at the end of its capacity, where attention reads all rows below:
+        // alias one set behind them all instead of backing the full length per lane (see
+        // `Session::alias_kv`); the caller trims it all afterwards.
+        for lane in lanes.iter_mut() {
+            let cap = lane.session.capacity;
+            lane.session.alias_kv(b, cap)?;
+        }
         {
             let lane = &mut lanes[0];
             let pos = lane.session.capacity.saturating_sub(chunk + VERIFY_MAX + 1);
