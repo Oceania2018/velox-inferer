@@ -815,6 +815,11 @@ pub enum AttnPrecision {
     Fp8QkF16Pv,
     /// Q, K, V and the softmax weights rounded to f16 for both products.
     F16,
+    /// The score product as [`AttnPrecision::Fp8QkF16Pv`]; the value product in FP8: V rounded
+    /// to E4M3 per channel (kv head x dim, `scale = amax / 448` over the `kv_len` rows) and the
+    /// softmax weights to E4M3 (times 256, so weights down to ~2^-17 of the row maximum stay).
+    /// The oracle emulates the V rounding only; the E4M3 weights set the looser tolerance.
+    Fp8QkFp8Pv,
 }
 
 /// Rows `[row_begin, row_begin + rows)` of a stored weight matrix `[parent_rows, k]`, kept in its
