@@ -57,6 +57,9 @@ pub fn max_err(got: &[f32], want: &[f32]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Tolerance for [`AttnPrecision::Fp8QkFp8Pv`] (see the arms that use it).
+const FP8_PV_TOL: f64 = 1e-2;
+
 /// Whether a weight's activation policy permits the input rounding a kernel reports.
 fn permitted(act: ActQuant, policy: ActPolicy) -> bool {
     match (act, policy) {
@@ -1400,6 +1403,10 @@ impl<B: Backend> Suite<'_, B> {
             AttnPrecision::Exact => ("", 2e-4),
             AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
             AttnPrecision::F16 => (" f16", 2e-3),
+            // E4M3 softmax weights are not emulated (3 mantissa bits, so a few keys' weights
+            // move the output by up to a few percent); rows see at least the FP8 kernel's
+            // minimum of keys here.
+            AttnPrecision::Fp8QkFp8Pv => (" fp8pv", FP8_PV_TOL),
         };
         let name = format!(
             "attention kv {} t={} h={}/{} d={} pos0={}{tag}",
@@ -1434,6 +1441,10 @@ impl<B: Backend> Suite<'_, B> {
             AttnPrecision::Exact => ("", 2e-4),
             AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
             AttnPrecision::F16 => (" f16", 2e-3),
+            // E4M3 softmax weights are not emulated (3 mantissa bits, so a few keys' weights
+            // move the output by up to a few percent); rows see at least the FP8 kernel's
+            // minimum of keys here.
+            AttnPrecision::Fp8QkFp8Pv => (" fp8pv", FP8_PV_TOL),
         };
         let name = format!(
             "attention t={} h={}/{} d={} pos0={}{tag}",
@@ -2288,6 +2299,10 @@ impl<B: Backend> Suite<'_, B> {
             AttnPrecision::Exact => ("", 2e-4),
             AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
             AttnPrecision::F16 => (" f16", 2e-3),
+            // E4M3 softmax weights are not emulated (3 mantissa bits, so a few keys' weights
+            // move the output by up to a few percent); rows see at least the FP8 kernel's
+            // minimum of keys here.
+            AttnPrecision::Fp8QkFp8Pv => (" fp8pv", FP8_PV_TOL),
         };
         let name = format!(
             "attention_windows h={heads}/{kv_heads} d={head_dim} prefix={prefix} {windows} x {window}{tag}"
@@ -2867,6 +2882,10 @@ impl<B: Backend> Suite<'_, B> {
             AttnPrecision::Exact => ("", 2e-4),
             AttnPrecision::Fp8QkF16Pv => (" fp8qk", 2e-3),
             AttnPrecision::F16 => (" f16", 2e-3),
+            // E4M3 softmax weights are not emulated (3 mantissa bits, so a few keys' weights
+            // move the output by up to a few percent); rows see at least the FP8 kernel's
+            // minimum of keys here.
+            AttnPrecision::Fp8QkFp8Pv => (" fp8pv", FP8_PV_TOL),
         };
         let name = format!(
             "attention_sparse {} t={} h={}/{} d={} pos0={} sel={sel_len}{tag}",
@@ -2936,7 +2955,7 @@ impl<B: Backend> Suite<'_, B> {
                 // f16 softmax weights are not emulated.
                 AttnPrecision::F16 => 2e-3,
                 // No FP8 contract exists for attention_full.
-                AttnPrecision::Fp8QkF16Pv => -1.0,
+                AttnPrecision::Fp8QkF16Pv | AttnPrecision::Fp8QkFp8Pv => -1.0,
             },
         );
         Ok(())
@@ -3545,6 +3564,15 @@ pub fn run<B: Backend>(b: &B) -> Result<Vec<CaseResult>> {
             kv_heads: 1,
             head_dim: 256,
             pos0: 0,
+            kv: KvFormat::F32,
+        },
+        // Long prefix: kernels may take a cheaper value product past a few thousand keys.
+        AttnShape {
+            tokens: 130,
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 256,
+            pos0: 9_000,
             kv: KvFormat::F32,
         },
         AttnShape {
