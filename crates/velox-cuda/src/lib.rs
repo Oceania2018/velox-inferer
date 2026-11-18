@@ -1456,12 +1456,28 @@ struct GraphKeys {
     /// Device bytes recorded graphs may hold (0: unbounded).
     budget: usize,
     released: usize,
+    /// `VELOX_GRAPH_REUSE`: new static steps adopt a sibling's graphs ([`GraphKeys::adopt`]).
+    reuse: bool,
+    /// Steps that took over a sibling's graphs ([`GraphKeys::adopt`]).
+    adoptions: usize,
 }
 
 #[derive(Default)]
 struct GraphStep {
     segs: Vec<i32>,
     used: u64,
+    /// Slots adopted from a sibling step (see [`GraphKeys::adopt`]) not yet given to a segment,
+    /// last segment first.
+    adopted: Vec<i32>,
+}
+
+/// Bits 24..40 of a static step's key: its KV bucket (see `velox_core::graph_kv_index`).
+const GRAPH_KV_BITS: u64 = 0xffff << 24;
+
+/// `VELOX_GRAPH_REUSE` (set, not empty or "0"): see [`GraphKeys::adopt`].
+fn graph_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VELOX_GRAPH_REUSE").is_ok_and(|v| !v.is_empty() && v != "0"))
 }
 
 impl GraphKeys {
@@ -1469,6 +1485,13 @@ impl GraphKeys {
     /// recently run other step when all are taken). `None`: no slot.
     fn slot_for(&mut self, seg_key: u64, step: u64) -> Option<i32> {
         if let Some(&s) = self.slots.get(&seg_key) {
+            return Some(s);
+        }
+        if !self.steps.contains_key(&step) {
+            self.adopt(step);
+        }
+        if let Some(s) = self.steps.get_mut(&step).and_then(|st| st.adopted.pop()) {
+            self.slots.insert(seg_key, s);
             return Some(s);
         }
         let s = match self.free.pop() {
@@ -1486,6 +1509,53 @@ impl GraphKeys {
         self.slots.insert(seg_key, s);
         self.steps.entry(step).or_default().segs.push(s);
         Some(s)
+    }
+
+    /// With `VELOX_GRAPH_REUSE`: a static step about to record for the first time takes over
+    /// the slots of the least recently run step whose key differs only in its KV bucket (same
+    /// kind, shape and session), so its recording patches those executable graphs
+    /// (cudaGraphExecUpdate) instead of instantiating new ones; the sibling records again when
+    /// it next runs. Executable graphs then stay one per kind, shape and session. On the RTX
+    /// 5090 Laptop under WSL, cudaGraphInstantiate spent 0.1–4 s per new graph (up to 62 s
+    /// right after a long prefill) in a WDDM allocation call (D3DKMTCreateAllocation2), and
+    /// once never returned; an update allocates nothing. A failed update falls back to
+    /// instantiating, as before.
+    fn adopt(&mut self, step: u64) {
+        if step & GRAPH_STATIC == 0 || !self.reuse {
+            return;
+        }
+        let base = step & !GRAPH_KV_BITS;
+        let Some(sibling) = self
+            .steps
+            .iter()
+            .filter(|(&k, _)| k != step && k & GRAPH_STATIC != 0 && k & !GRAPH_KV_BITS == base)
+            .min_by_key(|(_, st)| st.used)
+            .map(|(&k, _)| k)
+        else {
+            return;
+        };
+        let Some(st) = self.steps.remove(&sibling) else {
+            return;
+        };
+        self.slots.retain(|_, s| !st.segs.contains(s));
+        self.recorded.remove(&sibling);
+        let mut adopted = st.segs.clone();
+        adopted.reverse();
+        self.steps.insert(
+            step,
+            GraphStep {
+                segs: st.segs,
+                used: st.used,
+                adopted,
+            },
+        );
+        self.adoptions += 1;
+        if std::env::var_os("VELOX_GRAPH_DEBUG").is_some() {
+            eprintln!(
+                "[graph] step {step:#x} adopts the graphs of {sibling:#x} ({} adoptions)",
+                self.adoptions
+            );
+        }
     }
 
     fn touch(&mut self, step: u64) {
@@ -1626,8 +1696,14 @@ impl CudaBackend {
             profile,
             variant,
             kernels,
-            graphs: (timing.is_none() && std::env::var_os("VELOX_NO_GRAPHS").is_none())
-                .then(|| Mutex::new(GraphKeys::default())),
+            graphs: (timing.is_none() && std::env::var_os("VELOX_NO_GRAPHS").is_none()).then(
+                || {
+                    Mutex::new(GraphKeys {
+                        reuse: graph_reuse(),
+                        ..GraphKeys::default()
+                    })
+                },
+            ),
             timing,
         })
     }
@@ -3465,5 +3541,72 @@ mod host_arena_tests {
         a.give(y, 2 * P);
         assert_eq!(a.free_by_addr.len(), 2);
         assert_eq!(a.take(3 * P), None);
+    }
+}
+
+#[cfg(test)]
+mod graph_key_tests {
+    use super::*;
+
+    fn keys(reuse: bool) -> GraphKeys {
+        GraphKeys {
+            reuse,
+            ..GraphKeys::default()
+        }
+    }
+
+    const STEP: u64 = GRAPH_STATIC | 3 << 16 | 16 | 7 << 40;
+
+    fn bucket(b: u64) -> u64 {
+        STEP | b << 24
+    }
+
+    #[test]
+    fn a_new_bucket_adopts_its_siblings_segments_in_order() {
+        let mut g = keys(true);
+        let a = bucket(1);
+        let segs: Vec<i32> = (0..3)
+            .map(|i| g.slot_for(a | (i as u64) << 56, a).unwrap())
+            .collect();
+        g.recorded.insert(a);
+        let b = bucket(9);
+        let got: Vec<i32> = (0..3)
+            .map(|i| g.slot_for(b | (i as u64) << 56, b).unwrap())
+            .collect();
+        assert_eq!(got, segs);
+        assert!(!g.steps.contains_key(&a) && !g.recorded.contains(&a));
+        assert!(g.slots.keys().all(|k| k & !(0x7f << 56) == b));
+        assert_eq!(g.adoptions, 1);
+        // The sibling's next recording adopts them back, still without new slots.
+        let back: Vec<i32> = (0..3)
+            .map(|i| g.slot_for(a | (i as u64) << 56, a).unwrap())
+            .collect();
+        assert_eq!(back, segs);
+        assert_eq!(g.next, 3);
+    }
+
+    #[test]
+    fn other_kinds_sessions_and_dynamic_keys_take_new_slots() {
+        let mut g = keys(true);
+        let a = bucket(1);
+        g.slot_for(a, a).unwrap();
+        for other in [
+            bucket(2) ^ 1 << 40,
+            bucket(2) ^ 1 << 16,
+            bucket(2) ^ 1,
+            bucket(2) & !GRAPH_STATIC,
+        ] {
+            g.slot_for(other, other).unwrap();
+        }
+        assert_eq!(g.adoptions, 0);
+        assert_eq!(g.next, 5);
+    }
+
+    #[test]
+    fn off_by_default() {
+        let mut g = keys(false);
+        g.slot_for(bucket(1), bucket(1)).unwrap();
+        g.slot_for(bucket(2), bucket(2)).unwrap();
+        assert_eq!((g.adoptions, g.next), (0, 2));
     }
 }
