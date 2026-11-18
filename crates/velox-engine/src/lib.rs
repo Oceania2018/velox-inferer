@@ -1028,6 +1028,9 @@ where
             lane.session.trim_kv(&core.b, 0)?;
         }
         core.budget_memory(&mut state)?;
+        if std::env::var("VELOX_WARM_LONG").is_ok_and(|v| !v.is_empty() && v != "0") {
+            core.warm_long(&mut state)?;
+        }
         let queue = Arc::new(JobQueue {
             jobs: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -1470,6 +1473,173 @@ impl<B: Backend> Core<B> {
             }
         }
         b.synchronize()
+    }
+
+    /// `VELOX_WARM_LONG` (set, not empty or "0"), after the attention pool exists: every lane
+    /// backs its whole capacity from the pool, prefills two chunks at its end (filling the
+    /// drafter's window) and runs every decode step a long request runs there: verify and commit
+    /// for each kept length, both draft blocks, then the same batched across lanes — each twice
+    /// (the eager first run, then the recording). On the RTX 5090 Laptop under WSL the first
+    /// new graph a long request recorded after its prefill spent 46–62 s in
+    /// cudaGraphInstantiate (WDDM allocation calls); with every step recorded here, requests
+    /// only update existing graphs. `warm_up` cannot do this: it aliases one set behind every
+    /// lane, and the drafter's window stays short. Skipped when the pool cannot back every lane
+    /// at full length; best effort otherwise (a failure is logged; lanes are reset either way).
+    fn warm_long(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
+        use velox_models::qwen3_5::VERIFY_MAX;
+        let (b, model) = (&self.b, &self.model);
+        let limit = self.fe.public_vocab;
+        let t0 = Instant::now();
+        let st_pool_free = st.pool.as_ref().map(|p| p.free_sets());
+        let r = (|| -> Result<(), CoreError> {
+            let Lanes {
+                ws, lanes, bw, dw, ..
+            } = st;
+            if lanes.iter().any(|l| l.drafter.is_none()) {
+                return Ok(());
+            }
+            // Only within the pool: lending past it would take device memory the budget left.
+            let need: usize = lanes
+                .iter()
+                .map(|l| l.session.kv_need(l.session.capacity))
+                .sum();
+            let free = st_pool_free.unwrap_or(0);
+            if free < need {
+                eprintln!(
+                    "warm-up: long-context steps skipped ({free} pool sets free, every lane full needs {need})"
+                );
+                return Ok(());
+            }
+            let (Some(dm), Some(dw)) = (self.dflash.as_ref(), dw.as_mut()) else {
+                return Ok(());
+            };
+            let chunk = self.cfg.chunk;
+            // Every step a long request runs, each twice (the eager first run, then the
+            // recording), so none records for the first time on a request.
+            for (j, lane) in lanes.iter_mut().enumerate() {
+                let t = Instant::now();
+                let cap = lane.session.capacity;
+                lane.session.prepare_kv(b, 0, cap)?;
+                let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() else {
+                    continue;
+                };
+                // Two prompt chunks fill the drafter's window, as after a real prefill.
+                let start = cap.saturating_sub(2 * chunk + VERIFY_MAX + 1);
+                lane.session.pos = start;
+                for c in 0..2 {
+                    let ids = vec![0u32; chunk];
+                    let base0 = start + c * chunk;
+                    model.advance_rows(
+                        b,
+                        &mut lane.session,
+                        ws,
+                        &ids,
+                        None,
+                        &[],
+                        &mut [],
+                        &mut |ws, base, t| d.prefill_chunk(b, dm, dw, ws, base0 + base, t),
+                    )?;
+                }
+                let pos = lane.session.pos;
+                let window = [0u32; VERIFY_MAX];
+                for keep in 0..=VERIFY_MAX {
+                    for _ in 0..2 {
+                        lane.session.pos = pos;
+                        model.verify(b, &mut lane.session, ws, &window, CANDIDATES, limit)?;
+                        model.commit(b, &mut lane.session, ws, keep)?;
+                    }
+                }
+                lane.session.pos = pos;
+                for drafts in [d.long_block(), d.short_block()] {
+                    for _ in 0..2 {
+                        d.drafts = drafts;
+                        d.draft(b, dm, dw, model, ws, 0, 0, pos, 0, limit, &Sampler::greedy())?;
+                    }
+                }
+                b.synchronize()?;
+                eprintln!(
+                    "warm-up: lane {j} decode steps at {pos} over the pool in {:.1} s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            if let Some(bw) = bw.as_mut() {
+                let t = Instant::now();
+                let m = bw.window();
+                let n = lanes.len().min(bw.max_seqs());
+                let window = vec![0u32; m];
+                let windows: Vec<&[u32]> = vec![&window[..]; n];
+                let pos: Vec<usize> = lanes.iter().take(n).map(|l| l.session.pos).collect();
+                for keep in 0..=m {
+                    for _ in 0..2 {
+                        let mut sessions: Vec<&mut Session<B>> =
+                            lanes.iter_mut().take(n).map(|l| &mut l.session).collect();
+                        for (s, &p) in sessions.iter_mut().zip(&pos) {
+                            s.pos = p;
+                        }
+                        model.verify_batch(b, &mut sessions, ws, bw, &windows, CANDIDATES, limit)?;
+                        for s in sessions.iter_mut() {
+                            model.commit_batched(b, s, bw, keep)?;
+                        }
+                    }
+                }
+                if !solo_draft() {
+                    let drafts = lanes
+                        .iter()
+                        .filter_map(|l| match &l.drafter {
+                            Some(Drafter::DFlash(d)) => Some(d.short_block()),
+                            _ => None,
+                        })
+                        .min()
+                        .unwrap_or(1)
+                        .min(m.saturating_sub(1).max(1));
+                    for _ in 0..2 {
+                        for (l, &p) in lanes.iter_mut().take(n).zip(&pos) {
+                            l.session.pos = p;
+                            if let Some(Drafter::DFlash(d)) = l.drafter.as_mut() {
+                                d.drafts = drafts;
+                                d.align(dm, p);
+                            }
+                        }
+                        let states: Vec<&DFlashState<B>> = lanes
+                            .iter()
+                            .take(n)
+                            .filter_map(|l| match &l.drafter {
+                                Some(Drafter::DFlash(d)) => Some(d.context()),
+                                _ => None,
+                            })
+                            .collect();
+                        dm.propose_batch(b, model, &states, dw, &vec![0u32; n], drafts, limit)?;
+                    }
+                }
+                b.synchronize()?;
+                eprintln!(
+                    "warm-up: batched decode steps of {n} lanes over the pool in {:.1} s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            Ok(())
+        })();
+        if let Err(e) = &r {
+            eprintln!("warm-up: long verify failed: {e}");
+        }
+        for lane in st.lanes.iter_mut() {
+            lane.session.restore(b, &lane.zero)?;
+            lane.session.trim_kv(b, 0)?;
+            lane.keys.clear();
+            lane.checkpoints.clear();
+            if let (Some(Drafter::DFlash(d)), Some(dm)) =
+                (lane.drafter.as_mut(), self.dflash.as_ref())
+            {
+                d.forget(dm, 0);
+                d.reset();
+            }
+        }
+        b.synchronize()?;
+        eprintln!(
+            "warm-up: long-context steps in {:.1} s",
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(())
     }
 
     /// MTP and plain decoding keep per-step rows in the shared workspace between rounds, so only
