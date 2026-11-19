@@ -522,11 +522,16 @@ const GEMV_MAX_M: usize = 1;
 const FLASH_MIN_TOKENS: usize = 16;
 
 /// From this many keys the prefill kernel runs its value product in FP8 too
-/// (AttnPrecision::Fp8QkFp8Pv): 1.6x faster attention at 122K keys on this card, where f16 x f16
-/// -> f32 MMA runs at a quarter of block-scaled E4M3. Below it the f16 value product stays: E4M3
-/// softmax weights move short rows by up to a few percent, and the speed-up there is negligible
-/// (2026-11-18, end to end: 124K prefill 88.3 -> 77.4 s, <= 8K unchanged; needles and greedy
-/// outputs no further from the f16 kernel than its own f16-accumulating variant).
+/// (AttnPrecision::Fp8QkFp8Pv). Ported from the GeForce branches, where f16 x f16 -> f32 MMA runs
+/// at a quarter of block-scaled E4M3: `bench-attn --pos0 122880 --tokens 2048 --kv-format f32`
+/// 25.3 -> 16.3 ms on the RTX 5090 (59.7 -> 36.4 ms on the Laptop); end to end on the RTX 5090,
+/// 129K prefill 23.4 -> 18.8 s, 64K -13.6%, 32K -7.6%, 8K unchanged. NOT YET MEASURED on the RTX
+/// PRO 6000: if its f16 MMA with f32 accumulation is not rate-limited like GeForce's, the f16 value
+/// product is already faster here and the gain smaller; run that bench with VELOX_ATTN_FP8PV=0 / 1
+/// before relying on it. Below this many keys the f16 value product stays: E4M3 softmax weights
+/// move short rows by up to a few percent, and the speed-up there is negligible (needles and
+/// greedy outputs on the GeForce cards: no further from the f16 kernel than its own
+/// f16-accumulating variant; from 32K up reworded but factually the same).
 /// `VELOX_ATTN_FP8PV=0` keeps the f16 value product everywhere.
 const FP8_PV_MIN_KEYS: usize = 8192;
 
