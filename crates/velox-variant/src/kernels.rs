@@ -470,8 +470,12 @@ const FLASH_MIN_TOKENS: usize = 16;
 /// From this many keys the prefill kernel runs its value product in FP8 too
 /// (AttnPrecision::Fp8QkFp8Pv): f16 x f16 -> f32 MMA runs at half the E4M3 rate on Ada (165 vs
 /// 330 TFLOPS dense). Below it the f16 value product stays: E4M3 softmax weights move short rows
-/// by up to a few percent, and the speed-up there is negligible (ported from the RTX 5090, where
-/// 129K prefill went 23.4 -> 18.8 s and <= 8K was unchanged).
+/// by up to a few percent, and the speed-up there is negligible (ported from the RTX 5090).
+/// RTX 4090 (2026-11-19, `bench-attn --tokens 2048 --kv-format f32`): pos0 8K 3.21 -> 2.32 ms,
+/// 32K 10.2 -> 7.8, 64K 19.7 -> 15.1, 122K 36.7 -> 28.0 ms (1.3x; the 5090 gains 1.56x since its
+/// f16 rate is a quarter of FP8, Ada's a half). End to end (GSQ IQ2_S v1, DSpine, 2 x 131072):
+/// 37K prefill 11.3 -> 10.8 s, 75K 26.5 -> 24.6 s, 125K ~52.7 -> ~49.4 s (the IQ2 MLP dominates);
+/// needles at 8K..125K and 2 concurrent 110K all hit, CUA 14/14 and <= 8K speeds unchanged.
 /// `VELOX_ATTN_FP8PV=0` keeps the f16 value product everywhere.
 const FP8_PV_MIN_KEYS: usize = 8192;
 
