@@ -528,7 +528,9 @@ const FLASH_MIN_TOKENS: usize = 16;
 /// product stays: E4M3 softmax weights move short rows by up to a few percent, and the speed-up
 /// there is negligible (Laptop end to end: 124K prefill 88.3 -> 77.4 s, <= 8K unchanged; needles
 /// and greedy outputs no further from the f16 kernel than its own f16-accumulating variant).
-/// End to end on the RTX 5090 not yet measured.
+/// RTX 5090 end to end (v3 hybrid weights, A/B/A/B, fresh server per round, no prefix reuse):
+/// prefill 129K 23.4 -> 18.8 s (-19.5%), 64K 8.33 -> 7.19 s, 32K 3.27 -> 3.02 s, 8K unchanged;
+/// all needles hit, greedy outputs from 32K up reworded but factually the same.
 /// `VELOX_ATTN_FP8PV=0` keeps the f16 value product everywhere.
 const FP8_PV_MIN_KEYS: usize = 8192;
 
