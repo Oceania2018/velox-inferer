@@ -46,6 +46,7 @@ extern "C" {
         head_dim: i32,
         pos0: i32,
         scale: f32,
+        fp8_pv: i32,
     ) -> i32;
     fn velox_4090_attention_windows(
         q: *const f32,
@@ -465,6 +466,21 @@ const GEMV_MAX_M: usize = 1;
 /// From this many query tokens attention uses the tensor-core prefill kernel; below it the exact
 /// split-KV kernel, which is bound by reading the cache anyway.
 const FLASH_MIN_TOKENS: usize = 16;
+
+/// From this many keys the prefill kernel runs its value product in FP8 too
+/// (AttnPrecision::Fp8QkFp8Pv): f16 x f16 -> f32 MMA runs at half the E4M3 rate on Ada (165 vs
+/// 330 TFLOPS dense). Below it the f16 value product stays: E4M3 softmax weights move short rows
+/// by up to a few percent, and the speed-up there is negligible (ported from the RTX 5090, where
+/// 129K prefill went 23.4 -> 18.8 s and <= 8K was unchanged).
+/// `VELOX_ATTN_FP8PV=0` keeps the f16 value product everywhere.
+const FP8_PV_MIN_KEYS: usize = 8192;
+
+fn fp8_pv(s: &AttnShape) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VELOX_ATTN_FP8PV").map_or(true, |v| v != "0"))
+        && s.kv_len() >= FP8_PV_MIN_KEYS
+        && s.kv_heads <= 8
+}
 
 /// Decode, verify and prefill over an NVFP4 cache: f16 tensor-core flash attention that decodes
 /// the cache tiles in shared memory (the f32-cache prefill kernel does not read packed caches).
@@ -1263,7 +1279,11 @@ impl CudaKernels for Rtx4090Kernels {
             && s.heads % s.kv_heads == 0
             && s.kv_len() <= i32::MAX as usize
         {
-            AttnPrecision::Fp8QkF16Pv
+            if fp8_pv(&s) {
+                AttnPrecision::Fp8QkFp8Pv
+            } else {
+                AttnPrecision::Fp8QkF16Pv
+            }
         } else {
             AttnPrecision::Exact
         }
@@ -1324,6 +1344,7 @@ impl CudaKernels for Rtx4090Kernels {
                     to_i32("head_dim", s.head_dim)?,
                     to_i32("pos0", s.pos0)?,
                     s.scale(),
+                    i32::from(fp8_pv(&s)),
                 )
             },
             "rtx4090 attention prefill",

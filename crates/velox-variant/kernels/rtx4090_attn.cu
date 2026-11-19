@@ -5,6 +5,7 @@
 // (scale = amax / 448) and the scores use E4M3 MMA (sm_89), each k32 step promoted to FP32
 // (see mma_fp8). V and the softmax weights are f16 for the value
 // product. The caches stay f32; each call converts the prefix it reads.
+// With fp8_pv (AttnPrecision::Fp8QkFp8Pv) the value product is FP8 as well; see below.
 //
 // Block: one query head x 64 query tokens, 4 warps of 16 rows. Key tiles of 32 stream through a
 // two-stage cp.async pipeline; K rows are 256 bytes and V rows 512 bytes in shared memory, with
@@ -304,6 +305,264 @@ __global__ void __launch_bounds__(kThreads, 2) flash_prefill_kernel(AttnArgs p) 
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// FP8 value product (AttnPrecision::Fp8QkFp8Pv). The value product above runs f16 x f16 -> f32, which is
+// half the FP8 rate on the RTX 4090 (165 vs 330 TFLOPS dense with f32 accumulation; mma_fp8 adds
+// each k32 step to the f32 output on the CUDA cores). Here it is FP8 too:
+//   P: exp2(s - m + 8), i.e. the softmax weights times 256 (max 256, so E4M3 keeps weights down
+//      to ~2^-17 of the row maximum); the row sums use the same scaled values, so the scale cancels.
+//   V: E4M3 per channel (kv head x dim) over the whole prefix, s_d = amax_d / 448, applied to the
+//      output once at the end.
+// Fragments: thread (g, q4) holds scores of keys {2q4, 2q4+1, 8+2q4, 9+2q4} (+16 for the second
+// half) of each 32-key tile. The A fragment of m16n8k32 wants k = 4q4..4q4+3, so k slot s maps to
+// key kperm(s) and V is stored transposed per tile in that key order: [kv_head][tile][dim][32].
+
+__host__ __device__ __forceinline__ int kperm(int s) {
+    const int h = s & 16, r = s & 15, q = r >> 2, i = r & 3;
+    return h + (i < 2 ? 2 * q + i : 8 + 2 * q + (i - 2));
+}
+
+// amax per (kv_head, dim) over every key, as float bits (non-negative, so integer max works).
+__global__ void v_channel_amax(const float* __restrict__ v, long long kv_len, int kv_heads,
+                               unsigned* __restrict__ amax_bits) {
+    const long long n4 = kv_len * kv_heads * (kD / 4);
+    __shared__ unsigned local[8 * kD];  // up to 8 kv heads
+    for (int i = threadIdx.x; i < kv_heads * kD; i += blockDim.x) local[i] = 0u;
+    __syncthreads();
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < n4;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const float4 t = reinterpret_cast<const float4*>(v)[i];
+        const int c = static_cast<int>(i % (kv_heads * (kD / 4))) * 4;  // kv_head * kD + dim
+        atomicMax(&local[c + 0], __float_as_uint(fabsf(t.x)));
+        atomicMax(&local[c + 1], __float_as_uint(fabsf(t.y)));
+        atomicMax(&local[c + 2], __float_as_uint(fabsf(t.z)));
+        atomicMax(&local[c + 3], __float_as_uint(fabsf(t.w)));
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < kv_heads * kD; i += blockDim.x)
+        if (local[i]) atomicMax(&amax_bits[i], local[i]);
+}
+
+// vt[hk][tile][d][s] = e4m3(v[tile * 32 + kperm(s)][hk][d] / s_d); keys past kv_len are 0.
+// sv[hk * kD + d] = s_d. One block per (tile, kv_head).
+__global__ void v_to_fp8_t(const float* __restrict__ v, long long kv_len, int kv_heads,
+                           const unsigned* __restrict__ amax_bits, uint8_t* __restrict__ vt,
+                           float* __restrict__ sv) {
+    const long long tile = blockIdx.x;
+    const int hk = blockIdx.y;
+    __shared__ float inv[kD];
+    for (int d = threadIdx.x; d < kD; d += blockDim.x) {
+        const float sd = __fdiv_rn(__uint_as_float(amax_bits[hk * kD + d]), 448.0f);
+        inv[d] = sd > 0.0f ? __fdiv_rn(1.0f, sd) : 0.0f;
+        if (tile == 0) sv[hk * kD + d] = sd;
+    }
+    __syncthreads();
+    uint8_t* dst = vt + (static_cast<long long>(hk) * gridDim.x + tile) * (kD * 32);
+    // Thread w writes slots 4(w & 7) .. +3 of dim w >> 3 as one word; reads of a key are
+    // coalesced across consecutive dims.
+    for (int w = threadIdx.x; w < kD * 8; w += blockDim.x) {
+        const int d = w & (kD - 1), s0 = (w >> 8) * 4;
+        uint32_t word = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const long long key = tile * 32 + kperm(s0 + i);
+            const float x = key < kv_len ? v[(key * kv_heads + hk) * kD + d] * inv[d] : 0.0f;
+            word |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3)) << (8 * i);
+        }
+        *reinterpret_cast<uint32_t*>(dst + d * 32 + s0) = word;
+    }
+}
+
+struct Smem8 {
+    uint8_t k[2][kBN * kD];   // E4M3, 256 B per key
+    uint8_t vt[2][kD * kBN];  // E4M3, V transposed: 32 B per dim (keys in kperm order)
+    float ks[2][kBN];
+};
+
+// 32-byte rows of vt: the two 16-byte chunks swap on every fourth row, so ldmatrix over 8 rows
+// (256 bytes) touches every bank once.
+__device__ __forceinline__ int vt_off(int d, int byte) {
+    return d * kBN + ((((byte >> 4) ^ (d >> 2)) & 1) << 4) + (byte & 15);
+}
+
+struct Attn8Args {
+    const uint8_t* q;
+    const float* qs;
+    const uint8_t* k;
+    const float* ks;
+    const uint8_t* vt;  // [kv_heads][tiles][kD][32]
+    const float* sv;    // [kv_heads * kD]
+    float* out;
+    int tokens, heads, kv_heads, pos0, kv_len, tiles;
+};
+
+__device__ __forceinline__ void load_tile8(Smem8& s, const Attn8Args& p, int stage, int kt, int hk) {
+    const int t = threadIdx.x;
+    const int key0 = kt * kBN;
+#pragma unroll
+    for (int i = 0; i < (kBN * kD / 16) / kThreads; ++i) {  // K: 512 chunks
+        const int idx = t + i * kThreads, row = idx >> 4, c = idx & 15;
+        const int key = key0 + row;
+        const bool ok = key < p.kv_len;
+        cp_async16(s.k[stage] + k_off(row, c * 16),
+                   p.k + (static_cast<long long>(ok ? key : 0) * p.kv_heads + hk) * kD + c * 16, ok);
+    }
+    const uint8_t* src = p.vt + (static_cast<long long>(hk) * p.tiles + kt) * (kD * kBN);
+#pragma unroll
+    for (int i = 0; i < (kD * kBN / 16) / kThreads; ++i) {  // V^T: 512 chunks
+        const int idx = t + i * kThreads, d = idx >> 1, c = idx & 1;
+        cp_async16(s.vt[stage] + vt_off(d, c * 16), src + d * kBN + c * 16, true);
+    }
+    if (t < kBN) {
+        const int key = key0 + t;
+        s.ks[stage][t] = key < p.kv_len ? p.ks[static_cast<long long>(key) * p.kv_heads + hk] : 0.0f;
+    }
+}
+
+__device__ __forceinline__ uint32_t pack_e4m3x4(float a, float b, float c, float d) {
+    const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+    const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+    return lo | (hi << 16);
+}
+
+__global__ void __launch_bounds__(kThreads, 2) flash_prefill_fp8pv_kernel(Attn8Args p) {
+    extern __shared__ __align__(128) uint8_t smem_raw[];
+    Smem8& s = *reinterpret_cast<Smem8*>(smem_raw);
+    const int h = blockIdx.y, hk = h / (p.heads / p.kv_heads);
+    const int t0 = blockIdx.x * kBM;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, q4 = lane & 3;
+
+    const int r0 = t0 + warp * 16 + g, r1 = r0 + 8;
+    uint32_t qf[8][4];
+    {
+        const uint8_t* q0 = p.q + (static_cast<long long>(r0 < p.tokens ? r0 : 0) * p.heads + h) * kD;
+        const uint8_t* q1 = p.q + (static_cast<long long>(r1 < p.tokens ? r1 : 0) * p.heads + h) * kD;
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            qf[ks][0] = r0 < p.tokens ? *reinterpret_cast<const uint32_t*>(q0 + ks * 32 + 4 * q4) : 0u;
+            qf[ks][1] = r1 < p.tokens ? *reinterpret_cast<const uint32_t*>(q1 + ks * 32 + 4 * q4) : 0u;
+            qf[ks][2] = r0 < p.tokens ? *reinterpret_cast<const uint32_t*>(q0 + ks * 32 + 16 + 4 * q4) : 0u;
+            qf[ks][3] = r1 < p.tokens ? *reinterpret_cast<const uint32_t*>(q1 + ks * 32 + 16 + 4 * q4) : 0u;
+        }
+    }
+    const float qs0 = r0 < p.tokens ? p.qs[static_cast<long long>(r0) * p.heads + h] : 0.0f;
+    const float qs1 = r1 < p.tokens ? p.qs[static_cast<long long>(r1) * p.heads + h] : 0.0f;
+    const int qpos0 = p.pos0 + r0, qpos1 = p.pos0 + r1;
+
+    float o[32][4];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+
+    const int last = min(p.tokens, t0 + kBM) - 1;
+    const int n_keys = min(p.kv_len, p.pos0 + last + 1);
+    const int n_tiles = (n_keys + kBN - 1) / kBN;
+
+    load_tile8(s, p, 0, 0, hk);
+    cp_commit();
+    for (int kt = 0; kt < n_tiles; ++kt) {
+        const int st = kt & 1;
+        if (kt + 1 < n_tiles) {
+            load_tile8(s, p, st ^ 1, kt + 1, hk);
+            cp_commit();
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+
+        float sc[4][4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) sc[i][0] = sc[i][1] = sc[i][2] = sc[i][3] = 0.0f;
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+#pragma unroll
+            for (int np = 0; np < 2; ++np) {
+                uint32_t b[4];
+                const int row = np * 16 + (lane & 7) + ((lane >> 4) << 3);
+                ldsm_x4(b, s.k[st] + k_off(row, ks * 32 + (((lane >> 3) & 1) << 4)));
+                mma_fp8(sc[2 * np], qf[ks], b[0], b[1]);
+                mma_fp8(sc[2 * np + 1], qf[ks], b[2], b[3]);
+            }
+        }
+
+        const int key0 = kt * kBN;
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int j = nt * 8 + 2 * q4 + e, key = key0 + j;
+                const float kscale = s.ks[st][j];
+                sc[nt][e] = key <= qpos0 ? sc[nt][e] * qs0 * kscale : -INFINITY;
+                sc[nt][2 + e] = key <= qpos1 ? sc[nt][2 + e] * qs1 * kscale : -INFINITY;
+                mx0 = fmaxf(mx0, sc[nt][e]);
+                mx1 = fmaxf(mx1, sc[nt][2 + e]);
+            }
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float ref0 = mn0 == -INFINITY ? 0.0f : mn0, ref1 = mn1 == -INFINITY ? 0.0f : mn1;
+        const float al0 = exp2f(m0 - ref0), al1 = exp2f(m1 - ref1);
+        m0 = mn0, m1 = mn1;
+        // Weights times 256 (exponent + 8); the row sums carry the same factor.
+        const float b0 = ref0 - 8.0f, b1 = ref1 - 8.0f;
+        float ps0 = 0.0f, ps1 = 0.0f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            sc[nt][0] = exp2f(sc[nt][0] - b0);
+            sc[nt][1] = exp2f(sc[nt][1] - b0);
+            sc[nt][2] = exp2f(sc[nt][2] - b1);
+            sc[nt][3] = exp2f(sc[nt][3] - b1);
+            ps0 += sc[nt][0] + sc[nt][1];
+            ps1 += sc[nt][2] + sc[nt][3];
+        }
+        l0 = l0 * al0 + ps0;
+        l1 = l1 * al1 + ps1;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            o[i][0] *= al0, o[i][1] *= al0;
+            o[i][2] *= al1, o[i][3] *= al1;
+        }
+
+        // O += P V over the tile's 32 keys in one k-step: slots 4q4.. hold keys kperm(4q4..).
+        const uint32_t pa[4] = {pack_e4m3x4(sc[0][0], sc[0][1], sc[1][0], sc[1][1]),
+                                pack_e4m3x4(sc[0][2], sc[0][3], sc[1][2], sc[1][3]),
+                                pack_e4m3x4(sc[2][0], sc[2][1], sc[3][0], sc[3][1]),
+                                pack_e4m3x4(sc[2][2], sc[2][3], sc[3][2], sc[3][3])};
+#pragma unroll
+        for (int dn = 0; dn < 32; dn += 2) {
+            uint32_t b[4];
+            ldsm_x4(b, s.vt[st] + vt_off(dn * 8 + (lane & 7) + ((lane >> 4) << 3), ((lane >> 3) & 1) << 4));
+            mma_fp8(o[dn], pa, b[0], b[1]);
+            mma_fp8(o[dn + 1], pa, b[2], b[3]);
+        }
+        __syncthreads();
+    }
+
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    const float inv0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, inv1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    const float* sv = p.sv + hk * kD;
+#pragma unroll
+    for (int nt = 0; nt < 32; ++nt) {
+        const int d = nt * 8 + 2 * q4;
+        const float s0 = sv[d], s1 = sv[d + 1];
+        if (r0 < p.tokens)
+            *reinterpret_cast<float2*>(p.out + (static_cast<long long>(r0) * p.heads + h) * kD + d) =
+                make_float2(o[nt][0] * inv0 * s0, o[nt][1] * inv0 * s1);
+        if (r1 < p.tokens)
+            *reinterpret_cast<float2*>(p.out + (static_cast<long long>(r1) * p.heads + h) * kD + d) =
+                make_float2(o[nt][2] * inv1 * s0, o[nt][3] * inv1 * s1);
+    }
+}
+
 // Grow-only and never freed (VeloxScratch): recorded CUDA graphs may still reference old buffers.
 struct Scratch {
     VeloxScratch s;
@@ -317,9 +576,12 @@ size_t align_up(size_t x) { return (x + 255) / 256 * 256; }
 
 // Causal attention for head_dim 256 (see velox_core::backend::AttnShape). Returns
 // VELOX_ERR_UNSUPPORTED for other geometries.
+// fp8_pv != 0: the value product in FP8 (AttnPrecision::Fp8QkFp8Pv), for up to 8 kv heads.
 VELOX_API int velox_4090_attention_prefill(const float* q, const float* k, const float* v, float* out, int tokens,
-                                           int heads, int kv_heads, int head_dim, int pos0, float scale) {
+                                           int heads, int kv_heads, int head_dim, int pos0, float scale,
+                                           int fp8_pv) {
     if (head_dim != kD || tokens <= 0 || kv_heads <= 0 || heads % kv_heads != 0) return VELOX_ERR_UNSUPPORTED;
+    if (fp8_pv && kv_heads > 8) return VELOX_ERR_UNSUPPORTED;
     const long long kv_len = static_cast<long long>(pos0) + tokens;
     const long long q_rows = static_cast<long long>(tokens) * heads, k_rows = kv_len * kv_heads;
     const size_t qb = align_up(q_rows * kD), qsb = align_up(q_rows * 4), kb = align_up(k_rows * kD),
@@ -333,6 +595,38 @@ VELOX_API int velox_4090_attention_prefill(const float* q, const float* k, const
     __half* vh = reinterpret_cast<__half*>(base + qb + qsb + kb + ksb);
 
     constexpr float kLog2e = 1.4426950408889634f;
+    if (fp8_pv) {
+        // q/k as below; V as transposed E4M3 tiles with per-channel scales (vb has room: 2 bytes
+        // per value there, 1 here, plus the scales and channel maxima).
+        const long long tiles = (kv_len + kBN - 1) / kBN;
+        const size_t vtb = align_up(static_cast<size_t>(kv_heads) * tiles * kD * kBN),
+                     svb = align_up(kv_heads * kD * 4);
+        uint8_t* base8 = g_attn_scratch.get(qb + qsb + kb + ksb + vtb + 2 * svb);
+        if (!base8) return static_cast<int>(cudaErrorMemoryAllocation);
+        uint8_t* qc8 = base8;
+        float* qs8 = reinterpret_cast<float*>(base8 + qb);
+        uint8_t* kc8 = base8 + qb + qsb;
+        float* ks8 = reinterpret_cast<float*>(base8 + qb + qsb + kb);
+        uint8_t* vt = base8 + qb + qsb + kb + ksb;
+        float* sv = reinterpret_cast<float*>(vt + vtb);
+        unsigned* amax = reinterpret_cast<unsigned*>(vt + vtb + svb);
+        rows_to_fp8<<<static_cast<unsigned>((q_rows + 7) / 8), 256>>>(q, q_rows, scale * kLog2e, qc8, qs8);
+        rows_to_fp8<<<static_cast<unsigned>((k_rows + 7) / 8), 256>>>(k, k_rows, 1.0f, kc8, ks8);
+        if (cudaError_t e = cudaMemsetAsync(amax, 0, kv_heads * kD * 4, 0)) return static_cast<int>(e);
+        v_channel_amax<<<velox_grid_1d(k_rows * kD / 4, 256), 256>>>(v, kv_len, kv_heads, amax);
+        v_to_fp8_t<<<dim3(static_cast<unsigned>(tiles), kv_heads), 256>>>(v, kv_len, kv_heads, amax, vt, sv);
+        if (const int e = velox_launch_status()) return e;
+        static bool configured8 = false;
+        if (!configured8) {
+            cudaFuncSetAttribute(flash_prefill_fp8pv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 sizeof(Smem8));
+            configured8 = true;
+        }
+        Attn8Args p8{qc8, qs8, kc8, ks8, vt, sv, out, tokens, heads, kv_heads, pos0,
+                     static_cast<int>(kv_len), static_cast<int>(tiles)};
+        flash_prefill_fp8pv_kernel<<<dim3((tokens + kBM - 1) / kBM, heads), kThreads, sizeof(Smem8)>>>(p8);
+        return velox_launch_status();
+    }
     rows_to_fp8<<<static_cast<unsigned>((q_rows + 7) / 8), 256>>>(q, q_rows, scale * kLog2e, qc, qs);
     rows_to_fp8<<<static_cast<unsigned>((k_rows + 7) / 8), 256>>>(k, k_rows, 1.0f, kc, ks);
     to_f16<<<velox_grid_1d(k_rows * kD / 4, 256), 256>>>(v, k_rows * kD / 4, vh);
