@@ -461,6 +461,7 @@ extern "C" {
         head_dim: i32,
         pos0: i32,
         scale: f32,
+        fp8_pv: i32,
     ) -> i32;
     fn velox_5090_attention_windows(
         q: *const f32,
@@ -519,6 +520,26 @@ const GEMV_MAX_M: usize = 1;
 /// From this many query tokens attention uses the tensor-core prefill kernel; below it the exact
 /// split-KV kernel, which is bound by reading the cache anyway.
 const FLASH_MIN_TOKENS: usize = 16;
+
+/// From this many keys the prefill kernel runs its value product in FP8 too
+/// (AttnPrecision::Fp8QkFp8Pv), where f16 x f16 -> f32 MMA runs at a fraction of block-scaled
+/// E4M3. RTX 5090 (2026-11-18, `bench-attn --pos0 122880 --tokens 2048 --kv-format f32`):
+/// 25.3 -> 16.3 ms, 1.56x (the RTX 5090 Laptop: 59.7 -> 36.4 ms, 1.64x). Below it the f16 value
+/// product stays: E4M3 softmax weights move short rows by up to a few percent, and the speed-up
+/// there is negligible (Laptop end to end: 124K prefill 88.3 -> 77.4 s, <= 8K unchanged; needles
+/// and greedy outputs no further from the f16 kernel than its own f16-accumulating variant).
+/// RTX 5090 end to end (v3 hybrid weights, A/B/A/B, fresh server per round, no prefix reuse):
+/// prefill 129K 23.4 -> 18.8 s (-19.5%), 64K 8.33 -> 7.19 s, 32K 3.27 -> 3.02 s, 8K unchanged;
+/// all needles hit, greedy outputs from 32K up reworded but factually the same.
+/// `VELOX_ATTN_FP8PV=0` keeps the f16 value product everywhere.
+const FP8_PV_MIN_KEYS: usize = 8192;
+
+fn fp8_pv(s: &AttnShape) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VELOX_ATTN_FP8PV").map_or(true, |v| v != "0"))
+        && s.kv_len() >= FP8_PV_MIN_KEYS
+        && s.kv_heads <= 8
+}
 
 /// Decode, verify and prefill over an NVFP4 cache: f16 tensor-core flash attention that decodes
 /// the cache tiles in shared memory (the f32-cache prefill kernel does not read packed caches).
@@ -1356,7 +1377,11 @@ impl CudaKernels for Rtx5090Kernels {
             && s.heads % s.kv_heads == 0
             && s.kv_len() <= i32::MAX as usize
         {
-            AttnPrecision::Fp8QkF16Pv
+            if fp8_pv(&s) {
+                AttnPrecision::Fp8QkFp8Pv
+            } else {
+                AttnPrecision::Fp8QkF16Pv
+            }
         } else {
             AttnPrecision::Exact
         }
@@ -1417,6 +1442,7 @@ impl CudaKernels for Rtx5090Kernels {
                     to_i32("head_dim", s.head_dim)?,
                     to_i32("pos0", s.pos0)?,
                     s.scale(),
+                    i32::from(fp8_pv(&s)),
                 )
             },
             "rtx5060 attention prefill",
