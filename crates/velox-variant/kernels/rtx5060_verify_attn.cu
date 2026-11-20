@@ -14,6 +14,7 @@
 // (log2-domain max, sum, accumulator); a combine kernel merges splits and rotates the result back.
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "velox_common.cuh"
 
@@ -469,7 +470,302 @@ int verify_occupancy(int mt) {
     return occ[mt];
 }
 
+// ---------------------------------------------------------------------------------------------
+// Warp-specialized form of verify_kernel (same arithmetic, same partial layout).
+//
+// verify_kernel runs fetch+decode (all warps) and the tensor-core work (one warp per 16 query
+// rows) back to back between two __syncthreads per 32-key tile. ncu at 128K keys: one 255-register
+// block per SM, 84-87% of scheduler cycles with no eligible warp, and with compute stubbed out the
+// fetch+decode alone streams at ~1 TB/s; the time is the serial MMA chain of the busiest of the
+// four SM sub-partitions (6 row warps put two on sub-partitions 0 and 1).
+//
+// Here two producer warps fetch packed tiles (two ahead, in registers) and decode them into a
+// two-stage shared ring while the consumer warps run the tile before; stages are handed over with
+// named barriers (FULL: producers arrive, consumers sync; EMPTY: the reverse). Consumers keep their
+// 16 query rows as A fragments in registers. With few rows (at most 3 row tiles) each row tile gets
+// two consumers that take the even and the odd tiles (stage 0 / stage 1) and write separate
+// partials, which the combine kernel merges like extra splits.
+constexpr int kWsProducers = 2;
+constexpr int kWsMinKeys = 4096;
+constexpr int kWsMaxRowTiles = 6;
+constexpr int kWsBlockRows = kWsMaxRowTiles * 16;  // 96 = 16 verify tokens x 6 heads per KV head
+constexpr int kWsStageHalves = 2 * kTK * kD;  // K then V, f16
+constexpr size_t kWsSmem = 2 * kWsStageHalves * sizeof(__half);
+constexpr int kWsItems = 2 * kTK * kChunks / (kWsProducers * 32);
+static_assert((2 * kTK * kChunks) % (kWsProducers * 32) == 0, "whole items per producer thread");
+static_assert(kWsBlockRows * kD <= 2 * kWsStageHalves, "the query tile is staged in the ring");
+
+constexpr int kBarFull = 1, kBarEmpty = 3, kBarQ = 5;  // FULL/EMPTY + stage; 0 is __syncthreads
+
+__device__ __forceinline__ void named_sync(int id, int n) {
+    asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(n) : "memory");
+}
+__device__ __forceinline__ void named_arrive(int id, int n) {
+    asm volatile("bar.arrive %0, %1;\n" ::"r"(id), "r"(n) : "memory");
+}
+
+struct WsRaw {
+    uint4 w[kWsItems];
+    uint16_t s[kWsItems];
+};
+
+// p.splits is the partial slot count (splits x phases); `phases` is 1 or 2.
+__global__ void __launch_bounds__(kThreads) verify_ws_kernel(VerifyArgs p, int row_tiles, int phases) {
+    extern __shared__ __align__(128) __half smem[];
+    const int group = p.heads / p.kv_heads, row0 = blockIdx.z * kWsBlockRows;
+    const int rows = min(kWsBlockRows, p.tokens * group - row0), mt = (rows + 15) / 16;
+    const int consumers = row_tiles * phases, count = (row_tiles + kWsProducers) * 32;
+
+    const int pos0 = p.pp != nullptr ? static_cast<int>(p.pp[0]) : p.pos0;
+    const uint8_t* kc = p.pp != nullptr ? reinterpret_cast<const uint8_t*>(p.pp[1]) : p.k;
+    const uint8_t* vc = p.pp != nullptr ? reinterpret_cast<const uint8_t*>(p.pp[2]) : p.v;
+    const int sp = blockIdx.x, kvh = blockIdx.y;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, q4 = lane & 3;
+    const int split_keys = p.split_keys;
+    const int j0 = sp * split_keys, j1 = min(j0 + split_keys, pos0 + (row0 + rows - 1) / group + 1);
+    const int n = j1 > j0 ? (j1 - j0 + kTK - 1) / kTK : 0;
+
+    // Stage the query tile through the ring (swizzled like K/V), then consumers take fragments.
+    const __half* qsrc = p.q16 + (static_cast<size_t>(kvh) * p.tokens * group + row0) * kD;
+    for (int i = threadIdx.x; i < mt * 16 * (kD / 8); i += blockDim.x) {
+        const int r = i / (kD / 8), c = i % (kD / 8);
+        const uint4 x = r < rows ? *reinterpret_cast<const uint4*>(qsrc + static_cast<size_t>(r) * kD + c * 8)
+                                 : make_uint4(0, 0, 0, 0);
+        *reinterpret_cast<uint4*>(smem + sw(r, c * 8)) = x;
+    }
+    __syncthreads();
+
+    if (warp >= consumers) {
+        // ---- producer ----
+        const int pt = threadIdx.x - consumers * 32;
+        auto fetch = [&](WsRaw& r, int base) {
+#pragma unroll
+            for (int f = 0; f < kWsItems; ++f) {
+                const int idx = pt + f * kWsProducers * 32;
+                const int which = idx / (kTK * kChunks), key = idx / kChunks % kTK, c = idx % kChunks;
+                r.w[f] = make_uint4(0, 0, 0, 0);
+                r.s[f] = 0;
+                if (base + key < j1) {
+                    const uint8_t* row =
+                        (which ? vc : kc) + (static_cast<size_t>(base + key) * p.kv_heads + kvh) * kRowBytes;
+                    r.w[f] = __ldcs(reinterpret_cast<const uint4*>(row + 16 * c));
+                    r.s[f] = *reinterpret_cast<const uint16_t*>(row + kD / 2 + 2 * c);
+                }
+            }
+        };
+        auto decode = [&](const WsRaw& r, int stage) {
+            __half* ks = smem + stage * kWsStageHalves;
+            __half* vs = ks + kTK * kD;
+#pragma unroll
+            for (int f = 0; f < kWsItems; ++f) {
+                const int idx = pt + f * kWsProducers * 32;
+                const int which = idx / (kTK * kChunks), key = idx / kChunks % kTK, c = idx % kChunks;
+                const uint32_t s01 = e4m3x2_h(r.s[f]);
+                const uint32_t sa = __byte_perm(s01, 0u, 0x1010u), sb = __byte_perm(s01, 0u, 0x3232u);
+                const uint32_t u[4] = {r.w[f].x, r.w[f].y, r.w[f].z, r.w[f].w};
+                __half* dst = which ? vs : ks;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    uint32_t h[4];
+                    e2m1x8_h(u[j], h);
+                    const uint32_t sc = j < 2 ? sa : sb;
+                    *reinterpret_cast<uint4*>(dst + sw(key, c * 32 + j * 8)) =
+                        make_uint4(hmul2_u(h[0], sc), hmul2_u(h[1], sc), hmul2_u(h[2], sc), hmul2_u(h[3], sc));
+                }
+            }
+        };
+        WsRaw ra, rb;
+        if (n > 0) fetch(ra, j0);
+        if (n > 1) fetch(rb, j0 + kTK);
+        named_sync(kBarQ, blockDim.x);  // consumers hold their query fragments; the ring is free
+        auto stage = [&](WsRaw& r, int i) {
+            const int s = i & 1;
+            if (i >= 2) named_sync(kBarEmpty + s, count);
+            decode(r, s);
+            if (i + 2 < n) fetch(r, j0 + (i + 2) * kTK);
+            __threadfence_block();
+            named_arrive(kBarFull + s, count);
+        };
+        for (int i = 0; i < n; i += 2) {
+            stage(ra, i);
+            if (i + 1 < n) stage(rb, i + 1);
+        }
+        // Match the consumers' last EMPTY arrivals so no barrier is left half-complete.
+        for (int i = max(n - 2, 0); i < n; ++i) named_sync(kBarEmpty + (i & 1), count);
+        return;
+    }
+
+    // ---- consumer ----
+    const int rt = warp % row_tiles, phase = warp / row_tiles;
+    uint32_t qa[16][4];
+#pragma unroll
+    for (int kk = 0; kk < 16; ++kk) ldsm_x4(qa[kk], smem + sw(rt * 16 + (lane & 15), kk * 16 + ((lane >> 4) << 3)));
+    named_sync(kBarQ, blockDim.x);
+
+    const bool active = rt < mt;
+    const int r0 = rt * 16 + g, r1 = r0 + 8;
+    const int last0 = r0 < rows ? pos0 + (row0 + r0) / group : -1;
+    const int last1 = r1 < rows ? pos0 + (row0 + r1) / group : -1;
+    const int wlast = active ? pos0 + (row0 + min(rows - 1, rt * 16 + 15)) / group : -1;
+    float o[32][4];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+
+    auto compute = [&](const __half* ks, const __half* vs, int base) {
+        float sc[4][4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) sc[i][0] = sc[i][1] = sc[i][2] = sc[i][3] = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+#pragma unroll
+            for (int np = 0; np < 2; ++np) {
+                uint32_t b[4];
+                ldsm_x4(b, ks + sw(np * 16 + (lane & 7) + ((lane >> 4) << 3), kk * 16 + (((lane >> 3) & 1) << 3)));
+                mma_f16(sc[2 * np], qa[kk], b[0], b[1]);
+                mma_f16(sc[2 * np + 1], qa[kk], b[2], b[3]);
+            }
+        }
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int key = base + nt * 8 + 2 * q4 + e;
+                sc[nt][e] = key <= last0 ? sc[nt][e] : -INFINITY;
+                sc[nt][2 + e] = key <= last1 ? sc[nt][2 + e] : -INFINITY;
+                mx0 = fmaxf(mx0, sc[nt][e]);
+                mx1 = fmaxf(mx1, sc[nt][2 + e]);
+            }
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float ref0 = mn0 == -INFINITY ? 0.0f : mn0, ref1 = mn1 == -INFINITY ? 0.0f : mn1;
+        const float al0 = exp2f(m0 - ref0), al1 = exp2f(m1 - ref1);
+        m0 = mn0, m1 = mn1;
+        float ps0 = 0.0f, ps1 = 0.0f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            sc[nt][0] = exp2f(sc[nt][0] - ref0);
+            sc[nt][1] = exp2f(sc[nt][1] - ref0);
+            sc[nt][2] = exp2f(sc[nt][2] - ref1);
+            sc[nt][3] = exp2f(sc[nt][3] - ref1);
+            ps0 += sc[nt][0] + sc[nt][1];
+            ps1 += sc[nt][2] + sc[nt][3];
+        }
+        l0 = l0 * al0 + ps0;
+        l1 = l1 * al1 + ps1;
+        // Past the first tiles the running max rarely moves: skip the identity rescale.
+        if (!__all_sync(0xffffffffu, al0 == 1.0f && al1 == 1.0f)) {
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                o[i][0] *= al0, o[i][1] *= al0;
+                o[i][2] *= al1, o[i][3] *= al1;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const uint32_t a[4] = {pack_h2(sc[2 * j][0], sc[2 * j][1]), pack_h2(sc[2 * j][2], sc[2 * j][3]),
+                                   pack_h2(sc[2 * j + 1][0], sc[2 * j + 1][1]),
+                                   pack_h2(sc[2 * j + 1][2], sc[2 * j + 1][3])};
+            const int vrow = j * 16 + (lane & 7) + (((lane >> 3) & 1) << 3);
+#pragma unroll
+            for (int dn = 0; dn < 16; ++dn) {
+                uint32_t b[4];
+                ldsm_x4_t(b, vs + sw(vrow, dn * 16 + ((lane >> 4) << 3)));
+                mma_f16(o[2 * dn], a, b[0], b[1]);
+                mma_f16(o[2 * dn + 1], a, b[2], b[3]);
+            }
+        }
+    };
+
+    for (int i = phase; i < n; i += phases) {
+        const int s = i & 1, base = j0 + i * kTK;
+        named_sync(kBarFull + s, count);
+        if (base <= wlast) compute(smem + s * kWsStageHalves, smem + s * kWsStageHalves + kTK * kD, base);
+        named_arrive(kBarEmpty + s, count);
+    }
+    if (!active) return;
+
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    const int slot = sp * phases + phase;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int r = half ? r1 : r0;
+        if (r >= rows) continue;
+        const int t = (row0 + r) / group, h = kvh * group + (row0 + r) % group;
+        const size_t idx = (static_cast<size_t>(t) * p.heads + h) * p.splits + slot;
+        float* dst = p.part_acc + idx * kD;
+#pragma unroll
+        for (int nt = 0; nt < 32; ++nt)
+            *reinterpret_cast<float2*>(dst + nt * 8 + 2 * q4) =
+                half ? make_float2(o[nt][2], o[nt][3]) : make_float2(o[nt][0], o[nt][1]);
+        if (q4 == 0) {
+            p.part_ml[2 * idx] = half ? m1 : m0;
+            p.part_ml[2 * idx + 1] = half ? l1 : l0;
+        }
+    }
+}
+
+bool verify_ws_enabled() {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("VELOX_VERIFY_WS");
+        on = (e != nullptr && e[0] == '0') ? 0 : 1;
+    }
+    return on == 1;
+}
+
 size_t align_up(size_t x) { return (x + 255) / 256 * 256; }
+
+int verify_ws_launch(const float* q, const unsigned char* k, const unsigned char* v, float* out, int tokens, int heads,
+                     int kv_heads, int pos0, float scale, float norm, const long long* params, int kv) {
+    const long long rows = static_cast<long long>(tokens) * (heads / kv_heads);
+    const int row_blocks = static_cast<int>((rows + kWsBlockRows - 1) / kWsBlockRows);
+    const int row_tiles = static_cast<int>(rows < kWsBlockRows ? (rows + 15) / 16 : kWsMaxRowTiles);
+    const int phases = row_tiles <= 3 ? 2 : 1;
+    const int threads = (row_tiles * phases + kWsProducers) * 32;
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(verify_ws_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kWsSmem));
+        cudaFuncSetAttribute(verify_ws_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             static_cast<int>(cudaSharedmemCarveoutMaxShared));
+        configured = true;
+    }
+    static int occ[kThreads / 32 + 1] = {};
+    int& o = occ[threads / 32];
+    if (o == 0) {
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, verify_ws_kernel, threads, kWsSmem) != cudaSuccess ||
+            o <= 0)
+            o = 1;
+    }
+    // One wave of resident blocks, whole tiles per split, at least two tiles per phase.
+    const int want = (o * sm_count() + kv_heads * row_blocks - 1) / (kv_heads * row_blocks);
+    int split_keys = (kv + want - 1) / want;
+    split_keys = (split_keys + kTK - 1) / kTK * kTK;
+    if (split_keys < 2 * phases * kTK) split_keys = 2 * phases * kTK;
+    const int splits = (kv + split_keys - 1) / split_keys, slots = splits * phases;
+    const size_t n_rows = static_cast<size_t>(tokens) * heads;
+    const size_t qb = align_up(n_rows * kD * sizeof(__half)), ab = align_up(n_rows * slots * kD * sizeof(float));
+    uint8_t* base = verify_scratch(qb + ab + n_rows * slots * 2 * sizeof(float));
+    if (base == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
+    __half* q16 = reinterpret_cast<__half*>(base);
+    float* part_acc = reinterpret_cast<float*>(base + qb);
+    float* part_ml = reinterpret_cast<float*>(base + qb + ab);
+    prep_query<<<static_cast<unsigned>((n_rows + kPrepWarps - 1) / kPrepWarps), kPrepWarps * 32>>>(
+        q, q16, tokens, heads, kv_heads, scale * kLog2e, norm);
+    VerifyArgs a{q16, k, v, part_acc, part_ml, params, tokens, heads, kv_heads, pos0, slots, split_keys};
+    verify_ws_kernel<<<dim3(splits, kv_heads, row_blocks), threads, kWsSmem>>>(a, row_tiles, phases);
+    combine_kernel<<<static_cast<unsigned>(n_rows), kCombineWarps * 32>>>(part_acc, part_ml, out, slots, norm);
+    return velox_launch_status();
+}
 
 }  // namespace
 
@@ -484,6 +780,13 @@ VELOX_API int velox_5060_attention_verify_nvfp4(const float* q, const unsigned c
     const int row_blocks = static_cast<int>((rows + kBlockRows - 1) / kBlockRows);
     const int mt = static_cast<int>(rows < kBlockRows ? (rows + 15) / 16 : kBlockRows / 16);
     const int kv = kv_grid >= pos0 + tokens ? kv_grid : pos0 + tokens;
+    // Up to 96 rows (16 verify tokens x 6 heads per KV head) per KV head: one warp-specialized block decodes
+    // each tile once. Taller windows would decode it once per 96 rows; the 128-row kernel serves them, and
+    // short caches, where the extra barriers and register staging cost more than the overlap saves
+    // (RTX 4090, 24/4 heads: 300 keys t=1 15.9 -> 20.3 us, 2048 19.8 -> 21.4, 4096 26.5 -> 23.0; RTX 5090: 4096
+    // keys even, 128K t=8 / t=16 253 -> 221 / 455 -> 381 us min).
+    if (verify_ws_enabled() && rows <= kWsBlockRows && kv >= kWsMinKeys)
+        return verify_ws_launch(q, k, v, out, tokens, heads, kv_heads, pos0, scale, norm, params, kv);
     // One wave of resident blocks, whole tiles per split, at least two tiles.
     const int want = (verify_occupancy(mt) * sm_count() + kv_heads * row_blocks - 1) / (kv_heads * row_blocks);
     int split_keys = (kv + want - 1) / want;
