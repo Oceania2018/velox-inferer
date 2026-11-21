@@ -8,9 +8,13 @@ answers), `systemone_http.cpp` (HTTP) and `ProgramImpl::score_branches` (rank).
 ## Contract
 
 ```
-{ "model": "...", "state": "<text>" | {...} | [...], "images": ["<base64>", ...],
+{ "model"?: "...", "state": "<text>" | {...} | [...], "images": ["<base64>" | "data:image/<type>;base64,<base64>", ...],
   "system": "...", "keep_alive": ..., "questions": { "<name>": {"type": ..., "instructions": ..., ...} } }
 ```
+
+`model` is optional (llama.cpp's form): without it the loaded model answers; another name is a
+404. Images are base64 strings or base64 image data URLs, as llama.cpp sends them; a data URL keeps
+its declared type, a bare string is typed from its first bytes. Remote URLs are a 400.
 
 | type | criteria | assistant prefill | scored tokens | answer |
 |---|---|---|---|---|
