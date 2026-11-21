@@ -248,7 +248,7 @@ fn systemone_answers_every_question() {
     assert_eq!(s, 400);
     assert_eq!(
         serde_json::from_str::<Value>(&body).unwrap()["error"],
-        "missing required field: model"
+        "missing required field: state"
     );
     let req = json!({
         "model": "m",
@@ -268,6 +268,12 @@ fn systemone_answers_every_question() {
         v["usage"],
         json!({"input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 3})
     );
+    // llama.cpp's form leaves the model out: the loaded one answers.
+    let mut no_model = req.clone();
+    no_model.as_object_mut().unwrap().remove("model");
+    let (s, body) = http(port, "POST", "/v1/systemone", &no_model.to_string());
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["model"], "m");
     let mut wrong = req.clone();
     wrong["model"] = "other".into();
     assert_eq!(
@@ -279,7 +285,7 @@ fn systemone_answers_every_question() {
     assert!(
         metrics
             .lines()
-            .any(|l| l == "velox_prompt_tokens_total 100"),
+            .any(|l| l == "velox_prompt_tokens_total 200"),
         "{metrics}"
     );
 }
