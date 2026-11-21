@@ -7,8 +7,8 @@
 //! `images` are base64 strings shared by every question, answers carry their `type`, and errors
 //! are `{"error": "<message>"}`. Extensions: `rank`, `system`, and `usage.cached_input_tokens`.
 //!
-//! Prompts, labels and answer formulas follow ninfer exactly, so both engines score the same
-//! tokens for the same request.
+//! Prompts, labels and answer formulas follow ninfer, except rank candidate ids, which are
+//! letters here (see `rank_id`).
 
 use serde_json::{json, Map, Value};
 
@@ -20,7 +20,8 @@ const MAX_QUESTIONS: usize = 64;
 const MAX_CHOICE_OPTIONS: usize = 26;
 /// Score levels and rank scale levels: single-token labels 0..9.
 const MAX_SCORE_LEVELS: usize = 10;
-/// Rank candidates. A rank branch is `"<id>] "`: ids below 1000 take at most five tokens.
+/// Rank candidates. A rank branch is `"<id>] "` with a two-letter id (`rank_id`), well within
+/// [`MAX_BRANCH_TOKENS`].
 pub const MAX_RANK_CANDIDATES: usize = 256;
 /// Tokens of one rank branch, at most.
 pub const MAX_BRANCH_TOKENS: usize = 5;
@@ -333,9 +334,23 @@ fn parse_score(
     Ok(())
 }
 
+/// The id of the `n`th rank candidate: two letters, the first cycling fastest (AA, BA, .., ZA,
+/// AB, BB, ..; 256 candidates end at VJ).
+///
+/// The model scores a candidate after only its id, so it has to find that id's line in the list.
+/// Numeric ids made that lookup unreliable: neighbours share leading digits ("12", "13"), and the
+/// rating was often read off the line above or below, so the same candidate's similarity changed
+/// with the order of the list (up to 0.8 on 100 candidates). With neighbours that never share a
+/// first letter, about half of those order effects disappear. The branch stays as short as a
+/// numeric one, so scoring costs the same.
+fn rank_id(n: usize) -> String {
+    let letter = |i: usize| char::from(b'A' + i as u8);
+    format!("{}{}", letter(n % 26), letter(n / 26))
+}
+
 /// The candidate list, the rating scale and the reply format form one shared prefix that ends
-/// inside the assistant answer at "["; each candidate is then the branch "<id>] " and the rating
-/// digit that follows is scored.
+/// inside the assistant answer at "["; each candidate is then the branch "<id>] " (see
+/// [`rank_id`]) and the rating digit that follows is scored.
 fn parse_rank(
     item: &Value,
     param: &str,
@@ -404,6 +419,7 @@ fn parse_rank(
 
     let mut user = format!("{state}\n\nCandidates:");
     for (id, (key, text)) in candidates.into_iter().enumerate() {
+        let id = rank_id(id);
         // Newlines inside a candidate would read as the start of the next candidate.
         user.push_str(&format!("\n[{id}] {}", text.replace('\n', " ")));
         q.keys.push(key);
@@ -678,11 +694,11 @@ mod tests {
         let q = &r.questions[0];
         assert_eq!(q.kind, Kind::Rank);
         assert_eq!(q.keys, ["a", "b", "c"]);
-        assert_eq!(q.branches, ["0] ", "1] ", "2] "]);
+        assert_eq!(q.branches, ["AA] ", "BA] ", "CA] "]);
         assert_eq!(q.candidates, ["0", "1", "2", "3", "4"]);
         assert_eq!((q.threshold, q.limit), (0.5, None));
         let prompt = user_text(q);
-        assert!(prompt.contains("[0] first") && prompt.contains("[2] third"));
+        assert!(prompt.contains("[AA] first") && prompt.contains("[CA] third"));
         assert_eq!(q.request["messages"][2]["content"], "[");
         assert_eq!(q.request["chat_template_kwargs"]["enable_thinking"], false);
         // The same candidates listed differently build the same prompt.
@@ -694,13 +710,28 @@ mod tests {
     }
 
     #[test]
-    fn rank_prompt_is_ninfers() {
+    fn rank_ids_are_two_letters_with_neighbours_apart() {
+        assert_eq!((0..3).map(rank_id).collect::<Vec<_>>(), ["AA", "BA", "CA"]);
+        assert_eq!(
+            [rank_id(25), rank_id(26), rank_id(27)],
+            ["ZA", "AB", "BB"]
+        );
+        assert_eq!(rank_id(MAX_RANK_CANDIDATES - 1), "VJ");
+        let ids: Vec<String> = (0..MAX_RANK_CANDIDATES).map(rank_id).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len());
+        // Neighbours never share their first letter.
+        assert!(ids.windows(2).all(|w| w[0].as_bytes()[0] != w[1].as_bytes()[0]));
+    }
+
+    #[test]
+    fn rank_prompt_lists_candidates_by_letter_id() {
         let mut body = rank_body(json!({"x": "line one\nline two"}));
         body["questions"]["similar"]["scale"] = json!(["no", "yes"]);
         let q = &parse(&body).unwrap().questions[0];
         assert_eq!(
             user_text(q),
-            "New request: kitchen faucet leaking\n\nCandidates:\n[0] line one line two\n\n\
+            "New request: kitchen faucet leaking\n\nCandidates:\n[AA] line one line two\n\n\
              Rate how similar each past work order is to the new request:\n\n1: yes\n0: no\n\n\
              I will name one candidate by its id. Reply with the id in brackets followed by its \
              rating."
