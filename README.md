@@ -30,8 +30,8 @@ supported card gets its own hardware branch for tuned kernels.
 ## Status
 
 Serving Qwen3.8-27B NVFP4 on the RTX 5090 through llm-inference-daemon
-(`"Framework": "velox-inferer"`), with the OpenAI-compatible API, vision, DFlash2 speculative
-decoding and up to 6 concurrent requests. Prefixes are reused from a context store in system RAM
+(`"Framework": "velox-inferer"`), with the OpenAI-compatible API, vision, DFlash2 or DSpine
+speculative decoding and up to 6 concurrent requests. Prefixes are reused from a context store in system RAM
 (optional NVMe tier), and attention caches are paged so lanes share identical prefixes. Every op
 is checked against the CPU oracle (`velox selftest`). velox replaces ninfer on a card only when
 the replay gate ([docs/performance.md](docs/performance.md)) shows no regression.
@@ -61,6 +61,30 @@ the drafter predicts almost perfectly, so these decode rates are an upper bound.
 decode at about 270–300 tok/s. For the full matrix, method and notes, see
 [bench/2026-10-21-rtx5090-32g](bench/2026-10-21-rtx5090-32g/README.md); all runs are listed in
 [bench/](bench/README.md).
+
+### DSpine drafter
+
+`--drafter dspine` ([tencent/Qwen3.8-27B-DSpine-b16](docs/weights.md#dspine-drafter-import),
+NVFP4, 15 drafts every round, 4096-row window) compared with the DFlash2 drafter (7 drafts) on a
+real agent session: the Aiden replay (95 tool-call steps, ~20k prompt tokens, temperature 0). Same
+RTX 5090 32 GB, same target model, production flags (4 lanes, NVFP4 KV). The speed test above
+has not been rerun with DSpine yet.
+
+| Aiden replay | DFlash2 | DSpine | Change |
+|---|---:|---:|---:|
+| Drafter VRAM | 1.19 GB | 1.06 GB | −11% |
+| Tokens accepted per round, 1 replay | 4.86 | 8.02 | +65% |
+| Decode tok/s, 1 replay | 321 | 430 | +34% |
+| Total throughput (tok/s), 4 replays at once | 208 | 233 | +12% |
+| Wall time, 4 replays at once | 195 s | 171 s | −12% |
+| Decode per request (tok/s), 4 replays at once | 102 | 86 | −16% |
+| End-to-end latency p50 / p90, 4 replays at once | 1,327 / 2,643 ms | 1,511 / 2,767 ms | +14% / +5% |
+
+DSpine is faster for a single request and finishes a concurrent batch sooner. When 4 requests
+decode at once, each one waits on larger batched verify rounds, so per-request latency is worse.
+Tool-call quality matches DFlash2 (all tool calls valid, the same share of click points within
+20 px), and prefill speed is unchanged. Method and all variants:
+[docs/performance.md](docs/performance.md#dspine-drafter-2026-11-08).
 
 ## Build
 

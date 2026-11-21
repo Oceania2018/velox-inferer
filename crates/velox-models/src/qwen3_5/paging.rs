@@ -241,6 +241,36 @@ impl<B: Backend> Session<B> {
         self.back_chunks(b, 0, end)
     }
 
+    /// Warm-up only: maps ONE new set at every unbacked chunk index covering rows `0..rows`, so
+    /// kernels and recorded graphs see a full-length cache for the memory of a single set. The
+    /// aliased set counts as shared, so a write first copies the chunks it touches
+    /// ([`Self::prepare_kv`]); every other row reads whatever the one set holds. Contents are
+    /// garbage: only for steps whose results are thrown away. [`Self::trim_kv`] drops it all.
+    /// Without this, warming a lane at the end of a 128K capacity backs ~37 sets (2.3 GiB) per
+    /// lane before the pool exists, which does not fit 2 lanes on a 24 GB card.
+    pub fn alias_kv(&mut self, b: &B, rows: usize) -> Result<()> {
+        let end = self.kv_sets_for(rows);
+        let n = 2 * self.kv.len();
+        let Some(pg) = self.paging.as_mut() else {
+            return Ok(());
+        };
+        if pg.sets[..end].iter().all(Option::is_some) {
+            return Ok(());
+        }
+        let set = pg.new_set(b, n)?;
+        for i in 0..end {
+            if pg.sets[i].is_some() {
+                continue;
+            }
+            for (c, (k, v)) in self.kv.iter_mut().enumerate() {
+                b.map_chunk(k, i, &set.chunks[2 * c])?;
+                b.map_chunk(v, i, &set.chunks[2 * c + 1])?;
+            }
+            pg.sets[i] = Some(Arc::clone(&set));
+        }
+        Ok(())
+    }
+
     /// Paged caches: (chunks in one set, rows one set covers).
     pub fn kv_set_shape(&self) -> Option<(usize, usize)> {
         self.paging
