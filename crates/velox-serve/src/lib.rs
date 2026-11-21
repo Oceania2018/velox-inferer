@@ -548,14 +548,15 @@ impl Server {
             Ok(r) => r,
             Err(e) => return fail(w, e),
         };
-        if req.model != self.cfg.model_id {
+        let model = req.model.as_deref().unwrap_or(&self.cfg.model_id);
+        if model != self.cfg.model_id {
             return fail(
                 w,
                 ApiError {
                     status: 404,
                     kind: "invalid_request_error",
                     code: "model_not_found",
-                    message: format!("model '{}' not found", req.model),
+                    message: format!("model '{model}' not found"),
                 },
             );
         }
@@ -599,7 +600,7 @@ impl Server {
             w,
             200,
             &json!({
-                "model": req.model,
+                "model": model,
                 "answers": answers,
                 // cached_input_tokens is the part of input_tokens served from the prefix cache.
                 "usage": {

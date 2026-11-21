@@ -6,6 +6,7 @@
 //! candidate) on an ordered similarity scale. As in the spec (docs.ollama.com/api/systemone),
 //! `images` are base64 strings shared by every question, answers carry their `type`, and errors
 //! are `{"error": "<message>"}`. Extensions: `rank`, `system`, and `usage.cached_input_tokens`.
+//! llama.cpp's form is accepted too: `images` as base64 data URLs, and `model` left out.
 //!
 //! Prompts, labels and answer formulas follow ninfer, except rank candidate ids, which are
 //! letters here (see `rank_id`).
@@ -87,7 +88,8 @@ pub struct Question {
 
 #[derive(Debug)]
 pub struct Request {
-    pub model: String,
+    /// `None`: the loaded model.
+    pub model: Option<String>,
     pub questions: Vec<Question>,
 }
 
@@ -157,8 +159,20 @@ fn sniff_image_type(base64: &str) -> &'static str {
         .map_or("application/octet-stream", |(_, t)| t)
 }
 
-/// Spec: base64-encoded images shared by every question, in request order; URLs and data URLs
-/// are not accepted. Returned as OpenAI `image_url` parts with data URLs.
+/// Base64 payload and media type of a `data:<type>;base64,<payload>` URL (llama.cpp's form);
+/// `None` when the URL is not base64 image data.
+fn split_data_url(url: &str) -> Option<(&str, &str)> {
+    let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    if !(media_type.is_empty() || media_type.starts_with("image/")) || payload.is_empty() {
+        return None;
+    }
+    Some((media_type, payload))
+}
+
+/// Images shared by every question, in request order: base64 strings (the spec) or base64 data
+/// URLs (llama.cpp's form). Remote URLs are not fetched. Returned as OpenAI `image_url` parts
+/// with data URLs.
 fn parse_images(body: &Value) -> Result<Vec<Value>, ApiError> {
     let images = match body.get("images") {
         None | Some(Value::Null) => return Ok(Vec::new()),
@@ -175,15 +189,26 @@ fn parse_images(body: &Value) -> Result<Vec<Value>, ApiError> {
         .map(|(i, image)| {
             let param = format!("images[{i}]");
             let data = require_text(image, &param)?;
-            if data.starts_with("data:")
-                || data.starts_with("http://")
-                || data.starts_with("https://")
-            {
+            if data.starts_with("http://") || data.starts_with("https://") {
                 return Err(bad_request(format!(
-                    "{param} must be base64-encoded image data; URLs and data URLs are not supported"
+                    "{param} must be base64-encoded image data or a base64 data URL; remote URLs are not supported"
                 )));
             }
-            let url = format!("data:{};base64,{data}", sniff_image_type(&data));
+            let (declared, payload) = if data.starts_with("data:") {
+                split_data_url(&data).ok_or_else(|| {
+                    bad_request(format!(
+                        "{param} must be a base64 image data URL (data:image/<type>;base64,<data>)"
+                    ))
+                })?
+            } else {
+                ("", data.as_str())
+            };
+            let media_type = if declared.is_empty() {
+                sniff_image_type(payload)
+            } else {
+                declared
+            };
+            let url = format!("data:{media_type};base64,{payload}");
             Ok(json!({"type": "image_url", "image_url": {"url": url}}))
         })
         .collect()
@@ -443,11 +468,8 @@ pub fn parse(body: &Value) -> Result<Request, ApiError> {
     if !body.is_object() {
         return Err(bad_request("request body must be a JSON object"));
     }
-    let model = require_text(
-        body.get("model")
-            .ok_or_else(|| bad_request("missing required field: model"))?,
-        "model",
-    )?;
+    // Optional, as in llama.cpp: without it the request goes to the loaded model.
+    let model = optional_text(body, "model", "model")?;
     let images = parse_images(body)?;
     // Accepted for compatibility; the model stays loaded for the life of the server.
     if let Some(k) = body.get("keep_alive") {
@@ -788,7 +810,36 @@ mod tests {
             );
             assert_eq!(parts[2]["type"], "text");
         }
-        for source in ["data:image/png;base64,iVBORw0KGgo=", "https://x/a.png", ""] {
+        // llama.cpp's form: base64 data URLs keep their declared type; an untyped one is sniffed.
+        let mut data_urls = rank_body(json!({"x": "only"}));
+        data_urls["images"] = json!([
+            "data:image/png;base64,iVBORw0KGgoAAAA=",
+            "data:image/jpeg;base64,/9j/4AAQ",
+            "data:;base64,UklGRgAA"
+        ]);
+        let q = &parse(&data_urls).unwrap().questions[0];
+        let urls: Vec<&Value> = q.request["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.get("image_url").map(|u| &u["url"]))
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "data:image/png;base64,iVBORw0KGgoAAAA=",
+                "data:image/jpeg;base64,/9j/4AAQ",
+                "data:image/webp;base64,UklGRgAA"
+            ]
+        );
+        for source in [
+            "https://x/a.png",
+            "http://x/a.png",
+            "data:image/png,iVBORw0KGgo=",
+            "data:text/plain;base64,aGVsbG8=",
+            "data:image/png;base64,",
+            "",
+        ] {
             let mut bad = rank_body(json!({"x": "only"}));
             bad["images"] = json!([source]);
             assert!(!rejection(&bad).is_empty(), "{source}");
