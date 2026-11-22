@@ -67,6 +67,8 @@ mod ffi {
         pub fn velox_cuda_event_record(e: *mut c_void) -> i32;
         pub fn velox_cuda_event_elapsed(a: *mut c_void, b: *mut c_void, ms: *mut f32) -> i32;
         pub fn velox_cuda_event_destroy(e: *mut c_void) -> i32;
+        pub fn velox_cuda_fence_record(e: *mut *mut c_void) -> i32;
+        pub fn velox_cuda_fence_wait(e: *mut c_void) -> i32;
         pub fn velox_cuda_dtod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_synchronize() -> i32;
         pub fn velox_cuda_error_string(code: i32) -> *const c_char;
@@ -267,6 +269,31 @@ impl Drop for CudaChunk {
 // SAFETY: a device pointer is a plain address; synchronisation is CUDA's stream ordering.
 unsafe impl Send for CudaBuffer {}
 unsafe impl Sync for CudaBuffer {}
+
+/// A [`velox_core::backend::QueuePoint`]: a CUDA event (no timing), destroyed with it.
+struct CudaFence(*mut c_void);
+
+// SAFETY: a CUDA event handle may be waited on and destroyed from any thread.
+unsafe impl Send for CudaFence {}
+unsafe impl Sync for CudaFence {}
+
+impl velox_core::backend::QueuePoint for CudaFence {
+    fn wait(&self) -> Result<()> {
+        // SAFETY: the event was created by velox_cuda_fence_record and is destroyed only on drop.
+        status(
+            unsafe { ffi::velox_cuda_fence_wait(self.0) },
+            "cudaEventSynchronize (fence)",
+        )
+    }
+}
+
+impl Drop for CudaFence {
+    fn drop(&mut self) {
+        // SAFETY: created by velox_cuda_fence_record, destroyed exactly once; destroying an event
+        // whose work is still queued is allowed (resources are freed once it completes).
+        unsafe { ffi::velox_cuda_event_destroy(self.0) };
+    }
+}
 
 /// Bytes of device buffers (cudaMalloc) alive and at their peak, and of physical chunks alive:
 /// what the engine's memory log reports, to tell its own growth from the driver's.
@@ -2905,6 +2932,16 @@ impl Backend for CudaBackend {
             unsafe { ffi::velox_cuda_synchronize() },
             "cudaDeviceSynchronize",
         )
+    }
+
+    fn fence(&self) -> Result<Option<velox_core::backend::Fence>> {
+        let mut e: *mut c_void = std::ptr::null_mut();
+        // SAFETY: out-pointer to a live local.
+        status(
+            unsafe { ffi::velox_cuda_fence_record(&mut e) },
+            "cudaEventRecord (fence)",
+        )?;
+        Ok(Some(Arc::new(CudaFence(e))))
     }
 
     fn bind_thread(&self) -> Result<()> {
