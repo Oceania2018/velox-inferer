@@ -17,6 +17,16 @@ use crate::state::StateFormat;
 /// MiB), so a background thread can prepare it while the device works.
 pub type HostAlloc<T> = std::sync::Arc<dyn Fn(usize) -> Result<T> + Send + Sync>;
 
+/// A point in a backend's work queue ([`Backend::fence`]): once it is reached, all work queued
+/// before it has run. Waiting on one waits for that work only, not for work queued after it.
+pub trait QueuePoint: Send + Sync {
+    /// Blocks until the point is reached.
+    fn wait(&self) -> Result<()>;
+}
+
+/// A shared [`QueuePoint`]: one recording can guard several pieces of storage.
+pub type Fence = std::sync::Arc<dyn QueuePoint>;
+
 /// Pinned system RAM of this process ([`Backend::host_pinned`]), in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostPinned {
@@ -916,6 +926,12 @@ pub trait Backend {
     fn upload_bytes(&self, data: &[u8]) -> Result<Self::Buffer>;
     /// Waits for all queued work; timing and downloads rely on it.
     fn synchronize(&self) -> Result<()>;
+    /// Records a [`Fence`] after the work queued so far, so a caller can later wait for that work
+    /// alone instead of [`Self::synchronize`]-ing behind everything queued since. `None` when the
+    /// backend has no such points: callers then synchronize.
+    fn fence(&self) -> Result<Option<Fence>> {
+        Ok(None)
+    }
     /// Makes this backend's device current on the calling thread. Servers call it before using
     /// a backend from a thread other than the one that created it (CUDA devices are per-thread).
     fn bind_thread(&self) -> Result<()> {

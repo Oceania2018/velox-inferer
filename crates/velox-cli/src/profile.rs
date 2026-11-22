@@ -141,6 +141,9 @@ impl<B: Backend> Backend for Profiled<B> {
     fn synchronize(&self) -> Result<()> {
         self.inner.synchronize()
     }
+    fn fence(&self) -> Result<Option<velox_core::backend::Fence>> {
+        self.inner.fence()
+    }
     fn bind_thread(&self) -> Result<()> {
         self.inner.bind_thread()
     }
