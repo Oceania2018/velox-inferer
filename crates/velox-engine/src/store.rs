@@ -297,25 +297,12 @@ impl<B: Backend> ContextStore<B> {
         Ok(())
     }
 
-    /// Waits until no queued device work uses storage of `e` that is about to leave the store:
-    /// its state and drafter context, and the KV segments no other entry shares.
-    fn settle(&mut self, b: &B, e: &Entry<B>, synced: &mut bool) -> Result<(), CoreError> {
-        if self.unfenced {
-            if !*synced {
-                b.synchronize()?;
-                *synced = true;
-            }
-            return Ok(());
-        }
-        if let Some(f) = &e.fence {
-            f.wait()?;
-        }
-        for s in &e.kv {
-            if Arc::strong_count(s) == 1 {
-                if let Some(f) = self.seg_fences.remove(&(Arc::as_ptr(s) as usize)) {
-                    f.wait()?;
-                }
-            }
+    /// Before an eviction frees storage on a backend without fences: synchronizes the device
+    /// once per eviction. With fences, [`Self::release`] waits for the work using what it frees.
+    fn settle(&mut self, b: &B, synced: &mut bool) -> Result<(), CoreError> {
+        if self.unfenced && !*synced {
+            b.synchronize()?;
+            *synced = true;
         }
         Ok(())
     }
@@ -338,7 +325,9 @@ impl<B: Backend> ContextStore<B> {
         for id in disk.completed() {
             if let Some(i) = self.inflight.iter().position(|(r, _)| *r == id) {
                 let (_, e) = self.inflight.swap_remove(i);
-                self.release(e);
+                if let Err(err) = self.release(e) {
+                    eprintln!("context store: {err}");
+                }
             } else if let Some(e) = self.entries.iter_mut().find(|e| e.writing == Some(id)) {
                 e.writing = None;
             }
@@ -387,10 +376,21 @@ impl<B: Backend> ContextStore<B> {
     }
 
     /// Frees an entry no longer resident, or parks it until its disk copy is written.
-    fn retire(&mut self, e: Entry<B>) {
+    fn retire(&mut self, e: Entry<B>) -> Result<(), CoreError> {
         match e.writing {
-            Some(id) => self.inflight.push((id, e)),
+            Some(id) => {
+                self.inflight.push((id, e));
+                Ok(())
+            }
             None => self.release(e),
+        }
+    }
+
+    /// [`Self::retire`] on a path that cannot return an error (a failed fence wait means the
+    /// device already failed; the next device call reports it).
+    fn retire_logged(&mut self, e: Entry<B>) {
+        if let Err(err) = self.retire(e) {
+            eprintln!("context store: {err}");
         }
     }
 
@@ -746,7 +746,7 @@ impl<B: Backend> ContextStore<B> {
             for i in dead.into_iter().rev() {
                 let e = self.entries.swap_remove(i);
                 self.held.set(None);
-                self.retire(e);
+                self.retire_logged(e);
             }
         }
         let (lambda, now) = (self.lambda, self.now);
@@ -813,7 +813,7 @@ impl<B: Backend> ContextStore<B> {
         for i in old.into_iter().rev() {
             let e = self.entries.swap_remove(i);
             self.held.set(None);
-            self.retire(e);
+            self.retire_logged(e);
         }
     }
 
@@ -1128,12 +1128,12 @@ impl<B: Backend> ContextStore<B> {
             let Some(i) = victim else { break };
             let e = self.entries.swap_remove(i);
             self.held.set(None);
-            // Pending copies may still read the storage about to be freed: wait for the ones that
-            // use this entry's storage, not for everything queued (a whole-device synchronize
-            // waited out other lanes' prefill, up to 140 ms on the request path).
-            self.settle(b, &e, &mut synced)?;
+            // Pending copies may still read the storage about to be freed: `release` waits for the
+            // ones that use this entry's storage, not for everything queued (a whole-device
+            // synchronize waited out other lanes' prefill, up to 140 ms on the request path).
+            self.settle(b, &mut synced)?;
             t.sync += lap(&mut mark);
-            self.retire(e);
+            self.retire(e)?;
             t.retire += lap(&mut mark);
             t.victims += 1;
         }
@@ -1175,21 +1175,33 @@ impl<B: Backend> ContextStore<B> {
         pools.iter().zip(&drop).map(|((_, n, _), d)| n * d).sum()
     }
 
-    /// Returns an entry's storage to the pools (KV pages once no other entry shares them).
-    fn release(&mut self, e: Entry<B>) {
+    /// Returns an entry's storage to the pools (KV pages once no other entry shares them), after
+    /// the queued device work using it: pooled storage may next be written by the CPU
+    /// ([`Self::promote`] reads disk records into it) or freed, and only device reuse is ordered
+    /// by the stream. The fences are long reached in the usual case, so the waits cost nothing.
+    fn release(&mut self, e: Entry<B>) -> Result<(), CoreError> {
+        if let Some(f) = &e.fence {
+            f.wait()?;
+        }
+        for s in &e.kv {
+            if Arc::strong_count(s) == 1 {
+                if let Some(f) = self.seg_fences.remove(&(Arc::as_ptr(s) as usize)) {
+                    f.wait()?;
+                }
+            }
+        }
         if self.spare.len() < MAX_SPARE {
             self.spare.push(e.state);
         }
         for seg in e.kv {
-            let at = Arc::as_ptr(&seg) as usize;
             if let Ok(seg) = Arc::try_unwrap(seg) {
-                self.seg_fences.remove(&at);
                 self.pages.extend(seg.into_pages());
             }
         }
         if let Some(d) = e.draft {
             self.draft_pages.extend(d.into_pages());
         }
+        Ok(())
     }
 
     /// Summary for debug logs: `pos:demand` per entry, `*` for roots, `~` for superseded.
