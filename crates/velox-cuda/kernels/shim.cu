@@ -360,6 +360,21 @@ VELOX_API int velox_cuda_event_elapsed(void* start, void* end, float* ms) {
 }
 VELOX_API int velox_cuda_event_destroy(void* e) { return static_cast<int>(cudaEventDestroy(static_cast<cudaEvent_t>(e))); }
 
+// Fences (Backend::fence): an event without timing recorded on the legacy default stream, which
+// orders after all prior work of every blocking stream (the default stream and
+// cudaStreamPerThread, which is all this library queues on).
+VELOX_API int velox_cuda_fence_record(void** e) {
+    cudaEvent_t ev = nullptr;
+    if (cudaError_t err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming)) return static_cast<int>(err);
+    if (cudaError_t err = cudaEventRecord(ev, cudaStreamLegacy)) {
+        cudaEventDestroy(ev);
+        return static_cast<int>(err);
+    }
+    *e = ev;
+    return 0;
+}
+VELOX_API int velox_cuda_fence_wait(void* e) { return static_cast<int>(cudaEventSynchronize(static_cast<cudaEvent_t>(e))); }
+
 // CUDA graphs over the (per-thread) default stream, one per slot. A step is captured (again
 // whenever the caller cannot promise an identical recording), patched into the slot's executable
 // graph (cudaGraphExecUpdate) or instantiated, and launched as one submission. A static step is

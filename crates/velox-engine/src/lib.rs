@@ -3064,7 +3064,10 @@ impl<B: Backend> Core<B> {
                         None => d.forget(dm, shared),
                     }
                 }
-                return Ok((e.pos(), Some(e.id)));
+                let (pos, id) = (e.pos(), e.id);
+                // The copies just queued read the entry: evicting it waits for them.
+                store.restored_from(&self.b, id)?;
+                return Ok((pos, Some(id)));
             }
         }
         if live {
