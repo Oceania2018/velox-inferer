@@ -58,7 +58,7 @@ enum Src<'a, B: Backend> {
     Own(Checkpoint<B>),
 }
 
-use velox_core::backend::HostAlloc;
+use velox_core::backend::{Fence, HostAlloc};
 use velox_core::{Backend, Error as CoreError, StateFormat};
 use velox_models::qwen3_5::{
     Checkpoint, DFlashModel, DFlashState, DraftContext, KvSegment, Session, KV_PAGE_ROWS,
@@ -76,6 +76,9 @@ pub(crate) struct Entry<B: Backend> {
     pub kv: Vec<Arc<KvSegment<B>>>,
     /// The DFlash drafter's context rows ending at `pos`, when it had them.
     pub draft: Option<DraftContext<B>>,
+    /// After the last queued device work that wrote or read `state` / `draft` (the copies that
+    /// stored it, the latest restore from it); `None` when no device work touched them.
+    fence: Option<Fence>,
     root: bool,
     /// A prompt's end: the history point its request published (see `ContextStore::mark_tail`).
     tail: Option<usize>,
@@ -170,6 +173,13 @@ pub(crate) struct ContextStore<B: Backend> {
     format: StateFormat,
     /// [`Self::bytes`] while `entries` is unchanged (cleared at every change).
     held: Cell<Option<usize>>,
+    /// Per KV segment (by address), after the last queued device work that wrote or read it: a
+    /// segment outlives the entry that stored it when later entries share it, so its fence is
+    /// kept here rather than on an entry. Removed when the segment is released.
+    seg_fences: HashMap<usize, Fence>,
+    /// The backend gave no fences (see [`velox_core::Backend::fence`]): evictions synchronize the
+    /// device before freeing storage instead.
+    unfenced: bool,
 }
 
 /// Evicted state storage kept for reuse.
@@ -259,7 +269,55 @@ impl<B: Backend> ContextStore<B> {
             next_id: 1,
             format,
             held: Cell::new(None),
+            seg_fences: HashMap::new(),
+            unfenced: false,
         }
+    }
+
+    /// Records a fence after the device work queued so far (see [`Self::seg_fences`]).
+    fn stamp(&mut self, b: &B) -> Result<Option<Fence>, CoreError> {
+        let f = b.fence()?;
+        self.unfenced |= f.is_none();
+        Ok(f)
+    }
+
+    /// The device work just queued read entry `id` (a lane restored from it): freeing its storage
+    /// must wait for that work, and only for that work (see [`Self::evict`]).
+    pub fn restored_from(&mut self, b: &B, id: u64) -> Result<(), CoreError> {
+        let Some(f) = self.stamp(b)? else {
+            return Ok(());
+        };
+        let Some(e) = self.entries.iter_mut().find(|e| e.id == id) else {
+            return Ok(());
+        };
+        for s in &e.kv {
+            self.seg_fences.insert(Arc::as_ptr(s) as usize, f.clone());
+        }
+        e.fence = Some(f);
+        Ok(())
+    }
+
+    /// Waits until no queued device work uses storage of `e` that is about to leave the store:
+    /// its state and drafter context, and the KV segments no other entry shares.
+    fn settle(&mut self, b: &B, e: &Entry<B>, synced: &mut bool) -> Result<(), CoreError> {
+        if self.unfenced {
+            if !*synced {
+                b.synchronize()?;
+                *synced = true;
+            }
+            return Ok(());
+        }
+        if let Some(f) = &e.fence {
+            f.wait()?;
+        }
+        for s in &e.kv {
+            if Arc::strong_count(s) == 1 {
+                if let Some(f) = self.seg_fences.remove(&(Arc::as_ptr(s) as usize)) {
+                    f.wait()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn enabled(&self) -> bool {
@@ -437,6 +495,8 @@ impl<B: Backend> ContextStore<B> {
             state,
             kv: pages,
             draft,
+            // Read from disk by the CPU: no device work touched it yet.
+            fence: None,
             root,
             tail: None,
             adopted: 0,
@@ -842,6 +902,8 @@ impl<B: Backend> ContextStore<B> {
         let (mut fresh, mut pinned) = (0usize, 0usize);
         let hashes = page_hashes(keys);
         let mut kv = Vec::with_capacity(pos.div_ceil(KV_PAGE_ROWS));
+        // Segments this insert writes (the others are shared, written before).
+        let mut written = Vec::new();
         let (pool, page_len) = (&mut self.pages, session.kv_page_len());
         let mut page = || {
             fresh += 1;
@@ -867,6 +929,7 @@ impl<B: Backend> ContextStore<B> {
             if let Some(&h) = full {
                 self.shared.insert(h, Arc::downgrade(&seg));
             }
+            written.push(Arc::as_ptr(&seg) as usize);
             kv.push(seg);
         }
         let t_kv = t0.elapsed();
@@ -908,6 +971,13 @@ impl<B: Backend> ContextStore<B> {
             }
         };
         let t_state = t0.elapsed();
+        // After the copies above (and the prefill that wrote a taken snapshot).
+        let fence = self.stamp(b)?;
+        if let Some(f) = &fence {
+            for p in written {
+                self.seg_fences.insert(p, f.clone());
+            }
+        }
         let id = self.next_id;
         self.next_id += 1;
         let mut e = Entry {
@@ -916,6 +986,7 @@ impl<B: Backend> ContextStore<B> {
             state,
             kv,
             draft,
+            fence,
             root,
             tail: None,
             adopted: 0,
@@ -1055,14 +1126,13 @@ impl<B: Backend> ContextStore<B> {
                 .map(|(i, _)| i);
             t.select += lap(&mut mark);
             let Some(i) = victim else { break };
-            if !synced {
-                // Pending copies may still read the storage about to be freed.
-                b.synchronize()?;
-                synced = true;
-                t.sync += lap(&mut mark);
-            }
             let e = self.entries.swap_remove(i);
             self.held.set(None);
+            // Pending copies may still read the storage about to be freed: wait for the ones that
+            // use this entry's storage, not for everything queued (a whole-device synchronize
+            // waited out other lanes' prefill, up to 140 ms on the request path).
+            self.settle(b, &e, &mut synced)?;
+            t.sync += lap(&mut mark);
             self.retire(e);
             t.retire += lap(&mut mark);
             t.victims += 1;
@@ -1111,7 +1181,9 @@ impl<B: Backend> ContextStore<B> {
             self.spare.push(e.state);
         }
         for seg in e.kv {
+            let at = Arc::as_ptr(&seg) as usize;
             if let Ok(seg) = Arc::try_unwrap(seg) {
+                self.seg_fences.remove(&at);
                 self.pages.extend(seg.into_pages());
             }
         }
