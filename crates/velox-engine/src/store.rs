@@ -32,6 +32,24 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
+
+/// Where [`ContextStore::evict`] spent its time (ms), for the `[evict]` debug line: `sync` is the
+/// device synchronize before the first victim, `count` the byte recounts (`recounts` of them),
+/// `trim` and `retire` include freeing storage (pinned memory outside the arena is unpinned).
+#[derive(Default)]
+struct EvictTimes {
+    victims: usize,
+    recounts: usize,
+    trims: usize,
+    sync: f64,
+    count: f64,
+    pool: f64,
+    trim: f64,
+    select: f64,
+    retire: f64,
+    retain: f64,
+}
 
 /// The state a new entry stores: copied, or owned (taken over when it already lives in system
 /// RAM, copied and handed back when it is on the device).
@@ -923,7 +941,7 @@ impl<B: Backend> ContextStore<B> {
         }
         self.held.set(None);
         self.entries.push(e);
-        self.evict(b, id)?;
+        let ev = self.evict(b, id)?;
         if debug {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
@@ -933,6 +951,20 @@ impl<B: Backend> ContextStore<B> {
                 ms(t_state - t_draft),
                 self.format,
                 ms(t0.elapsed() - t_state)
+            );
+            eprintln!(
+                "[evict] entries {} victims {} recounts {} trims {}: sync {:.2} count {:.2} pool {:.2} trim {:.2} select {:.2} retire {:.2} retain {:.2} ms",
+                self.entries.len(),
+                ev.victims,
+                ev.recounts,
+                ev.trims,
+                ev.sync,
+                ev.count,
+                ev.pool,
+                ev.trim,
+                ev.select,
+                ev.retire,
+                ev.retain
             );
         }
         Ok(id)
@@ -977,18 +1009,38 @@ impl<B: Backend> ContextStore<B> {
     /// of evicted long prompts kept while short prompts' states needed new memory: 9 GiB over a
     /// 24 GiB budget after a day on an RTX 5090). Pool storage beyond its reserve goes first, then
     /// entries, whose storage joins the pools and is trimmed in turn.
-    fn evict(&mut self, b: &B, keep: u64) -> Result<(), CoreError> {
+    fn evict(&mut self, b: &B, keep: u64) -> Result<EvictTimes, CoreError> {
         let mut synced = false;
         let mut pinned: Option<HashSet<u64>> = None;
+        let mut t = EvictTimes::default();
+        let lap = |since: &mut Instant| {
+            let now = Instant::now();
+            let ms = (now - *since).as_secs_f64() * 1e3;
+            *since = now;
+            ms
+        };
+        let mut mark = Instant::now();
         loop {
-            let held = self.bytes(b) + self.pool_bytes(b);
+            if self.held.get().is_none() {
+                t.recounts += 1;
+            }
+            let held = self.bytes(b);
+            t.count += lap(&mut mark);
+            let held = held + self.pool_bytes(b);
+            t.pool += lap(&mut mark);
             if held <= self.budget {
                 break;
             }
-            if self.trim_pools(b, held - self.budget) > 0 {
+            let trimmed = self.trim_pools(b, held - self.budget);
+            t.trim += lap(&mut mark);
+            if trimmed > 0 {
+                t.trims += 1;
                 continue;
             }
-            let pinned = pinned.get_or_insert_with(|| self.pinned());
+            if pinned.is_none() {
+                pinned = Some(self.pinned());
+            }
+            let pinned = pinned.as_ref().unwrap();
             let victim = self
                 .entries
                 .iter()
@@ -1001,18 +1053,23 @@ impl<B: Backend> ContextStore<B> {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(i, _)| i);
+            t.select += lap(&mut mark);
             let Some(i) = victim else { break };
             if !synced {
                 // Pending copies may still read the storage about to be freed.
                 b.synchronize()?;
                 synced = true;
+                t.sync += lap(&mut mark);
             }
             let e = self.entries.swap_remove(i);
             self.held.set(None);
             self.retire(e);
+            t.retire += lap(&mut mark);
+            t.victims += 1;
         }
         self.shared.retain(|_, w| w.strong_count() > 0);
-        Ok(())
+        t.retain += lap(&mut mark);
+        Ok(t)
     }
 
     /// Bytes of reusable storage in the pools: spare states, KV pages and drafter pages.
