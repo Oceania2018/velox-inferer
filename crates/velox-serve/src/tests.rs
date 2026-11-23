@@ -22,6 +22,7 @@ impl ChatEngine for Scripted {
             prompt_ms: 20.0,
             predicted_ms: 50.0,
             first_token: None,
+            slot: None,
         })
     }
 }
@@ -49,6 +50,7 @@ impl ChatEngine for Thinking {
             prompt_ms: 1.0,
             predicted_ms: 1.0,
             first_token: None,
+            slot: None,
         })
     }
 }
@@ -399,5 +401,178 @@ fn errors_follow_openai_shape() {
     assert!(
         metrics.contains("velox_request_errors_total 4"),
         "{metrics}"
+    );
+}
+
+/// An engine with reserved slots: lane 2 for token "a" (renewed when it asks again), 409 for
+/// "full", and "a" is the only active token; chat requests report the lane they held.
+struct Slotted;
+
+impl ChatEngine for Slotted {
+    fn architecture(&self) -> &str {
+        "Slotted"
+    }
+
+    fn generate(&self, req: &Value, _: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
+        let held = req.get("slot_token").and_then(Value::as_str) == Some("a");
+        Ok(Outcome {
+            finish_reason: "stop".into(),
+            prompt_tokens: 1,
+            cached_tokens: 0,
+            completion_tokens: 1,
+            queue_ms: 0.0,
+            prompt_ms: 1.0,
+            predicted_ms: 1.0,
+            first_token: None,
+            slot: held.then_some(2),
+        })
+    }
+
+    fn slot_reserve(&self, token: &str, d: Duration, w: Duration) -> Result<SlotGrant, SlotError> {
+        if w.is_zero() {
+            // A request whose token holds nothing reserves again without waiting (here: full).
+            return Err(SlotError::NoSlot("held".into()));
+        }
+        assert_eq!(w, Duration::from_secs(30), "default wait");
+        match token {
+            "full" => Err(SlotError::NoSlot("held".into())),
+            _ => Ok(SlotGrant {
+                token: token.into(),
+                lane: 2,
+                expires_at_ms: 1_000 + d.as_millis() as u64,
+                idle_timeout_s: d.as_secs_f64(),
+                renewed: token == "a",
+                waited_ms: 0,
+            }),
+        }
+    }
+
+    fn slot_release(&self, token: &str) -> Result<bool, SlotError> {
+        Ok(token == "a")
+    }
+
+    fn slot_status(&self) -> Option<SlotStatus> {
+        Some(SlotStatus {
+            lanes: 4,
+            max_holds: 2,
+            holds: vec![SlotHold {
+                token: "a".into(),
+                lane: 2,
+                expires_at_ms: 5_000,
+                busy: false,
+            }],
+        })
+    }
+
+    fn slot_active(&self, token: &str) -> bool {
+        token == "a"
+    }
+
+    fn load(&self) -> Option<EngineLoad> {
+        Some(EngineLoad {
+            slot_holds: 1,
+            queue_depth: 3,
+            lanes_busy: 2,
+        })
+    }
+}
+
+#[test]
+fn slot_endpoints_follow_the_contract() {
+    let port = start(Box::new(Slotted));
+    let (status, body) = http(
+        port,
+        "POST",
+        "/v1/slots/reserve",
+        r#"{"token":"a"}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v,
+        json!({"token": "a", "lane": 2, "expires_at_ms": 61_000, "idle_timeout_s": 60.0, "renewed": true, "waited_ms": 0})
+    );
+    // An older client's duration_s is ignored: the idle timeout is the server's.
+    let (status, body) = http(port, "POST", "/v1/slots/reserve", r#"{"token":"a","duration_s":5}"#);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["idle_timeout_s"], 60.0);
+    // A generated token when none is given.
+    let (status, body) = http(port, "POST", "/v1/slots/reserve", "{}");
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["token"].as_str().unwrap().starts_with("slot_"));
+    let (status, body) = http(
+        port,
+        "POST",
+        "/v1/slots/reserve",
+        r#"{"token":"full"}"#,
+    );
+    assert_eq!(status, 409);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["code"],
+        "no_slot"
+    );
+    for bad in [
+        r#"{"token":"a b"}"#,
+        r#"{"wait_timeout_s":121}"#,
+        "nope",
+    ] {
+        assert_eq!(http(port, "POST", "/v1/slots/reserve", bad).0, 400, "{bad}");
+    }
+    assert_eq!(
+        http(port, "POST", "/v1/slots/release", r#"{"token":"a"}"#).0,
+        200
+    );
+    let (status, body) = http(port, "POST", "/v1/slots/release", r#"{"token":"b"}"#);
+    assert_eq!(status, 404);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["code"],
+        "unknown_token"
+    );
+    let (status, body) = http(port, "GET", "/v1/slots", "");
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"lanes": 4, "max_holds": 2, "holds": [{"token": "a", "lane": 2, "expires_at_ms": 5000, "busy": false}]})
+    );
+    let (_, metrics) = http(port, "GET", "/metrics", "");
+    assert!(metrics.contains("velox_slot_holds 1"));
+    assert!(metrics.contains("velox_queue_depth 3"));
+    assert!(metrics.contains("velox_lanes_busy 2"));
+}
+
+#[test]
+fn chat_timings_report_the_slot() {
+    let port = start(Box::new(Slotted));
+    let held = r#"{"model":"m","messages":[{"role":"user","content":"x"}],"slot_token":"a"}"#;
+    let (_, body) = http(port, "POST", "/v1/chat/completions", held);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["timings"]["slot"], json!({"held": true, "lane": 2}));
+    // An unknown token is not an error: not reserved again (all held), it runs unreserved.
+    let other = r#"{"model":"m","messages":[{"role":"user","content":"x"}],"slot_token":"zz","stream":true}"#;
+    let (status, body) = http(port, "POST", "/v1/chat/completions", other);
+    assert_eq!(status, 200);
+    let last = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str::<Value>(d).unwrap())
+        .find(|c| c.get("timings").is_some())
+        .unwrap();
+    assert_eq!(
+        last["timings"]["slot"],
+        json!({"held": false, "lane": null})
+    );
+}
+
+#[test]
+fn engines_without_slots_answer_501() {
+    let port = start(Box::new(Scripted));
+    assert_eq!(http(port, "GET", "/v1/slots", "").0, 501);
+    let (status, body) = http(port, "POST", "/v1/slots/reserve", "{}");
+    assert_eq!(status, 501);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["code"],
+        "slots_unsupported"
     );
 }

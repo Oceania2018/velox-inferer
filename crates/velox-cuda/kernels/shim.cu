@@ -220,6 +220,49 @@ VELOX_API int velox_cuda_malloc_zeroed(void** ptr, size_t bytes) {
 
 VELOX_API int velox_cuda_free(void* ptr) { return static_cast<int>(cudaFree(ptr)); }
 
+// Stream-ordered pool for small, short-lived device buffers (per-request inputs, vision outputs,
+// tables). Under WDDM/WSL with the device nearly full, cudaMalloc/cudaFree block the engine thread
+// for up to seconds (measured: a 12 ms image encode taking 0.3-2 s, all in allocation) while the
+// GPU idles; the pool reuses freed memory in stream order instead. Every kernel and copy runs on
+// the default stream, so a block freed with cudaFreeAsync is only reused by work queued after its
+// last user. VELOX_POOL_ALLOC_MAX_MIB (default 256; 0 = off) caps the size served from the pool,
+// VELOX_POOL_KEEP_MIB (default 1024) how much freed memory the pool keeps instead of returning it.
+static size_t velox_pool_max_bytes() {
+    static const size_t max_bytes = [] {
+        const char* e = std::getenv("VELOX_POOL_ALLOC_MAX_MIB");
+        long mib = e ? std::atol(e) : 256;
+        if (mib <= 0) return size_t(0);
+        int dev = 0;
+        cudaMemPool_t pool;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return size_t(0);
+        }
+        const char* k = std::getenv("VELOX_POOL_KEEP_MIB");
+        unsigned long long keep = static_cast<unsigned long long>(k ? std::atol(k) : 1024) << 20;
+        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+        return static_cast<size_t>(mib) << 20;
+    }();
+    return max_bytes;
+}
+
+// Zeroed device memory, from the stream-ordered pool when small enough (`*from_pool` = 1), else
+// from cudaMalloc. Free pool blocks with velox_cuda_free_pooled.
+VELOX_API int velox_cuda_malloc_pooled(void** ptr, size_t bytes, int* from_pool) {
+    *from_pool = 0;
+    size_t max_bytes = velox_pool_max_bytes();
+    if (max_bytes && bytes <= max_bytes) {
+        if (cudaMallocAsync(ptr, bytes, 0) == cudaSuccess) {
+            *from_pool = 1;
+            return static_cast<int>(cudaMemsetAsync(*ptr, 0, bytes, 0));
+        }
+        cudaGetLastError(); // fall back to cudaMalloc
+    }
+    return velox_cuda_malloc_zeroed(ptr, bytes);
+}
+
+VELOX_API int velox_cuda_free_pooled(void* ptr) { return static_cast<int>(cudaFreeAsync(ptr, 0)); }
+
 VELOX_API int velox_cuda_htod(void* dst, const void* src, size_t bytes) {
     return static_cast<int>(cudaMemcpy(dst, src, bytes, cudaMemcpyDefault));
 }
