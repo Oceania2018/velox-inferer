@@ -79,6 +79,65 @@ pub struct Outcome {
     /// When the first token was sampled. Engines that emit their output only once it is complete
     /// must set it; without it the first emitted delta stands in.
     pub first_token: Option<Instant>,
+    /// The lane the request ran on as its token's reserved slot (`slot_token`), if it did.
+    pub slot: Option<usize>,
+}
+
+/// A granted (or renewed) slot reservation (`POST /v1/slots/reserve`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotGrant {
+    pub token: String,
+    pub lane: usize,
+    /// Unix milliseconds.
+    pub expires_at_ms: u64,
+    /// How long the hold outlives the token's last use (see [`SLOT_IDLE_S`]).
+    pub idle_timeout_s: f64,
+    /// The token already held the lane: its expiry was moved, nothing was waited for.
+    pub renewed: bool,
+    pub waited_ms: u64,
+}
+
+/// One held lane (`GET /v1/slots`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotHold {
+    pub token: String,
+    pub lane: usize,
+    pub expires_at_ms: u64,
+    /// A request runs on the lane (an outsider's still finishing, or the holder's own).
+    pub busy: bool,
+}
+
+/// The engine's reservations (`GET /v1/slots`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SlotStatus {
+    pub lanes: usize,
+    pub max_holds: usize,
+    pub holds: Vec<SlotHold>,
+}
+
+/// Why a reservation was not granted.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SlotError {
+    /// Every reservable lane is held by other tokens (409 `no_slot`).
+    NoSlot(String),
+    /// The chosen lane's in-flight work did not finish within `wait_timeout_s` (504).
+    WaitTimeout(String),
+    /// The hold was released while the call waited for it (409 `released`).
+    Released,
+    /// The engine has no reserved slots (501 `slots_unsupported`).
+    Unsupported,
+    /// The engine could not answer (503).
+    Failed(String),
+}
+
+/// Load figures `GET /metrics` reports as `velox_slot_holds`, `velox_queue_depth` and
+/// `velox_lanes_busy`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EngineLoad {
+    pub slot_holds: u64,
+    /// Requests handed to the engine and not yet admitted to a lane.
+    pub queue_depth: u64,
+    pub lanes_busy: u64,
 }
 
 /// Result of a scoring request ([`ChatEngine::score`]).
@@ -104,6 +163,8 @@ pub struct ScoreQuery<'a> {
     pub request: &'a Value,
     pub candidates: &'a [String],
     pub branches: &'a [String],
+    /// The request's `slot_token` (see [`ChatEngine::slot_reserve`]).
+    pub slot_token: Option<&'a str>,
 }
 
 pub trait ChatEngine: Send + Sync {
@@ -134,6 +195,34 @@ pub trait ChatEngine: Send + Sync {
     /// images), which an engine can feed once.
     fn score(&self, _queries: &[ScoreQuery<'_>]) -> Result<Vec<ScoreOutcome>, ApiError> {
         Err(ApiError::not_implemented("this engine does not score"))
+    }
+    /// Reserves a lane for `token` until it is idle for `duration` (or renews the token's hold),
+    /// waiting at most `wait` for the lane's in-flight work. Requests carrying the token
+    /// (`slot_token`) then run on that lane ahead of every queue until the hold lapses or is
+    /// released.
+    fn slot_reserve(
+        &self,
+        _token: &str,
+        _duration: Duration,
+        _wait: Duration,
+    ) -> Result<SlotGrant, SlotError> {
+        Err(SlotError::Unsupported)
+    }
+    /// Releases `token`'s hold: false when it holds nothing (unknown or expired).
+    fn slot_release(&self, _token: &str) -> Result<bool, SlotError> {
+        Err(SlotError::Unsupported)
+    }
+    /// The current holds, when the engine has reserved slots.
+    fn slot_status(&self) -> Option<SlotStatus> {
+        None
+    }
+    /// Whether `token` holds a lane now: its requests skip the server's lane semaphore.
+    fn slot_active(&self, _token: &str) -> bool {
+        false
+    }
+    /// Queue and lane figures for `GET /metrics`, when the engine tracks them.
+    fn load(&self) -> Option<EngineLoad> {
+        None
     }
 }
 
@@ -166,21 +255,70 @@ pub struct Config {
     pub info: Vec<(String, String)>,
 }
 
-/// Counting semaphore bounding concurrent generations to the engine's lanes.
+/// Counting semaphore bounding concurrent generations to the engine's lanes. Requests on a
+/// reserved slot (a valid `slot_token`) do not take a permit: outsiders queued here must not
+/// delay them, and the engine admits them to their held lane ahead of its own queue.
 struct Lanes {
     free: Mutex<u32>,
     cv: Condvar,
+    /// Requests waiting here for a permit (part of `velox_queue_depth`).
+    waiting: AtomicU64,
 }
 
 impl Lanes {
     fn acquire(&self) -> LaneGuard<'_> {
         let mut free = self.free.lock().unwrap();
-        while *free == 0 {
-            free = self.cv.wait(free).unwrap();
+        if *free == 0 {
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            while *free == 0 {
+                free = self.cv.wait(free).unwrap();
+            }
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
         }
         *free -= 1;
         LaneGuard(self)
     }
+}
+
+/// A hold has no fixed length: it lasts while its token is in use and lapses this long after
+/// the last use (a reserve call with the token, or a request of the token running on the lane).
+/// A client that goes away without releasing frees the lane after this idle time.
+pub const SLOT_IDLE_S: f64 = 60.0;
+/// Default and longest wait for the chosen lane's in-flight work.
+pub const SLOT_DEFAULT_WAIT_S: f64 = 30.0;
+pub const SLOT_MAX_WAIT_S: f64 = 120.0;
+
+/// A slot token: 1-128 characters of `[A-Za-z0-9_.:-]`.
+fn valid_slot_token(t: &str) -> bool {
+    (1..=128).contains(&t.len())
+        && t.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-'))
+}
+
+/// A fresh slot token for a reserve call without one. Unguessable enough for a token that only
+/// grants scheduling priority on one node (std's randomly keyed SipHash over time and a counter);
+/// the hub passes its own reservation ids.
+fn new_slot_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let half = |salt: u64| {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u128(nanos);
+        h.write_u64(n);
+        h.write_u64(salt);
+        h.finish()
+    };
+    format!("slot_{:016x}{:016x}", half(1), half(2))
+}
+
+/// The JSON error of a slot endpoint: `{"error": {"code", "message"}}`.
+fn slot_error(code: &str, message: impl Into<String>) -> Value {
+    json!({"error": {"code": code, "message": message.into()}})
 }
 
 /// Histogram bucket bounds (seconds), ninfer's, so one query reads both engines.
@@ -323,7 +461,10 @@ fn respond(w: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> s
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         501 => "Not Implemented",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Error",
     };
     write!(w, "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
@@ -347,6 +488,7 @@ impl Server {
         let lanes = Lanes {
             free: Mutex::new(cfg.max_concurrency.max(1)),
             cv: Condvar::new(),
+            waiting: AtomicU64::new(0),
         };
         Arc::new(Server {
             cfg,
@@ -428,6 +570,34 @@ impl Server {
                 self.engine.idle();
                 r
             }
+            ("POST", "/v1/slots/reserve") => self.slot_reserve(w, &req.body),
+            ("POST", "/v1/slots/release") => self.slot_release(w, &req.body),
+            ("GET", "/v1/slots") => match self.engine.slot_status() {
+                Some(st) => respond_json(
+                    w,
+                    200,
+                    &json!({
+                        "lanes": st.lanes,
+                        "max_holds": st.max_holds,
+                        "holds": st.holds.iter().map(|h| json!({
+                            "token": h.token,
+                            "lane": h.lane,
+                            "expires_at_ms": h.expires_at_ms,
+                            "busy": h.busy,
+                        })).collect::<Vec<_>>(),
+                    }),
+                ),
+                None => respond_json(
+                    w,
+                    501,
+                    &slot_error("slots_unsupported", "this engine has no reserved slots"),
+                ),
+            },
+            (_, "/v1/slots" | "/v1/slots/reserve" | "/v1/slots/release") => respond_json(
+                w,
+                405,
+                &slot_error("method_not_allowed", "method not allowed"),
+            ),
             (_, "/health" | "/v1/models" | "/metrics" | "/v1/chat/completions") => {
                 respond_json(w, 405, &ApiError::invalid("method not allowed").body())
             }
@@ -491,8 +661,140 @@ impl Server {
             "Request receipt through generation settlement, including client cancellation",
         );
         drop(l);
+        {
+            use std::fmt::Write as _;
+            let load = self.engine.load().unwrap_or_default();
+            let mut gauge = |name: &str, help: &str, v: u64| {
+                let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
+            };
+            gauge(
+                "velox_slot_holds",
+                "Lanes held by slot reservations",
+                load.slot_holds,
+            );
+            gauge(
+                "velox_queue_depth",
+                "Requests waiting for a lane (for a server permit or engine admission)",
+                load.queue_depth + self.lanes.waiting.load(Ordering::Relaxed),
+            );
+            gauge(
+                "velox_lanes_busy",
+                "Lanes running a request",
+                load.lanes_busy,
+            );
+        }
         self.engine.gauges(&mut out);
         out
+    }
+
+    /// `POST /v1/slots/reserve`. Blocks this connection's thread until the hold is granted, times
+    /// out (504) or is refused (409). A client that disconnects meanwhile is not noticed (as with
+    /// generation, which a disconnect does not cancel either): the hold is still taken and lapses
+    /// at its expiry, or on release.
+    fn slot_reserve(&self, w: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+        let bad =
+            |w: &mut TcpStream, m: &str| respond_json(w, 400, &slot_error("invalid_request", m));
+        let req: Value = match serde_json::from_slice(body) {
+            Ok(v @ Value::Object(_)) => v,
+            _ => return bad(w, "body must be a JSON object"),
+        };
+        let token = match req.get("token") {
+            None | Some(Value::Null) => new_slot_token(),
+            Some(Value::String(t)) if valid_slot_token(t) => t.clone(),
+            Some(_) => return bad(w, "token must be 1-128 characters of [A-Za-z0-9_.:-]"),
+        };
+        // No duration: the hold lasts while the token is used (see SLOT_IDLE_S). A
+        // `duration_s` from older clients is ignored.
+        let wait = match req.get("wait_timeout_s") {
+            None | Some(Value::Null) => SLOT_DEFAULT_WAIT_S,
+            Some(v) => match v.as_f64() {
+                Some(t) if (0.0..=SLOT_MAX_WAIT_S).contains(&t) => t,
+                _ => return bad(w, "wait_timeout_s must be a number from 0 to 120"),
+            },
+        };
+        let r = self.engine.slot_reserve(
+            &token,
+            Duration::from_secs_f64(SLOT_IDLE_S),
+            Duration::from_secs_f64(wait),
+        );
+        match r {
+            Ok(g) => respond_json(
+                w,
+                200,
+                &json!({
+                    "token": g.token,
+                    "lane": g.lane,
+                    "expires_at_ms": g.expires_at_ms,
+                    "idle_timeout_s": g.idle_timeout_s,
+                    "renewed": g.renewed,
+                    "waited_ms": g.waited_ms,
+                }),
+            ),
+            Err(e) => slot_failure(w, e),
+        }
+    }
+
+    /// `POST /v1/slots/release`.
+    fn slot_release(&self, w: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+        let token = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("token").and_then(Value::as_str).map(str::to_owned));
+        let Some(token) = token.filter(|t| valid_slot_token(t)) else {
+            return respond_json(
+                w,
+                400,
+                &slot_error(
+                    "invalid_request",
+                    "token must be 1-128 characters of [A-Za-z0-9_.:-]",
+                ),
+            );
+        };
+        match self.engine.slot_release(&token) {
+            Ok(true) => respond_json(w, 200, &json!({"released": true})),
+            Ok(false) => respond_json(
+                w,
+                404,
+                &slot_error(
+                    "unknown_token",
+                    "the token holds no slot (unknown or expired)",
+                ),
+            ),
+            Err(e) => slot_failure(w, e),
+        }
+    }
+
+    /// A permit of the lane semaphore, unless the request carries a token holding a slot: then
+    /// none (the engine admits it to its held lane ahead of everyone). A token whose hold lapsed
+    /// while idle reserves again here, without waiting: granted at once (a free lane), the
+    /// request runs on it; otherwise (every reservable lane held, or the lane still busy) it
+    /// runs as a normal request and the next one tries again. A hold that lapses in between
+    /// leaves the request to the engine's queue without a permit, which is harmless (the engine
+    /// queues what its lanes cannot take).
+    fn lane_permit(&self, slot_token: Option<&str>) -> Option<LaneGuard<'_>> {
+        match slot_token {
+            Some(t) if self.engine.slot_active(t) => None,
+            Some(t) if valid_slot_token(t) && self.reacquire(t) => None,
+            _ => Some(self.lanes.acquire()),
+        }
+    }
+
+    /// Reserves `token` again after its hold lapsed (see [`Self::lane_permit`]).
+    fn reacquire(&self, token: &str) -> bool {
+        match self.engine.slot_reserve(
+            token,
+            Duration::from_secs_f64(SLOT_IDLE_S),
+            Duration::ZERO,
+        ) {
+            Ok(g) => {
+                eprintln!("[slots] {token} reserved again on its request (lane {})", g.lane);
+                true
+            }
+            Err(SlotError::Unsupported) => false,
+            Err(e) => {
+                eprintln!("[slots] {token} could not be reserved again: {e:?}; runs as a normal request");
+                false
+            }
+        }
     }
 
     fn validate(&self, body: &[u8]) -> Result<Value, ApiError> {
@@ -541,13 +843,15 @@ impl Server {
             self.count_error(&e, t_req);
             respond_json(w, e.status, &json!({"error": e.message}))
         };
-        let parsed = serde_json::from_slice::<Value>(body)
-            .map_err(|e| ApiError::invalid(format!("body is not JSON: {e}")))
-            .and_then(|v| systemone::parse(&v));
-        let req = match parsed {
+        let raw = match serde_json::from_slice::<Value>(body) {
+            Ok(v) => v,
+            Err(e) => return fail(w, ApiError::invalid(format!("body is not JSON: {e}"))),
+        };
+        let req = match systemone::parse(&raw) {
             Ok(r) => r,
             Err(e) => return fail(w, e),
         };
+        let slot_token = raw.get("slot_token").and_then(Value::as_str);
         let model = req.model.as_deref().unwrap_or(&self.cfg.model_id);
         if model != self.cfg.model_id {
             return fail(
@@ -561,7 +865,7 @@ impl Server {
             );
         }
         let t_lane = Instant::now();
-        let _lane = self.lanes.acquire();
+        let _lane = self.lane_permit(slot_token);
         let t0 = Instant::now();
         let mut answers = Map::new();
         let (mut input, mut cached, mut output, mut queue_ms) = (0u64, 0u64, 0u64, 0.0);
@@ -572,6 +876,7 @@ impl Server {
                 request: &q.request,
                 candidates: &q.candidates,
                 branches: &q.branches,
+                slot_token,
             })
             .collect();
         let outcomes = match self.engine.score(&queries) {
@@ -633,7 +938,7 @@ impl Server {
         let chunk = |delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
 
         let t_lane = Instant::now();
-        let _lane = self.lanes.acquire();
+        let _lane = self.lane_permit(req.get("slot_token").and_then(Value::as_str));
         let t0 = Instant::now();
         let mut content = String::new();
         let mut reasoning = String::new();
@@ -717,6 +1022,7 @@ impl Server {
             "predicted_ms": outcome.predicted_ms,
             "predicted_per_second": per_s(outcome.completion_tokens.saturating_sub(1), outcome.predicted_ms),
             "total_ms": t0.elapsed().as_secs_f64() * 1e3,
+            "slot": {"held": outcome.slot.is_some(), "lane": outcome.slot},
         });
         if stream {
             if !headers_sent {
@@ -751,6 +1057,24 @@ impl Server {
             }),
         )
     }
+}
+
+/// The response of a slot call that was not granted.
+fn slot_failure(w: &mut TcpStream, e: SlotError) -> std::io::Result<()> {
+    let (status, body) = match e {
+        SlotError::NoSlot(m) => (409, slot_error("no_slot", m)),
+        SlotError::WaitTimeout(m) => (504, slot_error("wait_timeout", m)),
+        SlotError::Released => (
+            409,
+            slot_error("released", "the hold was released while waiting for it"),
+        ),
+        SlotError::Unsupported => (
+            501,
+            slot_error("slots_unsupported", "this engine has no reserved slots"),
+        ),
+        SlotError::Failed(m) => (503, slot_error("unavailable", m)),
+    };
+    respond_json(w, status, &body)
 }
 
 #[cfg(test)]
