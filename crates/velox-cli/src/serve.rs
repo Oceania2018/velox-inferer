@@ -205,11 +205,6 @@ where
         // --score-pass-rows N (default 0 = --score-branch-rows x 6): tokens of one scoring pass,
         // capped at the prefill chunk. Raise it for requests with many questions.
         score_pass_rows: a.parse("score-pass-rows", 0)?,
-        // --max-slot-holds N (default 2; 0: off): lanes slot reservations (POST /v1/slots/reserve)
-        // may hold at once, at most --max-concurrency - 1 so one lane always takes normal traffic.
-        max_slot_holds: a
-            .parse::<usize>("max-slot-holds", 2)?
-            .min(a.parse::<usize>("max-concurrency", 6)?.saturating_sub(1)),
     };
     let vision = if art.components().contains_key("vision")
         && a.get("vision").is_none_or(|v| v != "false")
