@@ -142,8 +142,8 @@ COMMANDS:
                                most the prefill chunk; more rows = fewer passes for many questions)
       --max-vision-tokens <n>  merged vision tokens per image (32x32 px each) before it is
                             downscaled (1280: 1920x1080 -> 1504x832)
-      --max-slot-holds <n>  lanes reserved slots may hold at once (2; 0: off; at most
-                            --max-concurrency - 1): POST /v1/slots/reserve|release, GET /v1/slots
+      reserved slots (POST /v1/slots/reserve|release, GET /v1/slots) hold at most 3/4 of the
+                            lanes, rounded down: none with --max-concurrency 1 (no flag)
   replay                Replay a recorded agent session against an OpenAI-compatible server
       --session <dir>       directory with session.json and screenshots/
       --endpoint <url>      e.g. http://127.0.0.1:8010 (default)
