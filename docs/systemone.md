@@ -8,16 +8,20 @@ answers), `systemone_http.cpp` (HTTP) and `ProgramImpl::score_branches` (rank).
 ## Contract
 
 ```
-{ "model": "...", "state": "<text>" | {...} | [...], "images": ["<base64>", ...],
+{ "model"?: "...", "state": "<text>" | {...} | [...], "images": ["<base64>" | "data:image/<type>;base64,<base64>", ...],
   "system": "...", "keep_alive": ..., "questions": { "<name>": {"type": ..., "instructions": ..., ...} } }
 ```
+
+`model` is optional (llama.cpp's form): without it the loaded model answers; another name is a
+404. Images are base64 strings or base64 image data URLs, as llama.cpp sends them; a data URL keeps
+its declared type, a bare string is typed from its first bytes. Remote URLs are a 400.
 
 | type | criteria | assistant prefill | scored tokens | answer |
 |---|---|---|---|---|
 | `choice` | object, 2-26 options | `Answer:` | `" A"` .. `" Z"` | `choice`, `probabilities`, `confidence` (1 - H/ln N) |
 | `noul` | optional `{true, false}` descriptions | `Answer:` | `" true" " True" " false" " False"` | `noul` = P(first two) |
 | `score` | array, 2-10 levels | `Answer: (` | `"0"` .. `"9"` | expected `score`, `legend`, `probabilities`, `confidence` |
-| `rank` | object, 1-256 candidates; `threshold` (0.5), `limit`, `scale` (2-10 levels) | `[` | after each branch `"<id>] "`: the level digits | `similarities` (expected level / (L - 1), most similar first), `ranking`, `legend`, `threshold` |
+| `rank` | object, 1-256 candidates; `threshold` (0.5), `limit`, `scale` (2-10 levels) | `[` | after each branch `"<id>] "` (two-letter ids AA, BA, CA, .., the first letter cycling fastest so neighbours never share it): the level digits | `similarities` (expected level / (L - 1), most similar first), `ranking`, `legend`, `threshold` |
 
 Candidate probabilities are renormalized among the scored tokens. Every question is one scoring
 request: system, user (images first, then the state and question), and the assistant prefill,

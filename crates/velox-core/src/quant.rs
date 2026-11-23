@@ -160,7 +160,7 @@ pub fn round_full_attention_inputs(
             }
         }
         // No FP8 contract for attention_full; the conformance suite rejects a backend reporting it.
-        crate::backend::AttnPrecision::Fp8QkF16Pv => {}
+        crate::backend::AttnPrecision::Fp8QkF16Pv | crate::backend::AttnPrecision::Fp8QkFp8Pv => {}
     }
 }
 
@@ -189,8 +189,38 @@ pub fn round_attention_inputs(
     }
     quantize_activations(q, s.head_dim, ActQuant::Fp8Row);
     quantize_activations(&mut k[..kv], s.head_dim, ActQuant::Fp8Row);
+    if p == crate::backend::AttnPrecision::Fp8QkFp8Pv {
+        round_channels_e4m3(&mut v[..kv], s.kv_heads * s.head_dim);
+        return;
+    }
     for x in &mut v[..kv] {
         *x = round_f16(*x);
+    }
+}
+
+/// Rounds `x` (rows of `width` channels) to E4M3 per channel: `s = amax / 448` over every row,
+/// each value `e4m3(x * (1 / s)) * s`, single precision in the device's order.
+pub fn round_channels_e4m3(x: &mut [f32], width: usize) {
+    if width == 0 {
+        return;
+    }
+    let mut amax = vec![0f32; width];
+    for row in x.chunks_exact(width) {
+        for (a, v) in amax.iter_mut().zip(row) {
+            *a = a.max(v.abs());
+        }
+    }
+    let scales: Vec<(f32, f32)> = amax
+        .iter()
+        .map(|&a| {
+            let s = a / 448.0;
+            (s, if s > 0.0 { 1.0 / s } else { 0.0 })
+        })
+        .collect();
+    for row in x.chunks_exact_mut(width) {
+        for (v, &(s, inv)) in row.iter_mut().zip(&scales) {
+            *v = e4m3fn_to_f32(f32_to_e4m3fn(*v * inv)) * s;
+        }
     }
 }
 
@@ -211,6 +241,38 @@ mod tests {
             assert_eq!(round_f16(mid), want, "h = {h:#06x}");
         }
         assert_eq!(round_f16(1e6), f32::INFINITY);
+    }
+
+    #[test]
+    fn channel_e4m3_keeps_each_channel_maximum_and_bounds_the_error() {
+        // Two channels with very different ranges: each gets its own scale.
+        let mut x: Vec<f32> = (0..64)
+            .flat_map(|i| [(i as f32 - 31.5) * 0.01, (i as f32 - 20.0) * 30.0])
+            .collect();
+        let orig = x.clone();
+        round_channels_e4m3(&mut x, 2);
+        for c in 0..2 {
+            let amax = orig
+                .iter()
+                .skip(c)
+                .step_by(2)
+                .fold(0f32, |a, v| a.max(v.abs()));
+            for (got, want) in x.iter().zip(&orig).skip(c).step_by(2) {
+                // E4M3 keeps 3 mantissa bits: half a step is at most 1/16 relative, and
+                // subnormals (below 2^-6 of the 448 scale) at most half of 2^-9 * scale.
+                let tol = (want.abs() / 16.0).max(amax / 448.0 * 2f32.powi(-10));
+                assert!((got - want).abs() <= tol * 1.0001, "{want} -> {got}");
+            }
+            let max_got = x
+                .iter()
+                .skip(c)
+                .step_by(2)
+                .fold(0f32, |a, v| a.max(v.abs()));
+            assert!(
+                (max_got - amax).abs() <= amax * 1e-6,
+                "channel {c} max {amax} -> {max_got}"
+            );
+        }
     }
 
     #[test]

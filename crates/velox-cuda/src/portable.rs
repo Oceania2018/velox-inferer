@@ -11,7 +11,7 @@ use velox_core::backend::{
 };
 use velox_core::check::{self, to_i32};
 use velox_core::kv::{hadamard_norm, KvFormat};
-use velox_core::{Error, Result, StateFormat, WeightFormat, GRAPH_KV_BUCKET};
+use velox_core::{Error, Result, StateFormat, WeightFormat};
 
 use crate::{dtod, graph_mode, stage, status, CudaBuffer, GraphMode};
 
@@ -2228,7 +2228,7 @@ pub fn graph_params(values: &[i64]) -> Result<Option<*const i64>> {
 /// Context length a graph step sizes attention grids for: one bucket of 1024 keys, so steps
 /// within a bucket share a recording (the model's graph keys carry the same bucket).
 pub fn kv_bucket(kv_len: usize) -> usize {
-    kv_len.div_ceil(GRAPH_KV_BUCKET) * GRAPH_KV_BUCKET
+    velox_core::graph_kv_keys(kv_len)
 }
 
 /// The keys an attention grid covers: inside a static graph step, the KV bucket its key carries

@@ -17,6 +17,16 @@ use crate::state::StateFormat;
 /// MiB), so a background thread can prepare it while the device works.
 pub type HostAlloc<T> = std::sync::Arc<dyn Fn(usize) -> Result<T> + Send + Sync>;
 
+/// A point in a backend's work queue ([`Backend::fence`]): once it is reached, all work queued
+/// before it has run. Waiting on one waits for that work only, not for work queued after it.
+pub trait QueuePoint: Send + Sync {
+    /// Blocks until the point is reached.
+    fn wait(&self) -> Result<()>;
+}
+
+/// A shared [`QueuePoint`]: one recording can guard several pieces of storage.
+pub type Fence = std::sync::Arc<dyn QueuePoint>;
+
 /// Pinned system RAM of this process ([`Backend::host_pinned`]), in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostPinned {
@@ -173,6 +183,29 @@ pub const GRAPH_STATIC: u64 = 1 << 63;
 /// Static graph steps that attend over a KV cache are recorded per bucket of this many keys: the
 /// backend sizes attention grids for the bucket and reads the actual length on the device.
 pub const GRAPH_KV_BUCKET: usize = 1024;
+
+/// Keys a static graph step's KV bucket covers for `kv` keys (always a multiple of
+/// [`GRAPH_KV_BUCKET`], at least `kv`): 1024-key buckets up to 8K keys, then the largest power of
+/// two at most `kv / 8`, so a grid sized for the bucket overshoots the actual length by under 1/8
+/// (kernels stop at the actual length) and 64K-128K keys take 8 buckets instead of 64. Every new
+/// bucket records a new graph, and instantiating one at long context under WSL/WDDM spent 2.5-46 s
+/// in the driver's allocation (RTX 5090 Laptop, 124K keys): with 1024-key buckets, every long
+/// prompt of a slightly different length paid that again.
+pub fn graph_kv_keys(kv: usize) -> usize {
+    let step = if kv <= 8 * GRAPH_KV_BUCKET {
+        GRAPH_KV_BUCKET
+    } else {
+        let eighth = kv / 8;
+        (1usize << (usize::BITS - 1 - eighth.leading_zeros())).max(GRAPH_KV_BUCKET)
+    };
+    kv.max(1).div_ceil(step) * step
+}
+
+/// The bucket index a static graph key carries in bits 24..40 for `kv` keys (see
+/// [`graph_kv_keys`]); the backend reads it back as index x [`GRAPH_KV_BUCKET`] keys.
+pub fn graph_kv_index(kv: usize) -> u64 {
+    (graph_kv_keys(kv) / GRAPH_KV_BUCKET) as u64 & 0xffff
+}
 
 /// Non-causal attention of a query block over a sliding-window context (DFlash drafting).
 ///
@@ -792,6 +825,12 @@ pub enum AttnPrecision {
     Fp8QkF16Pv,
     /// Q, K, V and the softmax weights rounded to f16 for both products.
     F16,
+    /// The score product as [`AttnPrecision::Fp8QkF16Pv`]; the value product in FP8: V rounded
+    /// to E4M3 per channel (kv head x dim, `scale = amax / 448` over the `kv_len` rows) and the
+    /// softmax weights to E4M3 (times 256, so weights down to ~2^-17 of the row maximum stay).
+    /// The oracle emulates the V rounding only; the E4M3 weights set the looser tolerance, so
+    /// kernels take it over long prefixes only (rows over a few keys move by percents).
+    Fp8QkFp8Pv,
 }
 
 /// Rows `[row_begin, row_begin + rows)` of a stored weight matrix `[parent_rows, k]`, kept in its
@@ -887,6 +926,12 @@ pub trait Backend {
     fn upload_bytes(&self, data: &[u8]) -> Result<Self::Buffer>;
     /// Waits for all queued work; timing and downloads rely on it.
     fn synchronize(&self) -> Result<()>;
+    /// Records a [`Fence`] after the work queued so far, so a caller can later wait for that work
+    /// alone instead of [`Self::synchronize`]-ing behind everything queued since. `None` when the
+    /// backend has no such points: callers then synchronize.
+    fn fence(&self) -> Result<Option<Fence>> {
+        Ok(None)
+    }
     /// Makes this backend's device current on the calling thread. Servers call it before using
     /// a backend from a thread other than the one that created it (CUDA devices are per-thread).
     fn bind_thread(&self) -> Result<()> {
@@ -2356,4 +2401,38 @@ pub fn log_softmax_gather_row(row: &[f32], ids: &[u32]) -> Vec<f32> {
             None => f32::NEG_INFINITY,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod graph_kv_tests {
+    use super::{graph_kv_index, graph_kv_keys, GRAPH_KV_BUCKET};
+
+    #[test]
+    fn buckets_cover_the_length_and_grow_coarser() {
+        let mut last = 0;
+        for kv in 1..=262_144usize {
+            let keys = graph_kv_keys(kv);
+            assert!(keys >= kv, "{kv} -> {keys}");
+            assert_eq!(keys % GRAPH_KV_BUCKET, 0, "{kv} -> {keys}");
+            assert!(keys >= last, "not monotone at {kv}");
+            last = keys;
+            if kv <= 8 * GRAPH_KV_BUCKET {
+                assert_eq!(keys, kv.div_ceil(GRAPH_KV_BUCKET) * GRAPH_KV_BUCKET);
+            } else {
+                assert!(
+                    (keys - kv) * 8 < kv,
+                    "{kv} -> {keys} overshoots by 1/8 or more"
+                );
+            }
+            assert_eq!(graph_kv_index(kv) as usize * GRAPH_KV_BUCKET, keys);
+        }
+        // Long prompts a few hundred keys apart share one recording.
+        assert_eq!(graph_kv_keys(123_934), graph_kv_keys(124_839));
+        let distinct = |lo: usize, hi: usize| {
+            let mut v: Vec<usize> = (lo..hi).map(graph_kv_keys).collect();
+            v.dedup();
+            v.len()
+        };
+        assert_eq!(distinct(65_537, 131_073), 8);
+    }
 }

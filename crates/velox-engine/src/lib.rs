@@ -1028,6 +1028,9 @@ where
             lane.session.trim_kv(&core.b, 0)?;
         }
         core.budget_memory(&mut state)?;
+        if std::env::var("VELOX_WARM_LONG").is_ok_and(|v| !v.is_empty() && v != "0") {
+            core.warm_long(&mut state)?;
+        }
         let queue = Arc::new(JobQueue {
             jobs: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -1056,6 +1059,17 @@ impl<B: Backend> Drop for QwenEngine<B> {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+    }
+}
+
+/// (window length, kept rows) pairs [`Core::warm_long`] verifies and commits: at long context
+/// every kept length of a full window, at short context every window length (the drafter adapts
+/// its block), all kept. Kept rows are never 0 on a request (the sampled token stays).
+fn warm_windows(long: bool, max: usize) -> Vec<(usize, usize)> {
+    if long {
+        (1..=max).map(|keep| (max, keep)).collect()
+    } else {
+        (1..=max).map(|m| (m, m)).collect()
     }
 }
 
@@ -1153,11 +1167,22 @@ impl<B: Backend> Core<B> {
     /// idle lanes, least recently used first, give their chunks back (their conversations resume
     /// from the context store). False when that is not enough while other requests run: the
     /// request waits for them. Alone, it runs anyway (the pool lends past its size).
-    fn kv_room(&self, st: &mut Lanes<B>, li: usize, len: usize, busy: &[usize]) -> bool {
+    /// `reserved`: sets the running requests will still take (a prompt still prefilling backs its
+    /// chunks as it goes), so a request admitted beside one does not push the pool past its size
+    /// later (2 x 128K on a 24 GB card: lent sets overcommit the device, WDDM pages to system RAM
+    /// and both lanes decode ~50x slower).
+    fn kv_room(
+        &self,
+        st: &mut Lanes<B>,
+        li: usize,
+        len: usize,
+        busy: &[usize],
+        reserved: usize,
+    ) -> bool {
         let Some(pool) = st.pool.clone() else {
             return true;
         };
-        let need = st.lanes[li].session.kv_need(len + KV_TRIM_SLACK);
+        let need = st.lanes[li].session.kv_need(len + KV_TRIM_SLACK) + reserved;
         while pool.free_sets() < need {
             let Some(j) = (0..st.lanes.len())
                 .filter(|&j| j != li && !busy.contains(&j))
@@ -1305,6 +1330,13 @@ impl<B: Backend> Core<B> {
             sw,
             ..
         } = st;
+        // Every lane warms at the end of its capacity, where attention reads all rows below:
+        // alias one set behind them all instead of backing the full length per lane (see
+        // `Session::alias_kv`); the caller trims it all afterwards.
+        for lane in lanes.iter_mut() {
+            let cap = lane.session.capacity;
+            lane.session.alias_kv(b, cap)?;
+        }
         {
             let lane = &mut lanes[0];
             let pos = lane.session.capacity.saturating_sub(chunk + VERIFY_MAX + 1);
@@ -1377,6 +1409,56 @@ impl<B: Backend> Core<B> {
                 model.commit_batched(b, s, bw, 1)?;
             }
         }
+        // Lanes drafting together propose in one batched block forward (`batch_round`), recorded
+        // once per batch size: warm every size here, so its recording, workspace growth and
+        // first-use kernel loading do not land on a request (the first 2-lane round on the RTX
+        // 5090 Laptop took 16.6 s in the draft). Best effort: a failure only costs that first
+        // round later, so it is logged, not fatal.
+        if let (Some(dm), Some(dw)) = (self.dflash.as_ref(), dw.as_mut()) {
+            if lanes.len() > 1 && !solo_draft() {
+                let drafts = lanes
+                    .iter()
+                    .filter_map(|l| match &l.drafter {
+                        Some(Drafter::DFlash(d)) => Some(d.short_block()),
+                        _ => None,
+                    })
+                    .min()
+                    .unwrap_or(1)
+                    .min(
+                        model
+                            .batch_window_max(b, self.cfg.kv_format)
+                            .saturating_sub(1)
+                            .max(1),
+                    );
+                for n in 2..=lanes.len() {
+                    for l in lanes.iter_mut().take(n) {
+                        if let Some(Drafter::DFlash(d)) = l.drafter.as_mut() {
+                            d.drafts = drafts;
+                            d.align(dm, l.session.pos);
+                        }
+                    }
+                    let states: Vec<&DFlashState<B>> = lanes
+                        .iter()
+                        .take(n)
+                        .filter_map(|l| match &l.drafter {
+                            Some(Drafter::DFlash(d)) => Some(d.context()),
+                            _ => None,
+                        })
+                        .collect();
+                    if states.len() < n {
+                        break;
+                    }
+                    let t = Instant::now();
+                    match dm.propose_batch(b, model, &states, dw, &vec![0u32; n], drafts, limit) {
+                        Ok(_) => eprintln!(
+                            "warm-up: batched draft of {n} lanes in {:.1} ms",
+                            t.elapsed().as_secs_f64() * 1e3
+                        ),
+                        Err(e) => eprintln!("warm-up: batched draft of {n} lanes failed: {e}"),
+                    }
+                }
+            }
+        }
         if let (Some(v), Some((min_px, max_px))) = (&self.vision, self.fe.vision_pixels) {
             // A square image at the pixel budget: the most patches the tower sees.
             let side = ((max_px.min(1 << 26)) as f64).sqrt() as usize;
@@ -1402,6 +1484,222 @@ impl<B: Backend> Core<B> {
             }
         }
         b.synchronize()
+    }
+
+    /// `VELOX_WARM_LONG` (set, not empty or "0"), after the attention pool exists: every lane
+    /// backs its whole capacity from the pool, prefills two chunks at its end (filling the
+    /// drafter's window) and runs every decode step a request runs there: verify and commit (with
+    /// the drafter's context rows) for each kept length, both draft blocks, then the same batched
+    /// across lanes; then again two chunks from position 0, verifying every window length — each
+    /// step twice (the eager first run, then the recording). On the RTX 5090 Laptop under WSL a
+    /// graph a request recorded for the first time spent 0.1–83 s in cudaGraphInstantiate (a WDDM
+    /// allocation call) and once never returned; with every step recorded here (and
+    /// `VELOX_GRAPH_REUSE` for other KV buckets), requests only update existing graphs.
+    /// `warm_up` cannot do this: it aliases one set behind every lane, and the drafter's window
+    /// stays short. Skipped when the pool cannot back every lane at full length; best effort
+    /// otherwise (a failure is logged; lanes are reset either way).
+    fn warm_long(&self, st: &mut Lanes<B>) -> Result<(), CoreError> {
+        use velox_models::qwen3_5::VERIFY_MAX;
+        let (b, model) = (&self.b, &self.model);
+        let limit = self.fe.public_vocab;
+        let t0 = Instant::now();
+        let st_pool_free = st.pool.as_ref().map(|p| p.free_sets());
+        let r = (|| -> Result<(), CoreError> {
+            let Lanes {
+                ws, lanes, bw, dw, ..
+            } = st;
+            if lanes.iter().any(|l| l.drafter.is_none()) {
+                return Ok(());
+            }
+            // Only within the pool: lending past it would take device memory the budget left.
+            let need: usize = lanes
+                .iter()
+                .map(|l| l.session.kv_need(l.session.capacity))
+                .sum();
+            let free = st_pool_free.unwrap_or(0);
+            if free < need {
+                eprintln!(
+                    "warm-up: long-context steps skipped ({free} pool sets free, every lane full needs {need})"
+                );
+                return Ok(());
+            }
+            let (Some(dm), Some(dw)) = (self.dflash.as_ref(), dw.as_mut()) else {
+                return Ok(());
+            };
+            let chunk = self.cfg.chunk;
+            // Twice over: at the end of every lane's capacity (the long buckets), then at its
+            // start (the short buckets most requests decode in). There, every step a request
+            // runs, each twice (the eager first run, then the recording), so none records for
+            // the first time on a request.
+            for long in [true, false] {
+                for (j, lane) in lanes.iter_mut().enumerate() {
+                    let t = Instant::now();
+                    let cap = lane.session.capacity;
+                    lane.session.prepare_kv(b, 0, cap)?;
+                    let Some(Drafter::DFlash(d)) = lane.drafter.as_mut() else {
+                        continue;
+                    };
+                    d.forget(dm, 0);
+                    d.reset();
+                    // Two prompt chunks fill the drafter's window, as after a real prefill.
+                    let start = if long {
+                        cap.saturating_sub(2 * chunk + VERIFY_MAX + 1)
+                    } else {
+                        0
+                    };
+                    lane.session.pos = start;
+                    for c in 0..2 {
+                        let ids = vec![0u32; chunk];
+                        let base0 = start + c * chunk;
+                        model.advance_rows(
+                            b,
+                            &mut lane.session,
+                            ws,
+                            &ids,
+                            None,
+                            &[],
+                            &mut [],
+                            &mut |ws, base, t| d.prefill_chunk(b, dm, dw, ws, base0 + base, t),
+                        )?;
+                    }
+                    let pos = lane.session.pos;
+                    let window = [0u32; VERIFY_MAX];
+                    // Each commit also materializes the kept rows in the drafter's context, as
+                    // `after_commit` does (a recorded step per row count).
+                    for (m, keep) in warm_windows(long, VERIFY_MAX) {
+                        for _ in 0..2 {
+                            lane.session.pos = pos;
+                            model.verify(
+                                b,
+                                &mut lane.session,
+                                ws,
+                                &window[..m],
+                                CANDIDATES,
+                                limit,
+                            )?;
+                            model.commit(b, &mut lane.session, ws, keep)?;
+                            d.commit_rows(b, dm, dw, ws, 0, pos, keep)?;
+                        }
+                    }
+                    lane.session.pos = pos;
+                    for drafts in [d.long_block(), d.short_block()] {
+                        for _ in 0..2 {
+                            d.drafts = drafts;
+                            d.draft(
+                                b,
+                                dm,
+                                dw,
+                                model,
+                                ws,
+                                0,
+                                0,
+                                pos,
+                                0,
+                                limit,
+                                &Sampler::greedy(),
+                            )?;
+                        }
+                    }
+                    b.synchronize()?;
+                    eprintln!(
+                        "warm-up: lane {j} decode steps at {pos} over the pool in {:.1} s",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                let Some(bw) = bw.as_mut() else {
+                    continue;
+                };
+                let t = Instant::now();
+                let m_max = bw.window();
+                let n = lanes.len().min(bw.max_seqs());
+                let pos: Vec<usize> = lanes.iter().take(n).map(|l| l.session.pos).collect();
+                for (m, keep) in warm_windows(long, m_max) {
+                    let window = vec![0u32; m];
+                    let windows: Vec<&[u32]> = vec![&window[..]; n];
+                    for _ in 0..2 {
+                        let mut sessions: Vec<&mut Session<B>> =
+                            lanes.iter_mut().take(n).map(|l| &mut l.session).collect();
+                        for (s, &p) in sessions.iter_mut().zip(&pos) {
+                            s.pos = p;
+                        }
+                        model.verify_batch(
+                            b,
+                            &mut sessions,
+                            ws,
+                            bw,
+                            &windows,
+                            CANDIDATES,
+                            limit,
+                        )?;
+                        for s in sessions.iter_mut() {
+                            model.commit_batched(b, s, bw, keep)?;
+                        }
+                        // Window features follow each other: sequence i's start at row i * m.
+                        for (i, l) in lanes.iter_mut().take(n).enumerate() {
+                            if let Some(Drafter::DFlash(d)) = l.drafter.as_mut() {
+                                d.commit_rows(b, dm, dw, ws, i * m, pos[i], keep)?;
+                            }
+                        }
+                    }
+                }
+                if !solo_draft() {
+                    let drafts = lanes
+                        .iter()
+                        .filter_map(|l| match &l.drafter {
+                            Some(Drafter::DFlash(d)) => Some(d.short_block()),
+                            _ => None,
+                        })
+                        .min()
+                        .unwrap_or(1)
+                        .min(m_max.saturating_sub(1).max(1));
+                    for _ in 0..2 {
+                        for (l, &p) in lanes.iter_mut().take(n).zip(&pos) {
+                            l.session.pos = p;
+                            if let Some(Drafter::DFlash(d)) = l.drafter.as_mut() {
+                                d.drafts = drafts;
+                                d.align(dm, p);
+                            }
+                        }
+                        let states: Vec<&DFlashState<B>> = lanes
+                            .iter()
+                            .take(n)
+                            .filter_map(|l| match &l.drafter {
+                                Some(Drafter::DFlash(d)) => Some(d.context()),
+                                _ => None,
+                            })
+                            .collect();
+                        dm.propose_batch(b, model, &states, dw, &vec![0u32; n], drafts, limit)?;
+                    }
+                }
+                b.synchronize()?;
+                eprintln!(
+                    "warm-up: batched decode steps of {n} lanes over the pool in {:.1} s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            Ok(())
+        })();
+        if let Err(e) = &r {
+            eprintln!("warm-up: long verify failed: {e}");
+        }
+        for lane in st.lanes.iter_mut() {
+            lane.session.restore(b, &lane.zero)?;
+            lane.session.trim_kv(b, 0)?;
+            lane.keys.clear();
+            lane.checkpoints.clear();
+            if let (Some(Drafter::DFlash(d)), Some(dm)) =
+                (lane.drafter.as_mut(), self.dflash.as_ref())
+            {
+                d.forget(dm, 0);
+                d.reset();
+            }
+        }
+        b.synchronize()?;
+        eprintln!(
+            "warm-up: long-context steps in {:.1} s",
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(())
     }
 
     /// MTP and plain decoding keep per-step rows in the shared workspace between rounds, so only
@@ -1492,7 +1790,16 @@ impl<B: Backend> Core<B> {
                 let Some(li) = Self::pick_lane(&st.lanes, &busy, &waiting[0].p.keys) else {
                     break;
                 };
-                if !self.kv_room(&mut st, li, waiting[0].p.keys.len(), &busy) {
+                // What the running requests still back up to their prompt (and output room).
+                let reserved: usize = active
+                    .iter()
+                    .map(|a| {
+                        st.lanes[a.lane]
+                            .session
+                            .kv_need(a.job.p.keys.len() + KV_TRIM_SLACK)
+                    })
+                    .sum();
+                if !self.kv_room(&mut st, li, waiting[0].p.keys.len(), &busy, reserved) {
                     break;
                 }
                 let job = waiting.pop_front().expect("checked");
@@ -2004,12 +2311,24 @@ impl<B: Backend> Core<B> {
             .filter(|&i| matches!(st.lanes[active[i].lane].drafter, Some(Drafter::DFlash(_))))
             .collect();
         // Scoring prompts go first: their answer follows right after them, while a chat prompt
-        // is followed by its whole decode.
+        // is followed by its whole decode. Then the prompt with the fewest tokens left: one chunk
+        // per round, so taking the oldest made a short prompt admitted beside a 125K one wait for
+        // all of its ~60 chunks (52 s on the RTX 5090 Laptop); finished, the short request decodes
+        // and the long prompt's chunks ride with its windows (`batch_round`).
         let prefilling = |i: &usize| active[*i].pre.is_some();
+        let left = |i: usize| {
+            active[i].pre.as_ref().map_or(usize::MAX, |p| {
+                active[i].job.p.ids.len().saturating_sub(p.start + p.done)
+            })
+        };
         let next = (0..active.len())
             .filter(prefilling)
             .find(|&i| active[i].job.score.is_some())
-            .or_else(|| (0..active.len()).find(prefilling));
+            .or_else(|| {
+                (0..active.len())
+                    .filter(prefilling)
+                    .min_by_key(|&i| left(i))
+            });
         if let Some(pi) = next {
             if !dflash.is_empty() && st.bw.is_some() {
                 // The next prompt chunk rides with every decoding request's window.
@@ -2745,7 +3064,10 @@ impl<B: Backend> Core<B> {
                         None => d.forget(dm, shared),
                     }
                 }
-                return Ok((e.pos(), Some(e.id)));
+                let (pos, id) = (e.pos(), e.id);
+                // The copies just queued read the entry: evicting it waits for them.
+                store.restored_from(&self.b, id)?;
+                return Ok((pos, Some(id)));
             }
         }
         if live {

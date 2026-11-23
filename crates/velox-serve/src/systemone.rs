@@ -6,9 +6,10 @@
 //! candidate) on an ordered similarity scale. As in the spec (docs.ollama.com/api/systemone),
 //! `images` are base64 strings shared by every question, answers carry their `type`, and errors
 //! are `{"error": "<message>"}`. Extensions: `rank`, `system`, and `usage.cached_input_tokens`.
+//! llama.cpp's form is accepted too: `images` as base64 data URLs, and `model` left out.
 //!
-//! Prompts, labels and answer formulas follow ninfer exactly, so both engines score the same
-//! tokens for the same request.
+//! Prompts, labels and answer formulas follow ninfer, except rank candidate ids, which are
+//! letters here (see `rank_id`).
 
 use serde_json::{json, Map, Value};
 
@@ -20,7 +21,8 @@ const MAX_QUESTIONS: usize = 64;
 const MAX_CHOICE_OPTIONS: usize = 26;
 /// Score levels and rank scale levels: single-token labels 0..9.
 const MAX_SCORE_LEVELS: usize = 10;
-/// Rank candidates. A rank branch is `"<id>] "`: ids below 1000 take at most five tokens.
+/// Rank candidates. A rank branch is `"<id>] "` with a two-letter id (`rank_id`), well within
+/// [`MAX_BRANCH_TOKENS`].
 pub const MAX_RANK_CANDIDATES: usize = 256;
 /// Tokens of one rank branch, at most.
 pub const MAX_BRANCH_TOKENS: usize = 5;
@@ -86,7 +88,8 @@ pub struct Question {
 
 #[derive(Debug)]
 pub struct Request {
-    pub model: String,
+    /// `None`: the loaded model.
+    pub model: Option<String>,
     pub questions: Vec<Question>,
 }
 
@@ -156,8 +159,20 @@ fn sniff_image_type(base64: &str) -> &'static str {
         .map_or("application/octet-stream", |(_, t)| t)
 }
 
-/// Spec: base64-encoded images shared by every question, in request order; URLs and data URLs
-/// are not accepted. Returned as OpenAI `image_url` parts with data URLs.
+/// Base64 payload and media type of a `data:<type>;base64,<payload>` URL (llama.cpp's form);
+/// `None` when the URL is not base64 image data.
+fn split_data_url(url: &str) -> Option<(&str, &str)> {
+    let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    if !(media_type.is_empty() || media_type.starts_with("image/")) || payload.is_empty() {
+        return None;
+    }
+    Some((media_type, payload))
+}
+
+/// Images shared by every question, in request order: base64 strings (the spec) or base64 data
+/// URLs (llama.cpp's form). Remote URLs are not fetched. Returned as OpenAI `image_url` parts
+/// with data URLs.
 fn parse_images(body: &Value) -> Result<Vec<Value>, ApiError> {
     let images = match body.get("images") {
         None | Some(Value::Null) => return Ok(Vec::new()),
@@ -174,15 +189,26 @@ fn parse_images(body: &Value) -> Result<Vec<Value>, ApiError> {
         .map(|(i, image)| {
             let param = format!("images[{i}]");
             let data = require_text(image, &param)?;
-            if data.starts_with("data:")
-                || data.starts_with("http://")
-                || data.starts_with("https://")
-            {
+            if data.starts_with("http://") || data.starts_with("https://") {
                 return Err(bad_request(format!(
-                    "{param} must be base64-encoded image data; URLs and data URLs are not supported"
+                    "{param} must be base64-encoded image data or a base64 data URL; remote URLs are not supported"
                 )));
             }
-            let url = format!("data:{};base64,{data}", sniff_image_type(&data));
+            let (declared, payload) = if data.starts_with("data:") {
+                split_data_url(&data).ok_or_else(|| {
+                    bad_request(format!(
+                        "{param} must be a base64 image data URL (data:image/<type>;base64,<data>)"
+                    ))
+                })?
+            } else {
+                ("", data.as_str())
+            };
+            let media_type = if declared.is_empty() {
+                sniff_image_type(payload)
+            } else {
+                declared
+            };
+            let url = format!("data:{media_type};base64,{payload}");
             Ok(json!({"type": "image_url", "image_url": {"url": url}}))
         })
         .collect()
@@ -333,9 +359,23 @@ fn parse_score(
     Ok(())
 }
 
+/// The id of the `n`th rank candidate: two letters, the first cycling fastest (AA, BA, .., ZA,
+/// AB, BB, ..; 256 candidates end at VJ).
+///
+/// The model scores a candidate after only its id, so it has to find that id's line in the list.
+/// Numeric ids made that lookup unreliable: neighbours share leading digits ("12", "13"), and the
+/// rating was often read off the line above or below, so the same candidate's similarity changed
+/// with the order of the list (up to 0.8 on 100 candidates). With neighbours that never share a
+/// first letter, about half of those order effects disappear. The branch stays as short as a
+/// numeric one, so scoring costs the same.
+fn rank_id(n: usize) -> String {
+    let letter = |i: usize| char::from(b'A' + i as u8);
+    format!("{}{}", letter(n % 26), letter(n / 26))
+}
+
 /// The candidate list, the rating scale and the reply format form one shared prefix that ends
-/// inside the assistant answer at "["; each candidate is then the branch "<id>] " and the rating
-/// digit that follows is scored.
+/// inside the assistant answer at "["; each candidate is then the branch "<id>] " (see
+/// [`rank_id`]) and the rating digit that follows is scored.
 fn parse_rank(
     item: &Value,
     param: &str,
@@ -404,6 +444,7 @@ fn parse_rank(
 
     let mut user = format!("{state}\n\nCandidates:");
     for (id, (key, text)) in candidates.into_iter().enumerate() {
+        let id = rank_id(id);
         // Newlines inside a candidate would read as the start of the next candidate.
         user.push_str(&format!("\n[{id}] {}", text.replace('\n', " ")));
         q.keys.push(key);
@@ -427,11 +468,8 @@ pub fn parse(body: &Value) -> Result<Request, ApiError> {
     if !body.is_object() {
         return Err(bad_request("request body must be a JSON object"));
     }
-    let model = require_text(
-        body.get("model")
-            .ok_or_else(|| bad_request("missing required field: model"))?,
-        "model",
-    )?;
+    // Optional, as in llama.cpp: without it the request goes to the loaded model.
+    let model = optional_text(body, "model", "model")?;
     let images = parse_images(body)?;
     // Accepted for compatibility; the model stays loaded for the life of the server.
     if let Some(k) = body.get("keep_alive") {
@@ -678,11 +716,11 @@ mod tests {
         let q = &r.questions[0];
         assert_eq!(q.kind, Kind::Rank);
         assert_eq!(q.keys, ["a", "b", "c"]);
-        assert_eq!(q.branches, ["0] ", "1] ", "2] "]);
+        assert_eq!(q.branches, ["AA] ", "BA] ", "CA] "]);
         assert_eq!(q.candidates, ["0", "1", "2", "3", "4"]);
         assert_eq!((q.threshold, q.limit), (0.5, None));
         let prompt = user_text(q);
-        assert!(prompt.contains("[0] first") && prompt.contains("[2] third"));
+        assert!(prompt.contains("[AA] first") && prompt.contains("[CA] third"));
         assert_eq!(q.request["messages"][2]["content"], "[");
         assert_eq!(q.request["chat_template_kwargs"]["enable_thinking"], false);
         // The same candidates listed differently build the same prompt.
@@ -694,13 +732,28 @@ mod tests {
     }
 
     #[test]
-    fn rank_prompt_is_ninfers() {
+    fn rank_ids_are_two_letters_with_neighbours_apart() {
+        assert_eq!((0..3).map(rank_id).collect::<Vec<_>>(), ["AA", "BA", "CA"]);
+        assert_eq!(
+            [rank_id(25), rank_id(26), rank_id(27)],
+            ["ZA", "AB", "BB"]
+        );
+        assert_eq!(rank_id(MAX_RANK_CANDIDATES - 1), "VJ");
+        let ids: Vec<String> = (0..MAX_RANK_CANDIDATES).map(rank_id).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len());
+        // Neighbours never share their first letter.
+        assert!(ids.windows(2).all(|w| w[0].as_bytes()[0] != w[1].as_bytes()[0]));
+    }
+
+    #[test]
+    fn rank_prompt_lists_candidates_by_letter_id() {
         let mut body = rank_body(json!({"x": "line one\nline two"}));
         body["questions"]["similar"]["scale"] = json!(["no", "yes"]);
         let q = &parse(&body).unwrap().questions[0];
         assert_eq!(
             user_text(q),
-            "New request: kitchen faucet leaking\n\nCandidates:\n[0] line one line two\n\n\
+            "New request: kitchen faucet leaking\n\nCandidates:\n[AA] line one line two\n\n\
              Rate how similar each past work order is to the new request:\n\n1: yes\n0: no\n\n\
              I will name one candidate by its id. Reply with the id in brackets followed by its \
              rating."
@@ -757,7 +810,36 @@ mod tests {
             );
             assert_eq!(parts[2]["type"], "text");
         }
-        for source in ["data:image/png;base64,iVBORw0KGgo=", "https://x/a.png", ""] {
+        // llama.cpp's form: base64 data URLs keep their declared type; an untyped one is sniffed.
+        let mut data_urls = rank_body(json!({"x": "only"}));
+        data_urls["images"] = json!([
+            "data:image/png;base64,iVBORw0KGgoAAAA=",
+            "data:image/jpeg;base64,/9j/4AAQ",
+            "data:;base64,UklGRgAA"
+        ]);
+        let q = &parse(&data_urls).unwrap().questions[0];
+        let urls: Vec<&Value> = q.request["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.get("image_url").map(|u| &u["url"]))
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "data:image/png;base64,iVBORw0KGgoAAAA=",
+                "data:image/jpeg;base64,/9j/4AAQ",
+                "data:image/webp;base64,UklGRgAA"
+            ]
+        );
+        for source in [
+            "https://x/a.png",
+            "http://x/a.png",
+            "data:image/png,iVBORw0KGgo=",
+            "data:text/plain;base64,aGVsbG8=",
+            "data:image/png;base64,",
+            "",
+        ] {
             let mut bad = rank_body(json!({"x": "only"}));
             bad["images"] = json!([source]);
             assert!(!rejection(&bad).is_empty(), "{source}");

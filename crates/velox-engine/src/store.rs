@@ -32,6 +32,24 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
+
+/// Where [`ContextStore::evict`] spent its time (ms), for the `[evict]` debug line: `sync` is the
+/// device synchronize before the first victim, `count` the byte recounts (`recounts` of them),
+/// `trim` and `retire` include freeing storage (pinned memory outside the arena is unpinned).
+#[derive(Default)]
+struct EvictTimes {
+    victims: usize,
+    recounts: usize,
+    trims: usize,
+    sync: f64,
+    count: f64,
+    pool: f64,
+    trim: f64,
+    select: f64,
+    retire: f64,
+    retain: f64,
+}
 
 /// The state a new entry stores: copied, or owned (taken over when it already lives in system
 /// RAM, copied and handed back when it is on the device).
@@ -40,7 +58,7 @@ enum Src<'a, B: Backend> {
     Own(Checkpoint<B>),
 }
 
-use velox_core::backend::HostAlloc;
+use velox_core::backend::{Fence, HostAlloc};
 use velox_core::{Backend, Error as CoreError, StateFormat};
 use velox_models::qwen3_5::{
     Checkpoint, DFlashModel, DFlashState, DraftContext, KvSegment, Session, KV_PAGE_ROWS,
@@ -58,6 +76,9 @@ pub(crate) struct Entry<B: Backend> {
     pub kv: Vec<Arc<KvSegment<B>>>,
     /// The DFlash drafter's context rows ending at `pos`, when it had them.
     pub draft: Option<DraftContext<B>>,
+    /// After the last queued device work that wrote or read `state` / `draft` (the copies that
+    /// stored it, the latest restore from it); `None` when no device work touched them.
+    fence: Option<Fence>,
     root: bool,
     /// A prompt's end: the history point its request published (see `ContextStore::mark_tail`).
     tail: Option<usize>,
@@ -152,6 +173,13 @@ pub(crate) struct ContextStore<B: Backend> {
     format: StateFormat,
     /// [`Self::bytes`] while `entries` is unchanged (cleared at every change).
     held: Cell<Option<usize>>,
+    /// Per KV segment (by address), after the last queued device work that wrote or read it: a
+    /// segment outlives the entry that stored it when later entries share it, so its fence is
+    /// kept here rather than on an entry. Removed when the segment is released.
+    seg_fences: HashMap<usize, Fence>,
+    /// The backend gave no fences (see [`velox_core::Backend::fence`]): evictions synchronize the
+    /// device before freeing storage instead.
+    unfenced: bool,
 }
 
 /// Evicted state storage kept for reuse.
@@ -241,7 +269,42 @@ impl<B: Backend> ContextStore<B> {
             next_id: 1,
             format,
             held: Cell::new(None),
+            seg_fences: HashMap::new(),
+            unfenced: false,
         }
+    }
+
+    /// Records a fence after the device work queued so far (see [`Self::seg_fences`]).
+    fn stamp(&mut self, b: &B) -> Result<Option<Fence>, CoreError> {
+        let f = b.fence()?;
+        self.unfenced |= f.is_none();
+        Ok(f)
+    }
+
+    /// The device work just queued read entry `id` (a lane restored from it): freeing its storage
+    /// must wait for that work, and only for that work (see [`Self::evict`]).
+    pub fn restored_from(&mut self, b: &B, id: u64) -> Result<(), CoreError> {
+        let Some(f) = self.stamp(b)? else {
+            return Ok(());
+        };
+        let Some(e) = self.entries.iter_mut().find(|e| e.id == id) else {
+            return Ok(());
+        };
+        for s in &e.kv {
+            self.seg_fences.insert(Arc::as_ptr(s) as usize, f.clone());
+        }
+        e.fence = Some(f);
+        Ok(())
+    }
+
+    /// Before an eviction frees storage on a backend without fences: synchronizes the device
+    /// once per eviction. With fences, [`Self::release`] waits for the work using what it frees.
+    fn settle(&mut self, b: &B, synced: &mut bool) -> Result<(), CoreError> {
+        if self.unfenced && !*synced {
+            b.synchronize()?;
+            *synced = true;
+        }
+        Ok(())
     }
 
     pub fn enabled(&self) -> bool {
@@ -262,7 +325,9 @@ impl<B: Backend> ContextStore<B> {
         for id in disk.completed() {
             if let Some(i) = self.inflight.iter().position(|(r, _)| *r == id) {
                 let (_, e) = self.inflight.swap_remove(i);
-                self.release(e);
+                if let Err(err) = self.release(e) {
+                    eprintln!("context store: {err}");
+                }
             } else if let Some(e) = self.entries.iter_mut().find(|e| e.writing == Some(id)) {
                 e.writing = None;
             }
@@ -311,10 +376,21 @@ impl<B: Backend> ContextStore<B> {
     }
 
     /// Frees an entry no longer resident, or parks it until its disk copy is written.
-    fn retire(&mut self, e: Entry<B>) {
+    fn retire(&mut self, e: Entry<B>) -> Result<(), CoreError> {
         match e.writing {
-            Some(id) => self.inflight.push((id, e)),
+            Some(id) => {
+                self.inflight.push((id, e));
+                Ok(())
+            }
             None => self.release(e),
+        }
+    }
+
+    /// [`Self::retire`] on a path that cannot return an error (a failed fence wait means the
+    /// device already failed; the next device call reports it).
+    fn retire_logged(&mut self, e: Entry<B>) {
+        if let Err(err) = self.retire(e) {
+            eprintln!("context store: {err}");
         }
     }
 
@@ -419,6 +495,8 @@ impl<B: Backend> ContextStore<B> {
             state,
             kv: pages,
             draft,
+            // Read from disk by the CPU: no device work touched it yet.
+            fence: None,
             root,
             tail: None,
             adopted: 0,
@@ -668,7 +746,7 @@ impl<B: Backend> ContextStore<B> {
             for i in dead.into_iter().rev() {
                 let e = self.entries.swap_remove(i);
                 self.held.set(None);
-                self.retire(e);
+                self.retire_logged(e);
             }
         }
         let (lambda, now) = (self.lambda, self.now);
@@ -735,7 +813,7 @@ impl<B: Backend> ContextStore<B> {
         for i in old.into_iter().rev() {
             let e = self.entries.swap_remove(i);
             self.held.set(None);
-            self.retire(e);
+            self.retire_logged(e);
         }
     }
 
@@ -824,6 +902,8 @@ impl<B: Backend> ContextStore<B> {
         let (mut fresh, mut pinned) = (0usize, 0usize);
         let hashes = page_hashes(keys);
         let mut kv = Vec::with_capacity(pos.div_ceil(KV_PAGE_ROWS));
+        // Segments this insert writes (the others are shared, written before).
+        let mut written = Vec::new();
         let (pool, page_len) = (&mut self.pages, session.kv_page_len());
         let mut page = || {
             fresh += 1;
@@ -849,6 +929,7 @@ impl<B: Backend> ContextStore<B> {
             if let Some(&h) = full {
                 self.shared.insert(h, Arc::downgrade(&seg));
             }
+            written.push(Arc::as_ptr(&seg) as usize);
             kv.push(seg);
         }
         let t_kv = t0.elapsed();
@@ -890,6 +971,13 @@ impl<B: Backend> ContextStore<B> {
             }
         };
         let t_state = t0.elapsed();
+        // After the copies above (and the prefill that wrote a taken snapshot).
+        let fence = self.stamp(b)?;
+        if let Some(f) = &fence {
+            for p in written {
+                self.seg_fences.insert(p, f.clone());
+            }
+        }
         let id = self.next_id;
         self.next_id += 1;
         let mut e = Entry {
@@ -898,6 +986,7 @@ impl<B: Backend> ContextStore<B> {
             state,
             kv,
             draft,
+            fence,
             root,
             tail: None,
             adopted: 0,
@@ -923,7 +1012,7 @@ impl<B: Backend> ContextStore<B> {
         }
         self.held.set(None);
         self.entries.push(e);
-        self.evict(b, id)?;
+        let ev = self.evict(b, id)?;
         if debug {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
@@ -933,6 +1022,20 @@ impl<B: Backend> ContextStore<B> {
                 ms(t_state - t_draft),
                 self.format,
                 ms(t0.elapsed() - t_state)
+            );
+            eprintln!(
+                "[evict] entries {} victims {} recounts {} trims {}: sync {:.2} count {:.2} pool {:.2} trim {:.2} select {:.2} retire {:.2} retain {:.2} ms",
+                self.entries.len(),
+                ev.victims,
+                ev.recounts,
+                ev.trims,
+                ev.sync,
+                ev.count,
+                ev.pool,
+                ev.trim,
+                ev.select,
+                ev.retire,
+                ev.retain
             );
         }
         Ok(id)
@@ -977,18 +1080,38 @@ impl<B: Backend> ContextStore<B> {
     /// of evicted long prompts kept while short prompts' states needed new memory: 9 GiB over a
     /// 24 GiB budget after a day on an RTX 5090). Pool storage beyond its reserve goes first, then
     /// entries, whose storage joins the pools and is trimmed in turn.
-    fn evict(&mut self, b: &B, keep: u64) -> Result<(), CoreError> {
+    fn evict(&mut self, b: &B, keep: u64) -> Result<EvictTimes, CoreError> {
         let mut synced = false;
         let mut pinned: Option<HashSet<u64>> = None;
+        let mut t = EvictTimes::default();
+        let lap = |since: &mut Instant| {
+            let now = Instant::now();
+            let ms = (now - *since).as_secs_f64() * 1e3;
+            *since = now;
+            ms
+        };
+        let mut mark = Instant::now();
         loop {
-            let held = self.bytes(b) + self.pool_bytes(b);
+            if self.held.get().is_none() {
+                t.recounts += 1;
+            }
+            let held = self.bytes(b);
+            t.count += lap(&mut mark);
+            let held = held + self.pool_bytes(b);
+            t.pool += lap(&mut mark);
             if held <= self.budget {
                 break;
             }
-            if self.trim_pools(b, held - self.budget) > 0 {
+            let trimmed = self.trim_pools(b, held - self.budget);
+            t.trim += lap(&mut mark);
+            if trimmed > 0 {
+                t.trims += 1;
                 continue;
             }
-            let pinned = pinned.get_or_insert_with(|| self.pinned());
+            if pinned.is_none() {
+                pinned = Some(self.pinned());
+            }
+            let pinned = pinned.as_ref().unwrap();
             let victim = self
                 .entries
                 .iter()
@@ -1001,18 +1124,22 @@ impl<B: Backend> ContextStore<B> {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(i, _)| i);
+            t.select += lap(&mut mark);
             let Some(i) = victim else { break };
-            if !synced {
-                // Pending copies may still read the storage about to be freed.
-                b.synchronize()?;
-                synced = true;
-            }
             let e = self.entries.swap_remove(i);
             self.held.set(None);
-            self.retire(e);
+            // Pending copies may still read the storage about to be freed: `release` waits for the
+            // ones that use this entry's storage, not for everything queued (a whole-device
+            // synchronize waited out other lanes' prefill, up to 140 ms on the request path).
+            self.settle(b, &mut synced)?;
+            t.sync += lap(&mut mark);
+            self.retire(e)?;
+            t.retire += lap(&mut mark);
+            t.victims += 1;
         }
         self.shared.retain(|_, w| w.strong_count() > 0);
-        Ok(())
+        t.retain += lap(&mut mark);
+        Ok(t)
     }
 
     /// Bytes of reusable storage in the pools: spare states, KV pages and drafter pages.
@@ -1048,8 +1175,21 @@ impl<B: Backend> ContextStore<B> {
         pools.iter().zip(&drop).map(|((_, n, _), d)| n * d).sum()
     }
 
-    /// Returns an entry's storage to the pools (KV pages once no other entry shares them).
-    fn release(&mut self, e: Entry<B>) {
+    /// Returns an entry's storage to the pools (KV pages once no other entry shares them), after
+    /// the queued device work using it: pooled storage may next be written by the CPU
+    /// ([`Self::promote`] reads disk records into it) or freed, and only device reuse is ordered
+    /// by the stream. The fences are long reached in the usual case, so the waits cost nothing.
+    fn release(&mut self, e: Entry<B>) -> Result<(), CoreError> {
+        if let Some(f) = &e.fence {
+            f.wait()?;
+        }
+        for s in &e.kv {
+            if Arc::strong_count(s) == 1 {
+                if let Some(f) = self.seg_fences.remove(&(Arc::as_ptr(s) as usize)) {
+                    f.wait()?;
+                }
+            }
+        }
         if self.spare.len() < MAX_SPARE {
             self.spare.push(e.state);
         }
@@ -1061,6 +1201,7 @@ impl<B: Backend> ContextStore<B> {
         if let Some(d) = e.draft {
             self.draft_pages.extend(d.into_pages());
         }
+        Ok(())
     }
 
     /// Summary for debug logs: `pos:demand` per entry, `*` for roots, `~` for superseded.
