@@ -59,6 +59,8 @@ mod ffi {
         pub fn velox_vmm_map(va: *mut c_void, bytes: usize, handle: u64) -> i32;
         pub fn velox_vmm_unmap(va: *mut c_void, bytes: usize) -> i32;
         pub fn velox_cuda_free(ptr: *mut c_void) -> i32;
+        pub fn velox_cuda_malloc_pooled(ptr: *mut *mut c_void, bytes: usize, from_pool: *mut i32) -> i32;
+        pub fn velox_cuda_free_pooled(ptr: *mut c_void) -> i32;
         pub fn velox_cuda_htod(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_dtoh(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
         pub fn velox_cuda_htod_async(dst: *mut c_void, src: *const c_void, bytes: usize) -> i32;
@@ -244,6 +246,9 @@ pub struct CudaBuffer {
     pooled: bool,
     /// A reserved address range backed chunk by chunk (see `Backend::alloc_virtual`).
     vm: Option<Box<VmRange>>,
+    /// Device memory from the stream-ordered pool (freed with cudaFreeAsync; see
+    /// `velox_cuda_malloc_pooled` in the shim) rather than cudaMalloc.
+    stream_pool: bool,
 }
 
 /// The chunks of a virtual [`CudaBuffer`]: which are mapped, and the range's size.
@@ -420,13 +425,14 @@ impl HostArena {
 impl CudaBuffer {
     fn new(len: usize) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
+        let mut from_pool = 0i32;
         if len > 0 {
             let bytes = len
                 .checked_mul(4)
                 .ok_or_else(|| Error::Shape("allocation size overflows".into()))?;
-            // SAFETY: out-pointer to a live local.
+            // SAFETY: out-pointers to live locals.
             status(
-                unsafe { ffi::velox_cuda_malloc_zeroed(&mut ptr, bytes) },
+                unsafe { ffi::velox_cuda_malloc_pooled(&mut ptr, bytes, &mut from_pool) },
                 "cudaMalloc",
             )?;
             use std::sync::atomic::Ordering::Relaxed;
@@ -439,6 +445,7 @@ impl CudaBuffer {
             host: false,
             pooled: false,
             vm: None,
+            stream_pool: from_pool != 0,
         })
     }
 
@@ -487,6 +494,9 @@ impl Drop for CudaBuffer {
                     use std::sync::atomic::Ordering::Relaxed;
                     HOST_OUTSIDE_BYTES.fetch_sub(self.len * 4, Relaxed);
                     HOST_OUTSIDE_BUFFERS.fetch_sub(1, Relaxed);
+                } else if self.stream_pool {
+                    ffi::velox_cuda_free_pooled(self.ptr.cast());
+                    BUFFER_BYTES.fetch_sub(self.len * 4, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     ffi::velox_cuda_free(self.ptr.cast());
                     BUFFER_BYTES.fetch_sub(self.len * 4, std::sync::atomic::Ordering::Relaxed);
@@ -536,6 +546,7 @@ impl CudaBuffer {
             host: true,
             pooled,
             vm: None,
+            stream_pool: false,
         })
     }
 
@@ -2766,6 +2777,7 @@ impl Backend for CudaBackend {
                 chunk_bytes: chunk,
                 mapped: vec![false; chunks],
             })),
+            stream_pool: false,
         })
     }
 

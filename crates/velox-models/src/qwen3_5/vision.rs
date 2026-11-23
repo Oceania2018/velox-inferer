@@ -348,10 +348,13 @@ impl<B: Backend> Qwen35Vision<B> {
             layout: RopeLayout::Blocked,
         };
 
+        let dbg_t = std::env::var_os("VELOX_DEBUG_PREFIX").is_some();
+        let t_all = std::time::Instant::now();
         let mut guard = self
             .ws
             .lock()
             .map_err(|_| Error::Backend("vision workspace poisoned".into()))?;
+        let t_lock = t_all.elapsed().as_secs_f64() * 1e3;
         if guard
             .as_ref()
             .is_some_and(|w| w.grid != (gh, gw) && w.cap >= n)
@@ -401,7 +404,9 @@ impl<B: Backend> Qwen35Vision<B> {
             m,
             ..
         } = ws;
+        let t_ws = t_all.elapsed().as_secs_f64() * 1e3;
         let input = b.upload(patches)?;
+        let t_up = t_all.elapsed().as_secs_f64() * 1e3;
         self.linear_bias(b, &input, &self.patch, x, n)?;
         b.add(x, pos, n * h)?;
 
@@ -410,6 +415,7 @@ impl<B: Backend> Qwen35Vision<B> {
         // merger's after the last layer). The rotary table is computed once for all layers.
         let eps = 1e-6;
         let table = b.rope_table(&positions, rope)?;
+        let t_rope = t_all.elapsed().as_secs_f64() * 1e3;
         if let Some(first) = self.layers.first() {
             b.layer_norm(
                 x,
@@ -486,8 +492,16 @@ impl<B: Backend> Qwen35Vision<B> {
         let tokens = n / 4;
         self.linear_bias(b, hbuf, &self.merger_fc1, m, tokens)?;
         b.gelu(m, tokens * self.merger_fc1.0.rows, GeluKind::Erf)?;
+        let t_layers = t_all.elapsed().as_secs_f64() * 1e3;
         let mut out = b.alloc(tokens * self.merger_fc2.0.rows)?;
+        let t_out = t_all.elapsed().as_secs_f64() * 1e3;
         self.linear_bias(b, m, &self.merger_fc2, &mut out, tokens)?;
+        if dbg_t {
+            eprintln!(
+                "[vision-steps] n {n}: lock {t_lock:.1} ws {t_ws:.1} upload {t_up:.1} rope {t_rope:.1} layers {t_layers:.1} out_alloc {t_out:.1} total {:.1} ms (cumulative)",
+                t_all.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(out)
     }
 }
