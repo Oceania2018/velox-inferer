@@ -14,10 +14,12 @@
 mod disk;
 mod prompt;
 mod sampling;
+mod slots;
 pub mod spec;
 mod store;
 
 use disk::DiskTier;
+use slots::Reservations;
 use store::{ContextStore, Pinner};
 
 use spec::{DFlashDrafter, Drafter, MtpDrafter};
@@ -26,7 +28,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use velox_core::{Backend, Error as CoreError, KvFormat, StateFormat};
@@ -39,7 +41,10 @@ use velox_models::qwen3_5::{
     EmbedInsert, KvPool, KvShare, PrefillChunk, Qwen35Text, Qwen35Vision, Session, Workspace,
     DRAFT_PAGE_ROWS, KV_PAGE_ROWS,
 };
-use velox_serve::{ApiError, ChatEngine, Delta, Outcome, ScoreOutcome, ScoreQuery};
+use velox_serve::{
+    ApiError, ChatEngine, Delta, EngineLoad, Outcome, ScoreOutcome, ScoreQuery, SlotError,
+    SlotGrant, SlotHold, SlotStatus,
+};
 
 pub use prompt::{build as build_prompt, ImageRun, Prompt};
 pub use sampling::{Sampler, CANDIDATES};
@@ -138,6 +143,9 @@ pub struct EngineConfig {
     /// a window, so more rows mean fewer passes (each re-reads the weights and decodes the
     /// prompt's cache). About 80 KB of scoring buffers per row on Qwen3.8-27B.
     pub score_pass_rows: usize,
+    /// Lanes slot reservations may hold at once (`POST /v1/slots/reserve`, see `slots`); at most
+    /// `lanes - 1`, so one lane always takes normal traffic. 0 turns reservations off.
+    pub max_slot_holds: usize,
 }
 
 /// Tokens of one scoring window, at most: the prompt's last token, then a rank branch
@@ -316,6 +324,24 @@ struct Core<B: Backend> {
     score_cap: usize,
     /// What `GET /metrics` reports of memory and the cache tiers, published by the worker.
     gauges: Gauges,
+    /// The worker's reservations and load as the HTTP threads read them.
+    slots: SlotBoard,
+}
+
+/// What the worker publishes of its slot reservations (it owns the table, see `slots`) and of
+/// its load, for the HTTP threads.
+#[derive(Default)]
+struct SlotBoard {
+    status: Mutex<SlotStatus>,
+    holds: AtomicU64,
+    queue: AtomicU64,
+    busy: AtomicU64,
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Device memory and context-cache figures the worker publishes (it owns the store) for the
@@ -558,6 +584,32 @@ struct Job {
     score: Option<Scoring>,
     /// A tool request that may write a sentence before its call (see [`Preamble`]).
     preamble: Option<Preamble>,
+    /// The request's `slot_token`: while it holds a lane, the request runs there first.
+    slot: Option<String>,
+}
+
+/// The answer channel of a reserve call.
+type SlotReply = mpsc::Sender<Result<SlotGrant, SlotError>>;
+
+/// A reserved-slot call for the worker, which owns the reservation table.
+enum SlotCall {
+    Reserve {
+        token: String,
+        duration: Duration,
+        wait: Duration,
+        reply: SlotReply,
+    },
+    Release {
+        token: String,
+        reply: mpsc::Sender<bool>,
+    },
+}
+
+/// What the HTTP threads hand the worker (a job is moved once per request; not worth a box).
+#[allow(clippy::large_enum_variant)]
+enum Msg {
+    Job(Job),
+    Slot(SlotCall),
 }
 
 /// Request field `tool_preamble`: a request offering tools may write a short text before its
@@ -592,6 +644,22 @@ struct Think {
 
 /// `tool_preamble: true`: room for the one-sentence account an agent asks for (~25 words).
 const DEFAULT_PREAMBLE_TOKENS: usize = 64;
+
+/// Reserved-slot priority for outsiders with large images. Encoding such an image (and its
+/// prefill) runs on the worker as one block that cannot be interrupted: 1-5 s for a ~4900-patch
+/// screenshot, during which a holder's request that arrives can only wait (measured: a 30-token
+/// holder answer taking 5 s). So while holds are live and a holder request was seen within
+/// [`HOLDER_RECENT`], an outsider whose images exceed [`LARGE_IMAGE_PATCHES`] waits for a quiet
+/// window — but never longer than [`OUTSIDER_MAX_DEFER`] past its arrival, so outsiders are
+/// delayed, not starved. Text-only and small-image outsiders are admitted as before.
+const LARGE_IMAGE_PATCHES: usize = 2048;
+const HOLDER_RECENT: std::time::Duration = std::time::Duration::from_secs(4);
+const OUTSIDER_MAX_DEFER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Patches of all images in a job (the vision encoder's work).
+fn image_patches(job: &Job) -> usize {
+    job.images.iter().map(|i| i.grid_h * i.grid_w).sum()
+}
 
 impl Preamble {
     /// The token a request commits in place of `t`, with `out` committed so far, the call
@@ -721,6 +789,8 @@ struct Done {
     prompt_ms: f64,
     predicted_ms: f64,
     first_token: Instant,
+    /// The lane, when the request ran on its token's held lane.
+    slot: Option<usize>,
 }
 
 /// A request's prompt still being fed to its lane.
@@ -790,9 +860,62 @@ struct Active<B: Backend> {
     /// A thinking [`Preamble`] request has committed its `</think>`: the output tokens up to
     /// and including it.
     thought: Option<usize>,
+    /// Admitted to the lane its `slot` token holds (compute priority, see `Core::round`).
+    held: bool,
+}
+
+/// Whether a request other than `token`'s own (admitted on its hold) runs on lane `l`.
+fn outsider_on<B: Backend>(active: &[Active<B>], l: usize, token: &str) -> bool {
+    active
+        .iter()
+        .any(|a| a.lane == l && !(a.held && a.job.slot.as_deref() == Some(token)))
+}
+
+fn slot_grant(g: slots::Grant) -> SlotGrant {
+    SlotGrant {
+        token: g.token,
+        lane: g.lane,
+        expires_at_ms: g.expires_ms,
+        idle_timeout_s: g.duration.as_secs_f64(),
+        renewed: g.renewed,
+        waited_ms: g.waited.as_millis() as u64,
+    }
+}
+
+/// Reserve-call answers, sent once the [`SlotBoard`] shows the holds they grant (a holder's
+/// first request must find its token active there).
+type SlotOutbox = Vec<(SlotReply, Result<SlotGrant, SlotError>)>;
+
+/// Grants reservations whose lane has freed up, times out late reserve calls and drops expired
+/// holds.
+fn settle_slots<B: Backend>(
+    slots: &mut Reservations<SlotReply>,
+    active: &[Active<B>],
+    outbox: &mut SlotOutbox,
+) {
+    for (reply, r) in slots.tick(Instant::now(), |l, t| outsider_on(active, l, t)) {
+        outbox.push((reply, r.map(slot_grant)));
+    }
+}
+
+fn send_slot_answers(outbox: &mut SlotOutbox) {
+    for (reply, r) in outbox.drain(..) {
+        let _ = reply.send(r);
+    }
 }
 
 impl<B: Backend> Active<B> {
+    /// Rough work left, in decode-token equivalents, to reserve the lane that frees soonest:
+    /// prompt tokens still to feed count 1/16 (prefill feeds whole chunks per pass), output
+    /// tokens up to `max_tokens` count 1.
+    fn remaining(&self) -> u64 {
+        let fed = self
+            .pre
+            .as_ref()
+            .map_or(0, |p| self.job.p.ids.len().saturating_sub(p.start + p.done));
+        (fed / 16 + self.job.max_tokens.saturating_sub(self.out.len())) as u64
+    }
+
     /// `t`, or what a [`Preamble`] request commits in its place.
     fn steer(&self, t: u32, eos: bool) -> u32 {
         self.job.preamble.map_or(t, |p| {
@@ -825,9 +948,9 @@ impl<B: Backend> Active<B> {
     }
 }
 
-/// Requests handed from the HTTP threads to the worker.
+/// Requests (and slot calls) handed from the HTTP threads to the worker.
 struct JobQueue {
-    jobs: Mutex<VecDeque<Job>>,
+    jobs: Mutex<VecDeque<Msg>>,
     cv: Condvar,
     stop: AtomicBool,
 }
@@ -1003,6 +1126,15 @@ where
             share: KvShare::default(),
             pool: None,
         };
+        let slots = SlotBoard {
+            status: Mutex::new(SlotStatus {
+                lanes: state.lanes.len(),
+                max_holds: Reservations::<()>::new(state.lanes.len(), cfg.max_slot_holds)
+                    .max_holds(),
+                holds: Vec::new(),
+            }),
+            ..SlotBoard::default()
+        };
         let core = Arc::new(Core {
             b,
             model,
@@ -1013,6 +1145,7 @@ where
             special,
             score_cap,
             gauges: Gauges::default(),
+            slots,
         });
         let mut state = state;
         if let Some(used) = core.b.device_in_use() {
@@ -1049,6 +1182,19 @@ where
             worker: Some(worker),
             results: ScoreCache::default(),
         })
+    }
+}
+
+impl<B: Backend> QwenEngine<B> {
+    /// Hands a slot call to the worker.
+    fn slot_send(&self, call: SlotCall) -> Result<(), SlotError> {
+        self.queue
+            .jobs
+            .lock()
+            .map_err(|_| SlotError::Failed("engine queue poisoned".into()))?
+            .push_back(Msg::Slot(call));
+        self.queue.cv.notify_one();
+        Ok(())
     }
 }
 
@@ -1171,6 +1317,7 @@ impl<B: Backend> Core<B> {
     /// chunks as it goes), so a request admitted beside one does not push the pool past its size
     /// later (2 x 128K on a 24 GB card: lent sets overcommit the device, WDDM pages to system RAM
     /// and both lanes decode ~50x slower).
+    /// Lanes in `held` (reserved slots) keep theirs: the holder's prefix stays warm.
     fn kv_room(
         &self,
         st: &mut Lanes<B>,
@@ -1178,6 +1325,7 @@ impl<B: Backend> Core<B> {
         len: usize,
         busy: &[usize],
         reserved: usize,
+        held: &[usize],
     ) -> bool {
         let Some(pool) = st.pool.clone() else {
             return true;
@@ -1185,7 +1333,7 @@ impl<B: Backend> Core<B> {
         let need = st.lanes[li].session.kv_need(len + KV_TRIM_SLACK) + reserved;
         while pool.free_sets() < need {
             let Some(j) = (0..st.lanes.len())
-                .filter(|&j| j != li && !busy.contains(&j))
+                .filter(|&j| j != li && !busy.contains(&j) && !held.contains(&j))
                 .filter(|&j| st.lanes[j].session.kv_private_sets() > 1)
                 .min_by_key(|&j| st.lanes[j].last_used)
             else {
@@ -1709,7 +1857,9 @@ impl<B: Backend> Core<B> {
     }
 
     /// The worker: admits queued requests to free lanes (prefilling them) and runs speculative
-    /// rounds over every decoding request, batched into one verify pass.
+    /// rounds over every decoding request, batched into one verify pass. It also owns the
+    /// reserved-slot table: holds are settled (granted, timed out, expired) every iteration, and
+    /// an idle worker wakes for the next expiry.
     fn run(&self, mut st: Lanes<B>, queue: &JobQueue) {
         if let Err(e) = self.b.bind_thread() {
             eprintln!("engine worker: {e}");
@@ -1717,6 +1867,17 @@ impl<B: Backend> Core<B> {
         }
         let mut waiting: VecDeque<Job> = VecDeque::new();
         let mut active: Vec<Active<B>> = Vec::new();
+        // When a request of a token holding a lane was last waiting or running (see
+        // LARGE_IMAGE_PATCHES): large-image outsiders keep out of the holder's way meanwhile.
+        let mut holder_seen: Option<Instant> = None;
+        // Outsider deferrals already reported (by arrival time), so each is logged once.
+        let mut deferred_logged: Option<Instant> = None;
+        let mut slots: Reservations<SlotReply> =
+            Reservations::new(st.lanes.len(), self.cfg.max_slot_holds);
+        let mut calls: Vec<SlotCall> = Vec::new();
+        let mut outbox = SlotOutbox::new();
+        let mut board: Option<Vec<SlotHold>> = None;
+        let idle = |q: &mut VecDeque<Msg>| q.is_empty() && !queue.stop.load(Ordering::SeqCst);
         let mut mem_logged = Instant::now();
         let mut published: Option<Instant> = None;
         // Drafter context pages kept ready: a new conversation's captures save two windows, so
@@ -1738,12 +1899,18 @@ impl<B: Backend> Core<B> {
                 self.publish(&st);
             }
             st.store.feed(&self.b, &st.lanes[0].session, draft);
+            settle_slots(&mut slots, &active, &mut outbox);
             // New requests; while idle, pin context-store storage between them.
             loop {
                 let mut q = queue.jobs.lock().expect("queue lock");
                 let stop = queue.stop.load(Ordering::SeqCst);
                 if !q.is_empty() || !active.is_empty() || !waiting.is_empty() || stop {
-                    waiting.extend(q.drain(..));
+                    for m in q.drain(..) {
+                        match m {
+                            Msg::Job(j) => waiting.push_back(j),
+                            Msg::Slot(c) => calls.push(c),
+                        }
+                    }
                     break;
                 }
                 drop(q);
@@ -1762,11 +1929,24 @@ impl<B: Backend> Core<B> {
                 if !more {
                     // The state the last request left, which holds until the next one.
                     self.publish(&st);
+                    self.publish_slots(&slots, &active, waiting.len(), &mut board);
+                    send_slot_answers(&mut outbox);
                     let q = queue.jobs.lock().expect("queue lock");
-                    let _q = queue
-                        .cv
-                        .wait_while(q, |q| q.is_empty() && !queue.stop.load(Ordering::SeqCst))
-                        .expect("queue lock");
+                    // Woken for the next hold expiry too, so a lapsed hold is released (and
+                    // reported) on time while no request comes.
+                    match slots.next_deadline() {
+                        Some(at) => {
+                            let left = at.saturating_duration_since(Instant::now());
+                            let _q = queue
+                                .cv
+                                .wait_timeout_while(q, left, idle)
+                                .expect("queue lock");
+                        }
+                        None => {
+                            let _q = queue.cv.wait_while(q, idle).expect("queue lock");
+                        }
+                    }
+                    settle_slots(&mut slots, &active, &mut outbox);
                 }
             }
             if queue.stop.load(Ordering::SeqCst) {
@@ -1779,17 +1959,22 @@ impl<B: Backend> Core<B> {
                 for j in waiting.drain(..).chain(active.drain(..).map(|a| a.job)) {
                     let _ = j.reply.send(Reply::Done(Err(gone())));
                 }
+                // Pending reserve calls are answered by their dropped channels.
                 return;
             }
-            // Admission: a free lane for each waiting request, in arrival order.
-            while !waiting.is_empty() {
-                if !self.batchable() && !active.is_empty() {
+            for c in calls.drain(..) {
+                self.slot_call(&mut slots, &st, &active, c, &mut outbox);
+            }
+            // Admission. Requests carrying a token that holds a lane go first, each straight to
+            // its lane once that is free. The others take free lanes no token holds, in arrival
+            // order: an outsider that cannot be admitted (attention memory) stops the outsiders
+            // only, so a large prompt is not overtaken forever, and it never blocks a holder.
+            loop {
+                if waiting.is_empty() || (!self.batchable() && !active.is_empty()) {
                     break;
                 }
+                let now = Instant::now();
                 let busy: Vec<usize> = active.iter().map(|a| a.lane).collect();
-                let Some(li) = Self::pick_lane(&st.lanes, &busy, &waiting[0].p.keys) else {
-                    break;
-                };
                 // What the running requests still back up to their prompt (and output room).
                 let reserved: usize = active
                     .iter()
@@ -1799,12 +1984,62 @@ impl<B: Backend> Core<B> {
                             .kv_need(a.job.p.keys.len() + KV_TRIM_SLACK)
                     })
                     .sum();
-                if !self.kv_room(&mut st, li, waiting[0].p.keys.len(), &busy, reserved) {
-                    break;
+                let held = slots.held_lanes(now);
+                let lane_of = |j: &Job| j.slot.as_deref().and_then(|t| slots.lane_of(t, now));
+                let mut pick = None;
+                for (i, job) in waiting.iter().enumerate() {
+                    let Some(li) = lane_of(job) else { continue };
+                    if !busy.contains(&li)
+                        && self.kv_room(&mut st, li, job.p.keys.len(), &busy, reserved, &held)
+                    {
+                        pick = Some((i, li, true));
+                        break;
+                    }
                 }
-                let job = waiting.pop_front().expect("checked");
+                // Compute priority (see `round`): while a holder's request runs (prompt or
+                // decode), outsiders wait here; their admission (state restore, vision encode)
+                // and prefill would ride in the holder's forward passes and delay it.
+                let holder_active = active.iter().any(|a| a.held);
+                if holder_active || waiting.iter().any(|j| lane_of(j).is_some()) {
+                    holder_seen = Some(now);
+                }
+                if pick.is_none() && !holder_active {
+                    if let Some(i) = waiting.iter().position(|j| lane_of(j).is_none()) {
+                        // A large-image outsider while a holder is in use: wait for a quiet
+                        // window (bounded), keeping arrival order among outsiders.
+                        let job = &waiting[i];
+                        let patches = image_patches(job);
+                        let defer = patches > LARGE_IMAGE_PATCHES
+                            && !held.is_empty()
+                            && holder_seen.is_some_and(|t| now.duration_since(t) < HOLDER_RECENT)
+                            && now.duration_since(job.queued) < OUTSIDER_MAX_DEFER;
+                        if defer {
+                            if deferred_logged != Some(job.queued) {
+                                deferred_logged = Some(job.queued);
+                                eprintln!(
+                                    "[slots] outsider with {patches} image patches waits for the holder (at most {} s)",
+                                    OUTSIDER_MAX_DEFER.as_secs()
+                                );
+                            }
+                            break;
+                        }
+                        let mut closed = busy.clone();
+                        closed.extend_from_slice(&held);
+                        let keys = &waiting[i].p.keys;
+                        if let Some(li) = Self::pick_lane(&st.lanes, &closed, keys) {
+                            if self.kv_room(&mut st, li, keys.len(), &busy, reserved, &held) {
+                                pick = Some((i, li, false));
+                            }
+                        }
+                    }
+                }
+                let Some((i, li, on_hold)) = pick else {
+                    break;
+                };
+                let job = waiting.remove(i).expect("picked");
                 match self.begin(&mut st, li, job) {
-                    Ok(a) => {
+                    Ok(mut a) => {
+                        a.held = on_hold;
                         active.push(a);
                         if let Err(e) = self.evict_heads(&mut st, li) {
                             eprintln!("context store: moving a chain head failed: {e}");
@@ -1815,7 +2050,24 @@ impl<B: Backend> Core<B> {
                     }
                 }
             }
+            // A holder's running request is use of its hold: it lapses only once idle.
+            let (now, now_ms) = (Instant::now(), unix_ms());
+            for a in active.iter().filter(|a| a.held) {
+                slots.touch(a.lane, now, now_ms);
+            }
+            self.publish_slots(&slots, &active, waiting.len(), &mut board);
+            send_slot_answers(&mut outbox);
             if active.is_empty() {
+                if !waiting.is_empty() {
+                    // Nothing admissible with every lane free cannot happen (a lane is never
+                    // held for everyone, and kv_room lends to a lone request); should it, wait
+                    // for news or a hold to lapse instead of spinning.
+                    let q = queue.jobs.lock().expect("queue lock");
+                    let _q = queue
+                        .cv
+                        .wait_timeout_while(q, Duration::from_millis(20), idle)
+                        .expect("queue lock");
+                }
                 continue;
             }
             if let Err(e) = self.round(&mut st, &mut active) {
@@ -1838,6 +2090,93 @@ impl<B: Backend> Core<B> {
             for a in done {
                 self.complete(&st, a);
             }
+        }
+    }
+
+    /// Handles a reserved-slot call (see `slots`).
+    fn slot_call(
+        &self,
+        slots: &mut Reservations<SlotReply>,
+        st: &Lanes<B>,
+        active: &[Active<B>],
+        call: SlotCall,
+        outbox: &mut SlotOutbox,
+    ) {
+        let now = Instant::now();
+        match call {
+            SlotCall::Reserve {
+                token,
+                duration,
+                wait,
+                reply,
+            } => {
+                // Idle lanes first (least recently used: the conversation least likely to
+                // return), then the busy lane that frees soonest.
+                let rank = |l: usize| match active
+                    .iter()
+                    .filter(|a| a.lane == l)
+                    .map(Active::remaining)
+                    .max()
+                {
+                    None => (0, st.lanes[l].last_used),
+                    Some(left) => (1, left),
+                };
+                let answer = slots.reserve(
+                    &token,
+                    duration,
+                    wait,
+                    now,
+                    unix_ms(),
+                    reply,
+                    rank,
+                    |l, t| outsider_on(active, l, t),
+                );
+                if let Some((reply, r)) = answer {
+                    outbox.push((reply, r.map(slot_grant)));
+                }
+            }
+            SlotCall::Release { token, reply } => {
+                let found = match slots.release(&token, now) {
+                    Some(waiters) => {
+                        for w in waiters {
+                            outbox.push((w, Err(SlotError::Released)));
+                        }
+                        true
+                    }
+                    None => false,
+                };
+                let _ = reply.send(found);
+            }
+        }
+    }
+
+    /// Refreshes the [`SlotBoard`]: load gauges every time, the hold list when it changed.
+    fn publish_slots(
+        &self,
+        slots: &Reservations<SlotReply>,
+        active: &[Active<B>],
+        waiting: usize,
+        last: &mut Option<Vec<SlotHold>>,
+    ) {
+        let g = &self.slots;
+        let holds: Vec<SlotHold> = slots
+            .view(Instant::now())
+            .into_iter()
+            .map(|h| SlotHold {
+                busy: active.iter().any(|a| a.lane == h.lane),
+                token: h.token,
+                lane: h.lane,
+                expires_at_ms: h.expires_ms,
+            })
+            .collect();
+        g.holds.store(holds.len() as u64, Ordering::Relaxed);
+        g.queue.store(waiting as u64, Ordering::Relaxed);
+        g.busy.store(active.len() as u64, Ordering::Relaxed);
+        if last.as_ref() != Some(&holds) {
+            if let Ok(mut s) = g.status.lock() {
+                s.holds = holds.clone();
+            }
+            *last = Some(holds);
         }
     }
 
@@ -1947,21 +2286,31 @@ impl<B: Backend> Core<B> {
             Some(Drafter::DFlash(d)) => d.reset(),
             None => {}
         }
+        // Admission phase timings for the debug log.
+        let ph: std::cell::RefCell<Vec<(&'static str, f64)>> = std::cell::RefCell::new(Vec::new());
+        let tp = std::cell::Cell::new(Instant::now());
+        let mark = |name: &'static str| {
+            ph.borrow_mut().push((name, tp.get().elapsed().as_secs_f64() * 1e3));
+            tp.set(Instant::now());
+        };
         store.tick();
         // Hot entries the previous requests stored go to disk in the background.
         if let Err(e) = store.persist(&self.b) {
             eprintln!("disk context: {e}");
         }
+        mark("persist");
         let shared = common_prefix(&lane.keys, &p.keys);
         let r = (|| -> Result<Prefill<B>, CoreError> {
             if store.enabled() {
                 self.capture_head(lane, store, shared.min(p.keys.len() - 1))?;
             }
+            mark("capture");
             let scoring = job.score.is_some();
             lane.scored = scoring;
             // Windows follow a prompt that is complete as a state: it may come whole from one.
             let whole = job.score.as_ref().is_some_and(|s| !s.windows.is_empty());
             let (start, adopted) = self.reuse(lane, store, share, &p.keys, whole)?;
+            mark("reuse");
             lane.chain = store.resumed(&p.keys, start, adopted);
             if scoring {
                 // A scoring prompt is fed without the drafter (nothing is drafted after it), so
@@ -1995,6 +2344,7 @@ impl<B: Backend> Core<B> {
             // The prompt's rows are backed now rather than as its chunks run, so the next
             // admission's room check (`kv_room`) sees this request's share of the pool taken.
             lane.session.reserve_kv(&self.b, p.keys.len())?;
+            mark("kv");
             if trimmed > 0 && debug {
                 eprintln!(
                     "[kv] lane {li} returned {trimmed} chunks, {:.2} GB backed",
@@ -2021,6 +2371,7 @@ impl<B: Backend> Core<B> {
                 t0,
             )
         })();
+        mark("prefill_setup");
         trim_spare(&mut lane.spare, DEVICE_SPARE);
         pool.append(&mut lane.spare);
         if debug {
@@ -2030,10 +2381,11 @@ impl<B: Backend> Core<B> {
                 let _ = self.b.synchronize();
             }
             eprintln!(
-                "[admit] lane {li} from {} in {:.1} ms, queued {:.1} ms",
+                "[admit] lane {li} from {} in {:.1} ms, queued {:.1} ms, phases {}",
                 r.as_ref().map_or(0, |pre| pre.start),
                 t0.elapsed().as_secs_f64() * 1e3,
-                t0.duration_since(job.queued).as_secs_f64() * 1e3
+                t0.duration_since(job.queued).as_secs_f64() * 1e3,
+                ph.borrow().iter().map(|(n, ms)| format!("{n}={ms:.0}")).collect::<Vec<_>>().join(" ")
             );
         }
         let queue_ms = t0.duration_since(job.queued).as_secs_f64() * 1e3;
@@ -2056,6 +2408,7 @@ impl<B: Backend> Core<B> {
                 scores: Vec::new(),
                 opened: false,
                 thought: None,
+                held: false,
             }),
             Err(e) => {
                 lane.keys.clear();
@@ -2269,6 +2622,7 @@ impl<B: Backend> Core<B> {
             prompt_ms: a.prompt_ms,
             predicted_ms,
             first_token: a.t1,
+            slot: a.held.then_some(a.lane),
         })));
     }
 
@@ -2276,7 +2630,16 @@ impl<B: Backend> Core<B> {
     /// verify (batched when several DFlash requests decode) and commit; a prefilling request feeds
     /// its next prompt chunk in the same forward pass, or its whole prompt when nothing decodes.
     fn round(&self, st: &mut Lanes<B>, active: &mut [Active<B>]) -> Result<(), ApiError> {
-        for a in active.iter_mut().filter(|a| a.pre.is_none()) {
+        // Compute priority for reserved slots: while a holder's request is unfinished, it runs
+        // ALONE — every other lane is frozen for these rounds (no prompt chunk, no decode step;
+        // its state simply waits) and resumes once the holder is done. Batched with others a
+        // decode round costs ~300+ ms instead of ~25 ms, and a prompt chunk riding along costs a
+        // whole prefill pass, so letting outsiders share the passes made a holder's 30-token
+        // answer take seconds. A holder turn is short, so the outsiders' pause is too.
+        let holder_on = active.iter().any(|a| a.held && a.finish.is_none());
+        let frozen = |a: &Active<B>| holder_on && !a.held;
+        // (A frozen lane must not re-push the token it sampled before the freeze.)
+        for a in active.iter_mut().filter(|a| a.pre.is_none() && !frozen(a)) {
             // Steered before this round's forward pass feeds it.
             let c = a.steer(a.c, self.fe.is_eos(a.c));
             a.c = c;
@@ -2303,18 +2666,22 @@ impl<B: Backend> Core<B> {
             }
         }
         let live: Vec<usize> = (0..active.len())
-            .filter(|&i| active[i].pre.is_none() && active[i].finish.is_none())
+            .filter(|&i| active[i].pre.is_none() && active[i].finish.is_none() && !frozen(&active[i]))
             .collect();
         let dflash: Vec<usize> = live
             .iter()
             .copied()
             .filter(|&i| matches!(st.lanes[active[i].lane].drafter, Some(Drafter::DFlash(_))))
             .collect();
-        // Scoring prompts go first: their answer follows right after them, while a chat prompt
-        // is followed by its whole decode. Then the prompt with the fewest tokens left: one chunk
-        // per round, so taking the oldest made a short prompt admitted beside a 125K one wait for
-        // all of its ~60 chunks (52 s on the RTX 5090 Laptop); finished, the short request decodes
-        // and the long prompt's chunks ride with its windows (`batch_round`).
+        // One prompt chunk per round. A reserved slot's prompt goes first (compute priority):
+        // while it is fed, every other prompt waits (no outsider is admitted meanwhile either,
+        // see `run`), and the other lanes' decode steps keep riding in the same passes. While a
+        // holder is unfinished (prompt or decode), outsiders' prompt chunks wait: see `holder_on`
+        // above. Otherwise scoring prompts go first: their answer follows right after them, while
+        // a chat prompt is followed by its whole decode. Then the prompt with the fewest tokens
+        // left: taking the oldest made a short prompt admitted beside a 125K one wait for all of
+        // its ~60 chunks (52 s on the RTX 5090 Laptop); finished, the short request decodes and
+        // the long prompt's chunks ride with its windows (`batch_round`).
         let prefilling = |i: &usize| active[*i].pre.is_some();
         let left = |i: usize| {
             active[i].pre.as_ref().map_or(usize::MAX, |p| {
@@ -2323,11 +2690,19 @@ impl<B: Backend> Core<B> {
         };
         let next = (0..active.len())
             .filter(prefilling)
-            .find(|&i| active[i].job.score.is_some())
+            .find(|&i| active[i].held)
             .or_else(|| {
+                if holder_on {
+                    return None;
+                }
                 (0..active.len())
                     .filter(prefilling)
-                    .min_by_key(|&i| left(i))
+                    .find(|&i| active[i].job.score.is_some())
+                    .or_else(|| {
+                        (0..active.len())
+                            .filter(prefilling)
+                            .min_by_key(|&i| left(i))
+                    })
             });
         if let Some(pi) = next {
             if !dflash.is_empty() && st.bw.is_some() {
@@ -3114,6 +3489,8 @@ impl<B: Backend> Core<B> {
         scoring: bool,
         t0: Instant,
     ) -> Result<Prefill<B>, CoreError> {
+        let dbg_ph = std::env::var_os("VELOX_DEBUG_PREFIX").is_some();
+        let tv = Instant::now();
         let mut embeds: Vec<(usize, B::Buffer)> = Vec::new();
         for (r, run) in p.runs.iter().enumerate() {
             if run.start + run.len > start {
@@ -3128,6 +3505,16 @@ impl<B: Backend> Core<B> {
                 ));
             }
         }
+        if dbg_ph && !embeds.is_empty() {
+            let launch = tv.elapsed().as_secs_f64() * 1e3;
+            let _ = self.b.synchronize();
+            eprintln!(
+                "[vision] {} image(s): launch {launch:.1} ms, done {:.1} ms",
+                embeds.len(),
+                tv.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let ts = Instant::now();
         lane.session.rope_delta = p.rope_delta;
         // Checkpoints are filled inside the forward pass, so the prompt is not cut into short
         // segments there (each segment would stream every weight once more).
@@ -3204,6 +3591,14 @@ impl<B: Backend> Core<B> {
             cp.pos = pos;
             cp.rope_delta = p.rope_delta;
             snaps.push(cp);
+        }
+        if dbg_ph {
+            eprintln!(
+                "[snaps] {} snapshot(s) set up in {:.1} ms (host {})",
+                snaps.len(),
+                ts.elapsed().as_secs_f64() * 1e3,
+                snaps.iter().filter(|c| c.on_host()).count()
+            );
         }
         Ok(Prefill {
             start,
@@ -3676,6 +4071,7 @@ fn score_job(
             fork: None,
         }),
         preamble: None,
+        slot: None,
     }
 }
 
@@ -3819,6 +4215,71 @@ where
         );
     }
 
+    fn slot_reserve(
+        &self,
+        token: &str,
+        duration: Duration,
+        wait: Duration,
+    ) -> Result<SlotGrant, SlotError> {
+        if self.core.slots.status.lock().map_or(0, |s| s.max_holds) == 0 {
+            return Err(SlotError::NoSlot(
+                "reserved slots are off (--max-slot-holds 0, or a single lane)".into(),
+            ));
+        }
+        let (tx, rx) = mpsc::channel();
+        self.slot_send(SlotCall::Reserve {
+            token: token.to_string(),
+            duration,
+            wait,
+            reply: tx,
+        })?;
+        // The worker answers by `wait` itself (it settles holds every round and wakes for
+        // deadlines when idle); the margin covers one long round. The caller's thread just
+        // blocks here: a client that hangs up meanwhile is not noticed (nor is it during
+        // generation), and its hold lapses at expiry.
+        match rx.recv_timeout(wait + Duration::from_secs(10)) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(SlotError::WaitTimeout(
+                "the engine did not answer in time".into(),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(SlotError::Failed("engine worker stopped".into()))
+            }
+        }
+    }
+
+    fn slot_release(&self, token: &str) -> Result<bool, SlotError> {
+        let (tx, rx) = mpsc::channel();
+        self.slot_send(SlotCall::Release {
+            token: token.to_string(),
+            reply: tx,
+        })?;
+        rx.recv_timeout(Duration::from_secs(30))
+            .map_err(|_| SlotError::Failed("the engine did not answer".into()))
+    }
+
+    fn slot_status(&self) -> Option<SlotStatus> {
+        self.core.slots.status.lock().ok().map(|s| s.clone())
+    }
+
+    fn slot_active(&self, token: &str) -> bool {
+        let now = unix_ms();
+        self.core.slots.status.lock().is_ok_and(|s| {
+            s.holds
+                .iter()
+                .any(|h| h.token == token && h.expires_at_ms > now)
+        })
+    }
+
+    fn load(&self) -> Option<EngineLoad> {
+        let g = &self.core.slots;
+        Some(EngineLoad {
+            slot_holds: g.holds.load(Ordering::Relaxed),
+            queue_depth: g.queue.load(Ordering::Relaxed),
+            lanes_busy: g.busy.load(Ordering::Relaxed),
+        })
+    }
+
     fn generate(&self, req: &Value, emit: &mut dyn FnMut(Delta)) -> Result<Outcome, ApiError> {
         let core_ = &self.core;
         let (p, images, sampler, max_tokens, tools, forced, preamble) = core_.prepare(req)?;
@@ -3836,7 +4297,7 @@ where
                 .jobs
                 .lock()
                 .map_err(|_| core(CoreError::Backend("engine queue poisoned".into())))?;
-            q.push_back(Job {
+            q.push_back(Msg::Job(Job {
                 p,
                 images,
                 sampler,
@@ -3846,7 +4307,12 @@ where
                 queued: Instant::now(),
                 score: None,
                 preamble,
-            });
+                // An unknown or lapsed token is not an error: the request then runs normally.
+                slot: req
+                    .get("slot_token")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }));
         }
         self.queue.cv.notify_one();
         let stopped = || core(CoreError::Backend("engine worker stopped".into()));
@@ -3905,6 +4371,7 @@ where
             prompt_ms: done.prompt_ms,
             predicted_ms: done.predicted_ms,
             first_token: Some(done.first_token),
+            slot: done.slot,
         })
     }
 
@@ -3956,16 +4423,18 @@ where
                     decoded.len()
                 );
             }
+            let slot = queries.iter().find_map(|q| q.slot_token).map(str::to_owned);
             for (mut job, answers) in self.core.score_plan(&qs) {
                 let width = job.score.as_ref().map_or(0, |s| s.candidates.len());
                 let (tx, rx) = mpsc::channel();
                 job.reply = tx;
                 job.queued = Instant::now();
+                job.slot = slot.clone();
                 self.queue
                     .jobs
                     .lock()
                     .map_err(|_| core(CoreError::Backend("engine queue poisoned".into())))?
-                    .push_back(job);
+                    .push_back(Msg::Job(job));
                 self.queue.cv.notify_one();
                 let done = loop {
                     match rx
