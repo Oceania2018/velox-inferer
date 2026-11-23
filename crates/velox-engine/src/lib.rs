@@ -143,9 +143,6 @@ pub struct EngineConfig {
     /// a window, so more rows mean fewer passes (each re-reads the weights and decodes the
     /// prompt's cache). About 80 KB of scoring buffers per row on Qwen3.8-27B.
     pub score_pass_rows: usize,
-    /// Lanes slot reservations may hold at once (`POST /v1/slots/reserve`, see `slots`); at most
-    /// `lanes - 1`, so one lane always takes normal traffic. 0 turns reservations off.
-    pub max_slot_holds: usize,
 }
 
 /// Tokens of one scoring window, at most: the prompt's last token, then a rank branch
@@ -1129,8 +1126,7 @@ where
         let slots = SlotBoard {
             status: Mutex::new(SlotStatus {
                 lanes: state.lanes.len(),
-                max_holds: Reservations::<()>::new(state.lanes.len(), cfg.max_slot_holds)
-                    .max_holds(),
+                max_holds: Reservations::<()>::new(state.lanes.len()).max_holds(),
                 holds: Vec::new(),
             }),
             ..SlotBoard::default()
@@ -1872,8 +1868,7 @@ impl<B: Backend> Core<B> {
         let mut holder_seen: Option<Instant> = None;
         // Outsider deferrals already reported (by arrival time), so each is logged once.
         let mut deferred_logged: Option<Instant> = None;
-        let mut slots: Reservations<SlotReply> =
-            Reservations::new(st.lanes.len(), self.cfg.max_slot_holds);
+        let mut slots: Reservations<SlotReply> = Reservations::new(st.lanes.len());
         let mut calls: Vec<SlotCall> = Vec::new();
         let mut outbox = SlotOutbox::new();
         let mut board: Option<Vec<SlotHold>> = None;
@@ -4223,7 +4218,7 @@ where
     ) -> Result<SlotGrant, SlotError> {
         if self.core.slots.status.lock().map_or(0, |s| s.max_holds) == 0 {
             return Err(SlotError::NoSlot(
-                "reserved slots are off (--max-slot-holds 0, or a single lane)".into(),
+                "reserved slots are off (a single lane: --max-concurrency 1)".into(),
             ));
         }
         let (tx, rx) = mpsc::channel();
@@ -4426,6 +4421,8 @@ where
             let slot = queries.iter().find_map(|q| q.slot_token).map(str::to_owned);
             for (mut job, answers) in self.core.score_plan(&qs) {
                 let width = job.score.as_ref().map_or(0, |s| s.candidates.len());
+                // Several questions in one job share its prompt, prefilled once.
+                let shared = job.p.ids.len() as u64;
                 let (tx, rx) = mpsc::channel();
                 job.reply = tx;
                 job.queued = Instant::now();
@@ -4455,13 +4452,21 @@ where
                         let row = &done.scores[k * width..(k + 1) * width];
                         cols.iter().map(|&c| row[c]).collect()
                     };
-                    let prompt_tokens = qs[qi].p.ids.len() as u64;
+                    // Usage counts what the job processed: its shared prompt once (with the
+                    // first question), then each question's own window. Counting every
+                    // question's whole prompt reported the shared images once per question.
+                    let whole = qs[qi].p.ids.len() as u64;
+                    let (prompt_tokens, cached_tokens) = if single || k == 0 {
+                        (whole, (done.start as u64).min(whole))
+                    } else {
+                        (whole.saturating_sub(shared), 0)
+                    };
                     self.results
                         .put(keys[qi].clone(), logprobs.clone(), prompt_tokens);
                     out[qi] = Some(ScoreOutcome {
                         logprobs,
                         prompt_tokens,
-                        cached_tokens: (done.start as u64).min(prompt_tokens),
+                        cached_tokens,
                         queue_ms: done.queue_ms,
                     });
                 }
