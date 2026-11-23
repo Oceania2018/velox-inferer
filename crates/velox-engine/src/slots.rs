@@ -71,12 +71,12 @@ pub(crate) struct Reservations<W> {
 const RECENT_TOKENS: usize = 64;
 
 impl<W> Reservations<W> {
-    /// A table for `lanes` lanes holding at most `max_holds` of them (never all: one lane always
-    /// takes normal traffic).
-    pub fn new(lanes: usize, max_holds: usize) -> Self {
+    /// A table for `lanes` lanes holding at most three quarters of them (rounded down), which
+    /// always leaves at least one lane for normal traffic. A single lane offers no reservations.
+    pub fn new(lanes: usize) -> Self {
         Reservations {
             holds: (0..lanes).map(|_| None).collect(),
-            max_holds: max_holds.min(lanes.saturating_sub(1)),
+            max_holds: lanes * 3 / 4,
             last_lane: Vec::new(),
         }
     }
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn use_keeps_a_hold_alive() {
-        let mut r = Reservations::new(4, 2);
+        let mut r = Reservations::new(4);
         let t0 = Instant::now();
         let (_, g) = ok(r.reserve("a", 10 * S, S, t0, 1_000, 0, idle, free));
         // Used at 8 s: lapses 10 s after that, not at 10 s.
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn reserving_again_gets_the_same_lane_back() {
-        let mut r = Reservations::new(4, 2);
+        let mut r = Reservations::new(4);
         let t0 = Instant::now();
         // "a" is given lane 3 (least recently used), then lapses.
         let lru = |l: usize| (0, [5, 6, 7, 1][l]);
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn grants_an_idle_lane_at_once() {
-        let mut r = Reservations::new(4, 2);
+        let mut r = Reservations::new(4);
         let t0 = Instant::now();
         let (w, g) = ok(r.reserve("a", 10 * S, 30 * S, t0, 1_000, 7, idle, free));
         assert_eq!(w, 7);
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn prefers_the_best_ranked_lane() {
-        let mut r = Reservations::new(4, 2);
+        let mut r = Reservations::new(4);
         let t0 = Instant::now();
         // Lanes 0 and 1 busy (1 frees sooner), 2 idle but used recently, 3 idle and older.
         let rank = |l: usize| [(1, 50), (1, 10), (0, 9), (0, 3)][l];
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn renewal_extends_and_answers_at_once() {
-        let mut r = Reservations::new(4, 2);
+        let mut r = Reservations::new(4);
         let t0 = Instant::now();
         ok(r.reserve("a", 10 * S, S, t0, 0, 0, idle, free));
         let t1 = t0 + 8 * S;
@@ -428,10 +428,11 @@ mod tests {
 
     #[test]
     fn conflict_when_max_holds_are_taken() {
-        let mut r = Reservations::new(4, 2);
+        let mut r = Reservations::new(4); // 3 holds at most
         let t0 = Instant::now();
         ok(r.reserve("a", 10 * S, S, t0, 0, 0, idle, free));
         ok(r.reserve("b", 10 * S, S, t0, 0, 0, idle, free));
+        ok(r.reserve("x", 10 * S, S, t0, 0, 0, idle, free));
         match r.reserve("c", 10 * S, S, t0, 0, 9, idle, free) {
             Some((9, Err(SlotError::NoSlot(_)))) => {}
             other => panic!(
@@ -450,16 +451,21 @@ mod tests {
     }
 
     #[test]
-    fn never_holds_every_lane() {
-        let r: Reservations<u32> = Reservations::new(4, 9);
-        assert_eq!(r.max_holds(), 3);
-        let r: Reservations<u32> = Reservations::new(1, 2);
-        assert_eq!(r.max_holds(), 0);
+    fn holds_at_most_three_quarters_of_the_lanes() {
+        let holds = |lanes| Reservations::<u32>::new(lanes).max_holds();
+        assert_eq!(holds(1), 0); // a single lane: no reservations
+        assert_eq!(holds(2), 1);
+        assert_eq!(holds(3), 2);
+        assert_eq!(holds(4), 3);
+        assert_eq!(holds(6), 4);
+        assert_eq!(holds(8), 6);
+        // Never every lane: one always takes normal traffic.
+        assert!((1..=64).all(|lanes| holds(lanes) < lanes));
     }
 
     #[test]
     fn expiry_releases_the_lane() {
-        let mut r = Reservations::new(4, 2);
+        let mut r = Reservations::new(4);
         let t0 = Instant::now();
         ok(r.reserve("a", 5 * S, S, t0, 0, 0, idle, free));
         assert_eq!(r.next_deadline(), Some(t0 + 5 * S));
@@ -473,7 +479,7 @@ mod tests {
 
     #[test]
     fn busy_lane_is_held_then_granted_when_it_frees() {
-        let mut r = Reservations::new(2, 1);
+        let mut r = Reservations::new(2);
         let t0 = Instant::now();
         let busy = |l: usize, _: &str| l == 0;
         let rank = |l: usize| if l == 0 { (1, 5) } else { (1, 9) };
@@ -498,7 +504,7 @@ mod tests {
 
     #[test]
     fn wait_timeout_drops_the_tentative_hold() {
-        let mut r = Reservations::new(2, 1);
+        let mut r = Reservations::new(2);
         let t0 = Instant::now();
         let busy = |_: usize, _: &str| true;
         assert!(r
@@ -521,7 +527,7 @@ mod tests {
 
     #[test]
     fn release_answers_waiters_and_frees_the_lane() {
-        let mut r = Reservations::new(2, 1);
+        let mut r = Reservations::new(2);
         let t0 = Instant::now();
         let busy = |_: usize, _: &str| true;
         assert!(r
@@ -534,7 +540,7 @@ mod tests {
 
     #[test]
     fn holder_work_does_not_block_a_grant() {
-        let mut r = Reservations::new(2, 1);
+        let mut r = Reservations::new(2);
         let t0 = Instant::now();
         assert!(r
             .reserve("a", 60 * S, S, t0, 0, 0, idle, |_, _| true)
