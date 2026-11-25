@@ -303,6 +303,8 @@ pub struct QwenEngine<B: Backend> {
     core: Arc<Core<B>>,
     queue: Arc<JobQueue>,
     worker: Option<JoinHandle<()>>,
+    /// Device-memory gauges, measured off the worker (see `Core::sample_memory`).
+    sampler: Option<JoinHandle<()>>,
     /// Recent scoring answers (see `ScoreCache`).
     results: ScoreCache,
 }
@@ -1172,10 +1174,18 @@ where
                 .spawn(move || core.run(state, &queue))
                 .map_err(|e| CoreError::Backend(format!("engine worker: {e}")))?
         };
+        let sampler = {
+            let (core, queue) = (Arc::clone(&core), Arc::clone(&queue));
+            std::thread::Builder::new()
+                .name("velox-mem".into())
+                .spawn(move || core.sample_memory(&queue))
+                .map_err(|e| CoreError::Backend(format!("memory sampler: {e}")))?
+        };
         Ok(QwenEngine {
             core,
             queue,
             worker: Some(worker),
+            sampler: Some(sampler),
             results: ScoreCache::default(),
         })
     }
@@ -1200,6 +1210,9 @@ impl<B: Backend> Drop for QwenEngine<B> {
         self.queue.cv.notify_all();
         if let Some(w) = self.worker.take() {
             let _ = w.join();
+        }
+        if let Some(s) = self.sampler.take() {
+            let _ = s.join();
         }
     }
 }
@@ -1396,24 +1409,51 @@ impl<B: Backend> Core<B> {
         eprintln!(
             "[mem] device in use {}{pool}{allocs}{snaps}{store}{pinned}, graphs {graphs} ({:.2} \
              GB, {released} released)",
-            self.b.device_in_use().map_or("unknown".into(), |u| format!(
-                "{:.2} GiB",
-                u as f64 / (1u64 << 30) as f64
-            )),
+            // The sampler's last figure: measuring here would block the worker (sample_memory).
+            match self.gauges.device_used.load(Ordering::Relaxed) {
+                0 => "unknown".into(),
+                u => format!("{:.2} GiB", u as f64 / (1u64 << 30) as f64),
+            },
             gb(graph_bytes)
         );
     }
 
-    /// Refreshes [`Gauges`] from the device and the store.
+    /// Keeps the device-memory gauges current from their own thread, so the worker never calls
+    /// NVML or cudaMemGetInfo while serving. Under WSL both go through the dxg driver, which
+    /// stalls now and then for seconds (RTX 5090, 2026-11-25: NVML calls of 5-6 s); measured in
+    /// `publish`, which the worker runs every second and whenever it goes idle, such a stall held
+    /// the next request in the queue for 1-5 s (`[admit] … queued 5219.6 ms`, ~6% of back-to-back
+    /// System One rank requests) with the GPU idle.
+    fn sample_memory(&self, queue: &JobQueue) {
+        // NVML finds the device through the CUDA runtime's current device.
+        if let Err(e) = self.b.bind_thread() {
+            eprintln!("memory sampler: {e}; device memory gauges stay unset");
+            return;
+        }
+        let g = &self.gauges;
+        let stopped = || queue.stop.load(Ordering::SeqCst);
+        while !stopped() {
+            if let Some(used) = self.b.device_in_use() {
+                g.device_used.store(used as u64, Ordering::Relaxed);
+            }
+            // Fixed for the device: measured until it is known.
+            if g.device_total.load(Ordering::Relaxed) == 0 {
+                if let Some((_, total)) = self.b.mem_info() {
+                    g.device_total.store(total as u64, Ordering::Relaxed);
+                }
+            }
+            // Short naps, so a dropped engine joins this thread promptly.
+            let next = Instant::now() + GAUGES_EVERY;
+            while !stopped() && Instant::now() < next {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// Refreshes [`Gauges`] from the store (the device figures come from `sample_memory`).
     fn publish(&self, st: &Lanes<B>) {
         let g = &self.gauges;
         let set = |a: &AtomicU64, v: u64| a.store(v, Ordering::Relaxed);
-        if let Some(used) = self.b.device_in_use() {
-            set(&g.device_used, used as u64);
-        }
-        if let Some((_, total)) = self.b.mem_info() {
-            set(&g.device_total, total as u64);
-        }
         set(&g.host_used, st.store.bytes(&self.b) as u64);
         set(&g.host_budget, st.store.budget() as u64);
         set(&g.host_entries, st.store.len() as u64);
