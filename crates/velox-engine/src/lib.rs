@@ -145,6 +145,14 @@ pub struct EngineConfig {
     pub score_pass_rows: usize,
 }
 
+/// Whether a scoring prompt's last chunk carries its windows in the same forward pass
+/// (`Qwen35Text::advance_score`); `VELOX_SCORE_RIDE=0` scores them in a pass of their own, as
+/// before (for comparing the two).
+fn score_ride() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VELOX_SCORE_RIDE").map_or(true, |v| v != "0"))
+}
+
 /// Tokens of one scoring window, at most: the prompt's last token, then a rank branch
 /// (`"<id>] "`, at most five tokens).
 const SCORE_WINDOW: usize = 1 + velox_serve::systemone::MAX_BRANCH_TOKENS;
@@ -2509,8 +2517,9 @@ impl<B: Backend> Core<B> {
         if let Some(s) = &a.job.score {
             // Nothing is sampled. Without windows the scores were read off the prompt's last row
             // (`prefill_rest`, `batch_round`); otherwise every window is scored from the prompt's
-            // state, which the lane keeps for the next request.
-            if !s.windows.is_empty() {
+            // state, which the lane keeps for the next request. Windows that rode the prompt's
+            // last chunk (`prefill_rest`) are scored already.
+            if !s.windows.is_empty() && a.scores.is_empty() {
                 let t0 = Instant::now();
                 let refs: Vec<&[u32]> = s.windows.iter().map(|w| &w[..]).collect();
                 a.scores = self.model.score_windows(
@@ -2549,7 +2558,9 @@ impl<B: Backend> Core<B> {
     /// the rest of a long prompt (see `round`).
     fn prefill_rest(&self, st: &mut Lanes<B>, a: &mut Active<B>) -> Result<(), CoreError> {
         let cands = {
-            let Lanes { ws, lanes, dw, .. } = &mut *st;
+            let Lanes {
+                ws, lanes, dw, sw, ..
+            } = &mut *st;
             let lane = &mut lanes[a.lane];
             let pre = a.pre.as_mut().expect("a prefilling request");
             let p = &a.job.p;
@@ -2595,15 +2606,58 @@ impl<B: Backend> Core<B> {
                         },
                     )?;
                 }
-                None => self.model.advance_snap(
-                    &self.b,
-                    session,
-                    ws,
-                    ids,
-                    positions,
-                    &inserts,
-                    &mut pre.snaps,
-                )?,
+                None => {
+                    // A scoring prompt's last chunk takes its windows along when they fit the
+                    // pass (`Qwen35Text::advance_score`): no pass of their own afterwards.
+                    let windows: Vec<&[u32]> = a
+                        .job
+                        .score
+                        .as_ref()
+                        .filter(|_| from + n == p.ids.len() && score_ride())
+                        .map(|s| s.windows.iter().map(|w| &w[..]).collect())
+                        .unwrap_or_default();
+                    match a.job.score.as_ref().filter(|_| {
+                        self.model
+                            .rides_score(&self.b, session, ws, sw, n, &windows)
+                    }) {
+                        Some(s) => {
+                            let t0 = Instant::now();
+                            a.scores = self.model.advance_score(
+                                &self.b,
+                                session,
+                                ws,
+                                sw,
+                                ids,
+                                positions,
+                                &inserts,
+                                &mut pre.snaps,
+                                &windows,
+                                &s.candidates,
+                                self.fe.public_vocab,
+                            )?;
+                            if std::env::var_os("VELOX_DEBUG_PREFIX").is_some() {
+                                eprintln!(
+                                    "[score] lane {} {} windows (up to {} tokens) x {} candidates \
+                                     rode the prompt's last chunk ({n} tokens) in {:.1} ms",
+                                    a.lane,
+                                    windows.len(),
+                                    windows.iter().map(|w| w.len()).max().unwrap_or(0),
+                                    s.candidates.len(),
+                                    t0.elapsed().as_secs_f64() * 1e3
+                                );
+                            }
+                        }
+                        None => self.model.advance_snap(
+                            &self.b,
+                            session,
+                            ws,
+                            ids,
+                            positions,
+                            &inserts,
+                            &mut pre.snaps,
+                        )?,
+                    }
+                }
             }
             pre.done += n;
             pre.chunks += 1;
