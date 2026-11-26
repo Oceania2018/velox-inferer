@@ -130,7 +130,10 @@ language English<asr_text>",
             .map_err(|_| Error::Backend("engine exited during load".into()))??;
         let listener = TcpListener::bind((host.as_str(), port))
             .map_err(|e| Error::Config(format!("bind {host}:{port}: {e}")))?;
-        eprintln!("serve-asr listening on {host}:{port} (max batch {max_batch})");
+        eprintln!(
+            "serve-asr listening on {host}:{port} (max batch {max_batch}) | {}",
+            velox_serve::build_info::describe()
+        );
         for stream in listener.incoming() {
             if engine.is_finished() {
                 break;
@@ -719,6 +722,7 @@ fn connection(
     while let Some(req) = read_request(&mut r)? {
         let (code, body) = match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/health") => (200, json!({"status": "ok"})),
+            ("GET", "/version") => (200, velox_serve::build_info::json()),
             ("GET", "/v1/models") => (
                 200,
                 json!({"object": "list", "data": [{"id": MODEL_NAME, "object": "model"}]}),
