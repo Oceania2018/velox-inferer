@@ -30,6 +30,7 @@ velox - velox-inferer command line
 USAGE: velox <command> [options]
 
 COMMANDS:
+  version                 Build identity (commit, ref, build time) and the latest changes, as JSON
   devices                 Detected GPUs, their profiles and the branch tuned for each
   profiles                Hardware catalog
   variant                 Variant compiled into this build and its native ops
@@ -178,6 +179,15 @@ fn main() -> ExitCode {
 
 fn run(a: &Args) -> Result<ExitCode> {
     match a.command.as_deref() {
+        Some("version") => {
+            // Same body as GET /version, for `docker exec` when the server is not up.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&velox_serve::build_info::json())
+                    .unwrap_or_default()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Some("devices") => devices(),
         Some("profiles") => profiles(),
         Some("variant") => variant(a),

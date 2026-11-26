@@ -30,3 +30,10 @@ velox-inferer is a Rust (host) + CUDA (kernels) inference framework for consumer
 
 Use `scripts/dev.sh <cmd>` to run in the `velox-dev` container (CUDA 13.1, Rust stable, GPU).
 Commits use Conventional Commit subjects.
+
+## Change log
+
+A PR to main that changes behaviour (performance, API, defaults, fixes) adds an entry at the top
+of [CHANGES.md](CHANGES.md): `## YYYY-MM-DD · #PR · type: title`, then what changed and its
+measured effect. The server embeds the file (`GET /version`, `GET /changes`), so a node shows what
+its build contains.
