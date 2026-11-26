@@ -735,3 +735,127 @@ fn score_windows_match_each_window_fed_alone() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Scoring windows riding the prompt's last chunk (`advance_score`) against the two passes they
+/// replace (`advance_snap`, then `score_windows`): the same scores, the same session afterwards
+/// (position, recurrent state, cache rows of the prompt) and the same snapshot inside the chunk.
+#[test]
+fn advance_score_matches_prefill_then_score_windows() {
+    use crate::qwen3_5::{ExpertPolicy, Qwen35Text};
+
+    let dir = std::env::temp_dir().join(format!(
+        "velox-hf-{}",
+        velox_weights::hex(&velox_weights::new_artifact_id())
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    checkpoint(&dir);
+    let out = dir.join("model.vi");
+    import(&dir, &out, &mut |_| {}).unwrap();
+    let art = Artifact::open(&out).unwrap();
+    let cfg = TextConfig::from_json(&art.components()["text"]["config"]).unwrap();
+    let b = CpuBackend;
+    let w = TextWeights::load_opts(&b, &art, &cfg, false, &[], |_| {}).unwrap();
+    let mut model = Qwen35Text::new(cfg, w);
+    model
+        .enable_experts(&b, 0, ExpertPolicy::default())
+        .unwrap();
+    let mut ws = model.workspace(&b, 40).unwrap();
+    let prompt: Vec<u32> = (0..19).map(|i| (i * 37 + 11) % V as u32).collect();
+    // Rank branches: the prompt's last token, then an id of one to three tokens.
+    let windows: Vec<Vec<u32>> = vec![vec![7], vec![7, 200, 3], vec![7, 9], vec![7, 1, 2, 3]];
+    let refs: Vec<&[u32]> = windows.iter().map(|w| &w[..]).collect();
+    let targets = [0u32, 5, 17, (V - 1) as u32];
+    for fmt in [velox_core::KvFormat::F32, velox_core::KvFormat::Bf16] {
+        // `fed`: prompt tokens already in the session when the last chunk arrives (none: the
+        // whole prompt is that chunk).
+        for fed in [0usize, 7] {
+            let what = format!("{fmt}, {fed} tokens fed before");
+            let mut sw = model.score_workspace(&b, 4, 6).unwrap();
+            let snap_pos = fed + 5;
+
+            // Two passes: the chunk, then the windows.
+            let mut s = model.session_with(&b, 64, fmt).unwrap();
+            if fed > 0 {
+                model
+                    .advance(&b, &mut s, &mut ws, &prompt[..fed], None, &[])
+                    .unwrap();
+            }
+            let mut snaps = [s.blank_checkpoint(&b, snap_pos).unwrap()];
+            model
+                .advance_snap(&b, &mut s, &mut ws, &prompt[fed..], None, &[], &mut snaps)
+                .unwrap();
+            let want = model
+                .score_windows(&b, &mut s, &mut ws, &mut sw, &refs, &targets, V as usize)
+                .unwrap();
+            model
+                .advance(&b, &mut s, &mut ws, &[42], None, &[])
+                .unwrap();
+            let want_next = model.logits(&b, &mut ws).unwrap();
+            s.restore(&b, &snaps[0]).unwrap();
+            model
+                .advance(&b, &mut s, &mut ws, &prompt[snap_pos..], None, &[])
+                .unwrap();
+            let want_snap = model.logits(&b, &mut ws).unwrap();
+
+            // One pass.
+            let mut s = model.session_with(&b, 64, fmt).unwrap();
+            if fed > 0 {
+                model
+                    .advance(&b, &mut s, &mut ws, &prompt[..fed], None, &[])
+                    .unwrap();
+            }
+            let chunk = &prompt[fed..];
+            assert!(
+                model.rides_score(&b, &s, &ws, &sw, chunk.len(), &refs),
+                "{what}"
+            );
+            let mut snaps = [s.blank_checkpoint(&b, snap_pos).unwrap()];
+            let got = model
+                .advance_score(
+                    &b,
+                    &mut s,
+                    &mut ws,
+                    &mut sw,
+                    chunk,
+                    None,
+                    &[],
+                    &mut snaps,
+                    &refs,
+                    &targets,
+                    V as usize,
+                )
+                .unwrap();
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g.to_bits(), w.to_bits(), "{what}: {g} vs {w}");
+            }
+            // The session holds the prompt, as after the chunk alone.
+            assert_eq!(s.pos, prompt.len(), "{what}");
+            model
+                .advance(&b, &mut s, &mut ws, &[42], None, &[])
+                .unwrap();
+            assert_eq!(model.logits(&b, &mut ws).unwrap(), want_next, "{what}");
+            s.restore(&b, &snaps[0]).unwrap();
+            model
+                .advance(&b, &mut s, &mut ws, &prompt[snap_pos..], None, &[])
+                .unwrap();
+            assert_eq!(model.logits(&b, &mut ws).unwrap(), want_snap, "{what}");
+        }
+    }
+    // What does not fit one pass is refused: the caller scores in a pass of its own.
+    let s = model
+        .session_with(&b, 64, velox_core::KvFormat::F32)
+        .unwrap();
+    let sw = model.score_workspace(&b, 4, 6).unwrap();
+    assert!(
+        !model.rides_score(&b, &s, &ws, &sw, 30, &refs),
+        "30 + 16 rows > 40"
+    );
+    assert!(!model.rides_score(&b, &s, &ws, &sw, 12, &[]), "no windows");
+    let small = model.score_workspace(&b, 2, 6).unwrap();
+    assert!(
+        !model.rides_score(&b, &s, &ws, &small, 12, &refs),
+        "16 rows > 12"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
