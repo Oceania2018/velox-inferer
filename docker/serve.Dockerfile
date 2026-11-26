@@ -10,7 +10,7 @@
 ARG CUDA_VERSION=13.1.0
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS build
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git \
     && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
@@ -24,9 +24,19 @@ COPY . .
 # made would otherwise reuse them and ship another ref's binary. So the cache keeps the sha256 of
 # every source file of the last build, and files whose content differs from it are touched first.
 # The list is written before compiling, so a failed build cannot leave artifacts it does not cover.
+#
+# Build identity (`GET /version`, `velox_build_info`): the commit comes from .git, which a git-URL
+# context only keeps with the build arg BUILDKIT_CONTEXT_KEEP_GIT_DIR=1 (qwen-llm-inferencer's
+# compose passes it); VELOX_GIT_SHA overrides it, VELOX_GIT_REF names the branch the build asked for.
+ARG VELOX_GIT_SHA=
+ARG VELOX_GIT_REF=
 RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/src/target,sharing=locked \
-    find . -path ./target -prune -o -type f -print0 | xargs -0 sha256sum | LC_ALL=C sort > /tmp/new.sha256 \
+    export VELOX_GIT_SHA="${VELOX_GIT_SHA:-$(git rev-parse HEAD 2>/dev/null)}" \
+        VELOX_GIT_REF="${VELOX_GIT_REF:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null | grep -v '^HEAD$')}" \
+        VELOX_BUILD_UNIX="$(date +%s)" \
+    && echo "building velox ${VELOX_GIT_SHA:-unknown} (${VELOX_GIT_REF:-ref unknown})" \
+    && find . \( -path ./target -o -path ./.git \) -prune -o -type f -print0 | xargs -0 sha256sum | LC_ALL=C sort > /tmp/new.sha256 \
     && touch target/.src.sha256 && LC_ALL=C sort target/.src.sha256 > /tmp/old.sha256 \
     && LC_ALL=C comm -13 /tmp/old.sha256 /tmp/new.sha256 | cut -c67- | tr '\n' '\0' | xargs -0 -r touch -- \
     && cp /tmp/new.sha256 target/.src.sha256 \

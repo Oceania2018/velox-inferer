@@ -313,10 +313,11 @@ pub fn run(a: &Args) -> Result<ExitCode> {
         .map(|p| format!(" + {}", file_name(std::path::Path::new(p))))
         .unwrap_or_default();
     eprintln!(
-        "listening on http://{host}:{port} | model {model_id} ({architecture}, {}{draft}, {}) | variant {} | profile {profile}",
+        "listening on http://{host}:{port} | model {model_id} ({architecture}, {}{draft}, {}) | variant {} | profile {profile} | {}",
         file_name(&art.path),
         art.container,
-        velox_variant::INFO.id
+        velox_variant::INFO.id,
+        velox_serve::build_info::describe()
     );
     Server::new(cfg, engine)
         .serve(listener)

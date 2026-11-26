@@ -1,6 +1,7 @@
 //! OpenAI-compatible HTTP API.
 //!
-//! Endpoints: `GET /health`, `GET /v1/models`, `GET /metrics` (Prometheus text, including the
+//! Endpoints: `GET /health`, `GET /version` (the commit this binary was built from and its
+//! latest changes, see [`build_info`]), `GET /changes` (CHANGES.md), `GET /v1/models`, `GET /metrics` (Prometheus text, including the
 //! `velox_max_concurrency` gauge llm-inference-daemon probes), `POST /v1/chat/completions`
 //! (JSON or SSE stream), and `POST /v1/systemone` (ninfer's System One decisions, see
 //! [`systemone`]) when the engine scores. Responses carry llama.cpp-style `timings` like
@@ -9,6 +10,7 @@
 //! The API layer is engine-agnostic: it validates and frames requests and hands them to a
 //! [`ChatEngine`]. Model execution lives behind that trait.
 
+pub mod build_info;
 pub mod systemone;
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -544,6 +546,13 @@ impl Server {
                     respond_json(w, 503, &json!({"status": "device_lost", "reason": reason}))
                 }
             },
+            ("GET", "/version") => respond_json(w, 200, &build_info::json()),
+            ("GET", "/changes") => respond(
+                w,
+                200,
+                "text/markdown; charset=utf-8",
+                build_info::CHANGES.as_bytes(),
+            ),
             ("GET", "/v1/models") => respond_json(
                 w,
                 200,
@@ -598,7 +607,7 @@ impl Server {
                 405,
                 &slot_error("method_not_allowed", "method not allowed"),
             ),
-            (_, "/health" | "/v1/models" | "/metrics" | "/v1/chat/completions") => {
+            (_, "/health" | "/version" | "/changes" | "/v1/models" | "/metrics" | "/v1/chat/completions") => {
                 respond_json(w, 405, &ApiError::invalid("method not allowed").body())
             }
             (_, "/v1/systemone") if self.engine.scores() => {
@@ -644,6 +653,7 @@ impl Server {
             self.cached_tokens.load(Ordering::Relaxed),
             labels.join(",")
         );
+        out.push_str(&build_info::metric());
         let l = self.latency.lock().unwrap();
         l.ttft.render(
             &mut out,
