@@ -16,7 +16,9 @@ use velox_core::backend::{
 use velox_core::{Backend, Error, KvFormat, Result, GRAPH_KV_BUCKET, GRAPH_STATIC};
 
 use config::EncConfig;
-pub use config::{AsrConfig, ASR_TEXT, AUDIO_END, AUDIO_PAD, AUDIO_START, IM_END, IM_START};
+pub use config::{
+    is_stop, AsrConfig, ASR_TEXT, AUDIO_END, AUDIO_PAD, AUDIO_START, ENDOFTEXT, IM_END, IM_START,
+};
 use mel::MelFrontend;
 use weights::{DecWeights, EncWeights, Files, Linear};
 
@@ -822,7 +824,7 @@ impl<B: Backend> Qwen3Asr<B> {
                 b.fetch_u32_begin(&ws.id_history, slot, slot)?;
             }
             let id = b.fetch_u32(&ws.id_history, pending, pending)?;
-            if id == IM_END || !more {
+            if is_stop(id) || !more {
                 break;
             }
             out.push(id);
@@ -1369,7 +1371,7 @@ fn accepted(draft: &[u32], pred: &[u32]) -> usize {
     draft
         .iter()
         .zip(pred)
-        .take_while(|(d, p)| d == p && **p != IM_END)
+        .take_while(|(d, p)| d == p && !is_stop(**p))
         .count()
 }
 
@@ -1397,6 +1399,7 @@ mod tests {
         assert_eq!(accepted(&[], &[4]), 0);
         // The end token stops the sequence even when the draft has it too.
         assert_eq!(accepted(&[5, IM_END, 7], &[5, IM_END, 7, 8]), 1);
+        assert_eq!(accepted(&[5, ENDOFTEXT, 7], &[5, ENDOFTEXT, 7, 8]), 1);
     }
 
     #[test]
