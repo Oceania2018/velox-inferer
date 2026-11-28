@@ -75,10 +75,19 @@ pub struct AsrConfig {
 
 pub const IM_START: u32 = 151_644;
 pub const IM_END: u32 = 151_645;
+/// `<|endoftext|>`. The base model always ends with `<|im_end|>`, but fine-tunes of it
+/// (Confucius4-R2T2) sometimes end with this one instead; left unhandled it comes back as text
+/// and decoding runs on past the transcript.
+pub const ENDOFTEXT: u32 = 151_643;
 pub const AUDIO_START: u32 = 151_669;
 pub const AUDIO_END: u32 = 151_670;
 pub const AUDIO_PAD: u32 = 151_676;
 pub const ASR_TEXT: u32 = 151_704;
+
+/// True for any id that ends a transcript.
+pub fn is_stop(id: u32) -> bool {
+    id == IM_END || id == ENDOFTEXT
+}
 
 fn num(g: &Gguf, key: &str) -> Result<f64> {
     g.metadata

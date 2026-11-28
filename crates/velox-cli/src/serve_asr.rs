@@ -21,7 +21,7 @@ use velox_core::{Backend, Error, Result};
 use velox_frontend::PlainTokenizer;
 use velox_models::qwen3_asr::mel::{MelFrontend, SAMPLE_RATE};
 use velox_models::qwen3_asr::{
-    BatchWorkspace, KvPool, PoolSeq, Qwen3Asr, AUDIO_PAD, IM_END, MAX_BATCH, PREFILL_ROWS,
+    is_stop, BatchWorkspace, KvPool, PoolSeq, Qwen3Asr, AUDIO_PAD, IM_END, MAX_BATCH, PREFILL_ROWS,
     VERIFY_ROWS,
 };
 
@@ -182,7 +182,7 @@ impl Active {
 
     /// Records one produced id; true when the sequence is done (`truncated` set when cut short).
     fn push(&mut self, id: u32, truncated: &mut bool) -> bool {
-        if id == IM_END {
+        if is_stop(id) {
             return true;
         }
         self.ids.push(id);
@@ -596,7 +596,7 @@ fn admit_group<B: Backend>(
             draft_at: None,
             draft_from: 0,
         };
-        if first == IM_END {
+        if is_stop(first) {
             finish(pool, a, false);
             continue;
         }
